@@ -602,16 +602,18 @@ def handle_check_github(req):
         auto = bool(req.get("auto"))
         status = github_stage_release(cfg, force=bool(req.get("force")))
         send({"type": "github-update", **status})
-        watching = bool(cfg.get("autoUpdate")) and os.name == "nt"
-        if watching:
-            # A running folder-watcher installs whatever we just staged; driving
-            # handle_update too would prompt the user twice.
-            if not auto and status.get("reached") and not status.get("newer"):
+        if not status.get("reached"):
+            if not auto:
+                _info("Media Catcher", "Couldn't reach GitHub to check for updates.")
+            return
+        if not status.get("newer"):
+            if not auto:
                 _info("Media Catcher", "You're on the latest release (v%s)." % (status.get("latest") or "?"))
             return
-        if auto and not status.get("newer"):
-            return
-        handle_update({"extDir": cfg.get("extDir"), "zipDir": cfg.get("zipDir"), "silent": auto})
+        # Newer packages are staged in the watched folder — install them now.
+        # _install_updates is single-flight, so the folder-watcher firing on the
+        # same downloads can't double-prompt.
+        _install_updates(cfg.get("extDir"), cfg.get("zipDir") or downloads_dir(), silent=auto)
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -638,24 +640,27 @@ def start_github_poll():
     threading.Thread(target=_github_poll_loop, daemon=True).start()
 
 
-def handle_update(req):
-    """Manual 'Check & install update': install whichever of the extension / host
-    is newer, then offer a session-restoring Firefox restart."""
-    silent = bool(req.get("silent"))
-    def worker():
-        cfg = load_config()
-        ext_dir = req.get("extDir") or cfg.get("extDir")
-        zip_dir = req.get("zipDir") or cfg.get("zipDir") or downloads_dir()
-        if not ext_dir or not os.path.isdir(ext_dir):
-            send({"type": "update-result", "ok": False, "error": "Set the extension folder in Settings first."})
-            _info("Media Catcher", "Set the extension folder in Settings, then check for updates again.")
-            return
-        cfg["extDir"] = ext_dir; cfg["zipDir"] = zip_dir; save_config(cfg)
-        plan = plan_update(ext_dir, HERE, zip_dir)
-        apply_ext, apply_host = plan["ext_newer"], plan["host_newer"]
+_update_lock = threading.Lock()
+
+
+def _install_updates(ext_dir, zip_dir, silent=False):
+    """Install whatever in zip_dir is newer than what's installed.
+
+    The host updates regardless of the extension folder. The extension is only
+    overwritten when we actually have its source folder — a signed add-on lives in
+    the Firefox profile and only Firefox can update it, so we never touch it. When a
+    newer extension exists that we can't apply, we tell the extension so it can point
+    the user at the download. Single-flight: the folder-watcher and an explicit check
+    can't both prompt at once."""
+    if not _update_lock.acquire(blocking=False):
+        return
+    try:
+        have_ext = bool(ext_dir and os.path.isdir(ext_dir))
+        plan = plan_update(ext_dir if have_ext else "", HERE, zip_dir)
+        apply_ext = bool(plan["ext_newer"] and have_ext)
+        apply_host = bool(plan["host_newer"])
 
         # Content-hash fallback: a same-version host package whose code changed.
-        # Notify + ask (the version bump was skipped, but the code is different).
         if plan["host_same_ver_changed"] and not apply_host:
             if _yesno("Media Catcher — content change detected",
                       "A helper package with the SAME version (v%s) but DIFFERENT code was found.\n\n"
@@ -663,25 +668,45 @@ def handle_update(req):
                       % (plan["host_to"] or "?")):
                 apply_host = True
 
-        if not (apply_ext or apply_host):
-            send({"type": "update-result", "ok": True, "available": False, "version": plan["ext_from"]})
-            if not silent:
-                _info("Media Catcher", "You're up to date (extension v%s, helper v%s)." %
-                      (plan["ext_from"] or "?", plan["host_from"] or "?"))
+        if apply_ext or apply_host:
+            summary = plan_summary(plan) or ("helper v%s (content change)" % plan["host_to"] if apply_host else "update")
+            if not _yesno("Media Catcher — update ready",
+                          "About to install: %s\n\nThe reliability guardian will back up your current "
+                          "version, apply the update, verify it, and restart Firefox — reverting "
+                          "automatically if anything fails.\n\nProceed?" % summary):
+                send({"type": "update-result", "ok": True, "available": True, "deferred": True, "summary": summary})
+                return
+            mode = launch_guardian(apply_ext, apply_host, plan, ext_dir if have_ext else "", HERE, restart=True)
+            send({"type": "update-result", "ok": True, "available": True, "summary": summary, "mode": mode})
+            if mode == "error":
+                _info("Media Catcher", "Couldn't start the update guardian.")
             return
 
-        summary = plan_summary(plan) or ("helper v%s (content change)" % plan["host_to"] if apply_host else "update")
-        if not _yesno("Media Catcher — update ready",
-                      "About to install: %s\n\nThe reliability guardian will back up your current version, "
-                      "apply the update, verify it, and restart Firefox — reverting automatically if anything "
-                      "fails.\n\nProceed?" % summary):
-            send({"type": "update-result", "ok": True, "available": True, "deferred": True, "summary": summary})
+        # Nothing the guardian can install. A newer *extension* may still exist that
+        # only Firefox can install (signed add-on, no source folder) — surface it.
+        if plan["ext_newer"] and not have_ext and plan["ext_to"]:
+            send({"type": "ext-update-available", "version": plan["ext_to"]})
             return
+        send({"type": "update-result", "ok": True, "available": False, "version": plan["ext_from"]})
+        if not silent:
+            _info("Media Catcher", "You're up to date (extension v%s, helper v%s)." %
+                  (plan["ext_from"] or "?", plan["host_from"] or "?"))
+    finally:
+        _update_lock.release()
 
-        mode = launch_guardian(apply_ext, apply_host, plan, ext_dir, HERE, restart=True)
-        send({"type": "update-result", "ok": True, "available": True, "summary": summary, "mode": mode})
-        if mode == "error":
-            _info("Media Catcher", "Couldn't start the update guardian.")
+
+def handle_update(req):
+    """'Check & install update' from the extension: persist paths, then install
+    whatever is newer (host always; extension only for a source install)."""
+    def worker():
+        cfg = load_config()
+        ext_dir = req.get("extDir") or cfg.get("extDir")
+        zip_dir = req.get("zipDir") or cfg.get("zipDir") or downloads_dir()
+        if ext_dir and os.path.isdir(ext_dir):
+            cfg["extDir"] = ext_dir
+        cfg["zipDir"] = zip_dir
+        save_config(cfg)
+        _install_updates(ext_dir, zip_dir, silent=bool(req.get("silent")))
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -742,24 +767,7 @@ def _dir_watcher(path, stop_event, on_relevant):
 
 def _auto_update_check():
     cfg = load_config()
-    ext_dir = cfg.get("extDir")
-    zip_dir = cfg.get("zipDir") or downloads_dir()
-    if not ext_dir or not os.path.isdir(ext_dir):
-        return
-    plan = plan_update(ext_dir, HERE, zip_dir)
-    apply_ext, apply_host = plan["ext_newer"], plan["host_newer"]
-    if plan["host_same_ver_changed"] and not apply_host:
-        if _yesno("Media Catcher — content change detected",
-                  "A helper package with the SAME version (v%s) but DIFFERENT code was found.\n\n"
-                  "Install it anyway?" % (plan["host_to"] or "?")):
-            apply_host = True
-    if not (apply_ext or apply_host):
-        return
-    summary = plan_summary(plan) or "helper (content change)"
-    if _yesno("Media Catcher — update available",
-              "Update available: %s.\n\nThe reliability guardian will back up, install, verify, and "
-              "restart Firefox (reverting on failure). Proceed?" % summary):
-        launch_guardian(apply_ext, apply_host, plan, ext_dir, HERE, restart=True)
+    _install_updates(cfg.get("extDir"), cfg.get("zipDir") or downloads_dir(), silent=False)
 
 
 def start_watch(zip_dir):

@@ -87,6 +87,7 @@ const NATIVE_HOST = "com.mediacatcher.host";
 // same filename every release, so "latest/download/<name>" always points at the newest.
 const HELPER_INSTALLER_URL = "https://github.com/g9xdev/mCatcher/releases/latest/download/MediaCatcherHostSetup.exe";
 const HELPER_SETUP_PAGE = "setup/setup.html";
+const RELEASES_PAGE = "https://github.com/g9xdev/mCatcher/releases/latest";
 let nativePort = null;
 let nativeReady = false;          // true once the host confirms ffmpeg is available
 let nativeInfo = null;
@@ -162,7 +163,21 @@ function onNativeMessage(msg) {
     if (msg.newer && Array.isArray(msg.downloaded) && msg.downloaded.length && api.notifications) {
       api.notifications.create({ type: "basic", iconUrl: api.runtime.getURL("icons/icon-96.png"),
         title: "Media Catcher " + (msg.latest ? "v" + msg.latest : "update"),
-        message: "Downloading the latest release — you'll be asked to install it." });
+        message: "Downloading the latest release…" });
+    }
+    return;
+  }
+  if (msg.type === "ext-update-available") {
+    dlog("extension update available", msg.version);
+    broadcast({ type: "ext-update-available", version: msg.version });
+    if (api.notifications) {
+      const id = "mc-ext-update";
+      try {
+        api.notifications.create(id, { type: "basic", iconUrl: api.runtime.getURL("icons/icon-96.png"),
+          title: "Media Catcher " + (msg.version ? "v" + msg.version : "update") + " available",
+          message: "A newer version is ready. Click to open the download." });
+        notifyActions.set(id, { url: RELEASES_PAGE });
+      } catch (e) {}
     }
     return;
   }

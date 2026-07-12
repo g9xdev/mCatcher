@@ -147,4 +147,11 @@ api.runtime.onMessage.addListener((msg) => {
   else if (res.newer && res.downloaded && res.downloaded.length) s.textContent = "Found v" + (res.latest || "?") + " on GitHub — downloading…";
 });
 
+// A signed extension can only be updated by Firefox — surface the new version.
+api.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== "ext-update-available") return;
+  const s = get("updateStatus");
+  s.textContent = "Version v" + (msg.version || "?") + " available — install the new signed .xpi from the releases page.";
+});
+
 load();
