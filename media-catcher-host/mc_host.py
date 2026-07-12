@@ -1807,9 +1807,229 @@ def handle_discard(req):
     send({"type": "discarded", "id": jid})
 
 
+# ---- YouTube (and other sites) via yt-dlp + bgutil PO-token provider ------
+# YouTube's stream URLs, signatures and PO-token rules change constantly, so we
+# lean on yt-dlp (the maintained extractor) instead of reinventing it. The top
+# 4K/VP9/AV1 formats now require a PO token, minted by the bundled bgutil provider
+# (a small Node HTTP server); Firefox cookies supply auth (age-gate, members,
+# the user's account). All three are optional at runtime — missing pieces just
+# cap quality or surface a clear error rather than crashing.
+def find_ytdlp():
+    exe = "yt-dlp.exe" if os.name == "nt" else "yt-dlp"
+    local = os.path.join(HERE, exe)
+    return local if os.path.isfile(local) else shutil.which("yt-dlp")
+
+
+def find_node():
+    if os.name == "nt":
+        for c in (os.path.join(HERE, "node", "node.exe"), os.path.join(HERE, "node.exe")):
+            if os.path.isfile(c):
+                return c
+    return shutil.which("node")
+
+
+YTDLP = find_ytdlp()
+NODE = find_node()
+_POT_PORT = 4416          # bgutil-ytdlp-pot-provider HTTP server default
+_POT = {"proc": None}
+_YTDLP_VER = None
+
+
+def _ytdlp_version():
+    if not YTDLP:
+        return None
+    cf, si = _no_window()
+    try:
+        r = subprocess.run([YTDLP, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           creationflags=cf, startupinfo=si, timeout=20)
+        return (r.stdout.decode("utf-8", "replace").strip() or None)
+    except Exception:
+        return None
+
+
+def ytdlp_version_cached():
+    return _YTDLP_VER or ""
+
+
+def ytdlp_update():
+    """Ask yt-dlp to update itself (it breaks often as YouTube changes). Best-effort."""
+    global _YTDLP_VER
+    if not YTDLP:
+        return None
+    cf, si = _no_window()
+    try:
+        r = subprocess.run([YTDLP, "-U"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           creationflags=cf, startupinfo=si, timeout=180)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        _hlog("info", "yt-dlp self-update: %s" % (out.splitlines()[-1] if out else "done"))
+        _YTDLP_VER = _ytdlp_version() or _YTDLP_VER
+        return out
+    except Exception as e:
+        _hlog("warn", "yt-dlp self-update failed: %s" % e)
+        return None
+
+
+def _pot_server_entry():
+    for c in (os.path.join(HERE, "pot-provider", "build", "main.js"),
+              os.path.join(HERE, "pot-provider", "server", "build", "main.js"),
+              os.path.join(HERE, "pot-provider", "main.js")):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _pot_alive():
+    import socket
+    try:
+        socket.create_connection(("127.0.0.1", _POT_PORT), timeout=1.5).close()
+        return True
+    except Exception:
+        return False
+
+
+def start_pot_provider():
+    """Ensure the bgutil PO-token HTTP server is running (idempotent). Returns bool."""
+    if _pot_alive():
+        return True
+    entry = _pot_server_entry()
+    if not (NODE and entry):
+        return False
+    cf, si = _no_window()
+    try:
+        _POT["proc"] = subprocess.Popen([NODE, entry], cwd=os.path.dirname(entry),
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        creationflags=cf, startupinfo=si)
+    except Exception as e:
+        _hlog("warn", "PO-token provider failed to start: %s" % e)
+        return False
+    for _ in range(24):                       # up to ~6s to bind
+        time.sleep(0.25)
+        if _pot_alive():
+            _hlog("info", "PO-token provider ready on :%d" % _POT_PORT)
+            return True
+    return _pot_alive()
+
+
+# (regex, reason, friendly message) — yt-dlp's stderr mapped to explicit UI text.
+_YT_ERR = [
+    (r"sign in to confirm your age|age.?restricted|inappropriate", "age",
+     "Age-restricted — sign in to YouTube in Firefox so your cookies unlock it."),
+    (r"members[- ]only|available to .*members|join this channel to", "members",
+     "Members-only — needs a channel membership on your signed-in account."),
+    (r"private video|video is private", "private", "This video is private."),
+    (r"premiere|will begin|scheduled", "scheduled", "This is a scheduled premiere — not available yet."),
+    (r"requested format is not available|no video formats|po.?token|formats? have been skipped|http error 403", "token",
+     "YouTube blocked the high-quality formats (PO-token). Check the token provider is running and yt-dlp is up to date."),
+    (r"video unavailable|video is unavailable|has been removed|no longer available|not available in your", "unavailable",
+     "Video unavailable."),
+    (r"drm|protected content|widevine", "drm", "DRM-protected — cannot be downloaded."),
+    (r"confirm you.?re not a bot|not a bot|too many requests|http error 429", "bot",
+     "YouTube asked to confirm you're not a bot — sign in to YouTube in Firefox, then retry."),
+]
+
+
+def _map_yt_error(text):
+    low = (text or "").lower()
+    for pat, reason, msg in _YT_ERR:
+        if re.search(pat, low):
+            return reason, msg
+    return "generic", "Download failed — open the log console for yt-dlp's output."
+
+
+def _parse_yt_progress(line):
+    out = {"stage": "downloading"}
+    m = re.search(r"pct=\s*([\d.]+)%", line)
+    if m:
+        out["pct"] = float(m.group(1))
+    m = re.search(r"speed=([\d.]+)", line)
+    if m:
+        out["bps"] = float(m.group(1))
+    m = re.search(r"\bdl=(\d+)", line)
+    if m:
+        out["downloaded"] = int(m.group(1))
+    m = re.search(r"\btotal=(\d+)", line) or re.search(r"totalest=(\d+)", line)
+    if m:
+        out["total"] = int(m.group(1))
+    return out if len(out) > 1 else None
+
+
+def handle_ytdl(req):
+    """Download a YouTube (or other yt-dlp-supported) URL at the highest quality:
+    best video + best audio, merged to mp4 by yt-dlp+ffmpeg, using the PO-token
+    provider and Firefox cookies for reliability. Streams progress; maps failures
+    to explicit reasons instead of silently downgrading."""
+    def worker():
+        jid = req.get("id")
+        url = req.get("url") or ""
+        if not YTDLP:
+            send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
+                  "error": "The YouTube downloader (yt-dlp) isn't installed — re-run the Media Catcher helper installer."})
+            return
+        outdir = req.get("dir") or (load_config().get("saveFolder") or "") or downloads_dir()
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception:
+            pass
+        pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
+        outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
+        cmd = [YTDLP, "--no-playlist", "--no-mtime", "--newline", "--no-warnings", "--force-overwrites",
+               "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+               "--cookies-from-browser", "firefox",
+               "-o", outtmpl,
+               "--progress-template",
+               "download:@@PROG@@ pct=%(progress._percent_str)s dl=%(progress.downloaded_bytes)s "
+               "total=%(progress.total_bytes)s totalest=%(progress.total_bytes_estimate)s speed=%(progress.speed)s",
+               "--print", "after_move:@@FILE@@ %(filepath)s"]
+        if FFMPEG:
+            cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
+        cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT, url]
+        _hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
+        send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "starting"})
+        cf, si = _no_window()
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 creationflags=cf, startupinfo=si, text=True, bufsize=1)
+        except Exception as e:
+            send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
+            return
+        errbuf = []
+        filepath = None
+        _PGET[jid] = {"proc": p}               # so a cancel can kill it
+        for line in p.stdout:
+            s = line.strip()
+            if s.startswith("@@PROG@@"):
+                prog = _parse_yt_progress(s)
+                if prog:
+                    send({"type": "ytdl-progress", "id": jid, **prog})
+            elif s.startswith("@@FILE@@"):
+                filepath = s[len("@@FILE@@"):].strip()
+            elif s:
+                errbuf.append(s)
+                if "Merging formats" in s or s.startswith("[Merger]"):
+                    send({"type": "ytdl-progress", "id": jid, "pct": 99, "stage": "merging"})
+        p.wait()
+        _PGET.pop(jid, None)
+        if p.returncode == 0 and filepath and os.path.isfile(filepath):
+            send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": os.path.getsize(filepath)})
+            _hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
+        else:
+            reason, msg = _map_yt_error("\n".join(errbuf))
+            _hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
+            send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def main():
     init_io()
     _hlog("info", "host v%s connected — %s" % (VERSION, os.path.basename(sys.executable or "python")))
+    # Learn the yt-dlp version in the background so the handshake can report it
+    # without delaying startup.
+    def _yt_probe():
+        global _YTDLP_VER
+        _YTDLP_VER = _ytdlp_version() or ""
+        if YTDLP:
+            _hlog("info", "yt-dlp %s%s" % (_YTDLP_VER or "?", "" if NODE else " (no Node — PO-token provider unavailable)"))
+    threading.Thread(target=_yt_probe, daemon=True).start()
     # Resume watching the package folder if auto-update was left on.
     try:
         cfg = load_config()
@@ -1829,7 +2049,13 @@ def main():
         cmd = msg.get("cmd")
         try:
             if cmd == "ping":
-                send({"type": "pong", "ffmpeg": bool(FFMPEG), "ffmpegPath": FFMPEG or "", "version": VERSION})
+                send({"type": "pong", "ffmpeg": bool(FFMPEG), "ffmpegPath": FFMPEG or "", "version": VERSION,
+                      "ytdlp": bool(YTDLP), "ytdlpVersion": ytdlp_version_cached(),
+                      "node": bool(NODE), "pot": _pot_alive()})
+            elif cmd == "ytdl":
+                handle_ytdl(msg)
+            elif cmd == "ytdlUpdate":
+                threading.Thread(target=ytdlp_update, daemon=True).start()
             elif cmd == "record":
                 handle_record(msg)
             elif cmd == "stop":
@@ -1948,8 +2174,12 @@ def _pget_cleanup(path, n):
 
 def _pget_cancel(req):
     j = _PGET.get(req.get("id"))
-    if j:
-        j["stop"].set()
+    if not j:
+        return
+    if j.get("stop"):
+        j["stop"].set()          # segmented pget: signal the workers
+    if j.get("proc"):
+        _safe_kill(j["proc"])    # yt-dlp job: kill the process
 
 
 def handle_pget(req):
