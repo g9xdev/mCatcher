@@ -216,6 +216,7 @@ function renderItem(item) {
       text: item.probeStatus >= 400 ? "HTTP " + item.probeStatus : (item.container === "html" ? "NOT A VIDEO" : "UNVERIFIED") }));
     else if (item.container) chips.appendChild(h("span", { class: "chip ok", text: item.container.toUpperCase() }));
   }
+  if (item.codec) chips.appendChild(h("span", { class: "chip codec", text: item.codec }));
 
   const actions = h("div", { class: "actions" });
   const slot = h("div", { class: "slot" });

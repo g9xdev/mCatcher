@@ -561,6 +561,7 @@ async function enrichDash(tabId, key) {
     const parsed = self.DASH.parse(text, item.url);
     item.isMaster = parsed.variants.length > 1;
     item.variants = parsed.variants;      // {id,label,height,bandwidth,resolution}
+    item.codec = codecLabel((parsed.variants[0] || {}).codecs || "");
     item.drm = parsed.drm;
     item.hasAudio = parsed.audio.length > 0;
     item.duration = parsed.duration;
@@ -666,6 +667,54 @@ function mp4DurationFromHead(bytes) {
   } catch (e) { return 0; }
 }
 
+// Short label for a video codec — from an HLS/DASH CODECS string (avc1.640028,…)
+// or an mp4 sample-entry fourcc.
+function codecLabel(codecs) {
+  if (!codecs) return "";
+  const map = [[/av01|av1\b/i, "AV1"], [/hvc1|hev1|hevc|h\.?265/i, "HEVC"],
+               [/avc[13]|h\.?264/i, "AVC"], [/vp0?9/i, "VP9"], [/vp0?8/i, "VP8"],
+               [/mp4v/i, "MPEG-4"], [/theora/i, "Theora"]];
+  for (const [re, label] of map) if (re.test(codecs)) return label;
+  return "";
+}
+
+// Video codec from a faststart mp4 whose moov sits in the probed head. Walks
+// moov -> trak -> mdia -> minf -> stbl -> stsd and reads the sample-entry fourcc.
+function mp4CodecFromHead(bytes) {
+  try {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const fourcc = (p) => String.fromCharCode(bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]);
+    function children(start, end) {
+      const out = []; let p = start;
+      while (p + 8 <= end) {
+        let size = dv.getUint32(p), hdr = 8;
+        if (size === 1) { if (p + 16 > end) break; size = Number(dv.getBigUint64(p + 8)); hdr = 16; }
+        else if (size === 0) size = end - p;
+        if (size < hdr || p + size > end) break;
+        out.push({ type: fourcc(p + 4), dataStart: p + hdr, dataEnd: p + size });
+        p += size;
+      }
+      return out;
+    }
+    const first = (t, s, e) => children(s, e).find((b) => b.type === t) || null;
+    const VIDEO = { avc1: "AVC", avc3: "AVC", hev1: "HEVC", hvc1: "HEVC",
+                    av01: "AV1", vp09: "VP9", vp08: "VP8", mp4v: "MPEG-4" };
+    const moov = first("moov", 0, bytes.length);
+    if (!moov) return "";
+    for (const trak of children(moov.dataStart, moov.dataEnd).filter((b) => b.type === "trak")) {
+      const mdia = first("mdia", trak.dataStart, trak.dataEnd); if (!mdia) continue;
+      const minf = first("minf", mdia.dataStart, mdia.dataEnd); if (!minf) continue;
+      const stbl = first("stbl", minf.dataStart, minf.dataEnd); if (!stbl) continue;
+      const stsd = first("stsd", stbl.dataStart, stbl.dataEnd); if (!stsd) continue;
+      const entry = stsd.dataStart + 8;            // skip version/flags + entry_count
+      if (entry + 8 > stsd.dataEnd) continue;
+      const cc = fourcc(entry + 4);
+      if (VIDEO[cc]) return VIDEO[cc];
+    }
+    return "";
+  } catch (e) { return ""; }
+}
+
 async function enrichDirect(tabId, key) {
   if (enriching.has(key)) return;
   const map = mediaByTab.get(tabId);
@@ -690,6 +739,8 @@ async function enrichDirect(tabId, key) {
         item.duration = dur;
         if (item.size) item.estKbps = Math.round((item.size * 8) / dur / 1000);
       }
+      const codec = mp4CodecFromHead(r.head);
+      if (codec) item.codec = codec;
     }
     item.enrichState = "done";
     dlog("probed direct", { url: item.url, status: r.status, size: item.size, container, junk: item.junk, kbps: item.estKbps });
@@ -772,6 +823,7 @@ async function enrichHls(tabId, key) {
       // Probe the top variant so we can suppress its segments (they'd otherwise
       // flood the list) and learn whether the master is a live broadcast.
       const top = parsed.variants[0];
+      if (top && top.codecs) item.codec = codecLabel(top.codecs);
       if (top) {
         try {
           const vtext = await fetchText(tabId, top.uri);
