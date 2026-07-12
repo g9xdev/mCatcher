@@ -1,7 +1,17 @@
 # Media Catcher
 
+[![Latest release](https://img.shields.io/github/v/release/g9xdev/mCatcher?label=latest%20release&color=e69a3a)](https://github.com/g9xdev/mCatcher/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/g9xdev/mCatcher/total?color=3fd68f)](https://github.com/g9xdev/mCatcher/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/g9xdev/mCatcher/release.yml?label=build)](https://github.com/g9xdev/mCatcher/actions)
+
 A Firefox extension plus a native helper that detect, download, and record live
 web video and HLS streams to real files on disk.
+
+### ⬇ [Download the latest release](https://github.com/g9xdev/mCatcher/releases/latest)
+
+Grab the signed **`media_catcher-*.xpi`** (drag into Firefox) and the one-click
+**[`MediaCatcherHostSetup.exe`](https://github.com/g9xdev/mCatcher/releases/latest/download/MediaCatcherHostSetup.exe)**
+helper installer. Installed builds then [update themselves](#releases--auto-update).
 
 ## Layout
 
