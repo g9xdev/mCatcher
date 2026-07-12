@@ -154,4 +154,34 @@ api.runtime.onMessage.addListener((msg) => {
   s.textContent = "Version v" + (msg.version || "?") + " available — install the new signed .xpi from the releases page.";
 });
 
+// ---- native helper status (connection state + version) ----
+let helperState = "disconnected";
+function renderHelper(h) {
+  const el = get("helperStatus");
+  if (!el) return;
+  helperState = (h && h.state) || "disconnected";
+  const txt = el.querySelector(".htext");
+  el.classList.remove("ok", "warn", "off");
+  const ver = h && h.version ? " · v" + h.version : "";
+  if (helperState === "ready") {
+    el.classList.add("ok"); txt.textContent = "Native helper connected" + ver;
+  } else if (helperState === "no-ffmpeg") {
+    el.classList.add("warn"); txt.textContent = "Helper connected, ffmpeg missing — re-run the installer" + ver;
+  } else if (helperState === "connecting") {
+    el.classList.add("warn"); txt.textContent = "Connecting to the native helper…";
+  } else {
+    el.classList.add("off"); txt.textContent = "Native helper not connected — click to install it";
+  }
+}
+get("helperStatus").addEventListener("click", async () => {
+  if (helperState === "disconnected") { send({ type: "open-helper-setup" }); return; }
+  const r = await send({ type: "recheck-helper" });
+  if (r && r.helper) renderHelper(r.helper);
+});
+api.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "helper-status" && msg.helper) renderHelper(msg.helper);
+});
+try { get("extVer").textContent = api.runtime.getManifest().version; } catch (e) {}
+send({ type: "helper-status" }).then((r) => { if (r && r.helper) renderHelper(r.helper); }).catch(() => {});
+
 load();

@@ -311,18 +311,22 @@ def restart_firefox(firefox_path):
         return False
 
 
-def _yesno(title, msg):
+def _messagebox(title, msg, flags):
+    """Native Windows MessageBox via user32 — no tkinter/Tcl dependency, so it works
+    on any Python install. Returns the dialog's result code (0 on failure)."""
     try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk(); root.withdraw()
-        try: root.attributes("-topmost", True)
-        except Exception: pass
-        ans = messagebox.askyesno(title, msg, parent=root)
-        root.destroy()
-        return ans
+        import ctypes
+        MB_TOPMOST = 0x00040000
+        MB_SETFOREGROUND = 0x00010000
+        return ctypes.windll.user32.MessageBoxW(0, str(msg), str(title),
+                                                flags | MB_TOPMOST | MB_SETFOREGROUND)
     except Exception:
-        return False
+        return 0
+
+
+def _yesno(title, msg):
+    IDYES = 6
+    return _messagebox(title, msg, 0x04 | 0x20) == IDYES   # MB_YESNO | MB_ICONQUESTION
 
 
 def _ask_restart_plan(plan):
@@ -338,16 +342,7 @@ def _ask_install_restart_plan(plan):
 
 
 def _info(title, msg):
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk(); root.withdraw()
-        try: root.attributes("-topmost", True)
-        except Exception: pass
-        messagebox.showinfo(title, msg, parent=root)
-        root.destroy()
-    except Exception:
-        pass
+    _messagebox(title, msg, 0x00 | 0x40)   # MB_OK | MB_ICONINFORMATION
 
 
 def _zip_complete(path):
@@ -686,6 +681,11 @@ def _install_updates(ext_dir, zip_dir, silent=False):
         # only Firefox can install (signed add-on, no source folder) — surface it.
         if plan["ext_newer"] and not have_ext and plan["ext_to"]:
             send({"type": "ext-update-available", "version": plan["ext_to"]})
+            if not silent:
+                _info("Media Catcher — update available",
+                      "Media Catcher v%s is available.\n\nThe extension is a signed add-on, so it "
+                      "updates through Firefox — install the signed .xpi from the Releases page, or it "
+                      "will auto-update on Firefox's next check." % plan["ext_to"])
             return
         send({"type": "update-result", "ok": True, "available": False, "version": plan["ext_from"]})
         if not silent:

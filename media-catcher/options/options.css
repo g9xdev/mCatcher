@@ -46,6 +46,15 @@ details.advanced > summary {
 details.advanced > summary:hover { color: var(--amber); }
 details.advanced[open] > summary { margin-bottom: 10px; }
 
+.helper-flag {
+  display: inline-flex; align-items: center; gap: 8px; margin: -8px 0 22px;
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em; cursor: pointer;
+}
+.helper-flag .hdot { width: 9px; height: 9px; border-radius: 50%; background: #6b7280; flex: none; }
+.helper-flag.ok   { color: var(--ok); }    .helper-flag.ok   .hdot { background: var(--ok); }
+.helper-flag.warn { color: var(--amber); } .helper-flag.warn .hdot { background: var(--amber); }
+.helper-flag.off  { color: var(--tally); } .helper-flag.off  .hdot { background: var(--tally); }
+
 .actions { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
 .btn {
   font-family: var(--font-ui); font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
