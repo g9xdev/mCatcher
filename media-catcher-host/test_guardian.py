@@ -1,6 +1,6 @@
 """Offline test for guardian.ps1: backup / apply / verify / revert, headless.
 Requires PowerShell + Python. Run:  py test_guardian.py"""
-import os, sys, json, zipfile, tempfile, shutil, subprocess
+import os, sys, json, time, zipfile, tempfile, shutil, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARDIAN = os.path.join(HERE, "guardian.ps1")
@@ -37,6 +37,13 @@ def host_zip(path, body):
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("media-catcher-host/mc_host.py", body)
 
+def pythonw():
+    # The real host runs under pythonw.exe, which leaves $LASTEXITCODE unreadable — the
+    # guardian's verify must normalize it back to python.exe or it reverts every host
+    # update. Feed it pythonw here so that regression can't hide behind python.exe.
+    cand = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return cand if os.path.exists(cand) else sys.executable
+
 work = tempfile.mkdtemp(prefix="mc_guard_")
 try:
     extdir = os.path.join(work, "ext"); os.makedirs(extdir)
@@ -45,7 +52,7 @@ try:
     zdir = os.path.join(work, "zips"); os.makedirs(zdir)
     base = dict(applyExt=True, applyHost=False, extZip=None, hostZip=None, extDir=extdir, hostDir="",
                 profileDir="", extId="{id}", expectExtVersion=None, expectHostVersion=None,
-                python=sys.executable, firefox="", restart=False,
+                python=pythonw(), firefox="", restart=False,
                 backupRoot=os.path.join(work, "backups"), keep=3)
 
     # 1) good extension update
@@ -78,6 +85,31 @@ try:
     # 5) backups are pruned to keep=3
     n = len([d for d in os.listdir(os.path.join(work, "backups")) if os.path.isdir(os.path.join(work, "backups", d))])
     check("backups pruned to <= keep(3)", n <= 3)
+
+    # 6) the guardian must actually RUN when spawned the way mc_host spawns it:
+    # detached with a HIDDEN CONSOLE (CREATE_NO_WINDOW). DETACHED_PROCESS gives no
+    # console, and Windows PowerShell dies before its first line — the bug that made
+    # every real auto-update a silent no-op while tests (synchronous, inherited stdio)
+    # stayed green. A detached Popen has no synchronous exit code, so poll the log.
+    hdir6 = os.path.join(work, "host6"); os.makedirs(hdir6)
+    open(os.path.join(hdir6, "mc_host.py"), "w").write('VERSION = "1.0.0"\n')
+    hg6 = os.path.join(zdir, "media-catcher-host-detached.zip"); host_zip(hg6, 'VERSION = "1.1.0"\ny = 2\n')
+    braw = os.path.join(work, "backups6")
+    c6 = dict(base, applyExt=False, applyHost=True, hostZip=hg6, hostDir=hdir6,
+              expectHostVersion="1.1.0", backupRoot=braw)
+    confp = os.path.join(work, "config6.json"); json.dump(c6, open(confp, "w"))
+    NO_WINDOW, NEW_GROUP = 0x08000000, 0x00000200        # NOT 0x08 DETACHED_PROCESS
+    flags = (NO_WINDOW | NEW_GROUP) if os.name == "nt" else 0
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                      "-File", GUARDIAN, "-Config", confp, "-NoUi", "-NoRestart"],
+                     creationflags=flags, close_fds=True)
+    logf = os.path.join(braw, "guardian.log"); ran = False
+    for _ in range(60):
+        time.sleep(0.5)
+        if os.path.exists(logf) and "verify OK" in open(logf, encoding="utf-8-sig", errors="ignore").read():
+            ran = True; break
+    check("detached guardian actually ran + logged (CREATE_NO_WINDOW)", ran)
+    check("detached guardian upgraded host to 1.1.0", 'VERSION = "1.1.0"' in host_txt(hdir6))
 finally:
     shutil.rmtree(work, ignore_errors=True)
 

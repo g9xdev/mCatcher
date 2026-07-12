@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -522,6 +522,20 @@ def apply_update(plan, ext_dir, host_dir):
     return {"staged": staged}
 
 
+def _console_python():
+    """The CONSOLE interpreter for subprocess checks. The host runs under pythonw.exe
+    (no console, so Firefox spawning it doesn't flash a window), but
+    `pythonw.exe -m py_compile` returns no exit code PowerShell can read — so the
+    guardian's verify step read it as a failure and reverted EVERY host update. Hand
+    the guardian python.exe instead."""
+    exe = sys.executable or ""
+    if exe.lower().endswith("pythonw.exe"):
+        cand = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
 def _guardian_config(cfg, apply_ext, apply_host, plan, ext_dir, host_dir, profile, firefox, restart):
     """Build the JSON config handed to guardian.ps1."""
     return {
@@ -532,7 +546,7 @@ def _guardian_config(cfg, apply_ext, apply_host, plan, ext_dir, host_dir, profil
         "profileDir": profile or "", "extId": EXT_ID,
         "expectExtVersion": plan["ext_to"] if apply_ext else None,
         "expectHostVersion": plan["host_to"] if apply_host else None,
-        "python": sys.executable, "firefox": firefox, "restart": bool(restart),
+        "python": _console_python(), "firefox": firefox, "restart": bool(restart),
         "backupRoot": os.path.join(tempfile.gettempdir(), "media-catcher-backups"),
         "keep": 3,
     }
@@ -566,15 +580,28 @@ def launch_guardian(apply_ext, apply_host, plan, ext_dir, host_dir, restart=True
             restart_firefox(firefox)
         return "fallback"
 
-    flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0  # DETACHED | NEW_GROUP
-    try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-             "-File", guardian, "-Config", confpath],
-            creationflags=flags, close_fds=True)
-        return "guardian"
-    except Exception:
-        return "error"
+    argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+            "-File", guardian, "-Config", confpath]
+    if os.name != "nt":
+        try:
+            subprocess.Popen(argv, close_fds=True)
+            return "guardian"
+        except Exception:
+            return "error"
+    # CREATE_NO_WINDOW, NOT DETACHED_PROCESS. A detached process has no console, and
+    # Windows PowerShell can't start its host without one — it exits before running a
+    # single line, so the guardian silently never applied anything (no log, no update).
+    # NO_WINDOW gives it a hidden console. NEW_PROCESS_GROUP + BREAKAWAY_FROM_JOB let it
+    # outlive this host when Firefox restarts; breakaway raises if the job forbids it,
+    # so fall back without it.
+    NO_WINDOW, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000200, 0x01000000
+    for extra in (BREAKAWAY, 0):
+        try:
+            subprocess.Popen(argv, creationflags=NO_WINDOW | NEW_GROUP | extra, close_fds=True)
+            return "guardian"
+        except Exception:
+            continue
+    return "error"
 
 
 # ---- GitHub release auto-update ------------------------------------------

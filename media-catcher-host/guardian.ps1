@@ -114,11 +114,19 @@ function Verify-Update {
     if (-not (Test-Path -LiteralPath $mh)) { $errs += "mc_host.py is missing" }
     else {
       if ($cfg.python) {
+        # Use a CONSOLE python: pythonw.exe leaves $LASTEXITCODE unset, which read as a
+        # compile failure and reverted EVERY host update. Prefer python.exe next to it.
+        $py = $cfg.python
+        if ($py -match 'pythonw\.exe$') {
+          $c = ($py -replace 'pythonw\.exe$', 'python.exe')
+          if (Test-Path -LiteralPath $c) { $py = $c }
+        }
         # Native stderr under ErrorActionPreference=Stop would terminate Verify,
         # so merge stderr and judge purely by the exit code, inside try/catch.
         $compileOk = $true
         try {
-          $null = & $cfg.python -m py_compile $mh 2>&1
+          $global:LASTEXITCODE = 0
+          $null = & $py -m py_compile $mh 2>&1
           if ($LASTEXITCODE -ne 0) { $compileOk = $false }
         } catch { $compileOk = $false }
         if (-not $compileOk) { $errs += "mc_host.py failed to compile" }
