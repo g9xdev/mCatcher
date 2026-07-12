@@ -1367,25 +1367,30 @@ def _pget_open(url, referer, ua, range_header=None, timeout=30):
 
 
 def _pget_probe(urls, referer, ua):
-    """Ask each mirror for one byte; return (size, ranges_ok, url) for the first
-    that supports range requests, else (None, False, None)."""
+    """Probe every mirror with a 1-byte range request. Return (size, ok_mirrors),
+    where ok_mirrors is the list of URLs that answered 206 with a Content-Range
+    whose total matches the reference size — i.e. mirrors that both support ranges
+    AND serve the same file. A mirror that ignores the range (returns 200) or
+    reports a different size is dropped, since assigning it a segment would write
+    the wrong bytes. Empty list => no usable mirror (caller falls back)."""
+    size = None
+    ok = []
     for u in urls:
         try:
             with _pget_open(u, referer, ua, "bytes=0-0") as r:
+                if getattr(r, "status", None) != 206:
+                    continue                       # 200 => server ignored the range
                 cr = r.headers.get("Content-Range") or ""
-                size = None
-                if "/" in cr:
-                    try: size = int(cr.rsplit("/", 1)[1])
-                    except Exception: size = None
-                if size is None and r.headers.get("Content-Length"):
-                    try: size = int(r.headers.get("Content-Length"))
-                    except Exception: size = None
-                ranges_ok = getattr(r, "status", None) == 206 or "bytes" in r.headers.get("Accept-Ranges", "").lower()
-                if size and ranges_ok:
-                    return size, True, u
+                if "/" not in cr:
+                    continue
+                total = int(cr.rsplit("/", 1)[1])
+                if size is None:
+                    size = total
+                if total == size:                  # only mirrors serving the same-size file
+                    ok.append(u)
         except Exception:
             continue
-    return None, False, None
+    return size, ok
 
 
 def _pget_segment(part_path, urls, idx, start, end, referer, ua, seg_done, stop):
@@ -1398,6 +1403,8 @@ def _pget_segment(part_path, urls, idx, start, end, referer, ua, seg_done, stop)
         got = 0
         try:
             with _pget_open(u, referer, ua, "bytes=%d-%d" % (start, end)) as r, open(part_path, "wb") as f:
+                if getattr(r, "status", None) != 206:
+                    raise RuntimeError("not partial content (status %s)" % getattr(r, "status", None))
                 while got < length:
                     if stop.is_set():
                         raise RuntimeError("cancelled")
@@ -1441,10 +1448,10 @@ def handle_pget(req):
         if not urls:
             send({"type": "pget-fallback", "id": jid, "reason": "no-urls"}); return
         try:
-            size, ranges_ok, _ = _pget_probe(urls, referer, ua)
+            size, ok_urls = _pget_probe(urls, referer, ua)
         except Exception:
-            size, ranges_ok = None, False
-        if not size or not ranges_ok:
+            size, ok_urls = None, []
+        if not size or not ok_urls:
             send({"type": "pget-fallback", "id": jid, "reason": "no-range"}); return
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -1470,7 +1477,7 @@ def handle_pget(req):
         errors = []
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
-                futs = [ex.submit(_pget_segment, "%s.part%d" % (path, i), urls, i, s, e, referer, ua, seg_done, stop)
+                futs = [ex.submit(_pget_segment, "%s.part%d" % (path, i), ok_urls, i, s, e, referer, ua, seg_done, stop)
                         for i, (s, e) in enumerate(ranges)]
                 for fu in concurrent.futures.as_completed(futs):
                     try:
