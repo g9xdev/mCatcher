@@ -107,7 +107,7 @@ def sanitize(name):
 # ---- self-update ----------------------------------------------------------
 # The extension's gecko id — the persistent XPI must be named <id>.xpi.
 EXT_ID = "{27383706-fb43-40dc-9e94-d2578818bd6a}"
-import zipfile, glob, configparser
+import zipfile, glob, configparser, concurrent.futures
 
 CONFIG_PATH = os.path.join(HERE, "mc_config.json")
 
@@ -1290,8 +1290,170 @@ def main():
                 handle_check_github(msg)
             elif cmd == "discard":
                 handle_discard(msg)
+            elif cmd == "pget":
+                handle_pget(msg)
+            elif cmd == "pget-cancel":
+                _pget_cancel(msg)
         except Exception as e:
             send({"type": "error", "id": msg.get("id"), "error": str(e)})
+
+
+# ---- parallel multi-mirror direct download --------------------------------
+# Fetch a direct file from one or more mirror URLs using several range requests
+# at once, with per-segment failover to another mirror. Each segment streams to
+# its own part file (no concurrent writes to one handle), then the parts are
+# stitched in order. Any failure emits "pget-fallback" so the extension hands off
+# to the browser's own downloader — so it is never worse than a plain download.
+_PGET = {}  # id -> {"stop": threading.Event}
+
+
+def _pget_open(url, referer, ua, range_header=None, timeout=30):
+    import urllib.request
+    headers = {"User-Agent": ua or "Mozilla/5.0", "Accept": "*/*"}
+    if referer:
+        headers["Referer"] = referer
+    if range_header:
+        headers["Range"] = range_header
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+
+def _pget_probe(urls, referer, ua):
+    """Ask each mirror for one byte; return (size, ranges_ok, url) for the first
+    that supports range requests, else (None, False, None)."""
+    for u in urls:
+        try:
+            with _pget_open(u, referer, ua, "bytes=0-0") as r:
+                cr = r.headers.get("Content-Range") or ""
+                size = None
+                if "/" in cr:
+                    try: size = int(cr.rsplit("/", 1)[1])
+                    except Exception: size = None
+                if size is None and r.headers.get("Content-Length"):
+                    try: size = int(r.headers.get("Content-Length"))
+                    except Exception: size = None
+                ranges_ok = getattr(r, "status", None) == 206 or "bytes" in r.headers.get("Accept-Ranges", "").lower()
+                if size and ranges_ok:
+                    return size, True, u
+        except Exception:
+            continue
+    return None, False, None
+
+
+def _pget_segment(part_path, urls, idx, start, end, referer, ua, seg_done, stop):
+    """Download bytes [start, end] into part_path, trying the assigned mirror
+    first, then the others. Raises if every mirror fails."""
+    length = end - start + 1
+    order = urls[idx % len(urls):] + urls[:idx % len(urls)]
+    last = "no mirror"
+    for u in order:
+        got = 0
+        try:
+            with _pget_open(u, referer, ua, "bytes=%d-%d" % (start, end)) as r, open(part_path, "wb") as f:
+                while got < length:
+                    if stop.is_set():
+                        raise RuntimeError("cancelled")
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    if got + len(chunk) > length:
+                        chunk = chunk[:length - got]
+                    f.write(chunk)
+                    got += len(chunk)
+                    seg_done[idx] = got
+            if got >= length:
+                return
+            last = "short read %d/%d" % (got, length)
+        except Exception as e:
+            last = str(e)
+        seg_done[idx] = 0
+    raise RuntimeError("segment %d failed on all mirrors: %s" % (idx, last))
+
+
+def _pget_cleanup(path, n):
+    for p in [path] + ["%s.part%d" % (path, i) for i in range(n)]:
+        try: os.remove(p)
+        except Exception: pass
+
+
+def _pget_cancel(req):
+    j = _PGET.get(req.get("id"))
+    if j:
+        j["stop"].set()
+
+
+def handle_pget(req):
+    def worker():
+        jid = req.get("id")
+        urls = [u for u in (req.get("urls") or []) if u]
+        referer = req.get("referer") or ""
+        ua = req.get("userAgent") or ""
+        name = sanitize(req.get("name") or "download")
+        out_dir = req.get("dir") or downloads_dir()
+        if not urls:
+            send({"type": "pget-fallback", "id": jid, "reason": "no-urls"}); return
+        try:
+            size, ranges_ok, _ = _pget_probe(urls, referer, ua)
+        except Exception:
+            size, ranges_ok = None, False
+        if not size or not ranges_ok:
+            send({"type": "pget-fallback", "id": jid, "reason": "no-range"}); return
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            path = _dedup(os.path.join(out_dir, name))
+        except Exception:
+            send({"type": "pget-fallback", "id": jid, "reason": "path"}); return
+
+        n = max(1, min(6, size // (1024 * 1024)))
+        seg = size // n
+        ranges = [(i * seg, (size - 1 if i == n - 1 else (i + 1) * seg - 1)) for i in range(n)]
+        seg_done = [0] * n
+        stop = threading.Event()
+        _PGET[jid] = {"stop": stop}
+
+        def monitor():
+            while not stop.is_set():
+                send({"type": "pget-progress", "id": jid, "bytes": sum(seg_done), "total": size})
+                if sum(seg_done) >= size:
+                    break
+                time.sleep(0.5)
+        threading.Thread(target=monitor, daemon=True).start()
+
+        errors = []
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+                futs = [ex.submit(_pget_segment, "%s.part%d" % (path, i), urls, i, s, e, referer, ua, seg_done, stop)
+                        for i, (s, e) in enumerate(ranges)]
+                for fu in concurrent.futures.as_completed(futs):
+                    try:
+                        fu.result()
+                    except Exception as e:
+                        errors.append(str(e)); stop.set()
+        finally:
+            stop.set()
+            _PGET.pop(jid, None)
+
+        if errors:
+            _pget_cleanup(path, n)
+            send({"type": "pget-fallback", "id": jid, "reason": errors[0]}); return
+
+        try:  # stitch the parts in order into the final file
+            with open(path, "wb") as out:
+                for i in range(n):
+                    with open("%s.part%d" % (path, i), "rb") as pf:
+                        shutil.copyfileobj(pf, out, 1024 * 1024)
+            for i in range(n):
+                try: os.remove("%s.part%d" % (path, i))
+                except Exception: pass
+        except Exception as e:
+            _pget_cleanup(path, n)
+            send({"type": "pget-fallback", "id": jid, "reason": "stitch: %s" % e}); return
+
+        if os.path.getsize(path) != size:
+            _pget_cleanup(path, n)
+            send({"type": "pget-fallback", "id": jid, "reason": "size-mismatch"}); return
+        send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
+        send({"type": "pget-done", "id": jid, "file": path, "bytes": size})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 if __name__ == "__main__":

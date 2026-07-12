@@ -120,7 +120,7 @@ function render(items) {
   const isHot = (item) => {
     const id = itemDownloadId.get(item.url);
     const dl = id != null && downloadState.get(id);
-    return dl && dl.live && (dl.status === "recording" || dl.status === "stopped" || dl.status === "saving" || dl.status === "converting");
+    return dl && dl.live && (dl.status === "recording" || dl.status === "stopped" || dl.status === "saving" || dl.status === "converting" || dl.status === "downloading");
   };
   const hot = items.filter(isHot);
   const anyHot = hot.length > 0;
@@ -545,7 +545,10 @@ function renderProgress(el, dl) {
   else statusText = "Downloading";
 
   const right = dl.progress && dl.progress.total
-    ? dl.progress.done + "/" + dl.progress.total + " seg" : "";
+    ? (dl.progress.unit === "bytes"
+        ? humanSize(dl.progress.done) + " / " + humanSize(dl.progress.total)
+        : dl.progress.done + "/" + dl.progress.total + " seg")
+    : "";
 
   const fill = h("div", { class: "fill" });
   fill.style.width = pct + "%";

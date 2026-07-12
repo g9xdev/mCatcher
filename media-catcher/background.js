@@ -67,6 +67,7 @@ function tabTitle(tabId) {
 }
 // Active downloads: id -> { status, progress, ... }
 const activeDownloads = new Map();
+const pgetFallback = new Map();   // pget id -> { item, finalName } for the browser fallback
 let downloadCounter = 0;
 
 // Recordings that have been stopped but not yet saved. The captured bytes live
@@ -179,6 +180,38 @@ function onNativeMessage(msg) {
         notifyActions.set(id, { url: RELEASES_PAGE });
       } catch (e) {}
     }
+    return;
+  }
+  if (msg.type === "pget-progress") {
+    let d = activeDownloads.get(msg.id);
+    if (!d) {                                   // first progress -> create the tracked row
+      const fb = pgetFallback.get(msg.id);
+      if (!fb) return;
+      d = { id: msg.id, name: fb.finalName, kind: "direct", live: true, status: "downloading", url: fb.item.url };
+      activeDownloads.set(msg.id, d);
+    }
+    d.status = "downloading"; d.live = true;
+    d.progress = { done: msg.bytes || 0, total: msg.total || 0, unit: "bytes", live: false };
+    broadcast({ type: "download-update", download: d });
+    return;
+  }
+  if (msg.type === "pget-done") {
+    pgetFallback.delete(msg.id);
+    const d = activeDownloads.get(msg.id);
+    if (d) {
+      d.status = "done"; d.live = true; d.savedPath = msg.file || "";
+      d.progress = { done: msg.bytes || 0, total: msg.bytes || 0, unit: "bytes", live: false };
+      broadcast({ type: "download-update", download: d });
+      notifyDone(d.name, fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
+    }
+    return;
+  }
+  if (msg.type === "pget-fallback") {
+    dlog("pget fallback -> browser download", msg.reason || "");
+    const fb = pgetFallback.get(msg.id);
+    pgetFallback.delete(msg.id);
+    activeDownloads.delete(msg.id);
+    if (fb) { try { api.downloads.download({ url: fb.item.url, filename: fb.finalName, saveAs: true }); } catch (e) {} }
     return;
   }
   const dl = activeDownloads.get(msg.id);
@@ -451,12 +484,27 @@ function swapTrack(url, from, to) {
   return url.replace(new RegExp("([_\\-/.])" + from + "([_\\-/.])", "i"), "$1" + to + "$2");
 }
 
+// Group direct mirrors of the same file: same base domain + path, ignoring the
+// subdomain (video2.host vs host) and the query token. Collapses CDN duplicates
+// into one item that carries every mirror URL (used only for direct downloads).
+function directGroupKey(url) {
+  try {
+    const u = new URL(url);
+    const h = u.hostname.toLowerCase().split(".");
+    const base = h.length >= 2 ? h.slice(-2).join(".") : h.join(".");
+    return "direct|" + base + "|" + u.pathname.toLowerCase();
+  } catch (e) {
+    return url;
+  }
+}
+
 function addMedia(tabId, item) {
   if (tabId < 0) return;
   // De-dup key collapses Low-Latency HLS reloads of one playlist (differing only
   // by _HLS_msn / cache-bust params) into a single item. The item keeps its
   // original signed URL for fetching; the map is keyed by this stable key.
-  const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url) : item.url;
+  const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url)
+            : item.kind === "direct" ? directGroupKey(item.url) : item.url;
   item.key = key;
   // Stash any audio-track playlist URL (even one we're about to suppress) so the
   // recorder can pair it with the video by directory.
@@ -484,8 +532,11 @@ function addMedia(tabId, item) {
     // — the popup binds progress to item.url, so it mustn't change mid-stream.
     const existing = map.get(key);
     const stableUrl = existing.url;
-    Object.assign(existing, item, { url: stableUrl, key });
+    const mirrors = existing.mirrors || [existing.url];
+    if (item.kind === "direct" && item.url && !mirrors.includes(item.url)) mirrors.push(item.url);
+    Object.assign(existing, item, { url: stableUrl, key, mirrors });
   } else {
+    if (item.kind === "direct") item.mirrors = [item.url];
     map.set(key, item);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -901,9 +952,25 @@ function broadcast(msg) {
 }
 
 async function downloadDirect(item, tabId, filename) {
-  // Let the browser's own stack fetch it (carries cookies automatically).
-  const name = sanitizeFilename(filename || item.name) ;
+  const name = sanitizeFilename(filename || item.name);
   const finalName = /\.[a-z0-9]{2,4}$/i.test(name) ? name : name + guessExt(item);
+  const mirrors = (item.mirrors && item.mirrors.length > 1) ? item.mirrors.slice() : null;
+  // Multiple mirrors + a ready helper -> parallel, failover download in the host.
+  // The host emits "pget-fallback" if ranges aren't supported or anything fails,
+  // and we hand back to the browser download below (which carries cookies).
+  if (mirrors && nativePort && nativeReady) {
+    const id = "pget:" + (item.key || item.url);
+    const ctx = tabContext.get(tabId) || {};
+    pgetFallback.set(id, { item, finalName });
+    try {
+      nativePort.postMessage({ cmd: "pget", id, urls: mirrors, name: finalName,
+        dir: settings.saveFolder || "", referer: ctx.referer || "", userAgent: ctx.userAgent || "" });
+      return;
+    } catch (e) {
+      pgetFallback.delete(id);
+    }
+  }
+  // Browser fallback (carries cookies automatically).
   await api.downloads.download({ url: item.url, filename: finalName, saveAs: true });
 }
 
