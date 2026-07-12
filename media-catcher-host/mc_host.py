@@ -1098,59 +1098,76 @@ def _no_window():
     si.wShowWindow = 0
     return subprocess.CREATE_NO_WINDOW, si
 
-def find_hevc_encoder():
-    """Prefer a hardware HEVC encoder (much faster); fall back to software x265."""
-    global _HEVC_ENC
-    if _HEVC_ENC is not None:
-        return _HEVC_ENC
-    _HEVC_ENC = "libx265"
-    if FFMPEG:
-        try:
-            cf, si = _no_window()
-            out = subprocess.run([FFMPEG, "-hide_banner", "-encoders"],
-                                 capture_output=True, text=True, timeout=15,
-                                 creationflags=cf, startupinfo=si).stdout
-            for enc in ("hevc_nvenc", "hevc_qsv", "hevc_amf"):
-                if enc in out:
-                    _HEVC_ENC = enc
-                    break
-        except Exception:
-            pass
-    return _HEVC_ENC
+_ENC_CACHE = {}   # codec -> hardware encoder name (or None), probed once
 
-def _hevc_args(encoder, quality):
-    """Codec args per encoder + quality. 'visually-lossless' (CRF 18) is the
-    default and target: the re-encode is transparent - indistinguishable from the
-    source in normal viewing - while still smaller than the H.264 original.
-    'balanced' trades a little quality for a smaller file. 'true-lossless' is
-    bit-exact and forces software x265 (hardware encoders cannot do it)."""
+
+def find_encoder(codec, prefer="auto"):
+    """Pick an encoder for the target codec. prefer: 'auto' (hardware if present,
+    else software), 'gpu' (hardware only; None if absent), 'cpu' (software)."""
+    sw = {"h265": "libx265", "av1": "libsvtav1"}.get(codec, "libx265")
+    if prefer == "cpu":
+        return sw
+    if codec not in _ENC_CACHE:
+        hw = None
+        if FFMPEG:
+            try:
+                cf, si = _no_window()
+                out = subprocess.run([FFMPEG, "-hide_banner", "-encoders"],
+                                     capture_output=True, text=True, timeout=15,
+                                     creationflags=cf, startupinfo=si).stdout
+                cands = {"h265": ("hevc_nvenc", "hevc_qsv", "hevc_amf"),
+                         "av1": ("av1_nvenc", "av1_qsv", "av1_amf")}.get(codec, ())
+                for enc in cands:
+                    if enc in out:
+                        hw = enc
+                        break
+            except Exception:
+                hw = None
+        _ENC_CACHE[codec] = hw
+    hw = _ENC_CACHE[codec]
+    if prefer == "gpu":
+        return hw
+    return hw or sw
+
+def _codec_args(codec, encoder, quality):
+    """ffmpeg -c:v args for the chosen encoder + quality. 'visually-lossless' is
+    transparent (indistinguishable in normal viewing) yet smaller; 'balanced'
+    trades a little quality for a smaller file; 'true-lossless' (H.265 only) is
+    bit-exact and forces software x265."""
+    if codec == "av1":
+        q = {"visually-lossless": 30, "balanced": 38}.get(quality, 30)
+        if encoder == "av1_nvenc":
+            return ["-c:v", "av1_nvenc", "-preset", "p6", "-rc", "constqp", "-qp", str(q)]
+        if encoder == "av1_qsv":
+            return ["-c:v", "av1_qsv", "-global_quality", str(q)]
+        if encoder == "av1_amf":
+            return ["-c:v", "av1_amf", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
+        return ["-c:v", "libsvtav1", "-crf", str(q), "-preset", "6"]
     q = {"visually-lossless": 18, "balanced": 24}.get(quality, 18)
     if quality == "true-lossless":
         return ["-c:v", "libx265", "-x265-params", "lossless=1", "-preset", "medium"]
     if encoder == "hevc_nvenc":
-        # NVENC's QP scale is less efficient than x265's CRF, so hold the QP a
-        # touch lower to stay transparent; p6 is a slow, high-quality preset.
         return ["-c:v", "hevc_nvenc", "-preset", "p6", "-rc", "constqp", "-qp", str(q)]
     if encoder == "hevc_qsv":
         return ["-c:v", "hevc_qsv", "-global_quality", str(q)]
     if encoder == "hevc_amf":
         return ["-c:v", "hevc_amf", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
-    # 'slow' gives noticeably better compression at the same visual quality.
     return ["-c:v", "libx265", "-crf", str(q), "-preset", "slow"]
 
-def transcode_h265(src, quality):
-    """Re-encode src to HEVC and, if the result is smaller, replace src with it
-    (deleting the H.264 original). Returns a dict:
-        {"path": <final file>, "converted": bool, "note": <str or None>}
-    The saved file is NEVER larger than the original: if the HEVC is not smaller
-    (which can happen at a visually-lossless target on an already-compressed
-    stream), the HEVC is discarded and the untouched H.264 is kept."""
-    if not FFMPEG or not os.path.isfile(src):
+def transcode(src, codec="h265", quality="visually-lossless", prefer="auto"):
+    """Re-encode src to codec ('h265'|'av1') and, if the result is smaller, replace
+    src with it (deleting the original). The saved file is NEVER larger than the
+    original: if the re-encode isn't smaller (common at a visually-lossless target
+    on an already-compressed stream), it is discarded and src is kept untouched.
+    Returns {path, converted, note, srcBytes, hevcBytes} (hevcBytes = new size)."""
+    if not FFMPEG or not os.path.isfile(src) or codec not in ("h265", "av1"):
         return {"path": src, "converted": False, "note": "no ffmpeg", "srcBytes": None, "hevcBytes": None}
     src_bytes = os.path.getsize(src)
-    encoder = find_hevc_encoder()
+    encoder = find_encoder(codec, prefer)
+    sw = {"h265": "libx265", "av1": "libsvtav1"}[codec]
+    tag = "hvc1" if codec == "h265" else "av01"
     root, _ext = os.path.splitext(src)
-    out = root + ".hevc.mp4"
+    out = root + ".enc.mp4"
 
     def _rm(p):
         try:
@@ -1159,9 +1176,11 @@ def transcode_h265(src, quality):
             pass
 
     def run(enc):
+        if not enc:
+            return False
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-y",
-               "-i", src] + _hevc_args(enc, quality) + \
-              ["-tag:v", "hvc1", "-c:a", "copy", "-movflags", "+faststart", out]
+               "-i", src] + _codec_args(codec, enc, quality) + \
+              ["-tag:v", tag, "-c:a", "copy", "-movflags", "+faststart", out]
         cf, si = _no_window()
         try:
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1171,27 +1190,26 @@ def transcode_h265(src, quality):
             return False
 
     ok = run(encoder)
-    if not ok and encoder != "libx265":     # HW encoder present but unusable (no GPU/driver)
+    if not ok and encoder != sw:     # HW encoder present but unusable -> software fallback
         _rm(out)
-        ok = run("libx265")
+        ok = run(sw)
     if not ok:
         _rm(out)
-        return {"path": src, "converted": False, "note": "encode failed - kept H.264",
+        return {"path": src, "converted": False, "note": "encode failed - kept original",
                 "srcBytes": src_bytes, "hevcBytes": None}
 
-    hevc_bytes = os.path.getsize(out)
-    # Guarantee: never keep a file larger than the original.
-    if hevc_bytes >= src_bytes:
+    new_bytes = os.path.getsize(out)
+    if new_bytes >= src_bytes:        # never keep a file larger than the original
         _rm(out)
-        return {"path": src, "converted": False, "note": "H.265 was not smaller - kept H.264",
-                "srcBytes": src_bytes, "hevcBytes": hevc_bytes}
+        return {"path": src, "converted": False, "note": "%s was not smaller - kept original" % codec.upper(),
+                "srcBytes": src_bytes, "hevcBytes": new_bytes}
 
     try:
-        os.remove(src)          # delete the H.264 original
-        os.replace(out, src)    # keep the original .mp4 name/path, now HEVC
-        return {"path": src, "converted": True, "note": None, "srcBytes": src_bytes, "hevcBytes": hevc_bytes}
+        os.remove(src)              # delete the original
+        os.replace(out, src)        # keep the original .mp4 name/path, now re-encoded
+        return {"path": src, "converted": True, "note": None, "srcBytes": src_bytes, "hevcBytes": new_bytes}
     except Exception:
-        return {"path": out, "converted": True, "note": None, "srcBytes": src_bytes, "hevcBytes": hevc_bytes}
+        return {"path": out, "converted": True, "note": None, "srcBytes": src_bytes, "hevcBytes": new_bytes}
 
 
 def _finalize_move(job, jid, dest, req=None):
@@ -1213,12 +1231,14 @@ def _finalize_move(job, jid, dest, req=None):
     # otherwise the H.264 original is kept, so the saved file is never larger).
     conv_info = None
     conv = (req or {}).get("convert")
-    if conv and conv.get("codec") == "h265":
-        send({"type": "converting", "id": jid, "file": dest, "codec": "h265"})
-        res = transcode_h265(dest, conv.get("quality", "visually-lossless"))
+    if conv and conv.get("codec") in ("h265", "av1"):
+        codec = conv["codec"]
+        send({"type": "converting", "id": jid, "file": dest, "codec": codec})
+        res = transcode(dest, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"))
         dest = res["path"]
-        conv_info = {"converted": res["converted"], "note": res["note"],
-                     "srcBytes": res["srcBytes"], "hevcBytes": res["hevcBytes"], "kept": "h265" if res["converted"] else "h264"}
+        conv_info = {"converted": res["converted"], "note": res["note"], "codec": codec,
+                     "srcBytes": res["srcBytes"], "hevcBytes": res["hevcBytes"],
+                     "kept": codec if res["converted"] else "orig"}
 
     bytes_ = os.path.getsize(dest) if os.path.isfile(dest) else 0
     send({"type": "saved", "id": jid, "file": dest, "bytes": bytes_, "convert": conv_info})
@@ -1606,7 +1626,18 @@ def handle_pget(req):
             _pget_cleanup(path, n)
             send({"type": "pget-fallback", "id": jid, "reason": "size-mismatch"}); return
         send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
-        send({"type": "pget-done", "id": jid, "file": path, "bytes": size})
+        # Optional re-encode (H.265 / AV1) — same as recordings, kept only if smaller.
+        conv_info = None
+        conv = req.get("convert")
+        if conv and conv.get("codec") in ("h265", "av1") and FFMPEG:
+            codec = conv["codec"]
+            send({"type": "converting", "id": jid, "file": path, "codec": codec})
+            res = transcode(path, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"))
+            path = res["path"]
+            conv_info = {"converted": res["converted"], "note": res["note"], "codec": codec,
+                         "srcBytes": res["srcBytes"], "hevcBytes": res["hevcBytes"],
+                         "kept": codec if res["converted"] else "orig"}
+        send({"type": "pget-done", "id": jid, "file": path, "bytes": os.path.getsize(path), "convert": conv_info})
     threading.Thread(target=worker, daemon=True).start()
 
 

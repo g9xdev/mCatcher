@@ -29,8 +29,9 @@ const DEFAULT_SETTINGS = {
   updateExtDir: "",             // the extension's source folder (for self-update)
   updateZipDir: "",             // where update .zip packages land ("" = Downloads)
   autoUpdate: false,            // helper watches the package folder and auto-installs
-  convertH265: false,           // after saving, re-encode to H.265 and delete the H.264 original
-  h265Quality: "visually-lossless", // "visually-lossless" | "balanced" | "true-lossless"
+  convertCodec: "off",          // "off" | "h265" | "av1" — re-encode saved & downloaded files
+  convertQuality: "visually-lossless", // "visually-lossless" | "balanced" | "true-lossless" (h265 only)
+  convertEncoder: "auto",       // "auto" (GPU if available) | "cpu" (force software)
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
@@ -44,8 +45,10 @@ function saveSettings(next) {
 }
 
 // The H.265 conversion spec sent to the helper with a save, or null when off.
-function h265Convert() {
-  return settings.convertH265 ? { codec: "h265", quality: settings.h265Quality || "visually-lossless" } : null;
+function convertSpec() {
+  const c = settings.convertCodec;
+  if (c !== "h265" && c !== "av1") return null;
+  return { codec: c, quality: settings.convertQuality || "visually-lossless", encoder: settings.convertEncoder || "auto" };
 }
 
 // tabId -> Map(url -> mediaItem)
@@ -199,10 +202,11 @@ function onNativeMessage(msg) {
     pgetFallback.delete(msg.id);
     const d = activeDownloads.get(msg.id);
     if (d) {
-      d.status = "done"; d.live = true; d.savedPath = msg.file || "";
+      d.status = "done"; d.live = true; d.savedPath = msg.file || ""; d.convert = msg.convert || null;
       d.progress = { done: msg.bytes || 0, total: msg.bytes || 0, unit: "bytes", live: false };
       broadcast({ type: "download-update", download: d });
-      notifyDone(d.name, fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
+      const extra = msg.convert ? convertSummary(msg.convert) : fmtBytes(msg.bytes || 0);
+      notifyDone(d.name, extra, msg.file ? { path: msg.file } : null);
     }
     return;
   }
@@ -243,7 +247,7 @@ function onNativeMessage(msg) {
     dl.status = "done"; dl.savedPath = msg.file; dl.convert = msg.convert || null;
     broadcast({ type: "download-update", download: dl });
     addHistory({ name: dl.name || "recording", kind: "hls-live", ts: Date.now() });
-    const extra = msg.convert ? h265Summary(msg.convert) : (msg.file || null);
+    const extra = msg.convert ? convertSummary(msg.convert) : (msg.file || null);
     notifyDone(dl.name || "recording", extra, msg.file ? { path: msg.file } : null);
     setTimeout(() => activeDownloads.delete(dl.id), 120000);
   } else if (msg.type === "save-cancelled") {
@@ -1016,7 +1020,7 @@ async function downloadDirect(item, tabId, filename) {
     const ctx = tabContext.get(tabId) || {};
     pgetFallback.set(id, { item, finalName });
     try {
-      nativePort.postMessage({ cmd: "pget", id, urls, name: finalName,
+      nativePort.postMessage({ cmd: "pget", id, urls, name: finalName, convert: convertSpec(),
         dir: settings.saveFolder || "", referer: ctx.referer || "", userAgent: ctx.userAgent || "" });
       return;
     } catch (e) {
@@ -1494,18 +1498,19 @@ function fmtBytes(n) {
   return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
 }
 
-// One notification line describing the H.265 conversion outcome: before/after
-// sizes, percent change, and which version was kept.
-function h265Summary(c) {
+// One notification line describing the re-encode outcome: before/after sizes,
+// percent change, and which version was kept.
+function convertSummary(c) {
   if (!c) return null;
-  const src = c.srcBytes, hevc = c.hevcBytes;
+  const label = (c.codec || "h265") === "av1" ? "AV1" : "H.265";
+  const src = c.srcBytes, enc = c.hevcBytes;
   if (c.converted) {
-    const pct = src ? Math.round((1 - hevc / src) * 100) : 0;
-    return "Kept H.265 · " + fmtBytes(src) + " → " + fmtBytes(hevc) + " · " + pct + "% smaller";
+    const pct = src ? Math.round((1 - enc / src) * 100) : 0;
+    return "Kept " + label + " · " + fmtBytes(src) + " → " + fmtBytes(enc) + " · " + pct + "% smaller";
   }
-  if (hevc == null) return "Kept H.264 · H.265 conversion failed";
-  const pct = src ? Math.round((hevc / src - 1) * 100) : 0;
-  return "Kept H.264 · H.265 would be " + fmtBytes(hevc) + " vs " + fmtBytes(src) + " (" + pct + "% larger)";
+  if (enc == null) return "Kept original · " + label + " conversion failed";
+  const pct = src ? Math.round((enc / src - 1) * 100) : 0;
+  return "Kept original · " + label + " would be " + fmtBytes(enc) + " vs " + fmtBytes(src) + " (" + pct + "% larger)";
 }
 
 function notifyDone(name, extra, action) {
@@ -1752,7 +1757,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const dl = activeDownloads.get(msg.id);
         if (dl && dl.native && nativePort) {
           dl.status = "saving"; broadcast({ type: "download-update", download: dl });
-          nativePort.postMessage({ cmd: "save", id: msg.id, base: sanitizeFilename(dl.name || "recording"), dir: settings.saveFolder || "", convert: h265Convert() });
+          nativePort.postMessage({ cmd: "save", id: msg.id, base: sanitizeFilename(dl.name || "recording"), dir: settings.saveFolder || "", convert: convertSpec() });
         } else {
           saveRecording(msg.id, { saveAs: false });
         }
@@ -1762,7 +1767,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const dl = activeDownloads.get(msg.id);
         if (dl && dl.native && nativePort) {
           dl.status = "saving"; broadcast({ type: "download-update", download: dl });
-          nativePort.postMessage({ cmd: "saveAs", id: msg.id, base: sanitizeFilename(dl.name || "recording"), dir: settings.saveFolder || "", convert: h265Convert() });
+          nativePort.postMessage({ cmd: "saveAs", id: msg.id, base: sanitizeFilename(dl.name || "recording"), dir: settings.saveFolder || "", convert: convertSpec() });
         } else {
           saveRecording(msg.id, { saveAs: true });
         }

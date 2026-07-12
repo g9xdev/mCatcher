@@ -77,19 +77,30 @@
           <span class="label">Show a notification when a download finishes</span>
         </label>
 
-        <label class="row checkbox">
-          <input id="convertH265" type="checkbox" />
-          <span class="label">Convert recordings to H.265 (HEVC) and delete the original</span>
-        </label>
         <label class="row">
-          <span class="label">H.265 quality</span>
-          <select id="h265Quality">
-            <option value="visually-lossless">Same look, smaller (recommended)</option>
-            <option value="balanced">Smallest files</option>
-            <option value="true-lossless">True lossless (large, CPU only)</option>
+          <span class="label">Re-encode to</span>
+          <select id="convertCodec">
+            <option value="off">Off (keep original)</option>
+            <option value="h265">H.265 (HEVC)</option>
+            <option value="av1">AV1</option>
           </select>
         </label>
-        <p class="hint">Re-encodes each finished recording to H.265 after saving, then deletes the H.264 original. Uses your GPU when available. Needs the native helper.</p>
+        <label class="row">
+          <span class="label">Quality</span>
+          <select id="convertQuality">
+            <option value="visually-lossless">Same look, smaller (recommended)</option>
+            <option value="balanced">Smallest files</option>
+            <option value="true-lossless">True lossless (H.265, CPU only)</option>
+          </select>
+        </label>
+        <label class="row">
+          <span class="label">Encoder</span>
+          <select id="convertEncoder">
+            <option value="auto">Auto (GPU if available)</option>
+            <option value="cpu">Force CPU (software)</option>
+          </select>
+        </label>
+        <p class="hint">Re-encodes each saved recording <strong>and download</strong> to the chosen codec, then deletes the original — but only keeps it if the result is actually smaller. AV1 compresses best; H.265 is faster and more compatible. A GPU encoder (NVENC / QSV / AMF) is used when available. Needs the native helper.</p>
       </section>
 
       <div class="actions">

@@ -49,14 +49,15 @@ function humanSize(bytes) {
 // H.265 conversion outcome: before/after sizes, percent, and which version kept.
 function h265Note(c) {
   if (!c) return "";
-  const src = c.srcBytes, hevc = c.hevcBytes;
+  const label = (c.codec || "h265") === "av1" ? "AV1" : "H.265";
+  const src = c.srcBytes, enc = c.hevcBytes;
   if (c.converted) {
-    const pct = src ? Math.round((1 - hevc / src) * 100) : 0;
-    return "H.265 · " + humanSize(src) + " → " + humanSize(hevc) + " · " + pct + "% smaller";
+    const pct = src ? Math.round((1 - enc / src) * 100) : 0;
+    return label + " · " + humanSize(src) + " → " + humanSize(enc) + " · " + pct + "% smaller";
   }
-  if (hevc == null) return "Kept H.264 — H.265 conversion failed";
-  const pct = src ? Math.round((hevc / src - 1) * 100) : 0;
-  return "Kept H.264 — H.265 would be " + pct + "% larger";
+  if (enc == null) return "Kept original — " + label + " conversion failed";
+  const pct = src ? Math.round((enc / src - 1) * 100) : 0;
+  return "Kept original — " + label + " would be " + pct + "% larger";
 }
 
 function hostOf(url) {
