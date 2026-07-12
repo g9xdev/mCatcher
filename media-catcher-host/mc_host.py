@@ -109,12 +109,16 @@ def sanitize(name):
 EXT_ID = "{27383706-fb43-40dc-9e94-d2578818bd6a}"
 import zipfile, glob, configparser, concurrent.futures
 
-CONFIG_PATH = os.path.join(HERE, "mc_config.json")
+# Config is keyed per Firefox variant (Developer / Nightly / release) so several
+# Firefoxes sharing one native-host registration don't clobber each other's
+# settings. _variant_key() lives with the process-tree helpers below.
+def _config_path():
+    return os.path.join(HERE, "mc_config_%s.json" % _variant_key())
 
 
 def load_config():
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(_config_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -122,7 +126,7 @@ def load_config():
 
 def save_config(cfg):
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        with open(_config_path(), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
@@ -214,9 +218,99 @@ def _newest_zip(zip_dir, pattern):
     return best
 
 
+# ---- multi-instance: which Firefox launched this host? -------------------
+# Several Firefox variants share one native-host registration, so each spawns its
+# own host process. We identify OUR Firefox by walking up the process tree, key
+# the config per-variant, and (in the guardian) restart only our own Firefox.
+_FIREFOX_CACHE = "?"   # "?" = unresolved; None = not found
+
+
+def _proc_snapshot():
+    """pid -> (exe_name_lower, ppid) for all processes (Windows toolhelp)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PE(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    k32 = ctypes.windll.kernel32
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+    out = {}
+    try:
+        e = PE(); e.dwSize = ctypes.sizeof(e)
+        if k32.Process32FirstW(snap, ctypes.byref(e)):
+            while True:
+                out[int(e.th32ProcessID)] = (e.szExeFile.lower(), int(e.th32ParentProcessID))
+                if not k32.Process32NextW(snap, ctypes.byref(e)):
+                    break
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
+def _pid_exe_path(pid):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return buf.value
+    finally:
+        k32.CloseHandle(h)
+    return ""
+
+
+def launching_firefox():
+    """Full path of the firefox.exe that spawned this host (walking up past the
+    .bat/cmd wrapper). Cached for the process lifetime; None if not found."""
+    global _FIREFOX_CACHE
+    if _FIREFOX_CACHE != "?":
+        return _FIREFOX_CACHE
+    _FIREFOX_CACHE = None
+    if os.name == "nt":
+        try:
+            procs = _proc_snapshot()
+            pid = os.getpid()
+            for _ in range(8):
+                info = procs.get(pid)
+                if not info:
+                    break
+                name, ppid = info
+                if name == "firefox.exe":
+                    _FIREFOX_CACHE = _pid_exe_path(pid) or None
+                    break
+                pid = ppid
+        except Exception:
+            _FIREFOX_CACHE = None
+    return _FIREFOX_CACHE
+
+
+def _variant_key():
+    p = (launching_firefox() or "").lower()
+    if "nightly" in p:
+        return "nightly"
+    if "developer" in p or "aurora" in p:
+        return "dev"
+    if p.endswith("firefox.exe"):
+        return "release"
+    return "default"
+
+
 def find_firefox():
-    """Locate a firefox.exe — prefers whatever launched us, then registry, then
-    common install dirs (including Developer Edition)."""
+    """Locate a firefox.exe — prefers the one that launched us, then registry,
+    then common install dirs (including Developer Edition)."""
+    if os.name == "nt":
+        ff = launching_firefox()
+        if ff and os.path.isfile(ff):
+            return ff
     if os.name != "nt":
         return shutil.which("firefox")
     # App Paths registry
@@ -278,22 +372,21 @@ def find_profile():
 
 
 def restart_firefox(firefox_path):
-    """Spawn a DETACHED helper that gracefully closes Firefox, waits, and
-    relaunches it (Firefox restores the previous session per its own setting).
+    """Spawn a DETACHED helper that gracefully closes ONLY this Firefox variant
+    (by exe path, leaving other variants running), waits, then relaunches it.
     Detached so it survives this host dying when Firefox closes."""
     if not firefox_path:
         return False
-    script = os.path.join(TMPDIR, "mc_restart.py")
+    ff = firefox_path.replace("'", "''")
+    script = os.path.join(TMPDIR, "mc_restart.ps1")
     body = (
-        "import time, subprocess\n"
-        "time.sleep(1.2)\n"
-        "subprocess.run(['taskkill','/IM','firefox.exe'], capture_output=True)\n"
-        "for _ in range(80):\n"
-        "    out = subprocess.run(['tasklist','/FI','IMAGENAME eq firefox.exe'], capture_output=True, text=True).stdout\n"
-        "    if 'firefox.exe' not in out.lower(): break\n"
-        "    time.sleep(0.5)\n"
-        "time.sleep(1.0)\n"
-        "subprocess.Popen([%r])\n" % firefox_path
+        "Start-Sleep -Milliseconds 1200\n"
+        "$ff = '" + ff + "'\n"
+        "$mine = { Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | Where-Object { $_.ExecutablePath -eq $ff } }\n"
+        "& $mine | ForEach-Object { taskkill /PID $_.ProcessId *>$null }\n"
+        "for ($i=0; $i -lt 80; $i++) { if (-not (& $mine)) { break }; Start-Sleep -Milliseconds 500 }\n"
+        "Start-Sleep -Seconds 1\n"
+        "Start-Process -FilePath $ff\n"
     )
     try:
         with open(script, "w", encoding="utf-8") as f:
@@ -304,8 +397,8 @@ def restart_firefox(firefox_path):
         flags = 0
         if os.name == "nt":
             flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
-        exe = sys.executable  # pythonw
-        subprocess.Popen([exe, script], creationflags=flags, close_fds=True)
+        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+                         creationflags=flags, close_fds=True)
         return True
     except Exception:
         return False

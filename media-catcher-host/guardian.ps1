@@ -144,12 +144,18 @@ function Revert-Update {
   }
 }
 
+function Ff-Mine { Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $cfg.firefox } }
+
 function Restart-Firefox {
   if (-not $cfg.firefox -or $NoRestart) { return }
+  $all = @(Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue)
+  $others = @($all | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ne $cfg.firefox } | Select-Object -ExpandProperty ExecutablePath -Unique)
+  if ($others.Count) { Log ("leaving other Firefox variant(s) running: {0}" -f ($others -join '; ')) }
   Start-Sleep -Milliseconds 800
-  & taskkill /IM firefox.exe *>$null            # graceful close (session saved)
+  # Close ONLY our own Firefox variant (by exe path) so other Firefoxes keep running.
+  @(Ff-Mine) | ForEach-Object { & taskkill /PID $_.ProcessId *>$null }
   for ($i = 0; $i -lt 80; $i++) {
-    if (-not (Get-Process -Name firefox -ErrorAction SilentlyContinue)) { break }
+    if (-not (@(Ff-Mine).Count)) { break }
     Start-Sleep -Milliseconds 500
   }
   Start-Sleep -Seconds 1
@@ -157,6 +163,11 @@ function Restart-Firefox {
 }
 
 # ---- main ----
+# Single-flight across Firefox instances: only one guardian modifies the shared
+# host/extension files at a time; a second (from another Firefox) defers.
+$guardMutex = New-Object System.Threading.Mutex($false, 'MediaCatcherGuardian')
+try { $haveLock = $guardMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
+if (-not $haveLock) { Log 'another guardian is already running - deferring this update'; exit 0 }
 Log ("start: applyExt={0} applyHost={1} extZip={2} hostZip={3}" -f $cfg.applyExt, $cfg.applyHost, $cfg.extZip, $cfg.hostZip)
 try {
   Do-Backup
