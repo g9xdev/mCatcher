@@ -146,6 +146,24 @@ function Revert-Update {
 
 function Ff-Mine { Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $cfg.firefox } }
 
+function Log-Landscape {
+  # Transparency for multi-instance setups: which Firefox variants are running,
+  # and which profiles carry the Media Catcher extension. We only ever touch our
+  # own variant ($cfg.firefox); the rest is logged so nothing hides as a surprise.
+  $ffs = @(Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue |
+           Select-Object -ExpandProperty ExecutablePath -Unique | Where-Object { $_ })
+  Log ("firefox running: " + $(if ($ffs.Count) { $ffs -join '; ' } else { 'none' }))
+  Log ("updating (our variant): " + $(if ($cfg.firefox) { $cfg.firefox } else { '(unknown)' }))
+  $withExt = @()
+  $base = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
+  if (Test-Path $base) {
+    foreach ($d in Get-ChildItem $base -Directory -ErrorAction SilentlyContinue) {
+      if (Test-Path -LiteralPath (Join-Path $d.FullName ("extensions\" + $cfg.extId + ".xpi"))) { $withExt += $d.Name }
+    }
+  }
+  Log ("profiles with Media Catcher installed: " + $(if ($withExt.Count) { $withExt -join ', ' } else { 'none (or source-loaded)' }))
+}
+
 function Restart-Firefox {
   if (-not $cfg.firefox -or $NoRestart) { return }
   $all = @(Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue)
@@ -169,6 +187,7 @@ $guardMutex = New-Object System.Threading.Mutex($false, 'MediaCatcherGuardian')
 try { $haveLock = $guardMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
 if (-not $haveLock) { Log 'another guardian is already running - deferring this update'; exit 0 }
 Log ("start: applyExt={0} applyHost={1} extZip={2} hostZip={3}" -f $cfg.applyExt, $cfg.applyHost, $cfg.extZip, $cfg.hostZip)
+Log-Landscape
 try {
   Do-Backup
   Prune-Backups
