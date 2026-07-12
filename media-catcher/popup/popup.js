@@ -55,7 +55,7 @@ function h265Note(c) {
     const pct = src ? Math.round((1 - enc / src) * 100) : 0;
     return label + " · " + humanSize(src) + " → " + humanSize(enc) + " · " + pct + "% smaller";
   }
-  if (enc == null) return "Kept original — " + label + " conversion failed";
+  if (enc == null) return c.note ? "Kept original — " + c.note : "Kept original — " + label + " conversion failed";
   const pct = src ? Math.round((enc / src - 1) * 100) : 0;
   return "Kept original — " + label + " would be " + pct + "% larger";
 }

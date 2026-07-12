@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.4.10"
+VERSION = "1.4.11"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -1438,21 +1438,66 @@ def _safe_kill(p):
         pass
 
 
-def _probe_duration_us(path):
-    """Media duration in microseconds, parsed from ffmpeg's header read (no ffprobe
-    binary needed). 0 if unknown, in which case progress is reported indeterminate."""
+def _probe_media(path):
+    """Parse ffmpeg's header read (no ffprobe binary needed): duration (us), overall
+    bitrate, and the first video stream's codec, WxH, and fps. Missing fields are None."""
+    info = {"dur_us": 0, "bitrate": None, "codec": None, "width": None, "height": None, "fps": None}
     if not FFMPEG:
-        return 0
+        return info
     cf, si = _no_window()
     try:
         r = subprocess.run([FFMPEG, "-hide_banner", "-i", path], stdout=subprocess.DEVNULL,
                            stderr=subprocess.PIPE, creationflags=cf, startupinfo=si, timeout=30)
-        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr.decode("utf-8", "replace"))
-        if m:
-            return int((int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) * 1_000_000)
+        txt = r.stderr.decode("utf-8", "replace")
     except Exception:
-        pass
-    return 0
+        return info
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", txt)
+    if m:
+        info["dur_us"] = int((int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) * 1_000_000)
+    m = re.search(r"bitrate:\s*(\d+)\s*kb/s", txt)
+    if m:
+        info["bitrate"] = int(m.group(1)) * 1000
+    vline = re.search(r"Stream #\d+:\d+[^\n]*Video:\s*([^\n]+)", txt)
+    if vline:
+        v = vline.group(1)
+        cm = re.match(r"([a-z0-9]+)", v)
+        if cm:
+            info["codec"] = cm.group(1).lower()
+        rm = re.search(r"(\d{2,5})x(\d{2,5})", v)
+        if rm:
+            info["width"], info["height"] = int(rm.group(1)), int(rm.group(2))
+        fm = re.search(r"(\d+(?:\.\d+)?)\s*fps", v)
+        if fm:
+            info["fps"] = float(fm.group(1))
+    return info
+
+
+# Bits-per-pixel a target codec/quality roughly needs. If the SOURCE is already at or
+# below this, a re-encode would grow it (the source is more compressed than the target
+# would be), so we skip without encoding. Deliberately conservative.
+_TARGET_BPP = {
+    ("h265", "visually-lossless"): 0.050, ("h265", "balanced"): 0.030, ("h265", "true-lossless"): 1e9,
+    ("av1", "visually-lossless"): 0.038, ("av1", "balanced"): 0.024,
+}
+
+
+def _transcode_worthwhile(media, codec, quality):
+    """Predict — before encoding — whether re-encoding will actually shrink the file.
+    Returns (worth: bool, reason_if_not: str|None). Only says 'no' on strong evidence;
+    when data is missing it says 'yes' and lets the encode + early-abort decide."""
+    sc = (media.get("codec") or "")
+    if sc == "av1":
+        return False, "source is already AV1 (most efficient) — re-encoding would grow it"
+    if sc in ("hevc", "h265") and codec == "h265":
+        return False, "source is already H.265 — re-encoding would grow it"
+    w, h, fps, br = media.get("width"), media.get("height"), media.get("fps"), media.get("bitrate")
+    if w and h and fps and br and fps > 0:
+        bpp = br / float(w * h * fps)
+        thr = _TARGET_BPP.get((codec, quality), 0.045)
+        if bpp <= thr:
+            return False, ("already ~%.3f bpp — leaner than %s %s needs, so it would grow"
+                           % (bpp, codec.upper(), quality))
+    return True, None
 
 
 def transcode(src, codec="h265", quality="visually-lossless", prefer="auto", on_progress=None):
@@ -1466,7 +1511,13 @@ def transcode(src, codec="h265", quality="visually-lossless", prefer="auto", on_
     if not FFMPEG or not os.path.isfile(src) or codec not in ("h265", "av1"):
         return {"path": src, "converted": False, "note": "no ffmpeg", "srcBytes": None, "hevcBytes": None}
     src_bytes = os.path.getsize(src)
-    dur_us = _probe_duration_us(src)
+    media = _probe_media(src)
+    dur_us = media["dur_us"]
+    # Predict whether it can shrink at all; if not, skip WITHOUT encoding (no wasted work).
+    worth, why = _transcode_worthwhile(media, codec, quality)
+    if not worth:
+        _hlog("info", "convert skipped (%s): %s" % (codec.upper(), why))
+        return {"path": src, "converted": False, "note": why, "srcBytes": src_bytes, "hevcBytes": None}
     encoder = find_encoder(codec, prefer)
     sw = {"h265": "libx265", "av1": "libsvtav1"}[codec]
     tag = "hvc1" if codec == "h265" else "av01"
@@ -1496,6 +1547,7 @@ def transcode(src, codec="h265", quality="visually-lossless", prefer="auto", on_
         limit = max(300, int((dur_us / 1_000_000) * 20)) if dur_us else 1800
         killer = threading.Timer(limit, lambda: _safe_kill(p)); killer.daemon = True; killer.start()
         toobig = False
+        last_speed = last_fps = None
         try:
             for line in p.stdout:
                 line = line.strip()
@@ -1510,10 +1562,18 @@ def transcode(src, codec="h265", quality="visually-lossless", prefer="auto", on_
                         on_progress(max(0, min(99, int(int(line.split("=", 1)[1]) * 100 / dur_us))))
                     except Exception:
                         pass
+                elif line.startswith("speed="):
+                    last_speed = line.split("=", 1)[1].strip()
+                elif line.startswith("fps="):
+                    last_fps = line.split("=", 1)[1].strip()
         finally:
             killer.cancel()
             try: p.wait(timeout=10)
             except Exception: _safe_kill(p)
+        # Real encoder throughput -> the Settings console, so GPU-vs-CPU speed is visible.
+        _hlog("info", "convert %s via %s: speed %s, %s fps%s" % (
+            codec.upper(), enc, last_speed or "?", last_fps or "?",
+            " — aborted (would be larger)" if toobig else ""))
         if toobig:
             return "toobig"
         return "ok" if (p.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0) else "fail"
