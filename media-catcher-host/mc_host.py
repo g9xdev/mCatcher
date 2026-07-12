@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -2004,20 +2004,17 @@ def _map_yt_error(text):
 
 
 def _parse_yt_progress(line):
-    out = {"stage": "downloading"}
-    m = re.search(r"pct=\s*([\d.]+)%", line)
-    if m:
-        out["pct"] = float(m.group(1))
-    m = re.search(r"speed=([\d.]+)", line)
-    if m:
-        out["bps"] = float(m.group(1))
-    m = re.search(r"\bdl=(\d+)", line)
-    if m:
-        out["downloaded"] = int(m.group(1))
-    m = re.search(r"\btotal=(\d+)", line) or re.search(r"totalest=(\d+)", line)
-    if m:
-        out["total"] = int(m.group(1))
-    return out if len(out) > 1 else None
+    # yt-dlp default (--newline): "[download]  42.3% of  229.20MiB at   53.67MiB/s ETA 00:04"
+    m = re.search(r"\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+)\s*([KMGT]?)i?B", line)
+    if not m:
+        return None
+    def _bytes(num, unit):
+        return int(float(num) * {"K": 1024, "M": 1048576, "G": 1073741824, "T": 1099511627776}.get(unit, 1))
+    out = {"stage": "downloading", "pct": float(m.group(1)), "total": _bytes(m.group(2), m.group(3))}
+    sm = re.search(r"at\s+([\d.]+)\s*([KMGT]?)i?B/s", line)
+    if sm:
+        out["bps"] = _bytes(sm.group(1), sm.group(2))
+    return out
 
 
 def handle_ytdl(req):
@@ -2041,13 +2038,11 @@ def handle_ytdl(req):
             pass
         pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
         outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
-        cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--no-warnings", "--force-overwrites",
+        cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--progress", "--no-warnings", "--force-overwrites",
                "-f", "bv*+ba/b", "--merge-output-format", "mp4",
                "--cookies-from-browser", "firefox",
                "-o", outtmpl,
-               "--progress-template",
-               "download:@@PROG@@ pct=%(progress._percent_str)s dl=%(progress.downloaded_bytes)s "
-               "total=%(progress.total_bytes)s totalest=%(progress.total_bytes_estimate)s speed=%(progress.speed)s",
+               # --print puts yt-dlp in quiet mode; --progress above forces the bar back on.
                "--print", "after_move:@@FILE@@ %(filepath)s"]
         if FFMPEG:
             cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
@@ -2067,15 +2062,20 @@ def handle_ytdl(req):
             return
         errbuf = []
         filepath = None
+        last_pct = -1.0
         _PGET[jid] = {"proc": p}               # so a cancel can kill it
         for line in p.stdout:
             s = line.strip()
-            if s.startswith("@@PROG@@"):
+            if s.startswith("@@FILE@@"):
+                filepath = s[len("@@FILE@@"):].strip()
+            elif s.startswith("[download]"):
                 prog = _parse_yt_progress(s)
                 if prog:
-                    send({"type": "ytdl-progress", "id": jid, **prog})
-            elif s.startswith("@@FILE@@"):
-                filepath = s[len("@@FILE@@"):].strip()
+                    pct = prog.get("pct", 0.0)
+                    # throttle to ~1% steps; resend on a reset (audio stream starts after video)
+                    if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
+                        last_pct = pct
+                        send({"type": "ytdl-progress", "id": jid, **prog})
             elif s:
                 errbuf.append(s)
                 if "Merging formats" in s or s.startswith("[Merger]"):
