@@ -633,4 +633,46 @@ document.getElementById("clear").addEventListener("click", async () => {
   render([]);
 });
 
+// ---- one-click update from the popup (no about:addons needed) ----
+// Kicks the same GitHub check the settings page uses: the helper updates itself (guardian)
+// and, if the signed extension is behind, we surface a one-tap install of the new .xpi.
+const RELEASE_BASE = "https://github.com/g9xdev/mCatcher/releases/download";
+let _statusReset = null;
+function flashStatus(text) {
+  statusEl.textContent = text;
+  statusEl.classList.remove("clickable");
+  statusEl.onclick = null;
+  clearTimeout(_statusReset);
+  _statusReset = setTimeout(() => refresh(), 5000);   // restore the tab-watching status
+}
+document.getElementById("update").addEventListener("click", async () => {
+  const btn = document.getElementById("update");
+  btn.classList.add("active");
+  flashStatus("Checking for updates…");
+  clearTimeout(_statusReset);                          // keep 'checking…' until a result lands
+  await send({ type: "update-extension" });
+  setTimeout(() => btn.classList.remove("active"), 1500);
+});
+api.runtime.onMessage.addListener((msg) => {
+  if (!msg) return;
+  if (msg.type === "github-update") {
+    const r = msg.result || {};
+    if (r.reached === false) flashStatus("Couldn't reach GitHub — check your connection");
+    else if (r.newer === false) flashStatus("Up to date ✓");
+    else if (r.newer) flashStatus("Downloading update…");
+  } else if (msg.type === "update-result") {
+    const r = msg.result || {};
+    if (r.available === false) flashStatus("Up to date ✓");
+    else if (r.deferred) flashStatus("Update ready — deferred");
+    else if (r.available) flashStatus("Installing helper — Firefox will restart");
+  } else if (msg.type === "ext-update-available" && msg.version) {
+    // The signed add-on can only be (re)installed by Firefox — offer a one-tap install.
+    const url = RELEASE_BASE + "/v" + msg.version + "/media_catcher-" + msg.version + ".xpi";
+    clearTimeout(_statusReset);
+    statusEl.textContent = "Install v" + msg.version + " →";
+    statusEl.classList.add("clickable");
+    statusEl.onclick = () => { api.tabs.create({ url }); window.close(); };
+  }
+});
+
 init();

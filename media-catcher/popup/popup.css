@@ -174,6 +174,9 @@ input:focus-visible {
   box-shadow: 0 0 0 4px rgba(96, 205, 255, 0.1);
 }
 
+.status.clickable { color: var(--accent); cursor: pointer; font-weight: 600; }
+.status.clickable:hover { text-decoration: underline; }
+
 /* Media list */
 .list {
   max-height: 520px;
