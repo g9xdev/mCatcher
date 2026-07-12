@@ -86,7 +86,7 @@ select, input[type="number"], input[type="text"] {
 select:hover, input:hover { border-color: var(--stroke-strong); }
 select:focus, input:focus { outline: none; border-color: var(--accent); background: rgba(0, 0, 0, 0.32); }
 input[type="text"] { flex: 1; min-width: 0; }
-input[type="number"] { width: 88px; text-align: right; font-variant-numeric: tabular-nums; }
+input[type="number"] { width: 92px; text-align: right; font-variant-numeric: tabular-nums; padding-right: 22px; }
 input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
 .folder-row { display: flex; flex: 1; gap: 8px; min-width: 0; align-items: center; }
 .folder-row .btn.small { flex: 0 0 auto; }
