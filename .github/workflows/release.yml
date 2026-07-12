@@ -101,6 +101,12 @@ jobs:
           if ($xpi) {
             Copy-Item $xpi.FullName "dist/media_catcher-$v.xpi" -Force
             Write-Host "Signed -> dist/media_catcher-$v.xpi"
+            # Firefox self-hosted update manifest -> points at this version's signed xpi.
+            $addonId = "{27383706-fb43-40dc-9e94-d2578818bd6a}"
+            $link = "https://github.com/g9xdev/mCatcher/releases/download/v$v/media_catcher-$v.xpi"
+            $updates = @{ addons = @{ $addonId = @{ updates = @(@{ version = $v; update_link = $link }) } } }
+            $updates | ConvertTo-Json -Depth 8 | Set-Content 'dist/updates.json' -Encoding utf8
+            Write-Host "Wrote dist/updates.json (update_link -> $link)"
           } else {
             Write-Host "::warning::No signed .xpi produced (validation error, or v$v already signed)."
           }
@@ -122,5 +128,9 @@ jobs:
             Write-Host "Attaching signed .xpi."
           } else {
             Write-Host "::warning::No signed .xpi to attach to this release."
+          }
+          if (Test-Path "dist/updates.json") {
+            $files += "dist/updates.json"
+            Write-Host "Attaching updates.json (Firefox self-hosted auto-update manifest)."
           }
           gh release create "v$v" $files --title "Media Catcher $v" --generate-notes
