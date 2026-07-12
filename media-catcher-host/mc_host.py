@@ -1127,21 +1127,81 @@ def _finalize_move(job, jid, dest, req=None):
 
 
 def _ask_save_path(default_dir, default_name):
-    """Native Save-As dialog (tkinter). Returns "" on cancel or if unavailable."""
+    """Native Win32 Save-As dialog (comdlg32, no tkinter). Returns "" on cancel."""
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk(); root.withdraw()
-        try: root.attributes("-topmost", True)
+        import ctypes
+        from ctypes import wintypes
+        try: ctypes.windll.ole32.CoInitialize(None)
         except Exception: pass
-        path = filedialog.asksaveasfilename(
-            parent=root, initialdir=default_dir, initialfile=default_name,
-            defaultextension=".mp4",
-            filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")])
-        root.destroy()
-        return path
+
+        class OPENFILENAME(ctypes.Structure):
+            _fields_ = [
+                ("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE), ("lpstrFilter", wintypes.LPCWSTR),
+                ("lpstrCustomFilter", wintypes.LPWSTR), ("nMaxCustFilter", wintypes.DWORD),
+                ("nFilterIndex", wintypes.DWORD), ("lpstrFile", wintypes.LPWSTR),
+                ("nMaxFile", wintypes.DWORD), ("lpstrFileTitle", wintypes.LPWSTR),
+                ("nMaxFileTitle", wintypes.DWORD), ("lpstrInitialDir", wintypes.LPCWSTR),
+                ("lpstrTitle", wintypes.LPCWSTR), ("Flags", wintypes.DWORD),
+                ("nFileOffset", wintypes.WORD), ("nFileExtension", wintypes.WORD),
+                ("lpstrDefExt", wintypes.LPCWSTR), ("lCustData", ctypes.c_void_p),
+                ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wintypes.LPCWSTR),
+                ("pvReserved", ctypes.c_void_p), ("dwReserved", wintypes.DWORD),
+                ("FlagsEx", wintypes.DWORD),
+            ]
+        buf = ctypes.create_unicode_buffer(4096)
+        buf.value = default_name or "recording.mp4"
+        flt = ctypes.create_unicode_buffer("MP4 video\0*.mp4\0All files\0*.*\0\0")
+        ofn = OPENFILENAME()
+        ofn.lStructSize = ctypes.sizeof(ofn)
+        ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+        ofn.nMaxFile = 4096
+        ofn.lpstrFilter = ctypes.cast(flt, wintypes.LPCWSTR)
+        ofn.lpstrInitialDir = default_dir or None
+        ofn.lpstrTitle = "Save recording as"
+        ofn.lpstrDefExt = "mp4"
+        # OVERWRITEPROMPT | NOCHANGEDIR | PATHMUSTEXIST | EXPLORER
+        ofn.Flags = 0x2 | 0x8 | 0x800 | 0x80000
+        if ctypes.windll.comdlg32.GetSaveFileNameW(ctypes.byref(ofn)):
+            return buf.value
     except Exception:
-        return ""
+        pass
+    return ""
+
+
+def _ask_folder(default_dir):
+    """Native Win32 folder picker (shell32, no tkinter). Returns "" on cancel."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        try: ctypes.windll.ole32.CoInitialize(None)
+        except Exception: pass
+
+        class BROWSEINFO(ctypes.Structure):
+            _fields_ = [
+                ("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
+                ("pszDisplayName", wintypes.LPWSTR), ("lpszTitle", wintypes.LPCWSTR),
+                ("ulFlags", wintypes.UINT), ("lpfn", ctypes.c_void_p),
+                ("lParam", ctypes.c_void_p), ("iImage", ctypes.c_int),
+            ]
+        disp = ctypes.create_unicode_buffer(260)
+        bi = BROWSEINFO()
+        bi.pszDisplayName = ctypes.cast(disp, wintypes.LPWSTR)
+        bi.lpszTitle = "Select a folder"
+        bi.ulFlags = 0x1 | 0x40   # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+        shell32 = ctypes.windll.shell32
+        shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+        pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+        if not pidl:
+            return ""
+        path = ctypes.create_unicode_buffer(260)
+        shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), path)
+        try: ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+        except Exception: pass
+        return path.value or ""
+    except Exception:
+        pass
+    return ""
 
 
 def handle_save(req):
@@ -1193,18 +1253,7 @@ def handle_save_as(req):
 def handle_pick_folder(req):
     """Native folder picker for the settings page. Replies {type:folder,dir}."""
     def worker():
-        d = ""
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk(); root.withdraw()
-            try: root.attributes("-topmost", True)
-            except Exception: pass
-            d = filedialog.askdirectory(parent=root, initialdir=req.get("dir") or downloads_dir())
-            root.destroy()
-        except Exception as e:
-            send({"type": "error", "error": "folder dialog unavailable: %s" % e})
-            return
+        d = _ask_folder(req.get("dir") or downloads_dir())
         send({"type": "folder", "reqId": req.get("reqId"), "dir": d or ""})
     threading.Thread(target=worker, daemon=True).start()
 

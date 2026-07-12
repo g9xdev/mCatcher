@@ -954,16 +954,17 @@ function broadcast(msg) {
 async function downloadDirect(item, tabId, filename) {
   const name = sanitizeFilename(filename || item.name);
   const finalName = /\.[a-z0-9]{2,4}$/i.test(name) ? name : name + guessExt(item);
-  const mirrors = (item.mirrors && item.mirrors.length > 1) ? item.mirrors.slice() : null;
-  // Multiple mirrors + a ready helper -> parallel, failover download in the host.
-  // The host emits "pget-fallback" if ranges aren't supported or anything fails,
-  // and we hand back to the browser download below (which carries cookies).
-  if (mirrors && nativePort && nativeReady) {
+  // A ready helper downloads with several parallel range connections (and, when
+  // the file has mirrors, fails a segment over to another mirror). The host emits
+  // "pget-fallback" if ranges aren't supported or anything fails, and we hand back
+  // to the browser download below (which carries cookies).
+  const urls = (item.mirrors && item.mirrors.length) ? item.mirrors.slice() : [item.url];
+  if (nativePort && nativeReady) {
     const id = "pget:" + (item.key || item.url);
     const ctx = tabContext.get(tabId) || {};
     pgetFallback.set(id, { item, finalName });
     try {
-      nativePort.postMessage({ cmd: "pget", id, urls: mirrors, name: finalName,
+      nativePort.postMessage({ cmd: "pget", id, urls, name: finalName,
         dir: settings.saveFolder || "", referer: ctx.referer || "", userAgent: ctx.userAgent || "" });
       return;
     } catch (e) {
