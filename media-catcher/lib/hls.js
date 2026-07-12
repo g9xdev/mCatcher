@@ -229,6 +229,7 @@
     const results = new Array(total);
     const keyCache = {};
     let done = 0;
+    let bytesDone = 0;
     let nextIndex = 0;
     let aborted = false;
 
@@ -271,7 +272,8 @@
         }
         results[idx] = bytes;
         done++;
-        onProgress({ done, total });
+        bytesDone += (buf && buf.byteLength) || bytes.length;
+        onProgress({ done, total, bytes: bytesDone });
       }
     }
 

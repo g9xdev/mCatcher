@@ -553,11 +553,14 @@ function renderProgress(el, dl) {
   else if (dl.status === "cancelled") statusText = "Cancelled";
   else statusText = "Downloading";
 
-  const right = dl.progress && dl.progress.total
+  let right = dl.progress && dl.progress.total
     ? (dl.progress.unit === "bytes"
         ? humanSize(dl.progress.done) + " / " + humanSize(dl.progress.total)
         : dl.progress.done + "/" + dl.progress.total + " seg")
     : "";
+  if (dl.progress && dl.progress.bps > 0 && (dl.status === "downloading" || dl.status === "audio")) {
+    right += (right ? "  ·  " : "") + humanSize(dl.progress.bps) + "/s";
+  }
 
   const fill = h("div", { class: "fill" });
   fill.style.width = pct + "%";

@@ -16,7 +16,7 @@ function dlog() {
 
 // ---- Settings (persisted) ----
 const DEFAULT_SETTINGS = {
-  defaultQuality: "ask",        // "ask" | "highest" | "lowest"
+  defaultQuality: "highest",    // "ask" | "highest" | "lowest"
   concurrency: 6,               // parallel segment fetches
   maxConcurrentDownloads: 4,    // parallel assembly jobs
   retries: 3,                   // per-segment retry attempts
@@ -35,14 +35,20 @@ const DEFAULT_SETTINGS = {
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
-api.storage.local.get(["settings", "pd4done"]).then((r) => {
+api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
-  // One-time: move users off the old parallel-downloads default (2) to the new one (4).
-  // Guarded by pd4done so a later deliberate choice of 2 is respected.
+  // One-time migrations to newer defaults, each guarded by its own flag so a later
+  // deliberate choice is respected (won't be re-applied on the next load).
+  const flags = {};
   if (!(r && r.pd4done)) {
     if (settings.maxConcurrentDownloads === 2) settings.maxConcurrentDownloads = 4;
-    api.storage.local.set({ settings, pd4done: true }).catch(() => {});
+    flags.pd4done = true;
   }
+  if (!(r && r.dq1done)) {
+    if (settings.defaultQuality === "ask") settings.defaultQuality = "highest";
+    flags.dq1done = true;
+  }
+  if (Object.keys(flags).length) api.storage.local.set(Object.assign({ settings }, flags)).catch(() => {});
 }).catch(() => {});
 
 // ---- diagnostics log + update history (Settings "Log console" panel) -------
@@ -1130,7 +1136,24 @@ async function downloadPlaylist(playlistUrl, tabId, dl, containerHint) {
     concurrency: settings.concurrency,
     allowLive: false,
     containerHint: containerHint,
-    onProgress: (p) => { dl.progress = p; broadcast({ type: "download-update", download: dl }); },
+    onProgress: (p) => {
+      // Smooth the download speed (bytes/s) from cumulative bytes over time, so bursts
+      // of parallel segment completions read as a steady MB/s rather than spiking.
+      const now = Date.now();
+      if (p.bytes != null) {
+        if (dl._spT == null) { dl._spT = now; dl._spB = p.bytes; }
+        else {
+          const dt = (now - dl._spT) / 1000;
+          if (dt >= 0.4) {
+            const inst = (p.bytes - dl._spB) / dt;
+            dl._bps = dl._bps != null ? dl._bps * 0.65 + inst * 0.35 : inst;
+            dl._spT = now; dl._spB = p.bytes;
+          }
+        }
+      }
+      dl.progress = { done: p.done, total: p.total, bytes: p.bytes, bps: dl._bps };
+      broadcast({ type: "download-update", download: dl });
+    },
     shouldAbort: () => dl.status === "cancelled",
   });
 }
