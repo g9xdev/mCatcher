@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="options.css" />
+    <title>Media Catcher — Settings</title>
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>Media <em>Catcher</em></h1>
+      <p class="sub">Settings</p>
+
+      <section class="card">
+        <label class="row">
+          <span class="label">Default quality</span>
+          <select id="defaultQuality">
+            <option value="ask">Ask each time</option>
+            <option value="highest">Always highest</option>
+            <option value="lowest">Always lowest</option>
+          </select>
+        </label>
+
+        <label class="row">
+          <span class="label">Parallel segment fetches</span>
+          <input id="concurrency" type="number" min="1" max="16" />
+        </label>
+
+        <label class="row">
+          <span class="label">Parallel downloads</span>
+          <input id="maxConcurrentDownloads" type="number" min="1" max="6" />
+        </label>
+
+        <label class="row">
+          <span class="label">Segment retries</span>
+          <input id="retries" type="number" min="0" max="10" />
+        </label>
+
+        <label class="row">
+          <span class="label">Filename template</span>
+          <input id="filenameTemplate" type="text" spellcheck="false" />
+        </label>
+        <p class="hint">Tokens: {title} {host} {quality} {height} {date} {time} {name}</p>
+
+        <label class="row">
+          <span class="label">Default save folder</span>
+          <span class="folder-row">
+            <input id="saveFolder" type="text" spellcheck="false" placeholder="Downloads (default)" />
+            <button id="browseSave" type="button" class="btn ghost small">Browse…</button>
+          </span>
+        </label>
+        <p class="hint">Where “Save” puts recordings (native helper only). Blank = your Downloads folder.</p>
+
+        <label class="row checkbox">
+          <input id="preferHighestRendition" type="checkbox" />
+          <span class="label">Show only the highest-bitrate version of a stream</span>
+        </label>
+
+        <label class="row">
+          <span class="label">Hide direct files smaller than (MB)</span>
+          <input id="minDirectSizeMB" type="number" min="0" max="500" step="1" />
+        </label>
+        <p class="hint">Filters out tip sounds, avatars, and preview clips. 0 = show everything. Never affects HLS/DASH streams.</p>
+
+        <label class="row checkbox">
+          <input id="captureSubtitles" type="checkbox" />
+          <span class="label">Capture subtitles when available</span>
+        </label>
+
+        <label class="row checkbox">
+          <input id="notifications" type="checkbox" />
+          <span class="label">Show a notification when a download finishes</span>
+        </label>
+
+        <label class="row checkbox">
+          <input id="convertH265" type="checkbox" />
+          <span class="label">Convert recordings to H.265 (HEVC) and delete the original</span>
+        </label>
+        <label class="row">
+          <span class="label">H.265 quality</span>
+          <select id="h265Quality">
+            <option value="visually-lossless">Same look, smaller (recommended)</option>
+            <option value="balanced">Smallest files</option>
+            <option value="true-lossless">True lossless (large, CPU only)</option>
+          </select>
+        </label>
+        <p class="hint">Re-encodes each finished recording to H.265 after saving, then deletes the H.264 original. Uses your GPU when available. Needs the native helper.</p>
+      </section>
+
+      <div class="actions">
+        <button id="save" class="btn primary">Save</button>
+        <button id="reset" class="btn ghost">Reset to defaults</button>
+        <span id="status" class="status"></span>
+      </div>
+
+      <section class="card">
+        <div class="card-head"><span class="label">Updates</span></div>
+        <p class="hint">Drop a new <code>media_catcher-*.zip</code> (and optional <code>media-catcher-host.zip</code>) in the folder below, then check. The helper installs it and offers to restart Firefox (restoring your tabs). Requires the native helper; persistent auto-load needs Firefox Developer/Nightly with unsigned add-ons allowed.</p>
+
+        <label class="row">
+          <span class="label">Extension folder</span>
+          <span class="folder-row">
+            <input id="updateExtDir" type="text" spellcheck="false" placeholder="e.g. C:\Code\mCatcher\media-catcher" />
+            <button id="browseExtDir" type="button" class="btn ghost small">Browse…</button>
+          </span>
+        </label>
+
+        <label class="row">
+          <span class="label">Update package folder</span>
+          <span class="folder-row">
+            <input id="updateZipDir" type="text" spellcheck="false" placeholder="Downloads (default)" />
+            <button id="browseZipDir" type="button" class="btn ghost small">Browse…</button>
+          </span>
+        </label>
+
+        <label class="row checkbox">
+          <input id="autoUpdate" type="checkbox" />
+          <span class="label">Auto-install when a new package appears in that folder</span>
+        </label>
+        <p class="hint">The helper watches the folder via OS change events (no polling) and offers to install + restart when a newer build lands.</p>
+
+        <div class="actions">
+          <button id="checkUpdate" class="btn primary">Check &amp; install update</button>
+          <span id="updateStatus" class="status"></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="label">Download history</span>
+          <button id="clearHistory" class="btn ghost small">Clear</button>
+        </div>
+        <ul id="history" class="history"></ul>
+      </section>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

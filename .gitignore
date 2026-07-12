@@ -1,0 +1,31 @@
+# mCatcher repository — track ONLY the Media Catcher extension + host.
+# The workspace (C:\Code) holds other projects too, so ignore everything at the
+# root by default, then re-include the two Media Catcher projects.
+/*
+!/.gitignore
+!/README.md
+!/.github
+!/media-catcher
+!/media-catcher-host
+
+# --- exclusions inside the tracked projects ---
+
+# Large binaries: the installer downloads ffmpeg at install time.
+media-catcher-host/ffmpeg.exe
+media-catcher-host/ffprobe.exe
+
+# Build artifacts.
+media-catcher-host/installer/dist/
+
+# Machine-specific / installer-generated files (paths, user settings).
+media-catcher-host/mc_config.json
+media-catcher-host/com.mediacatcher.host.json
+media-catcher-host/mc_host.bat
+
+# Caches and cruft.
+**/__pycache__/
+*.pyc
+**/node_modules/
+*.log
+.DS_Store
+Thumbs.db
