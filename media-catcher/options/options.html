@@ -95,34 +95,37 @@
 
       <section class="card">
         <div class="card-head"><span class="label">Updates</span></div>
-        <p class="hint">Drop a new <code>media_catcher-*.zip</code> (and optional <code>media-catcher-host.zip</code>) in the folder below, then check. The helper installs it and offers to restart Firefox (restoring your tabs). Requires the native helper; persistent auto-load needs Firefox Developer/Nightly with unsigned add-ons allowed.</p>
-
-        <label class="row">
-          <span class="label">Extension folder</span>
-          <span class="folder-row">
-            <input id="updateExtDir" type="text" spellcheck="false" placeholder="e.g. C:\Code\mCatcher\media-catcher" />
-            <button id="browseExtDir" type="button" class="btn ghost small">Browse…</button>
-          </span>
-        </label>
-
-        <label class="row">
-          <span class="label">Update package folder</span>
-          <span class="folder-row">
-            <input id="updateZipDir" type="text" spellcheck="false" placeholder="Downloads (default)" />
-            <button id="browseZipDir" type="button" class="btn ghost small">Browse…</button>
-          </span>
-        </label>
+        <p class="hint">Media Catcher checks <a href="https://github.com/g9xdev/mCatcher/releases/latest" target="_blank" rel="noopener">GitHub Releases</a> for new versions of the extension and the native helper. The helper installs them — backing up, verifying, and reverting on failure — then offers to restart Firefox (restoring your tabs). Requires the native helper.</p>
 
         <label class="row checkbox">
           <input id="autoUpdate" type="checkbox" />
-          <span class="label">Auto-install when a new package appears in that folder</span>
+          <span class="label">Automatically install updates from GitHub</span>
         </label>
-        <p class="hint">The helper watches the folder via OS change events (no polling) and checks GitHub Releases for new versions, then offers to install + restart when a newer build lands.</p>
+        <p class="hint">The helper checks GitHub Releases on startup and every few hours, and offers to install + restart when a newer build lands. With this off, use the button below to check on demand.</p>
 
         <div class="actions">
-          <button id="checkUpdate" class="btn primary">Check &amp; install update</button>
+          <button id="checkUpdate" class="btn primary">Check GitHub for updates</button>
           <span id="updateStatus" class="status"></span>
         </div>
+
+        <details class="advanced">
+          <summary>Advanced — running an unsigned build from source (developers)</summary>
+          <p class="hint">Only needed if you load the extension from a source folder on Firefox Developer/Nightly. On a normal signed install, leave these blank — Firefox updates the add-on itself, and the helper still updates from GitHub.</p>
+          <label class="row">
+            <span class="label">Extension folder</span>
+            <span class="folder-row">
+              <input id="updateExtDir" type="text" spellcheck="false" placeholder="e.g. C:\Code\mCatcher\media-catcher" />
+              <button id="browseExtDir" type="button" class="btn ghost small">Browse…</button>
+            </span>
+          </label>
+          <label class="row">
+            <span class="label">Download folder</span>
+            <span class="folder-row">
+              <input id="updateZipDir" type="text" spellcheck="false" placeholder="Downloads (default)" />
+              <button id="browseZipDir" type="button" class="btn ghost small">Browse…</button>
+            </span>
+          </label>
+        </details>
       </section>
 
       <section class="card">

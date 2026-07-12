@@ -121,7 +121,7 @@ get("autoUpdate").addEventListener("change", async () => {
 get("checkUpdate").addEventListener("click", async () => {
   await save();                                  // persist paths before the helper reads them
   const s = get("updateStatus");
-  s.textContent = "Checking… watch for the helper's dialog.";
+  s.textContent = "Checking GitHub… watch for the helper's dialog.";
   const r = await send({ type: "update-extension" });
   if (r && r.ok === false) s.textContent = r.error || "Update needs the native helper.";
 });
@@ -135,6 +135,16 @@ api.runtime.onMessage.addListener((msg) => {
   else if (res.available === false) s.textContent = "Up to date (v" + (res.version || "?") + ").";
   else if (res.deferred) s.textContent = "Update available (" + (res.summary || "") + ") — deferred.";
   else if (res.available) s.textContent = "Guardian installing: " + (res.summary || "update") + " — it will verify, restart Firefox, and revert if anything fails.";
+});
+
+// GitHub check progress (arrives before the guardian's own update-result).
+api.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== "github-update") return;
+  const s = get("updateStatus");
+  const res = msg.result || {};
+  if (res.reached === false) s.textContent = "Couldn't reach GitHub — check your connection.";
+  else if (res.newer === false) s.textContent = "Up to date (latest release v" + (res.latest || "?") + ").";
+  else if (res.newer && res.downloaded && res.downloaded.length) s.textContent = "Found v" + (res.latest || "?") + " on GitHub — downloading…";
 });
 
 load();
