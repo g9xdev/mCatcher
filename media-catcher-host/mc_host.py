@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -1828,8 +1828,17 @@ def find_node():
     return shutil.which("node")
 
 
+def find_deno():
+    if os.name == "nt":
+        c = os.path.join(HERE, "deno.exe")
+        if os.path.isfile(c):
+            return c
+    return shutil.which("deno")
+
+
 YTDLP = find_ytdlp()
 NODE = find_node()
+DENO = find_deno()
 _POT_PORT = 4416          # bgutil-ytdlp-pot-provider HTTP server default
 _POT = {"proc": None}
 _YTDLP_VER = None
@@ -1896,6 +1905,35 @@ def ensure_ytdlp():
         return None
 
 
+def ensure_deno():
+    """Return a path to Deno — the JS runtime yt-dlp needs to solve YouTube's 'n' challenge
+    (without it, only storyboard images are downloadable). Fetches the official portable
+    build into HERE if missing. ~40MB compressed."""
+    global DENO
+    if DENO:
+        return DENO
+    if os.name != "nt":
+        return None
+    dest = os.path.join(HERE, "deno.exe")
+    try:
+        import urllib.request, zipfile, io
+        _hlog("info", "fetching Deno (JS runtime for YouTube — one-time)…")
+        req = urllib.request.Request(
+            "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
+            headers={"User-Agent": "MediaCatcher-Host/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            blob = r.read()
+        with zipfile.ZipFile(io.BytesIO(blob)) as z, z.open("deno.exe") as src, open(dest + ".part", "wb") as f:
+            shutil.copyfileobj(src, f)
+        os.replace(dest + ".part", dest)
+        DENO = dest
+        _hlog("info", "Deno installed")
+        return DENO
+    except Exception as e:
+        _hlog("error", "Deno download failed: %s" % e)
+        return None
+
+
 def _pot_server_entry():
     for c in (os.path.join(HERE, "pot-provider", "build", "main.js"),
               os.path.join(HERE, "pot-provider", "server", "build", "main.js"),
@@ -1945,8 +1983,10 @@ _YT_ERR = [
      "Members-only — needs a channel membership on your signed-in account."),
     (r"private video|video is private", "private", "This video is private."),
     (r"premiere|will begin|scheduled", "scheduled", "This is a scheduled premiere — not available yet."),
+    (r"n challenge|only images are available|challenge solv|js.?runtime|\bejs\b", "jschallenge",
+     "Couldn't solve YouTube's JS challenge — the Deno runtime is installing in the background; give it a moment and retry."),
     (r"requested format is not available|no video formats|po.?token|formats? have been skipped|http error 403", "token",
-     "YouTube blocked the high-quality formats (PO-token). Check the token provider is running and yt-dlp is up to date."),
+     "YouTube blocked the high-quality formats (PO-token). yt-dlp may need updating; your log console shows the details."),
     (r"video unavailable|video is unavailable|has been removed|no longer available|not available in your", "unavailable",
      "Video unavailable."),
     (r"drm|protected content|widevine", "drm", "DRM-protected — cannot be downloaded."),
@@ -1993,6 +2033,7 @@ def handle_ytdl(req):
             send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
                   "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
             return
+        deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
         outdir = req.get("dir") or (load_config().get("saveFolder") or "") or downloads_dir()
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -2010,6 +2051,8 @@ def handle_ytdl(req):
                "--print", "after_move:@@FILE@@ %(filepath)s"]
         if FFMPEG:
             cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
+        if deno:     # solve the 'n' challenge -> unlocks the real (incl. 4K) formats
+            cmd += ["--js-runtimes", "deno:%s" % deno]
         if pot:      # only when the optional PO-token provider is actually running
             cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT]
         cmd += [url]
@@ -2081,7 +2124,7 @@ def main():
             if cmd == "ping":
                 send({"type": "pong", "ffmpeg": bool(FFMPEG), "ffmpegPath": FFMPEG or "", "version": VERSION,
                       "ytdlp": bool(YTDLP), "ytdlpVersion": ytdlp_version_cached(),
-                      "node": bool(NODE), "pot": _pot_alive()})
+                      "node": bool(NODE), "deno": bool(DENO), "pot": _pot_alive()})
             elif cmd == "ytdl":
                 handle_ytdl(msg)
             elif cmd == "ytdlUpdate":

@@ -153,6 +153,29 @@ if (Test-Path $localYtdlp) {
   } catch { Warn ("yt-dlp: download failed (" + $_ + "). Put yt-dlp.exe in " + $InstallDir + " to enable YouTube.") }
 }
 
+# ---------- 3c. Deno (JS runtime yt-dlp needs to solve YouTube's 'n' challenge) ----------
+# Without it, YouTube offers only storyboard images. Auto-detected because it sits next
+# to yt-dlp.exe. yt-dlp-ejs (the solver scripts) is bundled inside yt-dlp.exe already.
+$localDeno = Join-Path $InstallDir "deno.exe"
+if (Test-Path $localDeno) {
+  Step "deno: present"
+} elseif ($SkipYtdlp) {
+  Warn "deno: skipped - YouTube will not work without a JS runtime"
+} else {
+  Warn "deno: downloading (JS runtime for YouTube)..."
+  try {
+    $dz = Join-Path $env:TEMP "deno-mc.zip"
+    Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile $dz
+    $dex = Join-Path $env:TEMP "deno-mc"
+    if (Test-Path $dex) { Remove-Item $dex -Recurse -Force }
+    Expand-Archive -Path $dz -DestinationPath $dex -Force
+    $hit = Get-ChildItem -Path $dex -Recurse -Filter "deno.exe" | Select-Object -First 1
+    if ($hit) { Copy-Item $hit.FullName $localDeno -Force }
+    Remove-Item $dz -Force; Remove-Item $dex -Recurse -Force
+    if (Test-Path $localDeno) { Step "deno: installed" } else { throw "deno.exe missing from archive" }
+  } catch { Warn ("deno: download failed (" + $_ + "). YouTube may be limited until deno.exe is in " + $InstallDir) }
+}
+
 # ---------- 4. launcher ----------
 $batBody = "@echo off`r`n`"$pythonw`" `"%~dp0mc_host.py`"`r`n"
 Set-Content -Path $Bat -Value $batBody -Encoding ASCII -NoNewline
