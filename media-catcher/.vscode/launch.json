@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "firefox",
+      "request": "launch",
+      "name": "Run Media Catcher in Firefox",
+      "reAttach": true,
+      "addonPath": "${workspaceFolder}"
+    }
+  ]
+}

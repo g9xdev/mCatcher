@@ -1,0 +1,15 @@
+{
+  "editor.formatOnSave": true,
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "editor.detectIndentation": false,
+  "files.eol": "\n",
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "javascript.validate.enable": true,
+  "javascript.preferences.quoteStyle": "single",
+  "javascript.suggest.autoImports": false,
+  "search.exclude": {
+    "**/.git": true
+  }
+}
