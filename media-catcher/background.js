@@ -307,9 +307,16 @@ function onNativeMessage(msg) {
     dl.recorded = { bytes: msg.bytes || 0, duration: msg.seconds || 0 };
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "converting") {
-    // The saved file is being re-encoded to H.265; the H.264 is kept only if the
-    // HEVC turns out not smaller, so the result is never larger than the original.
+    // The saved/downloaded file is being re-encoded (H.265 or AV1); the original is
+    // kept only if the re-encode turns out not smaller, so it's never larger.
     dl.status = "converting";
+    dl.convertCodec = msg.codec || "h265";
+    dl.convertPct = null;                       // indeterminate until first progress tick
+    broadcast({ type: "download-update", download: dl });
+  } else if (msg.type === "convert-progress") {
+    dl.status = "converting";
+    if (msg.codec) dl.convertCodec = msg.codec;
+    if (typeof msg.pct === "number") dl.convertPct = msg.pct;
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "saved") {
     dl.status = "done"; dl.savedPath = msg.file; dl.convert = msg.convert || null;

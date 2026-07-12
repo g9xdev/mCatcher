@@ -480,7 +480,14 @@ function renderLiveProgress(el, dl) {
   } else if (dl.status === "saving") {
     children.push(h("div", { class: "held-line" }, [h("b", { text: "Writing to disk…" })]));
   } else if (dl.status === "converting") {
-    children.push(h("div", { class: "held-line" }, [h("b", { text: "Converting to H.265…" }), " (deleting the original)"]));
+    const label = dl.convertCodec === "av1" ? "AV1" : "H.265";
+    const pct = typeof dl.convertPct === "number" ? dl.convertPct : null;
+    children.push(h("div", { class: "held-line" }, [
+      h("b", { text: "Converting to " + label + "…" }), pct != null ? "  " + pct + "%" : "  preparing…",
+    ]));
+    const cfill = h("div", { class: "fill" });
+    cfill.style.width = (pct != null ? pct : 0) + "%";
+    children.push(h("div", { class: "progress" }, [h("div", { class: "track" }, [cfill])]));
   } else if (dl.status === "stopped") {
     children.push(h("span", { class: "held-flag", text: "CAPTURE HELD" }));
     children.push(h("div", { class: "held-line" }, [

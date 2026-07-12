@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.4.9"
+VERSION = "1.4.10"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -1430,15 +1430,43 @@ def _codec_args(codec, encoder, quality):
         return ["-c:v", "hevc_amf", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
     return ["-c:v", "libx265", "-crf", str(q), "-preset", "slow"]
 
-def transcode(src, codec="h265", quality="visually-lossless", prefer="auto"):
-    """Re-encode src to codec ('h265'|'av1') and, if the result is smaller, replace
-    src with it (deleting the original). The saved file is NEVER larger than the
-    original: if the re-encode isn't smaller (common at a visually-lossless target
-    on an already-compressed stream), it is discarded and src is kept untouched.
+def _safe_kill(p):
+    try:
+        if p and p.poll() is None:
+            p.kill()
+    except Exception:
+        pass
+
+
+def _probe_duration_us(path):
+    """Media duration in microseconds, parsed from ffmpeg's header read (no ffprobe
+    binary needed). 0 if unknown, in which case progress is reported indeterminate."""
+    if not FFMPEG:
+        return 0
+    cf, si = _no_window()
+    try:
+        r = subprocess.run([FFMPEG, "-hide_banner", "-i", path], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, creationflags=cf, startupinfo=si, timeout=30)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr.decode("utf-8", "replace"))
+        if m:
+            return int((int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) * 1_000_000)
+    except Exception:
+        pass
+    return 0
+
+
+def transcode(src, codec="h265", quality="visually-lossless", prefer="auto", on_progress=None):
+    """Re-encode src to codec ('h265'|'av1') and, if the result is smaller, replace src
+    with it (deleting the original). The saved file is NEVER larger than the original:
+    the encode is ABORTED the moment the output exceeds the source size (re-encoding an
+    already-compressed stream at a visually-lossless target usually grows it — no point
+    finishing a file we'd discard), and a runaway encode is killed by a deadline.
+    on_progress(pct) is called with 0..99 while encoding.
     Returns {path, converted, note, srcBytes, hevcBytes} (hevcBytes = new size)."""
     if not FFMPEG or not os.path.isfile(src) or codec not in ("h265", "av1"):
         return {"path": src, "converted": False, "note": "no ffmpeg", "srcBytes": None, "hevcBytes": None}
     src_bytes = os.path.getsize(src)
+    dur_us = _probe_duration_us(src)
     encoder = find_encoder(codec, prefer)
     sw = {"h265": "libx265", "av1": "libsvtav1"}[codec]
     tag = "hvc1" if codec == "h265" else "av01"
@@ -1452,24 +1480,53 @@ def transcode(src, codec="h265", quality="visually-lossless", prefer="auto"):
             pass
 
     def run(enc):
+        """Encode with progress + safeguards. Returns 'ok' | 'fail' | 'toobig'."""
         if not enc:
-            return False
+            return "fail"
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats", "-y",
                "-i", src] + _codec_args(codec, enc, quality) + \
-              ["-tag:v", tag, "-c:a", "copy", "-movflags", "+faststart", out]
+              ["-tag:v", tag, "-c:a", "copy", "-movflags", "+faststart", "-progress", "pipe:1", out]
         cf, si = _no_window()
         try:
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               creationflags=cf, startupinfo=si)
-            return r.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 creationflags=cf, startupinfo=si, text=True)
         except Exception:
-            return False
+            return "fail"
+        # Deadline for a genuinely hung encode: 20x realtime, floor 5 min (30 if unknown).
+        limit = max(300, int((dur_us / 1_000_000) * 20)) if dur_us else 1800
+        killer = threading.Timer(limit, lambda: _safe_kill(p)); killer.daemon = True; killer.start()
+        toobig = False
+        try:
+            for line in p.stdout:
+                line = line.strip()
+                if line.startswith("total_size="):
+                    try:
+                        if int(line.split("=", 1)[1]) >= src_bytes:
+                            toobig = True; _safe_kill(p); break     # would be discarded — stop now
+                    except Exception:
+                        pass
+                elif line.startswith("out_time_us=") and dur_us and on_progress:
+                    try:
+                        on_progress(max(0, min(99, int(int(line.split("=", 1)[1]) * 100 / dur_us))))
+                    except Exception:
+                        pass
+        finally:
+            killer.cancel()
+            try: p.wait(timeout=10)
+            except Exception: _safe_kill(p)
+        if toobig:
+            return "toobig"
+        return "ok" if (p.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0) else "fail"
 
-    ok = run(encoder)
-    if not ok and encoder != sw:     # HW encoder present but unusable -> software fallback
+    st = run(encoder)
+    if st == "fail" and encoder != sw:     # HW encoder present but unusable -> software fallback
         _rm(out)
-        ok = run(sw)
-    if not ok:
+        st = run(sw)
+    if st == "toobig":
+        _rm(out)
+        return {"path": src, "converted": False, "note": "%s would be larger - kept original" % codec.upper(),
+                "srcBytes": src_bytes, "hevcBytes": None}
+    if st != "ok":
         _rm(out)
         return {"path": src, "converted": False, "note": "encode failed - kept original",
                 "srcBytes": src_bytes, "hevcBytes": None}
@@ -1510,7 +1567,8 @@ def _finalize_move(job, jid, dest, req=None):
     if conv and conv.get("codec") in ("h265", "av1"):
         codec = conv["codec"]
         send({"type": "converting", "id": jid, "file": dest, "codec": codec})
-        res = transcode(dest, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"))
+        res = transcode(dest, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"),
+                        on_progress=lambda pct, j=jid, c=codec: send({"type": "convert-progress", "id": j, "pct": pct, "codec": c}))
         dest = res["path"]
         conv_info = {"converted": res["converted"], "note": res["note"], "codec": codec,
                      "srcBytes": res["srcBytes"], "hevcBytes": res["hevcBytes"],
@@ -1911,7 +1969,8 @@ def handle_pget(req):
         if conv and conv.get("codec") in ("h265", "av1") and FFMPEG:
             codec = conv["codec"]
             send({"type": "converting", "id": jid, "file": path, "codec": codec})
-            res = transcode(path, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"))
+            res = transcode(path, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"),
+                            on_progress=lambda pct, j=jid, c=codec: send({"type": "convert-progress", "id": j, "pct": pct, "codec": c}))
             path = res["path"]
             conv_info = {"converted": res["converted"], "note": res["note"], "codec": codec,
                          "srcBytes": res["srcBytes"], "hevcBytes": res["hevcBytes"],
