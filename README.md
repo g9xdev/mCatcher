@@ -12,6 +12,23 @@ web video and HLS streams to real files on disk.
   verifies, and reverts updates. See `media-catcher-host/installer/` for the
   packaged installer.
 
+## Install (regular Firefox)
+
+No Developer/Nightly build required — the extension is AMO-signed. Two parts:
+
+1. **Extension** — from the [latest release](https://github.com/g9xdev/mCatcher/releases/latest),
+   download the signed `media_catcher-<version>.xpi`. In Firefox, drag the `.xpi`
+   onto a window (or open `about:addons` → the gear → **Install Add-on From File…**)
+   and confirm.
+2. **Helper** — from the same release, run `MediaCatcherHostSetup.exe`. It installs
+   Python + ffmpeg if they are missing and registers the recorder with Firefox.
+
+Restart Firefox and Media Catcher is ready.
+
+> Developers who load the extension from source instead should use the
+> `media_catcher-<version>.zip` source package with a Developer/Nightly build; see
+> `media-catcher-host/installer/`.
+
 ## Installing the helper
 
 From `media-catcher-host/installer/`, either run the packaged installer
