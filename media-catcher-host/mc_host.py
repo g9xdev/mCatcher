@@ -493,7 +493,11 @@ def launch_guardian(apply_ext, apply_host, plan, ext_dir, host_dir, restart=True
 # Pull new releases straight from GitHub Releases and drop the packages into
 # the watched folder, where the same guardian flow installs and verifies them.
 GITHUB_REPO = "g9xdev/mCatcher"
-GITHUB_LATEST_URL = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+# The releases list — the API behind https://github.com/g9xdev/mCatcher/releases.
+# Each tag keeps its assets under its own path (…/releases/download/<tag>/<file>),
+# so the helper reads the whole list and drills down to the highest version
+# rather than assuming a fixed URL or trusting a single "latest" endpoint.
+GITHUB_RELEASES_URL = "https://api.github.com/repos/%s/releases?per_page=30" % GITHUB_REPO
 _GITHUB_POLL_INTERVAL = 6 * 3600      # seconds between background checks
 _github_poll_started = False
 
@@ -510,19 +514,41 @@ def _http_get(url, timeout=30):
         return resp.read()
 
 
+def _tag_to_version(tag):
+    tag = (tag or "").strip()
+    return tag[1:] if tag[:1] in ("v", "V") else tag
+
+
 def github_latest_release():
-    """Return (version, {asset_name: url}) for the latest published release, or
-    (None, {}) when there is no release or GitHub can't be reached."""
+    """Scan the releases list and return (version, {asset_name: url}) for the
+    highest-versioned published release. Draft and pre-release tags are skipped.
+    Returns (None, {}) when there is no usable release or GitHub can't be reached.
+
+    GitHub stores each tag's assets under its own version path, so we read the
+    list and pick the newest by version number — the download URLs the API hands
+    back already point into the right per-version path, so nothing is hardcoded."""
     try:
-        data = json.loads(_http_get(GITHUB_LATEST_URL).decode("utf-8", "ignore"))
+        releases = json.loads(_http_get(GITHUB_RELEASES_URL).decode("utf-8", "ignore"))
     except Exception:
         return None, {}
-    tag = (data.get("tag_name") or "").strip()
-    version = tag[1:] if tag[:1] in ("v", "V") else tag
+    if not isinstance(releases, list):
+        return None, {}
+    best, best_vt, best_ver = None, None, None
+    for rel in releases:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        ver = _tag_to_version(rel.get("tag_name"))
+        if not ver:
+            continue
+        vt = _vtuple(ver)
+        if best is None or vt > best_vt:
+            best, best_vt, best_ver = rel, vt, ver
+    if best is None:
+        return None, {}
     assets = {a.get("name"): a.get("browser_download_url")
-              for a in (data.get("assets") or [])
+              for a in (best.get("assets") or [])
               if a.get("name") and a.get("browser_download_url")}
-    return (version or None), assets
+    return best_ver, assets
 
 
 def _download(url, dest):
