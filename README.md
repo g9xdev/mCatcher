@@ -9,9 +9,10 @@ web video and HLS streams to real files on disk.
 
 ### ⬇ [Download the latest release](https://github.com/g9xdev/mCatcher/releases/latest)
 
-Grab the signed **`media_catcher-*.xpi`** (drag into Firefox) and the one-click
-**[`MediaCatcherHostSetup.exe`](https://github.com/g9xdev/mCatcher/releases/latest/download/MediaCatcherHostSetup.exe)**
-helper installer. Installed builds then [update themselves](#releases--auto-update).
+Download the signed **`media_catcher-*.xpi`** and open it — Firefox installs the
+extension (no Developer/Nightly build needed), then the extension opens a setup page
+that offers the one-click **helper installer** so you can grab that too. Installed
+builds then [update themselves](#releases--auto-update).
 
 ## Layout
 
@@ -24,16 +25,21 @@ helper installer. Installed builds then [update themselves](#releases--auto-upda
 
 ## Install (regular Firefox)
 
-No Developer/Nightly build required — the extension is AMO-signed. Two parts:
+No Developer/Nightly build required — the extension is AMO-signed.
 
-1. **Extension** — from the [latest release](https://github.com/g9xdev/mCatcher/releases/latest),
-   download the signed `media_catcher-<version>.xpi`. In Firefox, drag the `.xpi`
-   onto a window (or open `about:addons` → the gear → **Install Add-on From File…**)
-   and confirm.
-2. **Helper** — from the same release, run `MediaCatcherHostSetup.exe`. It installs
-   Python + ffmpeg if they are missing and registers the recorder with Firefox.
+1. From the [latest release](https://github.com/g9xdev/mCatcher/releases/latest),
+   download **`media_catcher-<version>.xpi`** and **open it** — double-click it, drag
+   it onto a Firefox window, or use `about:addons` → the gear → **Install Add-on From
+   File…**. Firefox recognizes the signed add-on and asks you to confirm the install.
+2. On first install the extension **opens a setup page** with a **"Download the helper
+   installer"** button. Click it to get `MediaCatcherHostSetup.exe`, run it once (it
+   installs Python + ffmpeg if missing and registers the recorder with Firefox), then
+   restart Firefox.
 
-Restart Firefox and Media Catcher is ready.
+So you really only need the **`.xpi`** — opening it installs the extension, and the
+extension walks you to the helper. (You can also grab
+[`MediaCatcherHostSetup.exe`](https://github.com/g9xdev/mCatcher/releases/latest/download/MediaCatcherHostSetup.exe)
+directly from the release if you'd rather.)
 
 > Developers who load the extension from source instead should use the
 > `media_catcher-<version>.zip` source package with a Developer/Nightly build; see
