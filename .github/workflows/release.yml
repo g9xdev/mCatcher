@@ -78,6 +78,33 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed (exit $LASTEXITCODE)" }
           Copy-Item 'media-catcher-host/installer/dist/MediaCatcherHostSetup.exe' 'dist/MediaCatcherHostSetup.exe' -Force
 
+      - name: Sign extension (.xpi) via AMO
+        id: sign
+        continue-on-error: true
+        shell: pwsh
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          if (-not $env:AMO_JWT_ISSUER -or -not $env:AMO_JWT_SECRET) {
+            Write-Host "::warning::AMO secrets not set — skipping the signed .xpi."
+            exit 0
+          }
+          New-Item -ItemType Directory -Force signed | Out-Null
+          # Sign the stamped source as an unlisted (self-distribution) build.
+          npx --yes web-ext sign `
+            --source-dir media-catcher `
+            --api-key "$env:AMO_JWT_ISSUER" --api-secret "$env:AMO_JWT_SECRET" `
+            --channel unlisted --artifacts-dir signed --timeout 600000
+          $xpi = Get-ChildItem signed -Filter *.xpi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($xpi) {
+            Copy-Item $xpi.FullName "dist/media_catcher-$v.xpi" -Force
+            Write-Host "Signed -> dist/media_catcher-$v.xpi"
+          } else {
+            Write-Host "::warning::No signed .xpi produced (validation error, or v$v already signed)."
+          }
+
       - name: Publish GitHub Release
         shell: pwsh
         env:
@@ -85,8 +112,15 @@ jobs:
           V: ${{ steps.ver.outputs.version }}
         run: |
           $v = $env:V
-          gh release create "v$v" `
-            "dist/media_catcher-$v.zip" `
-            "dist/media-catcher-host-$v.zip" `
-            "dist/MediaCatcherHostSetup.exe" `
-            --title "Media Catcher $v" --generate-notes
+          $files = @(
+            "dist/media_catcher-$v.zip",
+            "dist/media-catcher-host-$v.zip",
+            "dist/MediaCatcherHostSetup.exe"
+          )
+          if (Test-Path "dist/media_catcher-$v.xpi") {
+            $files += "dist/media_catcher-$v.xpi"
+            Write-Host "Attaching signed .xpi."
+          } else {
+            Write-Host "::warning::No signed .xpi to attach to this release."
+          }
+          gh release create "v$v" $files --title "Media Catcher $v" --generate-notes
