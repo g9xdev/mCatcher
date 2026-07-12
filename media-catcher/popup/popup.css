@@ -34,10 +34,11 @@
 }
 
 /* Width is the one thing the side panel changes: classic single column by
-   default, a wide two-pane window when <html> carries .rail (set synchronously
-   from a cached hint in popup.js so the popup never visibly resizes). */
+   default, a wide two-pane window when <html> carries .rail. popup.js sets the
+   exact rail width inline to fit the browser window (Firefox clips a popup wider
+   than its window); this 660px is only a safety fallback if that JS never runs. */
 html { width: 420px; }
-html.rail { width: 780px; }
+html.rail { width: 660px; }
 
 html,
 body {

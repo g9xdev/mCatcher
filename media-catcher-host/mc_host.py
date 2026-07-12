@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None

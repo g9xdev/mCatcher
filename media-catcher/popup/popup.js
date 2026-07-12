@@ -25,17 +25,23 @@ const popCast = document.getElementById("pop-cast");
 // these mirror background.js DEFAULT_SETTINGS so first paint matches the default.
 let uiSettings = { showRail: true, showQueue: true, enableCasting: false };
 
-// The one layout choice that changes the popup's width (classic 420 vs wide 780)
-// is applied to <html> synchronously here, from a cached hint, so Firefox sizes
-// the popup correctly on the very first frame instead of resizing after settings
-// load. Absent hint → assume the panel is on (the default) to avoid a first-open jump.
+// Prime <html> from the last-known-good layout so the popup opens at a width that
+// already fits the window. A Firefox browser-action popup can't exceed the window
+// width — it CLIPS the overflow (taking the header's Settings button with it) rather
+// than shrinking — so the width must track the real window (measured in init()).
+// First-ever open (no cache) stays at the classic 420px, which never clips; init()
+// then widens it once the window width is known.
 (function primeLayout() {
   try {
     const raw = localStorage.getItem("mc-layout");
-    const hint = raw ? JSON.parse(raw) : { rail: true, cast: false };
-    document.documentElement.classList.toggle("rail", !!hint.rail);
-    document.documentElement.classList.toggle("cast", !!hint.cast);
-  } catch (e) { document.documentElement.classList.add("rail"); }
+    if (!raw) return;
+    const hint = JSON.parse(raw);
+    if (hint.cast) document.documentElement.classList.add("cast");
+    if (hint.rail && hint.w) {
+      document.documentElement.classList.add("rail");
+      document.documentElement.style.width = hint.w + "px";
+    }
+  } catch (e) {}
 })();
 
 function showEl(el, on) { if (el) el.style.display = on ? "" : "none"; }
@@ -110,25 +116,42 @@ async function init() {
     send({ type: "get-settings" }),
   ]);
   if (sresp && sresp.settings) uiSettings = Object.assign(uiSettings, sresp.settings);
-  applyLayout();
+  await applyLayout();
   if (!tabs.length) return;
   currentTabId = tabs[0].id;
   pageTitle = tabs[0].title || "";
   await refresh();
 }
 
-// Show/hide the panel and its sections from the current settings, and cache the
-// width-affecting bits for the next open's synchronous prime. Called once settings
-// are known; safe to call again if they change.
-function applyLayout() {
-  const railOn = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
+// Size the popup to fit the browser window (never wider, or Firefox clips it),
+// show/hide the panel + sections from settings, and cache the result for the next
+// open's synchronous prime.
+async function applyLayout() {
+  const wantRail = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
+
+  // A browser-action popup can't exceed the window width — Firefox clips the
+  // overflow rather than shrinking. Measure the real window and size to it; fall
+  // back to the classic single column when there isn't room for two panes.
+  let winW = 0;
+  try { const w = await api.windows.getCurrent(); winW = (w && w.width) || 0; } catch (e) {}
+  const avail = winW ? winW - 40 : 0;        // margin so the popup never touches the window edge
+  const WIDE_MAX = 760, TWO_PANE_MIN = 600;  // below TWO_PANE_MIN the two-pane view can't fit cleanly
+
+  let railOn = false, width = 0;
+  if (wantRail) {
+    if (avail >= TWO_PANE_MIN) { railOn = true; width = Math.min(WIDE_MAX, avail); }
+    else if (!winW) { railOn = true; width = 660; }  // window API unavailable → modest best-effort
+    // else: window too narrow for two panes → classic single column, nothing clips
+  }
+
   document.documentElement.classList.toggle("rail", railOn);
+  document.documentElement.style.width = railOn ? width + "px" : "";  // "" → CSS classic 420
   document.documentElement.classList.toggle("cast", !!uiSettings.enableCasting);
   showEl(castTitleEl, uiSettings.enableCasting);
   showEl(castSlotEl, uiSettings.enableCasting);
   showEl(queueTitleEl, uiSettings.showQueue);
   showEl(queueEl, uiSettings.showQueue);
-  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, cast: !!uiSettings.enableCasting })); } catch (e) {}
+  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, w: width, cast: !!uiSettings.enableCasting })); } catch (e) {}
   if (uiSettings.enableCasting) renderCastSlot();
   renderQueue();
 }

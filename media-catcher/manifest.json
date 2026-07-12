@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Media Catcher",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Detects and downloads video/audio from a tab \u2014 HLS (.m3u8) with AES-128, MPEG-DASH (.mpd), live-stream recording, byte-range, subtitles, and one-click yt-dlp/ffmpeg commands.",
   "icons": {
     "48": "icons/icon-48.png",
