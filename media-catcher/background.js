@@ -286,11 +286,18 @@ function onNativeMessage(msg) {
     broadcast({ type: "ext-update-available", version: msg.version });
     if (api.notifications) {
       const id = "mc-ext-update";
+      // Point the click at the signed .xpi (GitHub serves it as application/x-xpinstall),
+      // so Firefox shows its native "Add Media Catcher?" install prompt — no GitHub detour.
+      // (Firefox also auto-updates the add-on via update_url on its own schedule anyway.)
+      const xpi = msg.version
+        ? "https://github.com/g9xdev/mCatcher/releases/download/v" + msg.version + "/media_catcher-" + msg.version + ".xpi"
+        : RELEASES_PAGE;
       try {
         api.notifications.create(id, { type: "basic", iconUrl: api.runtime.getURL("icons/icon-96.png"),
           title: "Media Catcher " + (msg.version ? "v" + msg.version : "update") + " available",
-          message: "A newer version is ready. Click to open the download." });
-        notifyActions.set(id, { url: RELEASES_PAGE });
+          message: msg.version ? "Click to install it — Firefox will ask you to confirm."
+                               : "A newer version is ready. Click to open the download." });
+        notifyActions.set(id, { url: xpi });
       } catch (e) {}
     }
     return;
