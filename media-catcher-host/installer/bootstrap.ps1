@@ -23,6 +23,7 @@ param(
   [string]$RegRoot    = "HKCU:\Software\Mozilla\NativeMessagingHosts",  # overridable for tests
   [switch]$SkipPython,
   [switch]$SkipFfmpeg,
+  [switch]$SkipYtdlp,
   [switch]$Uninstall
 )
 
@@ -133,6 +134,23 @@ if (Test-Path $localFfmpeg) {
     Remove-Item $zip -Force; Remove-Item $ex -Recurse -Force
     if (Test-Path $localFfmpeg) { Step "ffmpeg: installed" } else { throw "ffmpeg.exe missing from archive" }
   } catch { Warn ("ffmpeg: download failed (" + $_ + "). Put ffmpeg.exe in " + $InstallDir + " to enable recording.") }
+}
+
+# ---------- 3b. yt-dlp (YouTube + many other sites) ----------
+# One self-contained binary. It self-updates (yt-dlp -U, triggered by the host) because
+# YouTube breaks it often. YouTube Premium cookies unlock 4K without a PO-token provider,
+# so no Node runtime is bundled.
+$localYtdlp = Join-Path $InstallDir "yt-dlp.exe"
+if (Test-Path $localYtdlp) {
+  Step "yt-dlp: present (self-updates)"
+} elseif ($SkipYtdlp) {
+  Warn "yt-dlp: skipped - YouTube downloads will be unavailable"
+} else {
+  Warn "yt-dlp: downloading the latest release..."
+  try {
+    Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile $localYtdlp
+    if (Test-Path $localYtdlp) { Step "yt-dlp: installed" } else { throw "yt-dlp.exe not written" }
+  } catch { Warn ("yt-dlp: download failed (" + $_ + "). Put yt-dlp.exe in " + $InstallDir + " to enable YouTube.") }
 }
 
 # ---------- 4. launcher ----------

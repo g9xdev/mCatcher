@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.4.16"
+VERSION = "1.5.0"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -1869,6 +1869,33 @@ def ytdlp_update():
         return None
 
 
+def ensure_ytdlp():
+    """Return a path to yt-dlp, fetching the official release into HERE if it's missing.
+    Lets auto-updated installs (which don't ship the binary) get YouTube without a
+    manual installer re-run."""
+    global YTDLP
+    if YTDLP:
+        return YTDLP
+    if os.name != "nt":
+        return None
+    dest = os.path.join(HERE, "yt-dlp.exe")
+    try:
+        import urllib.request
+        _hlog("info", "fetching yt-dlp (first YouTube use)…")
+        tmp = dest + ".part"
+        req = urllib.request.Request("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+                                     headers={"User-Agent": "MediaCatcher-Host/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(tmp, dest)
+        YTDLP = dest
+        _hlog("info", "yt-dlp installed")
+        return YTDLP
+    except Exception as e:
+        _hlog("error", "yt-dlp download failed: %s" % e)
+        return None
+
+
 def _pot_server_entry():
     for c in (os.path.join(HERE, "pot-provider", "build", "main.js"),
               os.path.join(HERE, "pot-provider", "server", "build", "main.js"),
@@ -1961,9 +1988,10 @@ def handle_ytdl(req):
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
-        if not YTDLP:
+        ytdlp = ensure_ytdlp()
+        if not ytdlp:
             send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
-                  "error": "The YouTube downloader (yt-dlp) isn't installed — re-run the Media Catcher helper installer."})
+                  "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
             return
         outdir = req.get("dir") or (load_config().get("saveFolder") or "") or downloads_dir()
         try:
@@ -1972,7 +2000,7 @@ def handle_ytdl(req):
             pass
         pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
         outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
-        cmd = [YTDLP, "--no-playlist", "--no-mtime", "--newline", "--no-warnings", "--force-overwrites",
+        cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--no-warnings", "--force-overwrites",
                "-f", "bv*+ba/b", "--merge-output-format", "mp4",
                "--cookies-from-browser", "firefox",
                "-o", outtmpl,
@@ -1982,7 +2010,9 @@ def handle_ytdl(req):
                "--print", "after_move:@@FILE@@ %(filepath)s"]
         if FFMPEG:
             cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
-        cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT, url]
+        if pot:      # only when the optional PO-token provider is actually running
+            cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT]
+        cmd += [url]
         _hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
         send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "starting"})
         cf, si = _no_window()

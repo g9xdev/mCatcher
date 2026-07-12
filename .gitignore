@@ -10,9 +10,12 @@
 
 # --- exclusions inside the tracked projects ---
 
-# Large binaries: the installer downloads ffmpeg at install time.
+# Large binaries: the installer downloads ffmpeg + yt-dlp at install time.
 media-catcher-host/ffmpeg.exe
 media-catcher-host/ffprobe.exe
+media-catcher-host/yt-dlp.exe
+media-catcher-host/node/
+media-catcher-host/pot-provider/
 
 # Build artifacts.
 media-catcher-host/installer/dist/
