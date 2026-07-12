@@ -18,7 +18,7 @@ function dlog() {
 const DEFAULT_SETTINGS = {
   defaultQuality: "ask",        // "ask" | "highest" | "lowest"
   concurrency: 6,               // parallel segment fetches
-  maxConcurrentDownloads: 2,    // parallel assembly jobs
+  maxConcurrentDownloads: 4,    // parallel assembly jobs
   retries: 3,                   // per-segment retry attempts
   filenameTemplate: "{title}",  // see lib/filename.js tokens
   notifications: true,
@@ -35,8 +35,14 @@ const DEFAULT_SETTINGS = {
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
-api.storage.local.get("settings").then((r) => {
+api.storage.local.get(["settings", "pd4done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
+  // One-time: move users off the old parallel-downloads default (2) to the new one (4).
+  // Guarded by pd4done so a later deliberate choice of 2 is respected.
+  if (!(r && r.pd4done)) {
+    if (settings.maxConcurrentDownloads === 2) settings.maxConcurrentDownloads = 4;
+    api.storage.local.set({ settings, pd4done: true }).catch(() => {});
+  }
 }).catch(() => {});
 
 // ---- diagnostics log + update history (Settings "Log console" panel) -------
@@ -1721,14 +1727,21 @@ function isDeadPlaylist(it) {
   return (it.kind === "hls" || it.kind === "dash") && it.enrichState === "error";
 }
 
+// The probe confirmed this direct URL is a web page (HTML) or a dead link (4xx/5xx) —
+// not a downloadable video. Hide it instead of showing a "NOT A VIDEO" row with a
+// Download button. Merely "unverified" items (probe inconclusive) still show.
+function isNotVideo(it) {
+  return it.kind === "direct" && it.junk && (it.container === "html" || it.probeStatus >= 400);
+}
+
 // The items a tab should actually surface: not a master's child, not sub-floor
-// noise, not a dead playlist, and collapsed to the highest rendition. Shared by
-// the popup list and the toolbar badge so the two always agree.
+// noise, not a dead playlist, not a confirmed non-video, and collapsed to the highest
+// rendition. Shared by the popup list and the toolbar badge so the two always agree.
 function visibleFor(tabId) {
   const map = mediaByTab.get(tabId);
   if (!map) return [];
   let items = Array.from(map.values())
-    .filter((it) => !isChild(tabId, it.url) && !isTooSmall(it) && !isDeadPlaylist(it));
+    .filter((it) => !isChild(tabId, it.url) && !isTooSmall(it) && !isDeadPlaylist(it) && !isNotVideo(it));
   if (settings.preferHighestRendition) items = keepHighestRendition(items);
   return items;
 }

@@ -9,7 +9,7 @@
 ;    into dist\MediaCatcherHostSetup.exe)
 
 #define AppName "Media Catcher Host"
-#define AppVersion "1.4.12"
+#define AppVersion "1.4.13"
 #define AppPublisher "Media Catcher"
 #define HostSrc "..\"
 
