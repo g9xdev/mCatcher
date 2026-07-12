@@ -229,7 +229,7 @@ function renderEvents(events) {
   const tbody = get("updHistory").querySelector("tbody");
   const empty = get("updHistoryEmpty");
   tbody.replaceChildren();
-  const evs = (events || []).slice().reverse();   // newest first
+  const evs = events || [];   // chronological (oldest → newest): newest at the bottom, like the console
   empty.style.display = evs.length ? "none" : "";
   get("updHistory").style.display = evs.length ? "" : "none";
   for (const e of evs) {
@@ -247,6 +247,9 @@ function renderEvents(events) {
     tr.appendChild(oc);
     tbody.appendChild(tr);
   }
+  // Newest row at the bottom, scrolled into view — consistent with the log console.
+  const wrap = document.querySelector(".histwrap");
+  if (wrap) wrap.scrollTop = wrap.scrollHeight;
 }
 
 function renderVersions(resp) {
