@@ -11,6 +11,34 @@ const itemElements = new Map();    // item.url -> rendered element
 const listEl = document.getElementById("list");
 const statusEl = document.getElementById("status");
 const footCount = document.getElementById("foot-count");
+const railEl = document.getElementById("rail");
+const queueEl = document.getElementById("queue");
+const queueTitleEl = document.getElementById("queue-title");
+const queueCountEl = document.getElementById("queue-count");
+const castSlotEl = document.getElementById("cast-slot");
+const castTitleEl = document.getElementById("cast-title");
+const hdrCastBtn = document.getElementById("hdr-cast");
+const leftCountEl = document.getElementById("left-count");
+const popCast = document.getElementById("pop-cast");
+
+// Popup layout / feature flags. Real values arrive from get-settings in init();
+// these mirror background.js DEFAULT_SETTINGS so first paint matches the default.
+let uiSettings = { showRail: true, showQueue: true, enableCasting: false };
+
+// The one layout choice that changes the popup's width (classic 420 vs wide 780)
+// is applied to <html> synchronously here, from a cached hint, so Firefox sizes
+// the popup correctly on the very first frame instead of resizing after settings
+// load. Absent hint → assume the panel is on (the default) to avoid a first-open jump.
+(function primeLayout() {
+  try {
+    const raw = localStorage.getItem("mc-layout");
+    const hint = raw ? JSON.parse(raw) : { rail: true, cast: false };
+    document.documentElement.classList.toggle("rail", !!hint.rail);
+    document.documentElement.classList.toggle("cast", !!hint.cast);
+  } catch (e) { document.documentElement.classList.add("rail"); }
+})();
+
+function showEl(el, on) { if (el) el.style.display = on ? "" : "none"; }
 
 // Tiny DOM builder — safe by construction (text goes through textContent).
 function h(tag, props, children) {
@@ -77,11 +105,32 @@ function send(msg) {
 }
 
 async function init() {
-  const tabs = await api.tabs.query({ active: true, currentWindow: true });
+  const [tabs, sresp] = await Promise.all([
+    api.tabs.query({ active: true, currentWindow: true }),
+    send({ type: "get-settings" }),
+  ]);
+  if (sresp && sresp.settings) uiSettings = Object.assign(uiSettings, sresp.settings);
+  applyLayout();
   if (!tabs.length) return;
   currentTabId = tabs[0].id;
   pageTitle = tabs[0].title || "";
   await refresh();
+}
+
+// Show/hide the panel and its sections from the current settings, and cache the
+// width-affecting bits for the next open's synchronous prime. Called once settings
+// are known; safe to call again if they change.
+function applyLayout() {
+  const railOn = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
+  document.documentElement.classList.toggle("rail", railOn);
+  document.documentElement.classList.toggle("cast", !!uiSettings.enableCasting);
+  showEl(castTitleEl, uiSettings.enableCasting);
+  showEl(castSlotEl, uiSettings.enableCasting);
+  showEl(queueTitleEl, uiSettings.showQueue);
+  showEl(queueEl, uiSettings.showQueue);
+  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, cast: !!uiSettings.enableCasting })); } catch (e) {}
+  if (uiSettings.enableCasting) renderCastSlot();
+  renderQueue();
 }
 
 let helperStatus = { state: "disconnected" };
@@ -97,12 +146,14 @@ async function refresh() {
     }
   }
   render(items);
+  renderQueue();
 }
 
 function render(items) {
   listEl.replaceChildren();
   itemElements.clear();
   footCount.textContent = items.length + (items.length === 1 ? " stream" : " streams");
+  if (leftCountEl) leftCountEl.textContent = items.length;
   renderHelperBadge();
 
   if (!items.length) {
@@ -307,6 +358,15 @@ function renderItem(item) {
     }));
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
+  }
+
+  // Cast (preview): available on any playable stream when casting is enabled.
+  if (uiSettings.enableCasting && !item.drm) {
+    actions.appendChild(h("button", {
+      class: "btn cast-btn",
+      title: "Cast to a device (preview)",
+      onClick: (e) => openCastPicker(item, e.currentTarget),
+    }, "Cast"));
   }
 
   const existingId = itemDownloadId.get(item.url);
@@ -607,6 +667,179 @@ function showLabel(el, text, cls) {
   );
 }
 
+// ========================================================================
+// Side panel — global downloads queue + casting (both opt-in via Settings)
+// ========================================================================
+
+// Rank groups a download for ordering: active first, then held, done, failed.
+function queueRank(dl) {
+  if (["downloading", "audio", "parsing", "saving", "converting", "recording"].includes(dl.status)) return 0;
+  if (dl.status === "stopped") return 1;
+  if (dl.status === "done") return 2;
+  return 3; // error / cancelled / discarded
+}
+
+// The queue mirrors background's activeDownloads (global — every tab), which the
+// popup accumulates via get-media + download-update. It re-renders wholesale, but
+// the cards carry no focused inputs so there's nothing to disturb.
+function renderQueue() {
+  if (!queueEl) return;
+  if (!uiSettings.showQueue) { queueEl.replaceChildren(); if (queueCountEl) queueCountEl.textContent = "0"; return; }
+  const all = Array.from(downloadState.values());
+  all.sort((a, b) => queueRank(a) - queueRank(b)); // stable → insertion order within a group
+  const active = all.filter((dl) => queueRank(dl) === 0).length;
+  if (queueCountEl) queueCountEl.textContent = String(active);
+  queueEl.replaceChildren();
+  if (!all.length) {
+    queueEl.appendChild(h("div", { class: "rail-card queue-empty",
+      text: "No downloads yet. Start one from a stream and it shows up here." }));
+    return;
+  }
+  for (const dl of all) queueEl.appendChild(renderQueueItem(dl));
+}
+
+function queueSpec(dl) {
+  const kind = dl.kind ? (dl.kind === "youtube" ? "YouTube" : dl.kind.toUpperCase()) : "";
+  return [kind, qualityLabel(dl)].filter(Boolean).join(" · ");
+}
+
+function renderQueueItem(dl) {
+  const p = dl.progress || {};
+  const card = h("div", { class: "rail-card dl", dataset: { id: String(dl.id) } });
+
+  if (dl.status === "done") {
+    const size = dl.recorded && dl.recorded.bytes ? humanSize(dl.recorded.bytes)
+      : (p.total && p.unit === "bytes" ? humanSize(p.total) : "");
+    card.appendChild(h("div", { class: "dl-done-row" }, [
+      h("span", { class: "dl-check", text: "✓" }),
+      h("div", { class: "dl-name", title: dl.savedPath || dl.name, text: dl.name }),
+    ]));
+    card.appendChild(h("div", { class: "progress-label done", text: "Done" + (size ? " · " + size : "") }));
+    if (dl.convert) card.appendChild(h("div", { class: "note", text: h265Note(dl.convert) }));
+    return card;
+  }
+
+  if (dl.status === "error" || dl.status === "cancelled" || dl.status === "discarded") {
+    const isErr = dl.status === "error";
+    card.appendChild(h("div", { class: "dl-done-row" }, [
+      h("span", { class: "dl-x", text: isErr ? "✕" : "—" }),
+      h("div", { class: "dl-name", title: dl.name, text: dl.name }),
+    ]));
+    card.appendChild(h("div", { class: "progress-label error",
+      text: dl.error || (dl.status === "cancelled" ? "Cancelled" : "Discarded") }));
+    card.appendChild(h("div", { class: "dl-actions" }, [
+      h("button", { class: "btn ghost sm", text: "Dismiss",
+        onClick: () => { downloadState.delete(dl.id); renderQueue(); } }),
+    ]));
+    return card;
+  }
+
+  // Active. Live recordings (indeterminate) get elapsed + bytes; everything else
+  // a determinate bar. A native recording is managed from its card, not here.
+  const recording = dl.live && ["recording", "stopped", "saving"].includes(dl.status);
+  const top = h("div", { class: "dl-top" }, [
+    h("div", { class: "dl-name", title: dl.name, text: dl.name }),
+  ]);
+  if (!recording) {
+    top.appendChild(h("button", { class: "dl-ic", title: "Cancel download", text: "✕",
+      onClick: () => send({ type: "cancel", id: dl.id }) }));
+  }
+  card.appendChild(top);
+  const spec = queueSpec(dl);
+  if (spec) card.appendChild(h("div", { class: "dl-spec", text: spec }));
+
+  if (recording) {
+    card.appendChild(h("div", { class: "progress-label" }, [
+      h("span", { text: dl.status === "recording" ? "Recording · " + (fmtDuration(p.duration) || "0:00") : "Held" }),
+      h("span", { text: humanSize(p.bytes) || "" }),
+    ]));
+    return card;
+  }
+
+  const pct = p.total ? Math.min(100, Math.round((p.done / p.total) * 100)) : 0;
+  const fill = h("div", { class: "fill" });
+  fill.style.width = pct + "%";
+  card.appendChild(h("div", { class: "track" }, [fill]));
+
+  let left;
+  if (p.unit === "bytes" && p.total) left = pct + "% of " + humanSize(p.total);
+  else if (p.unit === "pct") left = pct + "%";
+  else if (p.total) left = p.done + "/" + p.total + " seg";
+  else left = statusWord(dl.status);
+  const right = p.bps > 0 ? humanSize(p.bps) + "/s" : "";
+  card.appendChild(h("div", { class: "progress-label" }, [
+    h("span", { text: left }),
+    h("span", { text: right }),
+  ]));
+  return card;
+}
+
+function statusWord(s) {
+  if (s === "audio") return "Audio track…";
+  if (s === "saving") return "Assembling…";
+  if (s === "parsing") return "Reading…";
+  if (s === "converting") return "Converting…";
+  return "Downloading…";
+}
+
+// ---- casting (preview) --------------------------------------------------
+// The network backend (Chromecast / AirPlay / DLNA discovery + streaming) lives
+// in the native helper and isn't built yet, so no session ever goes active: the
+// slot shows the resting state and the picker is honest about what's coming.
+function renderCastSlot() {
+  if (!castSlotEl) return;
+  castSlotEl.replaceChildren(
+    h("div", { class: "rail-card cast-empty" }, [
+      h("b", { text: "Nothing casting" }),
+      "Use a stream's Cast button to send it to a TV. Device discovery is still being built — the transport appears here once a session starts.",
+    ])
+  );
+}
+
+let popAnchor = null;
+function closePops() {
+  if (popCast) popCast.classList.remove("open");
+  popAnchor = null;
+}
+function positionPop(pop, btn) {
+  pop.classList.add("open");
+  popAnchor = btn;
+  const pr = document.body.getBoundingClientRect();
+  const br = btn.getBoundingClientRect();
+  const left = br.left - pr.left;
+  const maxLeft = document.body.clientWidth - pop.offsetWidth - 10;
+  pop.style.left = Math.max(10, Math.min(left, maxLeft)) + "px";
+  let top = br.bottom - pr.top + 6;
+  if (top + pop.offsetHeight > document.body.clientHeight - 8) top = (br.top - pr.top) - pop.offsetHeight - 6;
+  pop.style.top = Math.max(8, top) + "px";
+}
+function buildCastPicker(item) {
+  const title = item ? ((item.pageTitle || "").trim() || item.name || "this stream") : "";
+  popCast.replaceChildren(
+    h("div", { class: "pop-head" }, ["Cast to", item ? h("b", { title: title, text: title }) : null]),
+    h("div", { class: "pop-empty" }, [
+      h("b", { text: "No devices found" }),
+      "Casting to Chromecast, Apple TV (AirPlay) and DLNA TVs runs in the native helper and is coming in a future update.",
+    ]),
+    h("div", { class: "pop-foot" }, [
+      h("span", { text: "Preview" }),
+      h("button", { type: "button", text: "Rescan", onClick: () => buildCastPicker(item) }),
+    ])
+  );
+}
+function openCastPicker(item, btn) {
+  if (!popCast) return;
+  const wasOpen = popCast.classList.contains("open") && popAnchor === btn;
+  closePops();
+  if (wasOpen) return;
+  buildCastPicker(item);
+  positionPop(popCast, btn);
+}
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".popover") && !e.target.closest(".cast-btn") && !e.target.closest("#hdr-cast")) closePops();
+});
+if (listEl) listEl.addEventListener("scroll", closePops);
+
 // Live updates from background during HLS downloads.
 let refreshTimer = null;
 api.runtime.onMessage.addListener((msg) => {
@@ -620,6 +853,7 @@ api.runtime.onMessage.addListener((msg) => {
     if (dl.url) itemDownloadId.set(dl.url, dl.id);
     const el = itemElements.get(dl.url);
     if (el) renderProgress(el, dl);
+    renderQueue();
   } else if (msg.type === "media-updated" && msg.tabId === currentTabId) {
     // A stream was detected or a manifest finished parsing — re-render soon.
     // Debounced so bursts of detections don't cause flicker.
@@ -632,16 +866,31 @@ document.getElementById("refresh").addEventListener("click", refresh);
 document.getElementById("settings").addEventListener("click", () => {
   if (api.runtime.openOptionsPage) api.runtime.openOptionsPage();
 });
-document.getElementById("alltabs").addEventListener("click", (e) => {
+function toggleAllTabs() {
   allTabs = !allTabs;
-  e.currentTarget.classList.toggle("active", allTabs);
+  document.getElementById("alltabs").classList.toggle("active", allTabs);
+  const link = document.getElementById("alltabs2");
+  if (link) { link.classList.toggle("active", allTabs); link.textContent = allTabs ? "This tab" : "All tabs"; }
   statusEl.textContent = allTabs ? "Showing streams from all tabs" : "Watching this tab";
   refresh();
-});
+}
+document.getElementById("alltabs").addEventListener("click", toggleAllTabs);
+const allTabsLink = document.getElementById("alltabs2");
+if (allTabsLink) allTabsLink.addEventListener("click", toggleAllTabs);
 document.getElementById("clear").addEventListener("click", async () => {
   await send({ type: "clear", tabId: currentTabId });
   render([]);
 });
+
+// Queue: dismiss every finished/failed entry (keeps the active ones).
+const queueClearBtn = document.getElementById("queue-clear");
+if (queueClearBtn) queueClearBtn.addEventListener("click", () => {
+  for (const [id, dl] of downloadState) if (queueRank(dl) >= 2) downloadState.delete(id);
+  renderQueue();
+});
+
+// Header cast indicator → open the device picker (preview).
+if (hdrCastBtn) hdrCastBtn.addEventListener("click", () => openCastPicker(null, hdrCastBtn));
 
 // ---- one-click update from the popup (no about:addons needed) ----
 // Kicks the same GitHub check the settings page uses: the helper updates itself (guardian)

@@ -1,7 +1,7 @@
 "use strict";
 const api = typeof browser !== "undefined" ? browser : chrome;
 
-const FIELDS = ["defaultQuality", "concurrency", "maxConcurrentDownloads", "retries", "filenameTemplate", "saveFolder", "updateExtDir", "updateZipDir", "autoUpdate", "convertCodec", "convertQuality", "convertEncoder", "preferHighestRendition", "minDirectSizeMB", "captureSubtitles", "notifications"];
+const FIELDS = ["defaultQuality", "concurrency", "maxConcurrentDownloads", "retries", "filenameTemplate", "saveFolder", "updateExtDir", "updateZipDir", "autoUpdate", "convertCodec", "convertQuality", "convertEncoder", "preferHighestRendition", "minDirectSizeMB", "captureSubtitles", "notifications", "showRail", "showQueue", "enableCasting"];
 
 function send(msg) {
   return new Promise((resolve) => api.runtime.sendMessage(msg, resolve));

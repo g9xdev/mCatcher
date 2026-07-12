@@ -32,6 +32,10 @@ const DEFAULT_SETTINGS = {
   convertCodec: "off",          // "off" | "h265" | "av1" — re-encode saved & downloaded files
   convertQuality: "visually-lossless", // "visually-lossless" | "balanced" | "true-lossless" (h265 only)
   convertEncoder: "auto",       // "auto" (GPU if available) | "cpu" (force software)
+  // ---- popup side panel (the wide two-pane layout) ----
+  showRail: true,               // show the right-hand panel → wide popup; off = classic single column
+  showQueue: true,              // panel: global downloads queue (every tab's active + recent jobs)
+  enableCasting: false,         // panel: Now-Casting transport + per-item Cast buttons (preview — network backend pending)
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 

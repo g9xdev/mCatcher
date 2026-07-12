@@ -12,9 +12,17 @@
   <header class="bar">
     <div class="brand">
       <div class="brand-name">Media Catcher</div>
-      <div class="brand-sub">Current tab media</div>
+      <div class="brand-sub" id="brand-sub">Current tab media</div>
     </div>
     <div class="bar-actions">
+      <button id="hdr-cast" class="icon-btn" title="Cast — no active session" aria-label="Casting">
+        <svg viewBox="0 0 16 16">
+          <path d="M2 4.8V4a1.6 1.6 0 0 1 1.6-1.6h8.8A1.6 1.6 0 0 1 14 4v8a1.6 1.6 0 0 1-1.6 1.6H8.6" />
+          <path d="M2 8.2a5.4 5.4 0 0 1 5.4 5.4M2 11a2.6 2.6 0 0 1 2.6 2.6" />
+        </svg>
+        <span class="dot"></span>
+      </button>
+      <span class="bar-sep"></span>
       <button id="alltabs" class="icon-btn" title="Show streams from all tabs" aria-label="Show streams from all tabs">
         <svg viewBox="0 0 16 16">
           <rect x="2" y="2" width="5" height="5" rx="1" />
@@ -50,15 +58,40 @@
 
   <div id="status" class="status">Watching this tab for streams…</div>
 
-  <main id="list" class="list" aria-live="polite"></main>
+  <div class="main">
+    <section class="pane-left">
+      <div class="pane-title">
+        Media on this tab <span class="count" id="left-count">0</span>
+        <span class="spacer"></span>
+        <button id="alltabs2" class="linkish" title="Show detected streams from every open tab">All tabs</button>
+      </div>
+      <main id="list" class="list" aria-live="polite"></main>
+    </section>
+
+    <aside class="pane-right" aria-label="Casting and downloads">
+      <div class="pane-title" id="cast-title">Now casting</div>
+      <div class="rail" id="rail">
+        <div id="cast-slot"></div>
+        <div class="pane-title sub" id="queue-title">
+          Downloads <span class="count" id="queue-count">0</span>
+          <span class="spacer"></span>
+          <button id="queue-clear" class="linkish" title="Dismiss finished downloads">Clear done</button>
+        </div>
+        <div id="queue"></div>
+      </div>
+    </aside>
+  </div>
 
   <footer class="foot">
     <div class="f-inner">
       <span id="foot-count">0 streams</span>
       <button id="helper-badge" title="Recording engine" aria-label="Recording engine status"></button>
     </div>
-    <span class="foot-note">Only save content you have the right to.</span>
+    <span class="foot-note">Only save or cast content you have the right to.</span>
   </footer>
+
+  <!-- Cast device picker (populated at runtime) -->
+  <div class="popover" id="pop-cast" role="menu" aria-label="Cast to a device"></div>
 
   <script src="popup.js"></script>
 </body>

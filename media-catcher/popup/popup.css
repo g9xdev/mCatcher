@@ -33,15 +33,22 @@
   padding: 0;
 }
 
+/* Width is the one thing the side panel changes: classic single column by
+   default, a wide two-pane window when <html> carries .rail (set synchronously
+   from a cached hint in popup.js so the popup never visibly resizes). */
+html { width: 420px; }
+html.rail { width: 780px; }
+
 html,
 body {
-  width: 420px;
   min-height: 148px;
   background: transparent;
   color: var(--text);
   font-family: var(--font-ui);
   font-size: 14px;
 }
+
+body { width: 100%; }
 
 body {
   position: relative;
@@ -815,3 +822,265 @@ input:focus-visible {
     background: Highlight;
   }
 }
+
+/* ============================================================
+   Side panel — the wide two-pane layout (opt-in via Settings).
+   Everything here is gated on html.rail; with the panel off the
+   rules above render the classic single column unchanged.
+   ============================================================ */
+
+/* Header: cast indicator button + its divider, shown only when casting is on. */
+.bar-sep { width: 1px; height: 20px; margin: 0 5px; background: var(--stroke); display: none; }
+#hdr-cast { position: relative; display: none; }
+html.cast #hdr-cast { display: inline-flex; }
+html.cast .bar-sep { display: inline-block; }
+#hdr-cast .dot {
+  position: absolute; top: 4px; right: 4px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgba(18, 23, 31, 0.9);
+  display: none;
+}
+#hdr-cast.casting { color: var(--accent); }
+#hdr-cast.casting .dot { display: block; }
+
+/* Two-pane frame. Classic mode leaves .main as a plain block wrapping the list. */
+.pane-left { min-width: 0; }
+.pane-right { display: none; }
+.pane-title { display: none; }
+
+html.rail .main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 264px;
+  height: 408px;                 /* keeps the popup under Firefox's ~600px ceiling */
+}
+html.rail .pane-left { display: flex; flex-direction: column; }
+html.rail .pane-right {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--stroke);
+  background: rgba(0, 0, 0, 0.10);
+}
+html.rail .list { max-height: none; flex: 1; min-height: 0; padding-top: 10px; }
+
+/* Section headers inside each pane. */
+html.rail .pane-title {
+  flex: none;
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 12px 16px 4px;
+  color: var(--text-tertiary);
+  font-size: 10px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.pane-title .count {
+  color: var(--accent);
+  font-family: var(--font-mono); font-size: 10px; font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.pane-title .spacer { flex: 1; }
+.pane-title .linkish {
+  border: 0; background: none; cursor: pointer;
+  color: var(--text-tertiary); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.pane-title .linkish:hover { color: var(--accent); }
+.pane-title.sub { padding: 8px 4px 0; }
+
+.rail {
+  overflow-y: auto;
+  padding: 10px 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  scrollbar-width: thin;
+}
+.rail::-webkit-scrollbar { width: 7px; }
+.rail::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(255, 255, 255, 0.2); }
+
+/* An item currently being cast gets a cyan halo + a Casting chip. */
+.item.casting {
+  border-color: rgba(96, 205, 255, 0.38);
+  background: linear-gradient(145deg, rgba(31, 48, 64, 0.9), rgba(24, 32, 43, 0.9));
+}
+.chip.castingflag { display: none; color: var(--accent-on); background: var(--accent); border-color: transparent; }
+.item.casting .chip.castingflag { display: inline-flex; align-items: center; gap: 5px; }
+.item.casting .chip.castingflag i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: blink 1.4s steps(2, start) infinite; }
+
+/* The per-item Cast button in its active (connected) state. */
+.btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.btn .caret { width: 10px; height: 10px; opacity: 0.75; }
+.btn.cast-active { color: var(--accent); background: rgba(96, 205, 255, 0.1); border-color: rgba(96, 205, 255, 0.32); }
+
+/* ---------- Rail cards ---------- */
+.rail-card {
+  padding: 11px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(145deg, var(--surface-raised), rgba(28, 34, 43, 0.82));
+  box-shadow: var(--shadow-card);
+}
+
+/* Now-casting transport */
+.cast-card { border-color: rgba(96, 205, 255, 0.36); background: linear-gradient(160deg, rgba(27, 47, 63, 0.92), rgba(22, 29, 39, 0.94)); }
+.cast-card.pulse { animation: castpulse 900ms ease 2; }
+.cast-topline { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cast-flag {
+  padding: 3px 9px; border-radius: 99px;
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--accent-on); background: var(--accent);
+  font-size: 9px; font-weight: 700; letter-spacing: 0.06em;
+}
+.cast-flag i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: blink 1.4s steps(2, start) infinite; }
+.cast-proto { color: var(--text-tertiary); font-size: 9px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+.cast-media { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+.cast-thumb {
+  width: 64px; aspect-ratio: 16/9; flex: none;
+  border: 1px solid var(--stroke); border-radius: var(--radius-sm);
+  background: #171b22; overflow: hidden;
+}
+.cast-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cast-info { min-width: 0; }
+.cast-title { font-size: 12px; font-weight: 600; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-device { margin-top: 4px; display: flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 10.5px; overflow: hidden; }
+.cast-device svg { width: 13px; height: 13px; flex: none; fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.cast-device span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.scrub-wrap { margin-top: 12px; }
+input.scrub {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 4px;
+  border: 0; border-radius: 99px;
+  background: linear-gradient(to right, var(--accent) var(--p, 0%), rgba(255, 255, 255, 0.12) var(--p, 0%));
+  cursor: pointer;
+}
+input.scrub::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #10161f;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+input.scrub::-moz-range-thumb {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #10161f;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+input.scrub::-moz-range-track { background: transparent; }
+input.scrub:disabled { opacity: 0.7; cursor: default; }
+.scrub-times {
+  margin-top: 6px;
+  display: flex; justify-content: space-between;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono); font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.scrub-times .livechip { display: inline-flex; align-items: center; gap: 5px; color: var(--danger); font-weight: 600; letter-spacing: 0.05em; }
+.scrub-times .livechip i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: blink 1.2s steps(2, start) infinite; }
+
+.transport { margin-top: 10px; display: flex; align-items: center; gap: 8px; }
+.t-btn {
+  width: 34px; height: 34px; flex: none;
+  border: 1px solid var(--stroke); border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text); background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.055);
+  cursor: pointer;
+  transition: background-color 120ms ease, transform 80ms ease;
+}
+.t-btn:hover { background: rgba(255, 255, 255, 0.11); }
+.t-btn:active { transform: scale(0.94); }
+.t-btn.main { width: 40px; height: 40px; color: var(--accent-on); background: var(--accent); border-color: transparent; box-shadow: inset 0 1px rgba(255, 255, 255, 0.34); }
+.t-btn.main:hover { background: var(--accent-hover); }
+.t-btn svg { width: 14px; height: 14px; fill: currentColor; stroke: none; }
+.vol { flex: 1; display: flex; align-items: center; gap: 7px; min-width: 0; }
+.vol svg { width: 14px; height: 14px; flex: none; fill: none; stroke: var(--text-tertiary); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.vol input.scrub { height: 3px; }
+
+.cast-empty {
+  border-style: dashed;
+  background: none; box-shadow: none;
+  color: var(--text-tertiary);
+  font-size: 11px; line-height: 1.55;
+  text-align: center;
+  padding: 18px 14px;
+}
+.cast-empty b { color: var(--text-secondary); font-weight: 600; display: block; margin-bottom: 3px; }
+
+/* Downloads queue cards */
+.dl { padding: 10px 11px; }
+.dl-top { display: flex; align-items: center; gap: 8px; }
+.dl-name { min-width: 0; flex: 1; font-size: 11.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl-ic {
+  width: 24px; height: 24px; flex: none;
+  border: 1px solid transparent; border-radius: var(--radius-sm);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text-tertiary); background: transparent; cursor: pointer;
+}
+.dl-ic:hover { color: var(--text); background: var(--surface-hover); border-color: var(--stroke); }
+.dl-ic svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.dl-spec { margin-top: 3px; color: var(--text-tertiary); font-family: var(--font-mono); font-size: 9.5px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl .track { margin-top: 8px; }
+.dl .progress-label { margin-top: 6px; font-family: var(--font-mono); font-size: 9.5px; }
+.dl .progress-label.done { color: var(--success); font-family: var(--font-ui); font-size: 10px; }
+.dl .progress-label.error { color: var(--danger); font-family: var(--font-ui); font-size: 10px; }
+.dl-done-row { display: flex; align-items: center; gap: 8px; }
+.dl-check { color: var(--success); font-size: 12px; font-weight: 700; flex: none; }
+.dl-x { color: var(--danger); font-size: 12px; font-weight: 700; flex: none; }
+.dl .note { margin-top: 6px; color: var(--text-tertiary); font-size: 10px; line-height: 1.5; }
+.dl .note em { color: var(--success); font-style: normal; }
+.dl-actions { display: flex; gap: 6px; margin-top: 8px; }
+.queue-empty {
+  border-style: dashed;
+  color: var(--text-tertiary);
+  font-size: 11px; line-height: 1.55;
+  text-align: center;
+  padding: 16px 14px;
+  background: none; box-shadow: none;
+}
+
+/* ---------- Popovers (device picker / quality) ---------- */
+.popover {
+  position: absolute; z-index: 30;
+  width: 248px;
+  padding: 6px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45), inset 0 1px rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(20px) saturate(125%);
+  display: none;
+}
+.popover.open { display: block; }
+.pop-head {
+  padding: 7px 10px 6px;
+  color: var(--text-tertiary);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pop-head b { display: block; margin-top: 3px; color: var(--text-secondary); font-weight: 400; font-size: 11px; letter-spacing: 0; text-transform: none; overflow: hidden; text-overflow: ellipsis; }
+.pop-row {
+  width: 100%;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid transparent; border-radius: var(--radius-sm);
+  background: none; color: var(--text); cursor: pointer;
+  text-align: left;
+}
+.pop-row:hover { background: var(--surface-hover); border-color: var(--stroke); }
+.pop-row svg { width: 18px; height: 18px; flex: none; fill: none; stroke: var(--text-secondary); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.pop-row .l { min-width: 0; flex: 1; }
+.pop-row .l b { display: block; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pop-row .l span { display: block; margin-top: 2px; color: var(--text-tertiary); font-size: 10px; }
+.pop-row .r { flex: none; color: var(--text-tertiary); font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; }
+.pop-row.sel { border-color: rgba(96, 205, 255, 0.32); background: rgba(96, 205, 255, 0.08); }
+.pop-row.sel .r, .pop-row.sel svg { color: var(--accent); stroke: var(--accent); }
+.pop-empty { padding: 14px 12px; color: var(--text-tertiary); font-size: 11px; line-height: 1.55; text-align: center; }
+.pop-empty b { display: block; color: var(--text-secondary); margin-bottom: 3px; }
+.pop-foot {
+  margin-top: 4px; padding: 7px 10px 5px;
+  border-top: 1px solid var(--stroke);
+  display: flex; justify-content: space-between; align-items: center;
+  color: var(--text-tertiary); font-size: 10px;
+}
+.pop-foot button { border: 0; background: none; color: var(--accent); font-size: 10px; font-weight: 600; cursor: pointer; }
+.pop-foot button:hover { text-decoration: underline; }
+
+@keyframes castpulse { 50% { box-shadow: 0 0 0 3px rgba(96, 205, 255, 0.28); } }

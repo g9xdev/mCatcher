@@ -103,6 +103,28 @@
         <p class="hint">Re-encodes each saved recording <strong>and download</strong> to the chosen codec, then deletes the original — but only keeps it if the result is actually smaller. AV1 compresses best; H.265 is faster and more compatible. A GPU encoder (NVENC / QSV / AMF) is used when available. Needs the native helper.</p>
       </section>
 
+      <section class="card">
+        <div class="card-head"><span class="label">Popup panel</span></div>
+
+        <label class="row checkbox">
+          <input id="showRail" type="checkbox" />
+          <span class="label">Show the side panel (wide popup)</span>
+        </label>
+        <p class="hint">Adds a panel beside the media list for the downloads queue and casting. Off = the classic single-column popup.</p>
+
+        <label class="row checkbox">
+          <input id="showQueue" type="checkbox" />
+          <span class="label">Global downloads queue in the panel</span>
+        </label>
+        <p class="hint">Lists active and just-finished downloads from <strong>every</strong> tab, with speed, progress, and cancel — not only this tab's.</p>
+
+        <label class="row checkbox">
+          <input id="enableCasting" type="checkbox" />
+          <span class="label">Casting to TVs <strong>(preview)</strong></span>
+        </label>
+        <p class="hint">Shows a Cast button on each stream and a Now-Casting transport in the panel. Device discovery (Chromecast / AirPlay / DLNA) runs in the native helper and is still being built — the controls appear but can't reach a TV yet.</p>
+      </section>
+
       <div class="actions">
         <button id="save" class="btn primary">Save</button>
         <button id="reset" class="btn ghost">Reset to defaults</button>
