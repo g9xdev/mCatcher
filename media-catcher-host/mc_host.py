@@ -20,6 +20,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
     {"cmd":"open","path":P}        # open a saved file with the OS default app
     {"cmd":"update","extDir":D,"zipDir":D?,"profileDir":D?}  # self-update from a packaged zip
     {"cmd":"watch","enable":bool,"extDir":D?,"zipDir":D?}    # auto-install when a package appears
+    {"cmd":"checkGithub","auto":bool?,"extDir":D?,"zipDir":D?}  # pull the latest GitHub release
     {"cmd":"discard","id":N}       # delete temp file
   host -> extension:
     {"type":"pong","ffmpeg":bool,"ffmpegPath":str,"version":str}
@@ -31,6 +32,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
     {"type":"save-cancelled","id":N}
     {"type":"folder","reqId":R,"dir":path}
     {"type":"discarded","id":N}
+    {"type":"github-update","reached":bool,"latest":str?,"newer":bool?,"downloaded":[str]?}
     {"type":"error","id":N?,"error":str}
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
@@ -487,9 +489,133 @@ def launch_guardian(apply_ext, apply_host, plan, ext_dir, host_dir, restart=True
         return "error"
 
 
+# ---- GitHub release auto-update ------------------------------------------
+# Pull new releases straight from GitHub Releases and drop the packages into
+# the watched folder, where the same guardian flow installs and verifies them.
+GITHUB_REPO = "g9xdev/mCatcher"
+GITHUB_LATEST_URL = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+_GITHUB_POLL_INTERVAL = 6 * 3600      # seconds between background checks
+_github_poll_started = False
+
+
+def _http_get(url, timeout=30):
+    """GET a URL and return the raw bytes. GitHub rejects API calls without a
+    User-Agent, so always send one."""
+    import urllib.request
+    r = urllib.request.Request(url, headers={
+        "User-Agent": "MediaCatcher-Host/%s" % VERSION,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(r, timeout=timeout) as resp:
+        return resp.read()
+
+
+def github_latest_release():
+    """Return (version, {asset_name: url}) for the latest published release, or
+    (None, {}) when there is no release or GitHub can't be reached."""
+    try:
+        data = json.loads(_http_get(GITHUB_LATEST_URL).decode("utf-8", "ignore"))
+    except Exception:
+        return None, {}
+    tag = (data.get("tag_name") or "").strip()
+    version = tag[1:] if tag[:1] in ("v", "V") else tag
+    assets = {a.get("name"): a.get("browser_download_url")
+              for a in (data.get("assets") or [])
+              if a.get("name") and a.get("browser_download_url")}
+    return (version or None), assets
+
+
+def _download(url, dest):
+    """Download url to dest atomically via a .part temp file."""
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        f.write(_http_get(url))
+    os.replace(tmp, dest)
+
+
+def github_stage_release(cfg, force=False):
+    """If the latest GitHub release is newer than what's installed, download its
+    extension/host packages into the watched folder. Returns a status dict and
+    never raises."""
+    ext_dir = cfg.get("extDir")
+    zip_dir = cfg.get("zipDir") or downloads_dir()
+    version, assets = github_latest_release()
+    if not version:
+        return {"reached": False}
+    ext_from = _installed_version(ext_dir) if ext_dir else None
+    newer = ((not ext_from or _vtuple(version) > _vtuple(ext_from))
+             or _vtuple(version) > _vtuple(VERSION))
+    if not (newer or force):
+        return {"reached": True, "latest": version, "newer": False, "downloaded": []}
+    got = []
+    try:
+        os.makedirs(zip_dir, exist_ok=True)
+        for name, url in assets.items():
+            low = name.lower()
+            if low.endswith(".zip") and (low.startswith("media_catcher")
+                                         or low.startswith("media-catcher-host")):
+                dest = os.path.join(zip_dir, name)
+                if not os.path.exists(dest):
+                    _download(url, dest)
+                got.append(name)
+    except Exception as e:
+        return {"reached": True, "latest": version, "newer": True, "downloaded": got, "error": str(e)}
+    return {"reached": True, "latest": version, "newer": True, "downloaded": got}
+
+
+def handle_check_github(req):
+    """Check GitHub for a newer release; download and install it if found.
+    'auto' keeps quiet when already up to date (for background checks)."""
+    def worker():
+        cfg = load_config()
+        if req.get("extDir"):
+            cfg["extDir"] = req["extDir"]
+        if req.get("zipDir"):
+            cfg["zipDir"] = req["zipDir"]
+        save_config(cfg)
+        auto = bool(req.get("auto"))
+        status = github_stage_release(cfg, force=bool(req.get("force")))
+        send({"type": "github-update", **status})
+        watching = bool(cfg.get("autoUpdate")) and os.name == "nt"
+        if watching:
+            # A running folder-watcher installs whatever we just staged; driving
+            # handle_update too would prompt the user twice.
+            if not auto and status.get("reached") and not status.get("newer"):
+                _info("Media Catcher", "You're on the latest release (v%s)." % (status.get("latest") or "?"))
+            return
+        if auto and not status.get("newer"):
+            return
+        handle_update({"extDir": cfg.get("extDir"), "zipDir": cfg.get("zipDir"), "silent": auto})
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _github_poll_loop():
+    time.sleep(90)   # let startup settle before the first check
+    while True:
+        try:
+            cfg = load_config()
+            if cfg.get("autoUpdate"):
+                status = github_stage_release(cfg)
+                if status.get("newer") and status.get("downloaded"):
+                    send({"type": "github-update", **status})
+        except Exception:
+            pass
+        time.sleep(_GITHUB_POLL_INTERVAL)
+
+
+def start_github_poll():
+    """Start the background GitHub poll once (idempotent)."""
+    global _github_poll_started
+    if _github_poll_started:
+        return
+    _github_poll_started = True
+    threading.Thread(target=_github_poll_loop, daemon=True).start()
+
+
 def handle_update(req):
     """Manual 'Check & install update': install whichever of the extension / host
     is newer, then offer a session-restoring Firefox restart."""
+    silent = bool(req.get("silent"))
     def worker():
         cfg = load_config()
         ext_dir = req.get("extDir") or cfg.get("extDir")
@@ -513,8 +639,9 @@ def handle_update(req):
 
         if not (apply_ext or apply_host):
             send({"type": "update-result", "ok": True, "available": False, "version": plan["ext_from"]})
-            _info("Media Catcher", "You're up to date (extension v%s, helper v%s)." %
-                  (plan["ext_from"] or "?", plan["host_from"] or "?"))
+            if not silent:
+                _info("Media Catcher", "You're up to date (extension v%s, helper v%s)." %
+                      (plan["ext_from"] or "?", plan["host_from"] or "?"))
             return
 
         summary = plan_summary(plan) or ("helper v%s (content change)" % plan["host_to"] if apply_host else "update")
@@ -649,6 +776,7 @@ def handle_watch(req):
     zdir = cfg.get("zipDir") or downloads_dir()
     if enable and os.name == "nt":
         start_watch(zdir)
+        start_github_poll()
         send({"type": "watch", "enabled": True, "dir": zdir})
     else:
         stop_watch()
@@ -1091,6 +1219,7 @@ def main():
         cfg = load_config()
         if cfg.get("autoUpdate") and cfg.get("extDir") and os.name == "nt":
             start_watch(cfg.get("zipDir") or downloads_dir())
+            start_github_poll()
     except Exception:
         pass
     while True:
@@ -1123,6 +1252,8 @@ def main():
                 handle_update(msg)
             elif cmd == "watch":
                 handle_watch(msg)
+            elif cmd == "checkGithub":
+                handle_check_github(msg)
             elif cmd == "discard":
                 handle_discard(msg)
         except Exception as e:

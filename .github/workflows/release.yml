@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build and release (no leading v, e.g. 1.4.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sanity check host
+        shell: pwsh
+        run: |
+          python -m py_compile media-catcher-host/mc_host.py
+          python media-catcher-host/test_guardian.py
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_NAME -match '^v(.+)$') {
+            $v = $Matches[1]
+          } else {
+            $v = '${{ github.event.inputs.version }}'
+          }
+          if ([string]::IsNullOrWhiteSpace($v)) { throw 'Could not determine version.' }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building Media Catcher $v"
+
+      - name: Stamp version into sources
+        shell: pwsh
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          $v = $env:V
+          $mf = 'media-catcher/manifest.json'
+          (Get-Content $mf -Raw) -replace '"version"\s*:\s*"[0-9.]+"', ('"version": "' + $v + '"') |
+            Set-Content $mf -NoNewline -Encoding utf8
+          $hp = 'media-catcher-host/mc_host.py'
+          (Get-Content $hp -Raw) -replace 'VERSION\s*=\s*"[0-9.]+"', ('VERSION = "' + $v + '"') |
+            Set-Content $hp -NoNewline -Encoding utf8
+          $iss = 'media-catcher-host/installer/media-catcher-host.iss'
+          (Get-Content $iss -Raw) -replace '#define AppVersion "[0-9.]+"', ('#define AppVersion "' + $v + '"') |
+            Set-Content $iss -NoNewline -Encoding utf8
+
+      - name: Package extension + host zips
+        shell: pwsh
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          $v = $env:V
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # Extension: manifest.json must sit at the zip root -> archive the folder CONTENTS
+          Compress-Archive -Path 'media-catcher/*' -DestinationPath "dist/media_catcher-$v.zip" -Force
+          # Host: only the runtime files (no ffmpeg, tests, installer, or machine files)
+          New-Item -ItemType Directory -Force host-staging | Out-Null
+          Copy-Item 'media-catcher-host/mc_host.py','media-catcher-host/guardian.ps1','media-catcher-host/README.md' host-staging/
+          Compress-Archive -Path 'host-staging/*' -DestinationPath "dist/media-catcher-host-$v.zip" -Force
+
+      - name: Build installer (MediaCatcherHostSetup.exe)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress | Out-Null
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "ISCC not found at $iscc" }
+          & $iscc 'media-catcher-host/installer/media-catcher-host.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed (exit $LASTEXITCODE)" }
+          Copy-Item 'media-catcher-host/installer/dist/MediaCatcherHostSetup.exe' 'dist/MediaCatcherHostSetup.exe' -Force
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          $v = $env:V
+          gh release create "v$v" `
+            "dist/media_catcher-$v.zip" `
+            "dist/media-catcher-host-$v.zip" `
+            "dist/MediaCatcherHostSetup.exe" `
+            --title "Media Catcher $v" --generate-notes

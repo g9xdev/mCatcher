@@ -20,6 +20,31 @@ From `media-catcher-host/installer/`, either run the packaged installer
 are missing and registers the helper with Firefox. See
 `media-catcher-host/installer/README.md` for details.
 
+## Releases & auto-update
+
+Tag a version to publish a release:
+
+```
+git tag v1.4.0
+git push origin v1.4.0
+```
+
+The **Release** GitHub Action (`.github/workflows/release.yml`) then builds and
+attaches three assets to the release:
+
+- `media_catcher-<version>.zip` — the extension package
+- `media-catcher-host-<version>.zip` — the native host package
+- `MediaCatcherHostSetup.exe` — the one-click host installer (downloads Python +
+  ffmpeg, registers the helper with Firefox)
+
+New users install with the `.exe`. Existing installs update themselves: the host
+checks GitHub Releases (on Firefox startup, and every few hours while auto-update is
+on), downloads the new packages into the watched folder, and the reliability guardian
+applies, verifies, and reverts on failure — restarting Firefox with your tabs intact.
+
+You can also build manually from the **Actions** tab (**Release → Run workflow**) by
+entering a version.
+
 ## Not committed here
 
 `ffmpeg.exe` (the installer downloads it), build artifacts under `installer/dist/`,

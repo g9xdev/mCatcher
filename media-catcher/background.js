@@ -137,6 +137,8 @@ function onNativeMessage(msg) {
     if (settings.autoUpdate && nativePort) {
       nativePort.postMessage({ cmd: "watch", enable: true,
         extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+      nativePort.postMessage({ cmd: "checkGithub", auto: true,
+        extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
     }
     return;
   }
@@ -148,6 +150,16 @@ function onNativeMessage(msg) {
   if (msg.type === "update-result") {
     dlog("update result", msg);
     broadcast({ type: "update-result", result: msg });   // options page shows it
+    return;
+  }
+  if (msg.type === "github-update") {
+    dlog("github update", msg);
+    broadcast({ type: "github-update", result: msg });    // options page shows it
+    if (msg.newer && Array.isArray(msg.downloaded) && msg.downloaded.length && api.notifications) {
+      api.notifications.create({ type: "basic", iconUrl: api.runtime.getURL("icons/icon-96.png"),
+        title: "Media Catcher " + (msg.latest ? "v" + msg.latest : "update"),
+        message: "Downloading the latest release — you'll be asked to install it." });
+    }
     return;
   }
   const dl = activeDownloads.get(msg.id);
@@ -1576,9 +1588,10 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         sendResponse({ ok: true });
       } else if (msg.type === "update-extension") {
-        // Ask the helper to check for a newer package and install it.
+        // Check GitHub for a newer release, then install the newest package
+        // available (downloaded from GitHub or dropped in the folder manually).
         if (nativePort) {
-          nativePort.postMessage({ cmd: "update", extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+          nativePort.postMessage({ cmd: "checkGithub", extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false, error: "Native helper not connected — install it first." });
