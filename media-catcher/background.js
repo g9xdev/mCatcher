@@ -83,6 +83,10 @@ const pendingFolderPicks = new Map();
 // records live HLS to a temp file, muxes the paired audio, and finalizes on
 // Stop. Save moves the temp file to Downloads; Discard/tab-close deletes it.
 const NATIVE_HOST = "com.mediacatcher.host";
+// Where regular-Firefox users get the native helper. The installer asset keeps the
+// same filename every release, so "latest/download/<name>" always points at the newest.
+const HELPER_INSTALLER_URL = "https://github.com/g9xdev/mCatcher/releases/latest/download/MediaCatcherHostSetup.exe";
+const HELPER_SETUP_PAGE = "setup/setup.html";
 let nativePort = null;
 let nativeReady = false;          // true once the host confirms ffmpeg is available
 let nativeInfo = null;
@@ -1383,6 +1387,41 @@ function notifyDone(name, extra, action) {
   } catch (e) {}
 }
 
+// Open the bundled setup page that walks the user through installing the native
+// helper. Focuses an existing setup tab instead of piling up duplicates.
+function openSetupPage() {
+  const url = api.runtime.getURL(HELPER_SETUP_PAGE);
+  try {
+    if (api.tabs && api.tabs.query) {
+      api.tabs.query({}, (tabs) => {
+        const open = (tabs || []).find((t) => t.url && t.url.indexOf(url) === 0);
+        if (open) api.tabs.update(open.id, { active: true });
+        else api.tabs.create({ url });
+      });
+    } else {
+      api.tabs.create({ url });
+    }
+  } catch (e) { try { api.tabs.create({ url }); } catch (e2) {} }
+}
+
+// Nudge once per session when the helper is missing; clicking opens the setup page.
+let helperMissingNotified = false;
+function promptInstallHelper() {
+  if (helperMissingNotified) return;
+  helperMissingNotified = true;
+  if (!api.notifications) { openSetupPage(); return; }
+  try {
+    const id = "mc-helper-missing";
+    api.notifications.create(id, {
+      type: "basic",
+      iconUrl: api.runtime.getURL("icons/icon-96.png"),
+      title: "Media Catcher — recorder helper needed",
+      message: "Recording to a file needs a small helper. Click to set it up.",
+    });
+    notifyActions.set(id, { url: api.runtime.getURL(HELPER_SETUP_PAGE) });
+  } catch (e) {}
+}
+
 if (api.notifications && api.notifications.onClicked) {
   api.notifications.onClicked.addListener((id) => {
     const action = notifyActions.get(id);
@@ -1391,6 +1430,8 @@ if (api.notifications && api.notifications.onClicked) {
     try { api.notifications.clear(id); } catch (e) {}
     if (action.path) {
       if (nativePort) nativePort.postMessage({ cmd: "open", path: action.path });
+    } else if (action.url) {
+      try { api.tabs.create({ url: action.url }); } catch (e) {}
     } else if (action.downloadId != null && api.downloads) {
       const openIt = api.downloads.open && api.downloads.open(action.downloadId);
       if (openIt && openIt.catch) openIt.catch(() => { try { api.downloads.show(action.downloadId); } catch (e) {} });
@@ -1531,6 +1572,9 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (nativePort) { try { nativePort.postMessage({ cmd: "ping" }); } catch (e) {} }
         else connectNative();
         sendResponse({ ok: true, helper: helperStatus() });
+      } else if (msg.type === "open-helper-setup") {
+        openSetupPage();
+        sendResponse({ ok: true });
       } else if (msg.type === "get-variants") {
         const info = await getVariants(msg.item, msg.tabId);
         sendResponse({ ok: true, info });
@@ -1546,6 +1590,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } else if (msg.type === "record-live") {
         const { item, tabId, filename, variantUrl } = msg;
+        if (!nativePort) promptInstallHelper();   // works in-browser, but the helper is better — nudge once
         const videoUrl = await resolveVideoUrl(item, tabId, variantUrl);
         const quality = (item.bandwidth || item.estKbps || item.height)
           ? { resolution: item.resolution, height: item.height,
@@ -1728,7 +1773,12 @@ function setupContextMenu() {
   } catch (e) {}
 }
 setupContextMenu();
-api.runtime.onInstalled && api.runtime.onInstalled.addListener(setupContextMenu);
+api.runtime.onInstalled && api.runtime.onInstalled.addListener((details) => {
+  setupContextMenu();
+  // First install (e.g. the signed .xpi on regular Firefox): walk the user
+  // through installing the native helper.
+  if (details && details.reason === "install") openSetupPage();
+});
 
 // Connect to the native helper (if installed) so recording can hand off to it.
 connectNative();

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set up Media Catcher</title>
+  <style>
+    :root { color-scheme: dark light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+           background: #14161a; color: #e7e9ee; display: flex; justify-content: center; }
+    .wrap { max-width: 640px; width: 100%; padding: 44px 26px 72px; }
+    h1 { font-size: 24px; margin: 0 0 6px; }
+    .sub { color: #9aa3b2; margin: 0 0 26px; }
+    .card { background: #1c1f26; border: 1px solid #2a2f3a; border-radius: 12px;
+            padding: 20px 22px; margin: 16px 0; }
+    .card p:first-child { margin-top: 0; }
+    .btn { display: inline-block; background: #3b82f6; color: #fff; text-decoration: none;
+           font-weight: 600; padding: 12px 20px; border-radius: 9px; border: 0;
+           cursor: pointer; font-size: 15px; }
+    .btn:hover { background: #2f6fe0; }
+    .btn.secondary { background: transparent; border: 1px solid #3a4150; color: #cdd3de; }
+    ol { padding-left: 20px; margin: 8px 0 0; }
+    li { margin: 8px 0; }
+    code { background: #0f1115; padding: 2px 6px; border-radius: 5px; font-size: 13px; }
+    .status { display: flex; align-items: center; gap: 10px; margin-top: 16px; font-weight: 600; }
+    .dot { width: 11px; height: 11px; border-radius: 50%; background: #6b7280; flex: none; }
+    .dot.ok { background: #22c55e; } .dot.warn { background: #f59e0b; } .dot.off { background: #ef4444; }
+    a.plain { color: #7fb0ff; }
+    .muted { color: #9aa3b2; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Almost there — install the recorder helper</h1>
+    <p class="sub">Media Catcher records live video and audio to real files using a small
+      native helper that drives <code>ffmpeg</code>. Install it once and you're set.</p>
+
+    <div class="card">
+      <p><strong>1. Download &amp; run the installer</strong></p>
+      <p><a class="btn" id="download"
+            href="https://github.com/g9xdev/mCatcher/releases/latest/download/MediaCatcherHostSetup.exe">Download the helper installer</a></p>
+      <p class="muted" style="margin-bottom: 0">Windows &middot; <code>MediaCatcherHostSetup.exe</code>
+        &middot; installs Python + ffmpeg if they're missing and registers the helper with Firefox.</p>
+    </div>
+
+    <div class="card">
+      <p><strong>2. Finish up</strong></p>
+      <ol>
+        <li>Run the downloaded <code>MediaCatcherHostSetup.exe</code> and let it complete.</li>
+        <li>Restart Firefox (or click <em>Re-check</em> below) so it picks up the helper.</li>
+      </ol>
+      <div class="status"><span class="dot" id="dot"></span><span id="statusText">Checking for the helper…</span></div>
+      <p style="margin: 16px 0 0"><button class="btn secondary" id="recheck">Re-check now</button></p>
+    </div>
+
+    <p class="muted">Prefer to browse? <a class="plain" id="releases"
+      href="https://github.com/g9xdev/mCatcher/releases/latest">All downloads on the releases page</a>.
+      On Developer/Nightly Firefox you can load the extension from source instead — see the project README.</p>
+  </div>
+  <script src="setup.js"></script>
+</body>
+</html>

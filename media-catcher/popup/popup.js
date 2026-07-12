@@ -143,7 +143,7 @@ const HELPER_UI = {
   ready:        { cls: "ok",   label: "helper on",     tip: "Native helper active — recordings use ffmpeg (one muxed file)." },
   "no-ffmpeg":  { cls: "warn", label: "helper: no ffmpeg", tip: "Helper is installed but ffmpeg wasn't found. Re-run the installer or drop ffmpeg.exe next to it." },
   connecting:   { cls: "warn", label: "helper…",       tip: "Connecting to the native helper…" },
-  disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not detected — recording runs in-browser. Click to re-check." },
+  disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not detected — recording runs in-browser. Click to install it." },
 };
 
 function renderHelperBadge() {
@@ -157,6 +157,10 @@ function renderHelperBadge() {
   badge.title = (helperStatus.error ? helperStatus.error + "  ·  " : "") + ui.tip +
     (helperStatus.ffmpegPath ? "\nffmpeg: " + helperStatus.ffmpegPath : "");
   badge.onclick = async () => {
+    if (helperStatus.state === "disconnected") {
+      send({ type: "open-helper-setup" });   // no helper yet — open the install page
+      return;
+    }
     badge.title = "Re-checking…";
     const r = await send({ type: "recheck-helper" });
     if (r && r.helper) helperStatus = r.helper;
