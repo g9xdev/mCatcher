@@ -143,7 +143,7 @@ function onNativeMessage(msg) {
     if (settings.autoUpdate && nativePort) {
       nativePort.postMessage({ cmd: "watch", enable: true,
         extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
-      nativePort.postMessage({ cmd: "checkGithub", auto: true,
+      nativePort.postMessage({ cmd: "checkGithub", auto: true, extVersion: api.runtime.getManifest().version,
         extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
     }
     return;
@@ -1719,7 +1719,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Check GitHub for a newer release, then install the newest package
         // available (downloaded from GitHub or dropped in the folder manually).
         if (nativePort) {
-          nativePort.postMessage({ cmd: "checkGithub", extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+          nativePort.postMessage({ cmd: "checkGithub", extVersion: api.runtime.getManifest().version, extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false, error: "Native helper not connected — install it first." });

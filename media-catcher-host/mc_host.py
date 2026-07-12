@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -554,7 +554,7 @@ def _download(url, dest):
     os.replace(tmp, dest)
 
 
-def github_stage_release(cfg, force=False):
+def github_stage_release(cfg, force=False, ext_version=None):
     """If the latest GitHub release is newer than what's installed, download its
     extension/host packages into the watched folder. Returns a status dict and
     never raises."""
@@ -563,7 +563,9 @@ def github_stage_release(cfg, force=False):
     version, assets = github_latest_release()
     if not version:
         return {"reached": False}
-    ext_from = _installed_version(ext_dir) if ext_dir else None
+    # Prefer the extension's own reported version (works for signed installs with
+    # no source folder); fall back to reading a source folder's manifest.
+    ext_from = ext_version or (_installed_version(ext_dir) if ext_dir else None)
     newer = ((not ext_from or _vtuple(version) > _vtuple(ext_from))
              or _vtuple(version) > _vtuple(VERSION))
     if not (newer or force):
@@ -595,7 +597,7 @@ def handle_check_github(req):
             cfg["zipDir"] = req["zipDir"]
         save_config(cfg)
         auto = bool(req.get("auto"))
-        status = github_stage_release(cfg, force=bool(req.get("force")))
+        status = github_stage_release(cfg, force=bool(req.get("force")), ext_version=req.get("extVersion"))
         send({"type": "github-update", **status})
         if not status.get("reached"):
             if not auto:
@@ -652,7 +654,10 @@ def _install_updates(ext_dir, zip_dir, silent=False):
     try:
         have_ext = bool(ext_dir and os.path.isdir(ext_dir))
         plan = plan_update(ext_dir if have_ext else "", HERE, zip_dir)
-        apply_ext = bool(plan["ext_newer"] and have_ext)
+        # Only overwrite the extension folder if it is ACTUALLY an extension source
+        # (has a manifest). Guards against a mis-set folder like C:\Code getting an
+        # extension unpacked into it.
+        apply_ext = bool(plan["ext_newer"] and have_ext and plan["ext_from"])
         apply_host = bool(plan["host_newer"])
 
         # Content-hash fallback: a same-version host package whose code changed.
@@ -679,7 +684,7 @@ def _install_updates(ext_dir, zip_dir, silent=False):
 
         # Nothing the guardian can install. A newer *extension* may still exist that
         # only Firefox can install (signed add-on, no source folder) — surface it.
-        if plan["ext_newer"] and not have_ext and plan["ext_to"]:
+        if plan["ext_newer"] and not apply_ext and plan["ext_to"]:
             send({"type": "ext-update-available", "version": plan["ext_to"]})
             if not silent:
                 _info("Media Catcher — update available",
