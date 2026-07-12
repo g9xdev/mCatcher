@@ -174,8 +174,38 @@ function helperStatus() {
     ready: nativeReady,
     ffmpegPath: nativeInfo ? nativeInfo.ffmpegPath : "",
     version: nativeInfo ? nativeInfo.version : "",
+    ytdlp: nativeInfo ? !!nativeInfo.ytdlp : false,
+    ytdlpVersion: nativeInfo ? (nativeInfo.ytdlpVersion || "") : "",
+    node: nativeInfo ? !!nativeInfo.node : false,
+    pot: nativeInfo ? !!nativeInfo.pot : false,
     error: nativeError,
   };
+}
+
+// YouTube (and any yt-dlp-supported site): hand the canonical URL to the native
+// helper, which runs yt-dlp (best video+audio, merged) with the PO-token provider
+// and Firefox cookies. Progress/done/error arrive as ytdl-* native messages.
+async function downloadYouTube(item, tabId, filename) {
+  const id = ++downloadCounter;
+  const dl = { id, url: item.url, name: sanitizeFilename(filename || item.name || "YouTube video"),
+               kind: "youtube", status: "downloading", live: true, tabId,
+               thumb: item.thumb || null, progress: { done: 0, total: 100, unit: "pct", live: true } };
+  activeDownloads.set(id, dl);
+  broadcast({ type: "download-update", download: dl });
+  if (!nativeReady || !nativePort) {
+    dl.status = "error";
+    dl.error = "YouTube needs the native helper (yt-dlp). Install/enable it, then retry.";
+    broadcast({ type: "download-update", download: dl });
+    promptInstallHelper();
+    return;
+  }
+  try {
+    nativePort.postMessage({ cmd: "ytdl", id, url: item.url, dir: settings.saveFolder || "" });
+    mclog("info", "yt-dlp: requested " + item.url);
+  } catch (e) {
+    dl.status = "error"; dl.error = "Couldn't reach the helper.";
+    broadcast({ type: "download-update", download: dl });
+  }
 }
 
 function connectNative() {
@@ -329,6 +359,23 @@ function onNativeMessage(msg) {
     dl.status = "converting";
     if (msg.codec) dl.convertCodec = msg.codec;
     if (typeof msg.pct === "number") dl.convertPct = msg.pct;
+    broadcast({ type: "download-update", download: dl });
+  } else if (msg.type === "ytdl-progress") {
+    dl.status = "downloading";
+    const pct = typeof msg.pct === "number" ? Math.max(0, Math.min(100, Math.round(msg.pct)))
+                                            : (dl.progress ? dl.progress.done : 0);
+    dl.progress = { done: pct, total: 100, unit: "pct", bps: msg.bps || 0,
+                    stage: msg.stage || "downloading", live: true };
+    broadcast({ type: "download-update", download: dl });
+  } else if (msg.type === "ytdl-done") {
+    dl.status = "done"; dl.live = true; dl.savedPath = msg.file || "";
+    dl.progress = { done: 100, total: 100, unit: "pct" };
+    broadcast({ type: "download-update", download: dl });
+    addHistory({ name: dl.name || "YouTube", kind: "youtube", ts: Date.now() });
+    notifyDone(dl.name || "YouTube video", fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
+    setTimeout(() => activeDownloads.delete(dl.id), 120000);
+  } else if (msg.type === "ytdl-error") {
+    dl.status = "error"; dl.error = msg.error || "YouTube download failed"; dl.errReason = msg.reason || "";
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "saved") {
     dl.status = "done"; dl.savedPath = msg.file; dl.convert = msg.convert || null;
@@ -991,6 +1038,9 @@ api.webRequest.onSendHeaders.addListener(
 api.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    // YouTube's media rides PO-token-gated googlevideo requests we can't reuse;
+    // suppress that noise — the tab's single YouTube item is handled via yt-dlp.
+    try { if (/(^|\.)googlevideo\.com$/i.test(new URL(details.url).hostname)) return; } catch (e) {}
     if (IGNORE_URL.test(details.url)) return;
 
     const ct = getHeader(details.responseHeaders, "content-type") || "";
@@ -1858,6 +1908,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           downloadHls(item, tabId, filename, variantUrl);
         } else if (item.kind === "dash") {
           downloadDash(item, tabId, filename, msg.variantId);
+        } else if (item.kind === "youtube") {
+          downloadYouTube(item, tabId, filename);
         } else {
           await downloadDirect(item, tabId, filename);
         }

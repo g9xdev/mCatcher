@@ -195,7 +195,7 @@ function bitrateLabel(item) {
 
 function renderItem(item) {
   const kind = item.kind || "direct";
-  const kindLabel = kind.toUpperCase();
+  const kindLabel = kind === "youtube" ? "YouTube" : kind.toUpperCase();
 
   // Amber data readout: KIND · quality · bitrate · duration.
   const quality = item.height ? item.height + "p" : (item.resolution || "");
@@ -291,6 +291,11 @@ function renderItem(item) {
     actions.appendChild(copyBtn);
   } else if (kind === "dash") {
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
+      onClick: () => startDownload(item, el, {}) }));
+    actions.appendChild(cmdBtn);
+    actions.appendChild(copyBtn);
+  } else if (kind === "youtube") {
+    actions.appendChild(h("button", { class: "btn amber", text: "Download highest quality",
       onClick: () => startDownload(item, el, {}) }));
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
@@ -556,7 +561,9 @@ function renderProgress(el, dl) {
   let right = dl.progress && dl.progress.total
     ? (dl.progress.unit === "bytes"
         ? humanSize(dl.progress.done) + " / " + humanSize(dl.progress.total)
-        : dl.progress.done + "/" + dl.progress.total + " seg")
+        : dl.progress.unit === "pct"
+          ? (dl.progress.stage === "merging" ? "merging…" : "")
+          : dl.progress.done + "/" + dl.progress.total + " seg")
     : "";
   if (dl.progress && dl.progress.bps > 0 && (dl.status === "downloading" || dl.status === "audio")) {
     right += (right ? "  ·  " : "") + humanSize(dl.progress.bps) + "/s";
