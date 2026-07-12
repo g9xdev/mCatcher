@@ -172,20 +172,50 @@ function Log-Landscape {
   Log ("profiles with Media Catcher installed: " + $(if ($withExt.Count) { $withExt -join ', ' } else { 'none (or source-loaded)' }))
 }
 
+function Schedule-Relaunch($exe) {
+  # Reopen Firefox from OUTSIDE our process tree via Task Scheduler. This guardian is a
+  # descendant of the Firefox it is about to close (Firefox -> native host -> guardian),
+  # so it can be torn down together with that Firefox before it reaches a direct relaunch.
+  # A scheduled task survives that and reopens Firefox a few seconds later in the user's
+  # session (Firefox restores the saved session per the user's settings).
+  try {
+    Unregister-ScheduledTask -TaskName 'MediaCatcherRelaunch' -Confirm:$false -ErrorAction SilentlyContinue
+    $trigger  = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(7))
+    $action   = New-ScheduledTaskAction -Execute $exe
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::FromMinutes(2))
+    Register-ScheduledTask -TaskName 'MediaCatcherRelaunch' -Trigger $trigger -Action $action -Settings $settings -Force -ErrorAction Stop | Out-Null
+    return $true
+  } catch {
+    Log ("scheduler relaunch registration failed: {0}" -f $_)
+    return $false
+  }
+}
+
 function Restart-Firefox {
   if (-not $cfg.firefox -or $NoRestart) { return }
-  $all = @(Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue)
-  $others = @($all | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ne $cfg.firefox } | Select-Object -ExpandProperty ExecutablePath -Unique)
+  $others = @(@(Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" -ErrorAction SilentlyContinue) |
+              Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ne $cfg.firefox } |
+              Select-Object -ExpandProperty ExecutablePath -Unique)
   if ($others.Count) { Log ("leaving other Firefox variant(s) running: {0}" -f ($others -join '; ')) }
+  # Register the relaunch BEFORE closing Firefox, so it survives us being killed with it.
+  $scheduled = Schedule-Relaunch $cfg.firefox
+  Log ("relaunch via scheduler: {0}" -f $(if ($scheduled) { 'registered (~7s)' } else { 'unavailable' }))
   Start-Sleep -Milliseconds 800
-  # Close ONLY our own Firefox variant (by exe path) so other Firefoxes keep running.
+  Log "closing our Firefox variant"
   @(Ff-Mine) | ForEach-Object { & taskkill /PID $_.ProcessId *>$null }
-  for ($i = 0; $i -lt 80; $i++) {
+  for ($i = 0; $i -lt 40; $i++) {
     if (-not (@(Ff-Mine).Count)) { break }
     Start-Sleep -Milliseconds 500
   }
-  Start-Sleep -Seconds 1
-  Start-Process -FilePath $cfg.firefox
+  # If the scheduler was unavailable AND we're still alive, relaunch directly. When the
+  # task registered, it owns the relaunch — don't double-launch here.
+  if (-not $scheduled) {
+    Start-Sleep -Seconds 1
+    try { Start-Process -FilePath $cfg.firefox; Log "relaunched Firefox directly" }
+    catch { Log ("direct relaunch failed: {0}" -f $_) }
+  } else {
+    Log "closed; scheduled task will reopen Firefox"
+  }
 }
 
 # ---- main ----
