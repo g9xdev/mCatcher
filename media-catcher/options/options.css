@@ -85,3 +85,46 @@ details.advanced[open] > summary { margin-bottom: 10px; }
 .history li:last-child { border-bottom: none; }
 .history .h-name { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .history .empty { color: var(--etch); }
+
+/* ---- Versions & update history ---- */
+.ver-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 2px 0 8px; }
+.ver-pill {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .05em; color: var(--etch);
+  background: #12161a; border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px;
+}
+.ver-pill b { color: var(--ink); font-weight: 700; }
+.ver-env { color: var(--etch); font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5; margin: 0 0 10px; cursor: help; }
+.histwrap { max-height: 260px; overflow: auto; }
+.histtable { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
+.histtable th {
+  text-align: left; color: var(--etch); font-weight: 400; letter-spacing: .06em; text-transform: uppercase;
+  font-size: 10.5px; padding: 4px 8px 6px; border-bottom: 1px solid var(--line); position: sticky; top: 0;
+  background: var(--panel); white-space: nowrap;
+}
+.histtable td { padding: 6px 8px; border-bottom: 1px solid var(--line); color: var(--ink); vertical-align: top; }
+.histtable tr:last-child td { border-bottom: none; }
+.obadge {
+  display: inline-block; font-size: 10.5px; letter-spacing: .04em; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line); white-space: nowrap;
+}
+.obadge.o-ok  { color: var(--ok); border-color: #1f6b4a; }
+.obadge.o-bad { color: var(--tally); border-color: #7a2420; }
+.obadge.o-warn{ color: var(--amber); border-color: var(--amber-dim); }
+.obadge.o-dim { color: var(--etch); }
+.odetail { color: var(--etch); font-size: 10.5px; margin-top: 3px; max-width: 220px; }
+
+/* ---- Log console ---- */
+.log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.log-filter { color: var(--etch); font-family: var(--font-mono); font-size: 11px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.log-console {
+  background: #0b0e11; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+  height: 240px; overflow-y: auto; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+}
+.log-line { display: flex; gap: 8px; padding: 1px 0; white-space: pre-wrap; word-break: break-word; }
+.log-line .lt { color: #5b636b; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.log-line .ls { color: var(--amber-dim); flex: 0 0 54px; text-transform: uppercase; font-size: 10px; padding-top: 1px; }
+.log-line .lm { color: var(--ink); flex: 1; min-width: 0; }
+.log-line.l-warn  .lm { color: var(--amber); }
+.log-line.l-error .lm { color: var(--tally); }
+.log-line.l-error .ls { color: var(--tally); }
+.log-line.l-debug .lm { color: var(--etch); }

@@ -39,6 +39,56 @@ api.storage.local.get("settings").then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
 }).catch(() => {});
 
+// ---- diagnostics log + update history (Settings "Log console" panel) -------
+// A rolling buffer of structured log lines (extension + host + guardian) and a
+// list of durable update-history events. Both stream live to the Settings page and
+// persist across background reloads, so a failed update leaves a legible trail
+// instead of vanishing. Host/guardian lines arrive as {type:"log"} native messages.
+const LOG_CAP = 500;
+const EVENT_CAP = 150;
+let logRing = [];
+let updateEvents = [];
+let _logSaveTimer = null;
+const pendingReports = new Map();   // reqId -> resolver, settled by a host "report"
+
+api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
+  // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
+  // "connecting to the native helper…" line — must survive the async restore.
+  if (r && Array.isArray(r.mcLogs)) logRing = r.mcLogs.concat(logRing).slice(-LOG_CAP);
+  if (r && Array.isArray(r.mcEvents)) updateEvents = r.mcEvents.concat(updateEvents).slice(-EVENT_CAP);
+  _persistDiag();
+}).catch(() => {});
+
+function _persistDiag() {
+  if (_logSaveTimer) return;
+  _logSaveTimer = setTimeout(() => {
+    _logSaveTimer = null;
+    api.storage.local.set({ mcLogs: logRing.slice(-LOG_CAP), mcEvents: updateEvents.slice(-EVENT_CAP) }).catch(() => {});
+  }, 800);
+}
+
+function pushLog(line) {
+  logRing.push(line);
+  if (logRing.length > LOG_CAP) logRing = logRing.slice(-LOG_CAP);
+  broadcast({ type: "log-line", line });
+  _persistDiag();
+}
+
+// Log a line originating in the extension itself (connect state, user actions).
+function mclog(level, msg) {
+  const line = { ts: Date.now(), level: level || "info", src: "ext", msg: String(msg) };
+  pushLog(line);
+  dlog("[ext/" + line.level + "]", msg);
+}
+
+function recordEvent(ev) {
+  if (!ev) return;
+  updateEvents.push(ev);
+  if (updateEvents.length > EVENT_CAP) updateEvents = updateEvents.slice(-EVENT_CAP);
+  broadcast({ type: "update-event", event: ev });
+  _persistDiag();
+}
+
 function saveSettings(next) {
   settings = Object.assign({}, DEFAULT_SETTINGS, next);
   return api.storage.local.set({ settings });
@@ -119,12 +169,14 @@ function helperStatus() {
 function connectNative() {
   if (nativePort) return;
   setNativeState("connecting");
+  mclog("info", "connecting to the native helper…");
   try {
     nativePort = api.runtime.connectNative(NATIVE_HOST);
     nativePort.onMessage.addListener(onNativeMessage);
     nativePort.onDisconnect.addListener(() => {
       const err = api.runtime.lastError && api.runtime.lastError.message;
       dlog("native host disconnected", err || "");
+      mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
       nativePort = null; nativeInfo = null;
       setNativeState("disconnected", err || "Helper not installed.");
     });
@@ -138,11 +190,27 @@ function connectNative() {
 
 function onNativeMessage(msg) {
   if (!msg) return;
+  if (msg.type === "log") {
+    // a structured line from the host or guardian → the live console
+    pushLog({ ts: msg.ts || Date.now(), level: msg.level || "info",
+      src: msg.src || "host", msg: String(msg.msg == null ? "" : msg.msg) });
+    return;
+  }
+  if (msg.type === "update-event") {
+    recordEvent(msg.event);
+    return;
+  }
+  if (msg.type === "report") {
+    const res = pendingReports.get(msg.reqId);
+    if (res) { pendingReports.delete(msg.reqId); res(msg); }
+    return;
+  }
   if (msg.type === "pong") {
     nativeInfo = msg;
     setNativeState(msg.ffmpeg ? "ready" : "no-ffmpeg",
       msg.ffmpeg ? null : "Helper is installed but ffmpeg was not found.");
     dlog("native helper", msg.ffmpeg ? "ready (ffmpeg ok)" : "connected but ffmpeg missing", msg.ffmpegPath || "");
+    mclog("info", "helper ready — v" + (msg.version || "?") + (msg.ffmpeg ? "" : " · ffmpeg MISSING"));
     if (settings.autoUpdate && nativePort) {
       nativePort.postMessage({ cmd: "watch", enable: true,
         extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
@@ -1715,6 +1783,29 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "open-helper-setup") {
         openSetupPage();
         sendResponse({ ok: true });
+      } else if (msg.type === "get-logs") {
+        sendResponse({ logs: logRing.slice(-LOG_CAP), events: updateEvents.slice(-EVENT_CAP) });
+      } else if (msg.type === "clear-logs") {
+        logRing = [];
+        api.storage.local.set({ mcLogs: [] }).catch(() => {});
+        sendResponse({ ok: true });
+      } else if (msg.type === "get-update-report") {
+        // Ask the helper for a fresh diagnostics report (env + history tail + guardian
+        // log tail), resolved when it replies with {type:"report"}. Falls back to the
+        // buffered data if the helper isn't connected or doesn't answer in time.
+        const extVersion = api.runtime.getManifest().version;
+        let report = null;
+        if (nativePort) {   // connected is enough — the report is useful even when ffmpeg is missing
+          report = await new Promise((resolve) => {
+            const reqId = "rpt-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
+            pendingReports.set(reqId, resolve);
+            try { nativePort.postMessage({ cmd: "getReport", reqId, extVersion }); }
+            catch (e) { pendingReports.delete(reqId); resolve(null); }
+            setTimeout(() => { if (pendingReports.has(reqId)) { pendingReports.delete(reqId); resolve(null); } }, 5000);
+          });
+        }
+        sendResponse({ ok: true, extVersion, helper: helperStatus(), report,
+          events: updateEvents.slice(-EVENT_CAP), logs: logRing.slice(-LOG_CAP) });
       } else if (msg.type === "get-variants") {
         const info = await getVariants(msg.item, msg.tabId);
         sendResponse({ ok: true, info });

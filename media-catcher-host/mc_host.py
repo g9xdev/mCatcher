@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -130,6 +130,209 @@ def save_config(cfg):
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
+
+
+# ---- diagnostics: structured logging + durable update history ------------
+# Everything the Settings "Log console" and "Update history" panels show comes
+# from here. _hlog streams a line to the extension (live console) and appends to
+# a rolling file; _log_event records a durable history entry (what changed, when,
+# from where, and how it turned out) so a FAILED update explains itself instead of
+# vanishing silently — the gap that let the guardian bug hide for so long.
+_HOST_LOG = os.path.join(TMPDIR, "host.log")
+_HISTORY_PATH = os.path.join(HERE, "update-history.jsonl")
+_log_lock = threading.Lock()
+_last_avail = None   # last extension version we recorded as 'update-available' (dedup)
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _hlog(level, msg, src="host"):
+    """Emit one structured log line: to the extension for the live console, and to
+    a rolling on-disk file for after-the-fact inspection. Never raises."""
+    try:
+        send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": str(msg)})
+    except Exception:
+        pass
+    try:
+        with _log_lock:
+            if os.path.exists(_HOST_LOG) and os.path.getsize(_HOST_LOG) > 512 * 1024:
+                # keep the last ~half when it grows past 512 KB
+                try:
+                    with open(_HOST_LOG, "r", encoding="utf-8", errors="replace") as f:
+                        tail = f.readlines()[-1500:]
+                    with open(_HOST_LOG, "w", encoding="utf-8") as f:
+                        f.writelines(tail)
+                except Exception:
+                    pass
+            with open(_HOST_LOG, "a", encoding="utf-8") as f:
+                f.write("%s  [%s/%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), src, level, msg))
+    except Exception:
+        pass
+
+
+def _log_event(component, outcome, frm=None, to=None, source=None, detail=None):
+    """Record a durable update-history entry and mirror it to the live console."""
+    rec = {"ts": _now_ms(), "component": component, "outcome": outcome,
+           "from": frm, "to": to, "source": source, "detail": detail}
+    try:
+        with _log_lock:
+            # Cap growth (repeated 'update-available' checks would otherwise append forever).
+            if os.path.exists(_HISTORY_PATH) and os.path.getsize(_HISTORY_PATH) > 256 * 1024:
+                try:
+                    with open(_HISTORY_PATH, "r", encoding="utf-8", errors="replace") as f:
+                        tail = f.readlines()[-1500:]
+                    with open(_HISTORY_PATH, "w", encoding="utf-8") as f:
+                        f.writelines(tail)
+                except Exception:
+                    pass
+            with open(_HISTORY_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    try:
+        send({"type": "update-event", "event": rec})
+    except Exception:
+        pass
+    bad = outcome in ("verify-failed", "reverted", "error", "guardian-did-not-run")
+    arrow = (" %s→%s" % (frm or "?", to or "?")) if (frm or to) else ""
+    _hlog("error" if bad else "info",
+          "update: %s %s%s%s%s" % (component, outcome, arrow,
+                                   (" via %s" % source) if source else "",
+                                   (" — %s" % detail) if detail else ""))
+
+
+def _read_history(limit=200):
+    out = []
+    try:
+        with open(_HISTORY_PATH, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    try:
+                        out.append(json.loads(ln))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return out[-limit:]
+
+
+def _backup_root():
+    return os.path.join(tempfile.gettempdir(), "media-catcher-backups")
+
+
+def _guardian_log_tail(lines=150):
+    try:
+        with open(os.path.join(_backup_root(), "guardian.log"), "r", encoding="utf-8-sig", errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except Exception:
+        return ""
+
+
+def _is_elevated():
+    try:
+        import ctypes   # imported lazily like every other ctypes use in this module
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _update_env():
+    """A snapshot of everything the update path depends on — the things that, when
+    wrong, silently break auto-update. Surfaced in Settings so failures are legible."""
+    guardian = os.path.join(HERE, "guardian.ps1")
+    def _which(n):
+        try:
+            return shutil.which(n) or ""
+        except Exception:
+            return ""
+    return {
+        "hostVersion": VERSION,
+        "hostDir": HERE,
+        "configVariant": _variant_key(),
+        "python": sys.executable,
+        "consolePython": _console_python(),
+        "runningPythonw": (sys.executable or "").lower().endswith("pythonw.exe"),
+        "powershell": _which("powershell"),
+        "firefox": find_firefox() or "",
+        "guardianPresent": os.path.isfile(guardian),
+        "hostDirWritable": bool(os.access(HERE, os.W_OK)),
+        "backupRoot": _backup_root(),
+        "guardianLogExists": os.path.exists(os.path.join(_backup_root(), "guardian.log")),
+        "elevated": _is_elevated(),
+        "ffmpeg": FFMPEG or "",
+    }
+
+
+def _apply_comps(apply_ext, apply_host, plan):
+    """The (component, from, to) tuples for each package actually being applied, so a
+    combined extension+host update records BOTH transitions in history — not just one."""
+    comps = []
+    if apply_host:
+        comps.append(("host", plan.get("host_from"), plan.get("host_to")))
+    if apply_ext:
+        comps.append(("extension", plan.get("ext_from"), plan.get("ext_to")))
+    return comps
+
+
+def _watch_guardian_outcome(apply_ext, apply_host, plan, source, base_size):
+    """After the guardian is spawned, tail its log to learn what ACTUALLY happened —
+    streaming each line to the console and recording a final history entry. Crucially,
+    if the guardian writes nothing at all, that's detected and reported ('did-not-run')
+    instead of failing silently — the precise blind spot that hid the spawn bug."""
+    logf = os.path.join(_backup_root(), "guardian.log")
+
+    def worker():
+        start = time.time()
+        pos = base_size
+        seen = False
+        outcome = None
+        detail = None
+        while time.time() - start < 120:
+            time.sleep(1.0)
+            if not os.path.exists(logf):
+                continue
+            try:
+                with open(logf, "r", encoding="utf-8-sig", errors="replace") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except Exception:
+                continue
+            for ln in chunk.splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                seen = True
+                low = ln.lower()
+                lvl = "error" if ("fail" in low or "fatal" in low or "error" in low) else "info"
+                _hlog(lvl, ln, src="guardian")
+                if "verify ok" in low:
+                    outcome, detail = "applied", None
+                elif "verify failed" in low:
+                    outcome = "verify-failed"
+                    detail = ln.split("FAILED:", 1)[-1].strip() if "FAILED:" in ln else ln
+                elif "reverted to previous" in low:
+                    outcome = outcome or "reverted"
+                elif "fatal" in low:
+                    outcome, detail = "error", ln
+            # 'verify-failed' must terminate too: the guardian reverts and then
+            # restarts Firefox, which kills THIS host — so the outcome has to be
+            # recorded within a second, before that teardown, or it's lost.
+            if outcome in ("applied", "reverted", "verify-failed", "error"):
+                break
+        if not seen:
+            final = "guardian-did-not-run"
+            det = "guardian spawned but wrote no log in 120s — a spawn or environment problem"
+        else:
+            final, det = (outcome or "unknown"), detail
+        # One entry per component actually applied (a combined update touches both).
+        for comp, frm, to in _apply_comps(apply_ext, apply_host, plan):
+            _log_event(comp, final, frm, to, source, det)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _vtuple(s):
@@ -547,7 +750,7 @@ def _guardian_config(cfg, apply_ext, apply_host, plan, ext_dir, host_dir, profil
         "expectExtVersion": plan["ext_to"] if apply_ext else None,
         "expectHostVersion": plan["host_to"] if apply_host else None,
         "python": _console_python(), "firefox": firefox, "restart": bool(restart),
-        "backupRoot": os.path.join(tempfile.gettempdir(), "media-catcher-backups"),
+        "backupRoot": _backup_root(),
         "keep": 3,
     }
 
@@ -717,20 +920,25 @@ def handle_check_github(req):
             cfg["zipDir"] = req["zipDir"]
         save_config(cfg)
         auto = bool(req.get("auto"))
+        _hlog("info", "checking GitHub for updates%s…" % (" (auto)" if auto else ""))
         status = github_stage_release(cfg, force=bool(req.get("force")), ext_version=req.get("extVersion"))
         send({"type": "github-update", **status})
         if not status.get("reached"):
+            _hlog("warn", "couldn't reach GitHub to check for updates")
             if not auto:
                 _info("Media Catcher", "Couldn't reach GitHub to check for updates.")
             return
         if not status.get("newer"):
+            _hlog("info", "GitHub: already on the latest release (v%s)" % (status.get("latest") or "?"))
             if not auto:
                 _info("Media Catcher", "You're on the latest release (v%s)." % (status.get("latest") or "?"))
             return
+        _hlog("info", "GitHub has v%s — staged %s" % (status.get("latest") or "?",
+              ", ".join(status.get("downloaded") or []) or "nothing new"))
         # Newer packages are staged in the watched folder — install them now.
         # _install_updates is single-flight, so the folder-watcher firing on the
         # same downloads can't double-prompt.
-        _install_updates(cfg.get("extDir"), cfg.get("zipDir") or downloads_dir(), silent=auto)
+        _install_updates(cfg.get("extDir"), cfg.get("zipDir") or downloads_dir(), silent=auto, source="github")
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -760,7 +968,7 @@ def start_github_poll():
 _update_lock = threading.Lock()
 
 
-def _install_updates(ext_dir, zip_dir, silent=False):
+def _install_updates(ext_dir, zip_dir, silent=False, source="manual"):
     """Install whatever in zip_dir is newer than what's installed.
 
     The host updates regardless of the extension folder. The extension is only
@@ -768,7 +976,7 @@ def _install_updates(ext_dir, zip_dir, silent=False):
     the Firefox profile and only Firefox can update it, so we never touch it. When a
     newer extension exists that we can't apply, we tell the extension so it can point
     the user at the download. Single-flight: the folder-watcher and an explicit check
-    can't both prompt at once."""
+    can't both prompt at once. Every branch records to the update history/console."""
     if not _update_lock.acquire(blocking=False):
         return
     try:
@@ -779,6 +987,9 @@ def _install_updates(ext_dir, zip_dir, silent=False):
         # extension unpacked into it.
         apply_ext = bool(plan["ext_newer"] and have_ext and plan["ext_from"])
         apply_host = bool(plan["host_newer"])
+        _hlog("info", "update check (%s): extension %s→%s, helper %s→%s" % (
+            source, plan["ext_from"] or "?", plan["ext_to"] or "?",
+            plan["host_from"] or "?", plan["host_to"] or "?"))
 
         # Content-hash fallback: a same-version host package whose code changed.
         if plan["host_same_ver_changed"] and not apply_host:
@@ -789,22 +1000,44 @@ def _install_updates(ext_dir, zip_dir, silent=False):
                 apply_host = True
 
         if apply_ext or apply_host:
+            comps = _apply_comps(apply_ext, apply_host, plan)
             summary = plan_summary(plan) or ("helper v%s (content change)" % plan["host_to"] if apply_host else "update")
             if not _yesno("Media Catcher — update ready",
                           "About to install: %s\n\nThe reliability guardian will back up your current "
                           "version, apply the update, verify it, and restart Firefox — reverting "
                           "automatically if anything fails.\n\nProceed?" % summary):
+                for c, f, t in comps:
+                    _log_event(c, "deferred", f, t, source, "user chose not to install now")
                 send({"type": "update-result", "ok": True, "available": True, "deferred": True, "summary": summary})
                 return
+            logf = os.path.join(_backup_root(), "guardian.log")
+            base = os.path.getsize(logf) if os.path.exists(logf) else 0
+            _hlog("info", "handing off to guardian: %s" % summary)
             mode = launch_guardian(apply_ext, apply_host, plan, ext_dir if have_ext else "", HERE, restart=True)
             send({"type": "update-result", "ok": True, "available": True, "summary": summary, "mode": mode})
-            if mode == "error":
+            if mode == "guardian":
+                _watch_guardian_outcome(apply_ext, apply_host, plan, source, base)
+            elif mode == "fallback":
+                for c, f, t in comps:
+                    _log_event(c, "applied", f, t, source, "in-process apply (guardian script absent)")
+            elif mode == "error":
+                for c, f, t in comps:
+                    _log_event(c, "error", f, t, source, "couldn't start the guardian process")
                 _info("Media Catcher", "Couldn't start the update guardian.")
             return
 
         # Nothing the guardian can install. A newer *extension* may still exist that
         # only Firefox can install (signed add-on, no source folder) — surface it.
         if plan["ext_newer"] and not apply_ext and plan["ext_to"]:
+            # Record the durable history row once per version — repeated checks would
+            # otherwise append the same 'update-available' line on every poll.
+            global _last_avail
+            if plan["ext_to"] != _last_avail:
+                _last_avail = plan["ext_to"]
+                _log_event("extension", "update-available", plan["ext_from"], plan["ext_to"], source,
+                           "signed add-on — Firefox installs it (or install the .xpi)")
+            else:
+                _hlog("info", "extension v%s available (signed add-on — install via Firefox)" % plan["ext_to"])
             send({"type": "ext-update-available", "version": plan["ext_to"]})
             if not silent:
                 _info("Media Catcher — update available",
@@ -812,6 +1045,7 @@ def _install_updates(ext_dir, zip_dir, silent=False):
                       "updates through Firefox — install the signed .xpi from the Releases page, or it "
                       "will auto-update on Firefox's next check." % plan["ext_to"])
             return
+        _hlog("info", "up to date (extension v%s, helper v%s)" % (plan["ext_from"] or "?", plan["host_from"] or "?"))
         send({"type": "update-result", "ok": True, "available": False, "version": plan["ext_from"]})
         if not silent:
             _info("Media Catcher", "You're up to date (extension v%s, helper v%s)." %
@@ -831,8 +1065,23 @@ def handle_update(req):
             cfg["extDir"] = ext_dir
         cfg["zipDir"] = zip_dir
         save_config(cfg)
-        _install_updates(ext_dir, zip_dir, silent=bool(req.get("silent")))
+        _install_updates(ext_dir, zip_dir, silent=bool(req.get("silent")), source="manual")
     threading.Thread(target=worker, daemon=True).start()
+
+
+def handle_get_report(req):
+    """Answer the Settings 'diagnostics' request: the environment the update path
+    depends on, the durable update history, and a tail of the guardian log. Also
+    narrates the key facts to the live console so a glance tells the story."""
+    env = _update_env()
+    send({"type": "report", "reqId": req.get("reqId"), "host": VERSION,
+          "env": env, "history": _read_history(200), "guardianTail": _guardian_log_tail(150)})
+    _hlog("info", "diagnostics: host v%s (%s) · powershell=%s · guardian.ps1=%s · Firefox=%s · guardian.log=%s" % (
+        VERSION, "pythonw" if env["runningPythonw"] else "python",
+        "ok" if env["powershell"] else "MISSING",
+        "ok" if env["guardianPresent"] else "MISSING",
+        "found" if env["firefox"] else "not found",
+        "present" if env["guardianLogExists"] else "never written"))
 
 
 # ---- auto-update watcher (event-driven, no polling) -----------------------
@@ -892,7 +1141,7 @@ def _dir_watcher(path, stop_event, on_relevant):
 
 def _auto_update_check():
     cfg = load_config()
-    _install_updates(cfg.get("extDir"), cfg.get("zipDir") or downloads_dir(), silent=False)
+    _install_updates(cfg.get("extDir"), cfg.get("zipDir") or downloads_dir(), silent=False, source="watcher")
 
 
 def start_watch(zip_dir):
@@ -1442,6 +1691,7 @@ def handle_discard(req):
 
 def main():
     init_io()
+    _hlog("info", "host v%s connected — %s" % (VERSION, os.path.basename(sys.executable or "python")))
     # Resume watching the package folder if auto-update was left on.
     try:
         cfg = load_config()
@@ -1486,6 +1736,8 @@ def main():
                 handle_discard(msg)
             elif cmd == "pget":
                 handle_pget(msg)
+            elif cmd == "getReport":
+                handle_get_report(msg)
             elif cmd == "pget-cancel":
                 _pget_cancel(msg)
         except Exception as e:

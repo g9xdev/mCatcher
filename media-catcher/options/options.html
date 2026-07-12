@@ -146,10 +146,43 @@
 
       <section class="card">
         <div class="card-head">
+          <span class="label">Versions &amp; update history</span>
+          <button id="refreshDiag" class="btn ghost small">Refresh</button>
+        </div>
+        <div class="ver-row">
+          <span class="ver-pill">Extension <b id="verExt">…</b></span>
+          <span class="ver-pill">Helper <b id="verHost">…</b></span>
+        </div>
+        <p class="ver-env" id="verEnv"></p>
+        <div class="histwrap">
+          <table class="histtable" id="updHistory">
+            <thead><tr><th>When</th><th>What</th><th>Change</th><th>Source</th><th>Outcome</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="hint" id="updHistoryEmpty">No update activity recorded yet — it fills in as the helper checks for and installs updates.</p>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
           <span class="label">Download history</span>
           <button id="clearHistory" class="btn ghost small">Clear</button>
         </div>
         <ul id="history" class="history"></ul>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="label">Log console</span>
+          <span class="log-actions">
+            <label class="log-filter"><input id="logAutoscroll" type="checkbox" checked /> Autoscroll</label>
+            <button id="runDiag" class="btn ghost small">Run diagnostics</button>
+            <button id="copyLog" class="btn ghost small">Copy</button>
+            <button id="clearLog" class="btn ghost small">Clear</button>
+          </span>
+        </div>
+        <p class="hint">Live activity from the extension, the native helper, and the update guardian. <strong>Run diagnostics</strong> asks the helper to report its environment — PowerShell, Firefox, the guardian script, and write permissions — so a failed update explains itself.</p>
+        <div id="logConsole" class="log-console" role="log" aria-live="polite"></div>
       </section>
     </main>
     <script src="options.js"></script>

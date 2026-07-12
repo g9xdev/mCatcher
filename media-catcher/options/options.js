@@ -34,6 +34,7 @@ async function load() {
   const r = await send({ type: "get-settings" });
   if (r && r.settings) apply(r.settings);
   loadHistory();
+  loadDiagnostics(true);
 }
 
 async function loadHistory() {
@@ -183,5 +184,141 @@ api.runtime.onMessage.addListener((msg) => {
 });
 try { get("extVer").textContent = api.runtime.getManifest().version; } catch (e) {}
 send({ type: "helper-status" }).then((r) => { if (r && r.helper) renderHelper(r.helper); }).catch(() => {});
+
+// ---- diagnostics: versions, update history, live log console --------------
+const LEVEL_CLASS = { info: "l-info", warn: "l-warn", error: "l-error", debug: "l-debug" };
+const OUTCOME_CLASS = {
+  applied: "o-ok", "up-to-date": "o-dim", deferred: "o-warn", "update-available": "o-warn",
+  "verify-failed": "o-bad", reverted: "o-bad", error: "o-bad", "guardian-did-not-run": "o-bad", unknown: "o-warn",
+};
+let histEvents = [];
+
+function fmtTime(ts) { try { return new Date(ts).toLocaleTimeString(); } catch (e) { return ""; } }
+function fmtDateTime(ts) { try { return new Date(ts).toLocaleString(); } catch (e) { return ""; } }
+
+function logLineEl(line) {
+  const row = document.createElement("div");
+  row.className = "log-line " + (LEVEL_CLASS[line.level] || "l-info");
+  const t = document.createElement("span"); t.className = "lt"; t.textContent = fmtTime(line.ts);
+  const s = document.createElement("span"); s.className = "ls"; s.textContent = line.src || "ext";
+  const m = document.createElement("span"); m.className = "lm"; m.textContent = line.msg || "";
+  row.append(t, s, m);
+  return row;
+}
+
+function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
+
+function appendLog(line) {
+  const el = get("logConsole");
+  if (!el) return;
+  const stick = get("logAutoscroll").checked && nearBottom(el);
+  el.appendChild(logLineEl(line));
+  while (el.childElementCount > 1000) el.removeChild(el.firstChild);
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+function seedConsole(logs) {
+  const el = get("logConsole");
+  if (!el) return;
+  el.replaceChildren();
+  for (const l of (logs || [])) el.appendChild(logLineEl(l));
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderEvents(events) {
+  const tbody = get("updHistory").querySelector("tbody");
+  const empty = get("updHistoryEmpty");
+  tbody.replaceChildren();
+  const evs = (events || []).slice().reverse();   // newest first
+  empty.style.display = evs.length ? "none" : "";
+  get("updHistory").style.display = evs.length ? "" : "none";
+  for (const e of evs) {
+    const tr = document.createElement("tr");
+    for (const c of [fmtDateTime(e.ts), e.component || "",
+                     (e.from || e.to) ? ((e.from || "?") + " → " + (e.to || "?")) : "—", e.source || "—"]) {
+      const td = document.createElement("td"); td.textContent = c; tr.appendChild(td);
+    }
+    const oc = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "obadge " + (OUTCOME_CLASS[e.outcome] || "o-warn");
+    badge.textContent = e.outcome || "?";
+    oc.appendChild(badge);
+    if (e.detail) { const d = document.createElement("div"); d.className = "odetail"; d.textContent = e.detail; oc.appendChild(d); }
+    tr.appendChild(oc);
+    tbody.appendChild(tr);
+  }
+}
+
+function renderVersions(resp) {
+  const ext = (resp && resp.extVersion) || api.runtime.getManifest().version;
+  get("verExt").textContent = "v" + ext;
+  const env = resp && resp.report && resp.report.env;
+  const hostV = (resp && resp.report && resp.report.host) || (env && env.hostVersion);
+  get("verHost").textContent = hostV ? ("v" + hostV) : "not connected";
+  const ve = get("verEnv");
+  if (env) {
+    const mark = (b) => (b ? "✓" : "✗");
+    ve.textContent = "PowerShell " + mark(!!env.powershell) + " · Firefox " + mark(!!env.firefox)
+      + " · guardian.ps1 " + mark(env.guardianPresent) + " · host dir writable " + mark(env.hostDirWritable)
+      + " · elevated " + (env.elevated ? "yes" : "no") + " · " + (env.runningPythonw ? "pythonw" : "python");
+    ve.title = "Config variant: " + (env.configVariant || "?") + "\nHost dir: " + (env.hostDir || "?")
+      + "\nPython: " + (env.python || "?") + "\nBackups: " + (env.backupRoot || "?")
+      + "\nguardian.log: " + (env.guardianLogExists ? "present" : "never written");
+    ve.style.display = "";
+  } else {
+    ve.textContent = "Helper not connected — version, environment, and history come from the helper.";
+    ve.style.display = "";
+  }
+}
+
+async function loadDiagnostics(seed) {
+  const resp = await send({ type: "get-update-report" });
+  if (!resp) return resp;
+  // The host's durable update-history is the source of truth — it survives the Firefox
+  // restart a failed update triggers, whereas the in-memory buffer can lose that last
+  // outcome. Fall back to the volatile buffer only when the helper isn't connected.
+  const durable = (resp.report && resp.report.history) || [];
+  histEvents = durable.length ? durable.slice() : (resp.events || []);
+  renderVersions(resp);
+  renderEvents(histEvents);
+  if (seed) seedConsole(resp.logs);
+  return resp;
+}
+
+// Live streams from the background page.
+api.runtime.onMessage.addListener((msg) => {
+  if (!msg) return;
+  if (msg.type === "log-line" && msg.line) appendLog(msg.line);
+  else if (msg.type === "update-event" && msg.event) { histEvents.push(msg.event); renderEvents(histEvents); }
+});
+
+function flashBtn(btnId, text) {
+  const b = get(btnId); if (!b) return;
+  const prev = b.textContent; b.textContent = text;
+  setTimeout(() => (b.textContent = prev), 1200);
+}
+
+get("refreshDiag").addEventListener("click", () => loadDiagnostics(true));
+get("runDiag").addEventListener("click", async () => {
+  const resp = await loadDiagnostics(false);   // helper streams its env line into the console
+  const tail = resp && resp.report && resp.report.guardianTail;
+  if (tail && tail.trim()) {
+    appendLog({ ts: Date.now(), level: "info", src: "guardian", msg: "— guardian.log tail —" });
+    for (const ln of tail.split(/\r?\n/)) {
+      if (ln.trim()) appendLog({ ts: Date.now(), level: /fail|fatal|error/i.test(ln) ? "error" : "info", src: "guardian", msg: ln });
+    }
+  }
+});
+get("copyLog").addEventListener("click", async () => {
+  const el = get("logConsole");
+  // Join each row's fields with a tab — textContent alone would mash time/src/msg together.
+  const text = Array.from(el.children).map((r) => Array.from(r.children).map((c) => c.textContent).join("\t")).join("\n");
+  try { await navigator.clipboard.writeText(text); flashBtn("copyLog", "Copied ✓"); }
+  catch (e) { flashBtn("copyLog", "Copy failed"); }
+});
+get("clearLog").addEventListener("click", async () => {
+  await send({ type: "clear-logs" });
+  get("logConsole").replaceChildren();
+});
 
 load();
