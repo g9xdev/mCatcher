@@ -22,6 +22,10 @@ builds then [update themselves](#releases--auto-update).
   ffmpeg to record and mux streams, plus the reliability guardian that applies,
   verifies, and reverts updates. See `media-catcher-host/installer/` for the
   packaged installer.
+- **`docs/`** — engineering notes, including
+  [AirPlay video casting on modern receivers (tvOS 17/18+)](docs/airplay-modern-receivers.md):
+  why stock pyatv silently fails, the community fix (pyatv PR #2846) that works,
+  and the DLNA quirks for LG/webOS TVs — all verified against real devices.
 
 ## Install (regular Firefox)
 
