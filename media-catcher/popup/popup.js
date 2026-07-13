@@ -37,9 +37,13 @@ let uiSettings = { showRail: true, showQueue: true, enableCasting: false };
     if (!raw) return;
     const hint = JSON.parse(raw);
     if (hint.cast) document.documentElement.classList.add("cast");
-    if (hint.rail && hint.w) {
+    if (hint.rail) {
       document.documentElement.classList.add("rail");
-      document.documentElement.style.width = hint.w + "px";
+      // Start at a safe narrow width that fits virtually any window; applyLayout then
+      // GROWS it to the measured fit. A Firefox popup grows to its content reliably but
+      // often will NOT shrink after first paint — so we must never start wider than the
+      // window, or the overflow is clipped (taking the Settings button with it).
+      document.documentElement.style.width = "560px";
     }
   } catch (e) {}
 })();
@@ -134,13 +138,13 @@ async function applyLayout() {
   // back to the classic single column when there isn't room for two panes.
   let winW = 0;
   try { const w = await api.windows.getCurrent(); winW = (w && w.width) || 0; } catch (e) {}
-  const avail = winW ? winW - 40 : 0;        // margin so the popup never touches the window edge
-  const WIDE_MAX = 760, TWO_PANE_MIN = 600;  // below TWO_PANE_MIN the two-pane view can't fit cleanly
+  const avail = winW ? winW - 44 : 0;        // margin so the popup never touches the window edge
+  const WIDE_MAX = 640, TWO_PANE_MIN = 560;  // 640 fits a narrow window; below MIN → classic column
 
   let railOn = false, width = 0;
   if (wantRail) {
     if (avail >= TWO_PANE_MIN) { railOn = true; width = Math.min(WIDE_MAX, avail); }
-    else if (!winW) { railOn = true; width = 660; }  // window API unavailable → modest best-effort
+    else if (!winW) { railOn = true; width = 560; }  // window API unavailable → safe narrow width
     // else: window too narrow for two panes → classic single column, nothing clips
   }
 

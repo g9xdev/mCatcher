@@ -38,7 +38,7 @@
    exact rail width inline to fit the browser window (Firefox clips a popup wider
    than its window); this 660px is only a safety fallback if that JS never runs. */
 html { width: 420px; }
-html.rail { width: 660px; }
+html.rail { width: 560px; }
 
 html,
 body {
@@ -869,7 +869,7 @@ html.cast .bar-sep { display: inline-block; }
 
 html.rail .main {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 264px;
+  grid-template-columns: minmax(0, 1fr) 240px;
   height: 408px;                 /* keeps the popup under Firefox's ~600px ceiling */
 }
 html.rail .pane-left { display: flex; flex-direction: column; }
