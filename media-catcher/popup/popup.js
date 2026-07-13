@@ -369,10 +369,14 @@ function renderItem(item) {
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
   } else if (kind === "youtube") {
-    actions.appendChild(h("button", { class: "btn amber", text: "Download highest quality",
+    actions.appendChild(h("button", { class: "btn amber",
+      text: item.height ? "Download " + item.height + "p" : "Download highest quality",
       onClick: () => startDownload(item, el, {}) }));
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
+    if (item.enrichState === "loading") appendNote(slot, "Reading formats…");
+    else if (item.ytFormats && item.ytFormats.length) slot.appendChild(renderYtQualities(item, el));
+    else if (item.enrichState === "error") appendNote(slot, "Couldn't read formats — the highest-quality download still works.");
   } else {
     actions.appendChild(h("button", {
       class: "btn amber",
@@ -415,6 +419,27 @@ function renderQualities(item, el, variants) {
       })
     );
   }
+  return wrap;
+}
+
+// YouTube quality picker — real formats from the helper's yt-dlp probe. Each button
+// downloads that height (video+audio, merged); "Audio" grabs the best audio only.
+function renderYtQualities(item, el) {
+  const wrap = h("div", { class: "qualities" });
+  for (const f of item.ytFormats) {
+    wrap.appendChild(h("button", {
+      class: "q-btn",
+      title: [f.tbr ? f.tbr + " kbps" : "", f.size ? humanSize(f.size) : "", f.fps ? f.fps + "fps" : ""].filter(Boolean).join(" · "),
+      text: f.height + "p" + (f.codec ? " " + f.codec : ""),
+      onClick: () => startDownload(item, el, { ytHeight: f.height }),
+    }));
+  }
+  wrap.appendChild(h("button", {
+    class: "q-btn",
+    title: item.ytAudioSize ? humanSize(item.ytAudioSize) : "Best audio only",
+    text: "Audio",
+    onClick: () => startDownload(item, el, { ytAudioOnly: true }),
+  }));
   return wrap;
 }
 
@@ -488,6 +513,8 @@ async function startDownload(item, el, selection) {
     type: "download", item, tabId: item.tabId || currentTabId, filename,
     variantUrl: selection.variantUrl || null,
     variantId: selection.variantId || null,
+    ytHeight: selection.ytHeight || null,
+    ytAudioOnly: !!selection.ytAudioOnly,
   });
   if (resp && resp.ok === false) {
     showLabel(el, resp.error || "Download failed.", "error");
@@ -509,7 +536,7 @@ async function startRecording(item, el, selection) {
 
 function qualityLabel(dl) {
   const q = dl.quality || {};
-  const res = q.resolution || (q.height ? q.height + "p" : "");
+  const res = q.resolution || (q.height ? q.height + "p" : "") || q.label || "";
   const kbps = (dl.progress && dl.progress.kbps) ? dl.progress.kbps + " kbps"
     : (q.bandwidth ? Math.round(q.bandwidth / 1000) + " kbps" : "");
   return [res, kbps].filter(Boolean).join(" · ");
@@ -626,6 +653,20 @@ function renderProgress(el, dl) {
   // Live recordings have no known total; show elapsed stats + Stop/Save controls.
   if (dl.live && ["recording", "stopped", "saving", "converting", "done", "discarded"].includes(dl.status)) {
     renderLiveProgress(el, dl);
+    return;
+  }
+
+  // Pre-download resolution phase (YouTube reads cookies, solves the JS challenge,
+  // picks formats before any bytes flow). Show a live indeterminate bar, not a dead 0%.
+  const p0 = dl.progress || {};
+  if (dl.status === "downloading" && (p0.stage === "resolving" || p0.stage === "starting")) {
+    const note = p0.note ? "Preparing · " + p0.note : "Preparing…";
+    el.querySelector(".slot").replaceChildren(
+      h("div", { class: "progress" }, [
+        h("div", { class: "track indet" }, [h("div", { class: "ind" })]),
+        h("div", { class: "progress-label" }, [h("span", { text: note }), h("span", { text: "" })]),
+      ])
+    );
     return;
   }
 
@@ -776,6 +817,13 @@ function renderQueueItem(dl) {
       h("span", { text: dl.status === "recording" ? "Recording · " + (fmtDuration(p.duration) || "0:00") : "Held" }),
       h("span", { text: humanSize(p.bytes) || "" }),
     ]));
+    return card;
+  }
+
+  // Pre-download resolution phase — same indeterminate "Preparing…" as the item card.
+  if (p.stage === "resolving" || p.stage === "starting") {
+    card.appendChild(h("div", { class: "track indet" }, [h("div", { class: "ind" })]));
+    card.appendChild(h("div", { class: "progress-label" }, [h("span", { text: p.note ? "Preparing · " + p.note : "Preparing…" })]));
     return card;
   }
 

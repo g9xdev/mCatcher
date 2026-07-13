@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -2003,6 +2003,31 @@ def _map_yt_error(text):
     return "generic", "Download failed — open the log console for yt-dlp's output."
 
 
+def _yt_stage_note(s):
+    """A yt-dlp status line → a short 'what it's doing now' label for the pre-download
+    phase (cookies/player/n-challenge/format pick), so the bar isn't a dead 0%."""
+    low = s.lower()
+    if "downloading webpage" in low:
+        return "Reading page"
+    if "player" in low and "download" in low:
+        return "Loading player"
+    if "api json" in low or "player api" in low:
+        return "Reading video info"
+    if "n challenge" in low or "solving" in low or "[jsc" in low:
+        return "Solving JS challenge"
+    if s.startswith("[info]") and "format" in low:
+        return "Choosing format"
+    if s.startswith("[download] destination"):
+        return "Starting download"
+    if "m3u8" in low and "download" in low:
+        return "Reading streams"
+    if s.startswith("[youtube"):
+        return "Contacting YouTube"
+    if s.startswith("[info]"):
+        return "Preparing"
+    return ""
+
+
 def _parse_yt_progress(line):
     # yt-dlp default (--newline): "[download]  42.3% of  229.20MiB at   53.67MiB/s ETA 00:04"
     m = re.search(r"\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+)\s*([KMGT]?)i?B", line)
@@ -2015,6 +2040,112 @@ def _parse_yt_progress(line):
     if sm:
         out["bps"] = _bytes(sm.group(1), sm.group(2))
     return out
+
+
+def _simplify_vcodec(vc):
+    """yt-dlp's vcodec strings (av01.0.08M.08, vp09.00.., avc1.640028) → a short label."""
+    vc = (vc or "").lower()
+    if vc in ("", "none"):
+        return ""
+    if vc.startswith(("av01", "av1")):
+        return "AV1"
+    if vc.startswith(("vp9", "vp09")):
+        return "VP9"
+    if vc.startswith("vp8"):
+        return "VP8"
+    if vc.startswith(("avc", "h264")):
+        return "H.264"
+    if vc.startswith(("hev", "hvc", "h265")):
+        return "HEVC"
+    return vc.split(".")[0].upper()
+
+
+def handle_ytmeta(req):
+    """Probe a yt-dlp URL (yt-dlp -J, no download) for its real formats so the popup
+    can show codec/resolution/bitrate/size + a quality picker. Best format per height,
+    with a video+audio size estimate. Replies once with a {type:"ytmeta"} message."""
+    def worker():
+        reqid = req.get("reqId")
+        url = req.get("url") or ""
+        ytdlp = find_ytdlp()   # display-only; don't self-fetch here — download still can
+        if not ytdlp:
+            send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "yt-dlp not installed"})
+            return
+        deno = DENO or find_deno()
+        cmd = [ytdlp, "-J", "--no-warnings", "--no-playlist", "--skip-download",
+               "--cookies-from-browser", "firefox"]
+        if deno:
+            cmd += ["--js-runtimes", "deno:%s" % deno]
+        cmd += [url]
+        cf, si = _no_window()
+        try:
+            # Kept under the extension's 60s wait so a completed probe is never orphaned.
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=cf, startupinfo=si, timeout=45)
+        except Exception as e:
+            send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": str(e)})
+            return
+        if r.returncode != 0 or not r.stdout:
+            _reason, emsg = _map_yt_error((r.stderr or b"").decode("utf-8", "replace"))
+            send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": emsg})
+            return
+        try:
+            info = json.loads(r.stdout.decode("utf-8", "replace"))
+        except Exception as e:
+            send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "parse: %s" % e})
+            return
+        fmts = info.get("formats") or []
+        dur = info.get("duration") or 0
+        # Best audio-only stream (for the size estimate + an audio-only download option).
+        best_a = None
+        for f in fmts:
+            if f.get("acodec") and f.get("acodec") != "none" and f.get("vcodec") in (None, "none"):
+                abr = f.get("abr") or f.get("tbr") or 0
+                if not best_a or abr > (best_a.get("abr") or best_a.get("tbr") or 0):
+                    best_a = f
+        a_size = 0
+        if best_a:
+            a_size = best_a.get("filesize") or best_a.get("filesize_approx") or 0
+            if not a_size and dur:
+                a_size = int((best_a.get("abr") or 128) * 1000 / 8 * dur)
+        # Best video stream per height.
+        by_h = {}
+        for f in fmts:
+            if not f.get("vcodec") or f.get("vcodec") == "none":
+                continue
+            h = f.get("height") or 0
+            if not h:
+                continue
+            tbr = f.get("tbr") or f.get("vbr") or 0
+            cur = by_h.get(h)
+            if not cur or tbr > (cur.get("tbr") or cur.get("vbr") or 0):
+                by_h[h] = f
+        out = []
+        for h in sorted(by_h.keys(), reverse=True):
+            f = by_h[h]
+            tbr = int(round(f.get("tbr") or f.get("vbr") or 0))
+            vsize = f.get("filesize") or f.get("filesize_approx") or 0
+            if not vsize and tbr and dur:
+                vsize = int(tbr * 1000 / 8 * dur)
+            # A muxed/progressive format (itag 18/22) already carries audio, so don't
+            # add the separate audio stream again; DASH video-only formats do need it.
+            muxed = f.get("acodec") not in (None, "none")
+            out.append({
+                "height": h,
+                "fps": int(f.get("fps") or 0),
+                "codec": _simplify_vcodec(f.get("vcodec")),
+                "tbr": tbr,                       # kbps
+                "size": int((vsize or 0) + (0 if muxed else (a_size or 0))),
+                "id": f.get("format_id") or "",
+            })
+        send({"type": "ytmeta", "reqId": reqid, "ok": True,
+              "title": info.get("title") or "",
+              "duration": int(dur or 0),
+              "thumb": info.get("thumbnail") or "",
+              "audioSize": int(a_size or 0),
+              "audioAbr": int((best_a or {}).get("abr") or 0),
+              "formats": out})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_ytdl(req):
@@ -2038,8 +2169,10 @@ def handle_ytdl(req):
             pass
         pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
         outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
+        # Optional format selector from the popup's quality picker; default = best.
+        fmt = req.get("format") or "bv*+ba/b"
         cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--progress", "--no-warnings", "--force-overwrites",
-               "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+               "-f", fmt, "--merge-output-format", "mp4",
                "--cookies-from-browser", "firefox",
                "-o", outtmpl,
                # --print puts yt-dlp in quiet mode; --progress above forces the bar back on.
@@ -2052,7 +2185,7 @@ def handle_ytdl(req):
             cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT]
         cmd += [url]
         _hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
-        send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "starting"})
+        send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": "Preparing"})
         cf, si = _no_window()
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -2063,12 +2196,17 @@ def handle_ytdl(req):
         errbuf = []
         filepath = None
         last_pct = -1.0
+        last_note = ""
+        last_note_ts = 0.0
         _PGET[jid] = {"proc": p}               # so a cancel can kill it
         for line in p.stdout:
             s = line.strip()
+            if not s:
+                continue
             if s.startswith("@@FILE@@"):
                 filepath = s[len("@@FILE@@"):].strip()
-            elif s.startswith("[download]"):
+                continue
+            if s.startswith("[download]"):
                 prog = _parse_yt_progress(s)
                 if prog:
                     pct = prog.get("pct", 0.0)
@@ -2076,10 +2214,19 @@ def handle_ytdl(req):
                     if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
                         last_pct = pct
                         send({"type": "ytdl-progress", "id": jid, **prog})
-            elif s:
-                errbuf.append(s)
-                if "Merging formats" in s or s.startswith("[Merger]"):
-                    send({"type": "ytdl-progress", "id": jid, "pct": 99, "stage": "merging"})
+                    continue
+            errbuf.append(s)
+            if "Merging formats" in s or s.startswith("[Merger]"):
+                send({"type": "ytdl-progress", "id": jid, "pct": 99, "stage": "merging"})
+                continue
+            # Before the first real byte, echo yt-dlp's resolution steps as a live label.
+            if last_pct < 0:
+                note = _yt_stage_note(s)
+                now = time.time()
+                if note and (note != last_note or now - last_note_ts > 0.5):
+                    last_note = note
+                    last_note_ts = now
+                    send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": note})
         p.wait()
         _PGET.pop(jid, None)
         if p.returncode == 0 and filepath and os.path.isfile(filepath):
@@ -2127,6 +2274,8 @@ def main():
                       "node": bool(NODE), "deno": bool(DENO), "pot": _pot_alive()})
             elif cmd == "ytdl":
                 handle_ytdl(msg)
+            elif cmd == "ytmeta":
+                handle_ytmeta(msg)
             elif cmd == "ytdlUpdate":
                 threading.Thread(target=ytdlp_update, daemon=True).start()
             elif cmd == "record":

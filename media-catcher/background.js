@@ -66,6 +66,7 @@ let logRing = [];
 let updateEvents = [];
 let _logSaveTimer = null;
 const pendingReports = new Map();   // reqId -> resolver, settled by a host "report"
+const pendingYtMeta = new Map();    // reqId -> resolver, settled by a host "ytmeta"
 
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
@@ -189,11 +190,14 @@ function helperStatus() {
 // YouTube (and any yt-dlp-supported site): hand the canonical URL to the native
 // helper, which runs yt-dlp (best video+audio, merged) with the PO-token provider
 // and Firefox cookies. Progress/done/error arrive as ytdl-* native messages.
-async function downloadYouTube(item, tabId, filename) {
+async function downloadYouTube(item, tabId, filename, opts) {
+  opts = opts || {};
   const id = ++downloadCounter;
   const dl = { id, url: item.url, name: sanitizeFilename(filename || item.name || "YouTube video"),
                kind: "youtube", status: "downloading", live: true, tabId,
-               thumb: item.thumb || null, progress: { done: 0, total: 100, unit: "pct", live: true } };
+               quality: opts.audioOnly ? { label: "Audio" } : (opts.height ? { height: opts.height } : null),
+               thumb: item.thumb || null,
+               progress: { done: 0, total: 100, unit: "pct", live: true, stage: "resolving", note: "Preparing" } };
   activeDownloads.set(id, dl);
   broadcast({ type: "download-update", download: dl });
   if (!nativeReady || !nativePort) {
@@ -203,9 +207,13 @@ async function downloadYouTube(item, tabId, filename) {
     promptInstallHelper();
     return;
   }
+  // Format selector from the quality picker; blank → helper's default (best).
+  let format = "";
+  if (opts.audioOnly) format = "ba/bestaudio";
+  else if (opts.height) format = "bv*[height<=" + opts.height + "]+ba/b[height<=" + opts.height + "]";
   try {
-    nativePort.postMessage({ cmd: "ytdl", id, url: item.url, dir: settings.saveFolder || "" });
-    mclog("info", "yt-dlp: requested " + item.url);
+    nativePort.postMessage({ cmd: "ytdl", id, url: item.url, dir: settings.saveFolder || "", format });
+    mclog("info", "yt-dlp: requested " + item.url + (format ? " [" + format + "]" : ""));
   } catch (e) {
     dl.status = "error"; dl.error = "Couldn't reach the helper.";
     broadcast({ type: "download-update", download: dl });
@@ -249,6 +257,11 @@ function onNativeMessage(msg) {
   if (msg.type === "report") {
     const res = pendingReports.get(msg.reqId);
     if (res) { pendingReports.delete(msg.reqId); res(msg); }
+    return;
+  }
+  if (msg.type === "ytmeta") {
+    const res = pendingYtMeta.get(msg.reqId);
+    if (res) { pendingYtMeta.delete(msg.reqId); res(msg); }
     return;
   }
   if (msg.type === "pong") {
@@ -376,7 +389,7 @@ function onNativeMessage(msg) {
     const pct = typeof msg.pct === "number" ? Math.max(0, Math.min(100, Math.round(msg.pct)))
                                             : (dl.progress ? dl.progress.done : 0);
     dl.progress = { done: pct, total: 100, unit: "pct", bps: msg.bps || 0,
-                    stage: msg.stage || "downloading", live: true };
+                    stage: msg.stage || "downloading", note: msg.note || "", live: true };
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "ytdl-done") {
     dl.status = "done"; dl.live = true; dl.savedPath = msg.file || "";
@@ -692,6 +705,63 @@ function addMedia(tabId, item) {
     if (item.kind === "hls") enrichHls(tabId, key);
     else if (item.kind === "dash") enrichDash(tabId, key);
     else if (item.kind === "direct") enrichDirect(tabId, key);
+    else if (item.kind === "youtube") enrichYouTube(tabId, key);
+  }
+}
+
+// Ask the helper (yt-dlp -J) for a YouTube URL's real formats so the popup can show
+// codec / resolution / bitrate / size + a quality picker. Mirrors the HLS/DASH enrich
+// pattern; needs the native helper, and is a no-op (leaves the bare item) without it.
+function requestYtMeta(url) {
+  return new Promise((resolve) => {
+    const reqId = "ytm-" + (++downloadCounter);
+    pendingYtMeta.set(reqId, resolve);
+    try { nativePort.postMessage({ cmd: "ytmeta", reqId, url }); }
+    catch (e) { pendingYtMeta.delete(reqId); resolve(null); }
+    // Longer than the host's 45s probe timeout so a completed probe is never orphaned.
+    setTimeout(() => { if (pendingYtMeta.has(reqId)) { pendingYtMeta.delete(reqId); resolve(null); } }, 60000);
+  });
+}
+
+async function enrichYouTube(tabId, key) {
+  if (!nativePort || !nativeReady) return;   // needs the helper to run yt-dlp
+  const map = mediaByTab.get(tabId);
+  const item = map && map.get(key);
+  if (!item || item.kind !== "youtube") return;
+  // Probe once per item. "error" is included so a failed probe doesn't re-fire on
+  // every get-media (its own media-updated would otherwise loop it forever). The
+  // helper-not-ready case below returns before setting a state, so it still retries.
+  if (["done", "loading", "error"].includes(item.enrichState) || enriching.has(key)) return;
+  enriching.add(key);
+  item.enrichState = "loading";
+  broadcast({ type: "media-updated", tabId });
+  try {
+    const meta = await requestYtMeta(item.url);
+    if (meta && meta.ok) {
+      if (meta.duration) item.duration = meta.duration;
+      if (meta.title && !item.pageTitle) item.pageTitle = meta.title;
+      const fmts = (meta.formats || []).filter((f) => f.height);
+      if (fmts.length) {
+        item.ytFormats = fmts;                 // for the quality picker
+        item.ytAudioSize = meta.audioSize || 0;
+        item.hasAudio = true;                  // YouTube video always carries audio
+        const best = fmts[0];                  // highest height (host sorts desc)
+        item.height = best.height;
+        item.codec = best.codec || item.codec;
+        item.bandwidth = best.tbr ? best.tbr * 1000 : item.bandwidth;
+        item.size = best.size || item.size;
+      }
+      item.enrichState = "done";
+    } else {
+      item.enrichState = "error";
+      item.enrichError = (meta && meta.error) || "Couldn't read formats";
+    }
+  } catch (e) {
+    item.enrichState = "error";
+    item.enrichError = e.message || String(e);
+  } finally {
+    enriching.delete(key);
+    broadcast({ type: "media-updated", tabId });
   }
 }
 
@@ -1869,11 +1939,17 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           thumb: tabThumbs.get(tid) || null,
           pageTitle: it.pageTitle || tabTitle(tid) || undefined,
         });
+        // Kick a YouTube format probe for any not-yet-enriched item on the tab(s) —
+        // covers the case where the helper connected after the item was detected.
+        const kickYt = (tid) => { const m = mediaByTab.get(tid); if (m) for (const [k, it] of m) if (it.kind === "youtube") enrichYouTube(tid, k); };
         if (msg.allTabs) {
           items = [];
-          for (const tid of mediaByTab.keys())
+          for (const tid of mediaByTab.keys()) {
+            kickYt(tid);
             for (const it of visibleFor(tid)) items.push(decorate(it, tid));
+          }
         } else {
+          kickYt(tabId);
           items = visibleFor(tabId).map((it) => decorate(it, tabId));
         }
         items.sort((a, b) => b.ts - a.ts);
@@ -1920,7 +1996,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else if (item.kind === "dash") {
           downloadDash(item, tabId, filename, msg.variantId);
         } else if (item.kind === "youtube") {
-          downloadYouTube(item, tabId, filename);
+          downloadYouTube(item, tabId, filename, { height: msg.ytHeight, audioOnly: msg.ytAudioOnly });
         } else {
           await downloadDirect(item, tabId, filename);
         }
