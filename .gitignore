@@ -7,6 +7,7 @@
 !/.github
 !/media-catcher
 !/media-catcher-host
+!/docs
 
 # --- exclusions inside the tracked projects ---
 
@@ -17,6 +18,7 @@ media-catcher-host/yt-dlp.exe
 media-catcher-host/deno.exe
 media-catcher-host/node/
 media-catcher-host/pot-provider/
+media-catcher-host/pylibs/
 
 # Build artifacts.
 media-catcher-host/installer/dist/
@@ -25,6 +27,7 @@ media-catcher-host/installer/dist/
 media-catcher-host/mc_config.json
 media-catcher-host/com.mediacatcher.host.json
 media-catcher-host/mc_host.bat
+media-catcher-host/cast_creds_*.json
 
 # Caches and cruft.
 **/__pycache__/
