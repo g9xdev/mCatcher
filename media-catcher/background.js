@@ -68,6 +68,12 @@ let _logSaveTimer = null;
 const pendingReports = new Map();   // reqId -> resolver, settled by a host "report"
 const pendingYtMeta = new Map();    // reqId -> resolver, settled by a host "ytmeta"
 
+// ---- casting (DLNA via the helper) ----
+// The host runs discovery/playback and streams cast-status once a second; the
+// popup renders that state and sends control actions. One session at a time.
+let castState = { state: "idle" };
+const pendingCastDiscover = new Map();   // reqId -> resolver, settled by "cast-devices"
+
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
   // "connecting to the native helper…" line — must survive the async restore.
@@ -233,6 +239,13 @@ function connectNative() {
       mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
       nativePort = null; nativeInfo = null;
       setNativeState("disconnected", err || "Helper not installed.");
+      // The host owned the cast session and its status poller — without it the
+      // session is gone; don't leave the popup showing a live transport forever.
+      if (castState.state !== "idle") {
+        castState = { state: "idle" };
+        broadcast({ type: "cast-update", cast: castState, error: "Casting ended — the helper disconnected." });
+      }
+      for (const [id, res] of pendingCastDiscover) { pendingCastDiscover.delete(id); res(null); }
     });
     nativePort.postMessage({ cmd: "ping" });
   } catch (e) {
@@ -262,6 +275,38 @@ function onNativeMessage(msg) {
   if (msg.type === "ytmeta") {
     const res = pendingYtMeta.get(msg.reqId);
     if (res) { pendingYtMeta.delete(msg.reqId); res(msg); }
+    return;
+  }
+  if (msg.type === "cast-devices") {
+    const res = pendingCastDiscover.get(msg.reqId);
+    if (res) { pendingCastDiscover.delete(msg.reqId); res(msg.devices || []); }
+    return;
+  }
+  if (msg.type === "cast-status") {
+    castState = msg.state === "idle" ? { state: "idle" } : {
+      state: msg.state || "playing",
+      id: msg.id || castState.id,
+      device: msg.device || castState.device || "",
+      title: msg.title || castState.title || "",
+      position: msg.position || 0,
+      duration: msg.duration || 0,
+      protocol: msg.protocol || castState.protocol || "dlna",
+    };
+    broadcast({ type: "cast-update", cast: castState });
+    return;
+  }
+  if (msg.type === "cast-error") {
+    mclog("warn", "cast: " + (msg.error || "unknown error"));
+    // A failed discover carries its reqId — settle the waiting promise so the
+    // popup's picker shows the error instead of spinning until the timeout.
+    if (msg.reqId && pendingCastDiscover.has(msg.reqId)) {
+      const res = pendingCastDiscover.get(msg.reqId);
+      pendingCastDiscover.delete(msg.reqId);
+      res(null);
+      return;
+    }
+    castState = { state: "idle" };
+    broadcast({ type: "cast-update", cast: castState, error: msg.error || "Casting failed." });
     return;
   }
   if (msg.type === "pong") {
@@ -1953,7 +1998,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           items = visibleFor(tabId).map((it) => decorate(it, tabId));
         }
         items.sort((a, b) => b.ts - a.ts);
-        sendResponse({ items, downloads: Array.from(activeDownloads.values()), helper: helperStatus() });
+        sendResponse({ items, downloads: Array.from(activeDownloads.values()), helper: helperStatus(), cast: castState });
       } else if (msg.type === "helper-status") {
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "recheck-helper") {
@@ -2075,6 +2120,41 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const dl = activeDownloads.get(msg.id);
         if (dl && dl.native && nativePort) nativePort.postMessage({ cmd: "discard", id: msg.id });
         else discardRecording(msg.id, "Discarded.");
+        sendResponse({ ok: true });
+      } else if (msg.type === "cast-discover") {
+        if (!nativePort || !nativeReady) {
+          sendResponse({ ok: false, error: "Casting needs the native helper — install/enable it first." });
+        } else {
+          const reqId = "cd" + (++downloadCounter);
+          const devices = await new Promise((resolve) => {
+            pendingCastDiscover.set(reqId, resolve);
+            try { nativePort.postMessage({ cmd: "cast", sub: "discover", reqId }); }
+            catch (e) { pendingCastDiscover.delete(reqId); resolve(null); }
+            // Generous: SSDP (5s) + per-device description fetches + the AirPlay listing scan.
+            setTimeout(() => { if (pendingCastDiscover.has(reqId)) { pendingCastDiscover.delete(reqId); resolve(null); } }, 45000);
+          });
+          sendResponse({ ok: devices != null, devices: devices || [],
+                         error: devices == null ? "Scan timed out — is the helper running?" : undefined });
+        }
+      } else if (msg.type === "cast-start") {
+        if (!nativePort || !nativeReady) {
+          sendResponse({ ok: false, error: "Casting needs the native helper." });
+        } else {
+          nativePort.postMessage({ cmd: "cast", sub: "start", id: msg.deviceId,
+            device: msg.deviceName || "", url: msg.url || "", title: msg.title || "" });
+          castState = { state: "loading", id: msg.deviceId, device: msg.deviceName || "",
+                        title: msg.title || "", position: 0, duration: 0, protocol: "dlna" };
+          broadcast({ type: "cast-update", cast: castState });
+          mclog("info", "cast: " + (msg.title || msg.url) + " → " + (msg.deviceName || msg.deviceId));
+          sendResponse({ ok: true });
+        }
+      } else if (msg.type === "cast-control") {
+        if (nativePort) nativePort.postMessage({ cmd: "cast", sub: "control", action: msg.action, value: msg.value });
+        sendResponse({ ok: !!nativePort });
+      } else if (msg.type === "cast-stop") {
+        if (nativePort) nativePort.postMessage({ cmd: "cast", sub: "stop" });
+        castState = { state: "idle" };
+        broadcast({ type: "cast-update", cast: castState });
         sendResponse({ ok: true });
       } else if (msg.type === "get-command") {
         sendResponse({ ok: true, command: buildCommand(msg.item, msg.tabId, msg.tool, msg.variantUrl) });

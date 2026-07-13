@@ -24,6 +24,9 @@ const popCast = document.getElementById("pop-cast");
 // Popup layout / feature flags. Real values arrive from get-settings in init();
 // these mirror background.js DEFAULT_SETTINGS so first paint matches the default.
 let uiSettings = { showRail: true, showQueue: true, enableCasting: false };
+// Casting is only offered when the side panel is visible — otherwise a started
+// session would have no transport (no pause/stop) anywhere in the UI.
+let castUiReady = false;
 
 // Prime <html> from the last-known-good layout so the popup opens at a width that
 // already fits the window. A Firefox browser-action popup can't exceed the window
@@ -148,15 +151,18 @@ async function applyLayout() {
     // else: window too narrow for two panes → classic single column, nothing clips
   }
 
+  // Casting is only offered when the panel is visible — a session started with
+  // the rail hidden would have no transport (no pause/stop) anywhere in the UI.
+  castUiReady = railOn && !!uiSettings.enableCasting;
   document.documentElement.classList.toggle("rail", railOn);
   document.documentElement.style.width = railOn ? width + "px" : "";  // "" → CSS classic 420
-  document.documentElement.classList.toggle("cast", !!uiSettings.enableCasting);
-  showEl(castTitleEl, uiSettings.enableCasting);
-  showEl(castSlotEl, uiSettings.enableCasting);
+  document.documentElement.classList.toggle("cast", castUiReady);
+  showEl(castTitleEl, castUiReady);
+  showEl(castSlotEl, castUiReady);
   showEl(queueTitleEl, uiSettings.showQueue);
   showEl(queueEl, uiSettings.showQueue);
-  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, w: width, cast: !!uiSettings.enableCasting })); } catch (e) {}
-  if (uiSettings.enableCasting) renderCastSlot();
+  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, w: width, cast: castUiReady })); } catch (e) {}
+  if (castUiReady) renderCastSlot();
   renderQueue();
 }
 
@@ -166,6 +172,7 @@ async function refresh() {
   const resp = await send({ type: "get-media", tabId: currentTabId, allTabs });
   const items = (resp && resp.items) || [];
   if (resp && resp.helper) helperStatus = resp.helper;
+  if (resp && resp.cast && castUiReady) { castState = resp.cast; renderCastSlot(); }
   if (resp && resp.downloads) {
     for (const d of resp.downloads) {
       downloadState.set(d.id, d);
@@ -391,11 +398,12 @@ function renderItem(item) {
     actions.appendChild(copyBtn);
   }
 
-  // Cast (preview): available on any playable stream when casting is enabled.
-  if (uiSettings.enableCasting && !item.drm) {
+  // Cast: direct video files only for now — DLNA renderers play a plain URL,
+  // while HLS/DASH manifests and YouTube pages need a remux/serve step (future).
+  if (castUiReady && kind === "direct" && !item.drm && !item.junk) {
     actions.appendChild(h("button", {
       class: "btn cast-btn",
-      title: "Cast to a device (preview)",
+      title: "Cast to a TV on your network",
       onClick: (e) => openCastPicker(item, e.currentTarget),
     }, "Cast"));
   }
@@ -857,18 +865,106 @@ function statusWord(s) {
   return "Downloading…";
 }
 
-// ---- casting (preview) --------------------------------------------------
-// The network backend (Chromecast / AirPlay / DLNA discovery + streaming) lives
-// in the native helper and isn't built yet, so no session ever goes active: the
-// slot shows the resting state and the picker is honest about what's coming.
+// ---- casting (DLNA via the native helper) --------------------------------
+// The helper discovers renderers (SSDP), serves/proxies the media over local
+// HTTP, and streams cast-status once a second. AirPlay devices are listed but
+// flagged unsupported until pyatv's video fix lands upstream.
+let castState = { state: "idle" };
+let scrubbing = false;          // true while the user drags the position or volume slider
+let castVolume = 100;           // last volume the user chose — survives the 1 Hz rebuilds
+let castPickerGen = 0;          // invalidates in-flight discovery when the picker reopens
+
+function fmtClock(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const hh = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60), ss = sec % 60;
+  return (hh ? hh + ":" + String(mm).padStart(2, "0") : mm) + ":" + String(ss).padStart(2, "0");
+}
+
+function renderHeaderCast() {
+  if (!hdrCastBtn) return;
+  const on = castState.state !== "idle";
+  hdrCastBtn.classList.toggle("casting", on);
+  hdrCastBtn.title = on ? "Casting to " + (castState.device || "TV") : "Cast — no active session";
+}
+
 function renderCastSlot() {
   if (!castSlotEl) return;
-  castSlotEl.replaceChildren(
-    h("div", { class: "rail-card cast-empty" }, [
-      h("b", { text: "Nothing casting" }),
-      "Use a stream's Cast button to send it to a TV. Device discovery is still being built — the transport appears here once a session starts.",
-    ])
-  );
+  renderHeaderCast();
+  if (castState.state === "idle") {
+    scrubbing = false;   // session over — never leave the drag-guard stuck on
+    castSlotEl.replaceChildren(
+      h("div", { class: "rail-card cast-empty" }, [
+        h("b", { text: "Nothing casting" }),
+        "Use a stream's Cast button to send it to a DLNA-capable TV. First cast: accept the permission prompt on the TV.",
+      ])
+    );
+    return;
+  }
+  if (scrubbing) return;   // don't rebuild under the user's finger
+
+  const st = castState;
+  const card = h("div", { class: "rail-card cast-card" });
+  card.appendChild(h("div", { class: "cast-topline" }, [
+    h("span", { class: "cast-flag" }, [h("i"), st.state === "loading" ? "STARTING" : "CASTING"]),
+    h("span", { class: "cast-proto", text: (st.protocol || "dlna").toUpperCase() }),
+  ]));
+  card.appendChild(h("div", { class: "cast-media" }, [
+    h("div", { class: "cast-info" }, [
+      h("div", { class: "cast-title", title: st.title || "", text: st.title || "Casting" }),
+      h("div", { class: "cast-device" }, [h("span", { text: st.device || "" })]),
+    ]),
+  ]));
+
+  // Position scrub — only when the TV reports a duration.
+  if (st.duration > 0) {
+    const scrub = h("input", { class: "scrub", type: "range", min: "0", max: String(st.duration) });
+    scrub.value = String(st.position || 0);
+    const cur = h("span", { text: fmtClock(st.position) });
+    const paint = () => {
+      scrub.style.setProperty("--p", (st.duration ? (scrub.value / st.duration) * 100 : 0) + "%");
+      cur.textContent = fmtClock(Number(scrub.value));
+    };
+    paint();
+    scrub.addEventListener("input", () => { scrubbing = true; paint(); });
+    scrub.addEventListener("change", () => {
+      scrubbing = false;
+      send({ type: "cast-control", action: "seek", value: Number(scrub.value) });
+    });
+    card.appendChild(h("div", { class: "scrub-wrap" }, [
+      scrub,
+      h("div", { class: "scrub-times" }, [cur, h("span", { text: fmtClock(st.duration) })]),
+    ]));
+  }
+
+  // Transport: play/pause, stop, volume.
+  const playBtn = h("button", {
+    class: "t-btn main",
+    title: st.state === "paused" ? "Play" : "Pause",
+    text: st.state === "paused" ? "▶" : "❚❚",
+    onClick: () => send({ type: "cast-control", action: "playpause" }),
+  });
+  const stopBtn = h("button", {
+    class: "t-btn", title: "Stop casting", text: "■",
+    onClick: () => send({ type: "cast-stop" }),
+  });
+  const vol = h("input", { class: "scrub", type: "range", min: "0", max: "100" });
+  vol.value = String(castVolume);                  // survives the 1 Hz card rebuilds
+  vol.style.setProperty("--p", castVolume + "%");
+  vol.addEventListener("input", () => {
+    scrubbing = true;                              // guard the drag like the position slider
+    castVolume = Number(vol.value);
+    vol.style.setProperty("--p", vol.value + "%");
+  });
+  vol.addEventListener("change", () => {
+    scrubbing = false;
+    send({ type: "cast-control", action: "volume", value: Number(vol.value) });
+  });
+  card.appendChild(h("div", { class: "transport" }, [
+    playBtn, stopBtn,
+    h("div", { class: "vol", title: "TV volume" }, [vol]),
+  ]));
+
+  castSlotEl.replaceChildren(card);
 }
 
 let popAnchor = null;
@@ -888,27 +984,64 @@ function positionPop(pop, btn) {
   if (top + pop.offsetHeight > document.body.clientHeight - 8) top = (br.top - pr.top) - pop.offsetHeight - 6;
   pop.style.top = Math.max(8, top) + "px";
 }
-function buildCastPicker(item) {
+async function buildCastPicker(item, btn) {
+  const myGen = ++castPickerGen;   // reopening for another item invalidates this build
   const title = item ? ((item.pageTitle || "").trim() || item.name || "this stream") : "";
-  popCast.replaceChildren(
-    h("div", { class: "pop-head" }, ["Cast to", item ? h("b", { title: title, text: title }) : null]),
-    h("div", { class: "pop-empty" }, [
-      h("b", { text: "No devices found" }),
-      "Casting to Chromecast, Apple TV (AirPlay) and DLNA TVs runs in the native helper and is coming in a future update.",
-    ]),
-    h("div", { class: "pop-foot" }, [
-      h("span", { text: "Preview" }),
-      h("button", { type: "button", text: "Rescan", onClick: () => buildCastPicker(item) }),
-    ])
-  );
+  const head = h("div", { class: "pop-head" }, ["Cast to", item ? h("b", { title: title, text: title }) : null]);
+  popCast.replaceChildren(head, h("div", { class: "pop-empty" }, [h("b", { text: "Scanning network…" }),
+    "Looking for TVs on your network."]));
+  positionPop(popCast, btn);
+
+  const resp = await send({ type: "cast-discover" });
+  // Stale build: closed while scanning, or reopened for a different item — that
+  // newer build owns the popover now (else this one could cast the WRONG item).
+  if (myGen !== castPickerGen || !popCast.classList.contains("open")) return;
+  const devices = (resp && resp.devices) || [];
+  popCast.replaceChildren(head);
+  if (!resp || resp.ok === false) {
+    popCast.appendChild(h("div", { class: "pop-empty" }, [
+      h("b", { text: "Scan failed" }), (resp && resp.error) || "Casting needs the native helper.",
+    ]));
+  } else if (!devices.length) {
+    popCast.appendChild(h("div", { class: "pop-empty" }, [
+      h("b", { text: "No TVs found" }),
+      "Make sure the TV is on and on the same network as this PC.",
+    ]));
+  } else {
+    for (const d of devices) {
+      const row = h("button", {
+        class: "pop-row",
+        title: d.unsupported
+          ? "AirPlay-only device — video casting needs a pending pyatv fix; not available yet"
+          : (item ? "Cast to " + d.name : "Use a stream's Cast button to pick what to send"),
+        onClick: (d.unsupported || !item) ? null : async () => {
+          closePops();
+          await send({ type: "cast-start", deviceId: d.id, deviceName: d.name,
+                       url: item.url, title: title });
+        },
+      }, [
+        h("span", { class: "l" }, [
+          h("b", { text: d.name }),
+          h("span", { text: [d.model, d.protocol === "dlna" ? "DLNA" : "AirPlay"].filter(Boolean).join(" · ") }),
+        ]),
+        h("span", { class: "r", text: d.unsupported ? "soon" : "" }),
+      ]);
+      if (d.unsupported) { row.style.opacity = "0.45"; row.style.cursor = "default"; }
+      popCast.appendChild(row);
+    }
+  }
+  popCast.appendChild(h("div", { class: "pop-foot" }, [
+    h("span", { text: devices.length + (devices.length === 1 ? " device" : " devices") }),
+    h("button", { type: "button", text: "Rescan", onClick: () => buildCastPicker(item, btn) }),
+  ]));
+  positionPop(popCast, btn);   // re-measure after content changes
 }
 function openCastPicker(item, btn) {
   if (!popCast) return;
   const wasOpen = popCast.classList.contains("open") && popAnchor === btn;
   closePops();
   if (wasOpen) return;
-  buildCastPicker(item);
-  positionPop(popCast, btn);
+  buildCastPicker(item, btn);
 }
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".popover") && !e.target.closest(".cast-btn") && !e.target.closest("#hdr-cast")) closePops();
@@ -929,6 +1062,12 @@ api.runtime.onMessage.addListener((msg) => {
     const el = itemElements.get(dl.url);
     if (el) renderProgress(el, dl);
     renderQueue();
+  } else if (msg.type === "cast-update") {
+    if (msg.cast) castState = msg.cast;
+    if (castUiReady) renderCastSlot();
+    // flashStatus owns its own reset timer — using refreshTimer here would fight
+    // the media-updated debounce (either killing the error or refreshing early).
+    if (msg.error) flashStatus(msg.error);
   } else if (msg.type === "media-updated" && msg.tabId === currentTabId) {
     // A stream was detected or a manifest finished parsing — re-render soon.
     // Debounced so bursts of detections don't cause flicker.
