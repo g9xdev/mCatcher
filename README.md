@@ -14,6 +14,27 @@ extension (no Developer/Nightly build needed), then the extension opens a setup 
 that offers the one-click **helper installer** so you can grab that too. Installed
 builds then [update themselves](#releases--auto-update).
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/popup-streams.png" alt="Media Catcher popup: detected streams on the left with per-stream download, copy-URL, and quality options; a live downloads queue on the right." width="720">
+</p>
+
+Every stream on the current tab — YouTube, HLS (with quality variants), MPEG-DASH,
+and direct files — with one-click downloads, a global downloads queue, and casting to
+your TV.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/cast-picker.png" alt="Cast device picker listing an Apple TV over AirPlay and two TVs over DLNA." width="100%"></td>
+    <td width="50%"><img src="docs/screenshots/casting-active.png" alt="Now-casting card with the title, target device, a position scrubber, and play/pause, stop, and volume controls." width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Cast to any TV</b> — AirPlay (Apple TV) and DLNA (LG, Sony, …) discovered on your network.</td>
+    <td align="center"><b>Full transport</b> — scrub, play/pause, stop, and volume, right from the popup.</td>
+  </tr>
+</table>
+
 ## Layout
 
 - **`media-catcher/`** — the Firefox (MV2) extension: stream detection, the popup
