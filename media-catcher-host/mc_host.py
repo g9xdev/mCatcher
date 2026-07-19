@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -2708,8 +2708,16 @@ _CAST = {"loop": None, "thread": None, "atv": None, "device_id": None,
          "storage": None, "pairing": None, "poll": None, "play_task": None}
 
 
+# AirPlay VIDEO is broken in released pyatv on modern receivers (tvOS 17/18+ / webOS);
+# the fix is community PR postlund/pyatv#2846, pinned here to the exact commit we
+# verified live against an Apple TV 4K (tvOS 18.6). See docs/airplay-modern-receivers.md.
+_PYATV_SRC = ("https://github.com/jlacivita/pyatv/archive/"
+              "8848ad3fd9ae46b8eb733bfc667b536a28f04c5a.tar.gz")
+
+
 def ensure_pyatv():
-    """Make pyatv importable, installing it into HERE/pylibs on first use. Returns bool."""
+    """Make pyatv (the pinned AirPlay-video fork) importable, installing it into
+    HERE/pylibs on first use. Returns bool."""
     if _PYLIBS not in sys.path:
         sys.path.insert(0, _PYLIBS)
     try:
@@ -2720,12 +2728,12 @@ def ensure_pyatv():
     py = _console_python() or sys.executable
     try:
         os.makedirs(_PYLIBS, exist_ok=True)
-        _hlog("info", "casting: installing pyatv (first run, ~45 MB)…")
+        _hlog("info", "casting: installing AirPlay support (pyatv fork, first run ~45 MB)…")
         send({"type": "cast-status", "state": "installing"})
         cf, si = _no_window()
-        r = subprocess.run([py, "-m", "pip", "install", "--target", _PYLIBS, "--upgrade", "pyatv"],
+        r = subprocess.run([py, "-m", "pip", "install", "--target", _PYLIBS, _PYATV_SRC],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           creationflags=cf, startupinfo=si, timeout=420)
+                           creationflags=cf, startupinfo=si, timeout=600)
         if r.returncode != 0:
             _hlog("error", "pyatv install failed: %s" % r.stdout.decode("utf-8", "replace")[-500:])
             return False
@@ -2780,6 +2788,55 @@ async def _find_config(device_id, timeout=6):
     return results[0]
 
 
+# Recently-seen cast devices (address -> {"d": device, "ts": epoch}). SSDP (UDP
+# multicast) and mDNS are both lossy, so a single scan often misses a device that
+# was there last time; returning the union of the last ~90s of scans makes the
+# picker stable instead of flickering between the DLNA and AirPlay TVs.
+_CAST_SEEN = {}
+_CAST_SEEN_TTL = 90
+
+
+def _is_apple_tv(d):
+    return "apple tv" in ((d.get("model") or "") + " " + (d.get("name") or "")).lower()
+
+
+def _cast_merged_discover(timeout=5):
+    # Overlap the two scans (AirPlay on the cast loop, DLNA on this thread) so the
+    # picker isn't the sum of both timeouts.
+    import asyncio
+    air_future = None
+    if ensure_pyatv():
+        try:
+            air_future = asyncio.run_coroutine_threadsafe(_cast_discover(max(5, timeout)), _cast_loop())
+        except Exception:
+            air_future = None
+    found = {}
+    # DLNA first — preferred for any device that speaks BOTH (e.g. LG advertises DLNA
+    # *and* AirPlay, but only its DLNA video actually works), keyed by device address.
+    for d in _dlna_discover(timeout):
+        found[d["address"]] = d
+    if air_future is not None:
+        try:
+            for d in air_future.result(30):
+                if d["address"] in found:
+                    continue          # a DLNA renderer already covers this device
+                if not _is_apple_tv(d):
+                    continue          # non-Apple AirPlay video is unreliable/unsupported
+                found[d["address"]] = d
+        except Exception as e:
+            _hlog("warn", "cast: AirPlay scan failed: %s" % e)
+    now = time.time()
+    for addr, d in found.items():
+        _CAST_SEEN[addr] = {"d": d, "ts": now}
+    out = []
+    for addr in list(_CAST_SEEN):
+        if now - _CAST_SEEN[addr]["ts"] > _CAST_SEEN_TTL:
+            del _CAST_SEEN[addr]
+            continue
+        out.append(_CAST_SEEN[addr]["d"])
+    return out
+
+
 async def _cast_discover(timeout=6):
     import pyatv
     from pyatv.const import Protocol
@@ -2800,12 +2857,23 @@ async def _cast_discover(timeout=6):
 async def _cast_pair_begin(device_id):
     import pyatv
     from pyatv.const import Protocol
+    await _cast_pair_cancel()          # close any prior handler first (retry / re-begin)
     st = await _cast_storage()
     config = await _find_config(device_id)
     handler = await pyatv.pair(config, Protocol.AirPlay, _cast_loop(), storage=st)
     await handler.begin()
     _CAST["pairing"] = handler
     return bool(handler.device_provides_pin)
+
+
+async def _cast_pair_cancel():
+    handler = _CAST.get("pairing")
+    if handler:
+        try:
+            await handler.close()
+        except Exception:
+            pass
+    _CAST["pairing"] = None
 
 
 async def _cast_pair_pin(pin):
@@ -2828,37 +2896,31 @@ async def _cast_pair_pin(pin):
 async def _cast_start(device_id, url):
     import asyncio, pyatv
     from pyatv.const import Protocol
-    from pyatv.settings import MrpTunnel
     await _cast_teardown()
     st = await _cast_storage()
     config = await _find_config(device_id)
     svc = config.get_service(Protocol.AirPlay)
     if svc is not None and getattr(svc, "requires_password", False):
-        # tvOS "Require Password" mode enforces the password at the stream layer, which
-        # pyatv can't satisfy for video — pairing succeeds but play always 401s.
+        # tvOS "Require Password" enforces the password at the stream layer, which pyatv
+        # can't satisfy for video — pairing succeeds but play always 401s.
         raise RuntimeError("requires_password")
-    # The MRP remote-control tunnel over AirPlay needs Companion pairing and otherwise
-    # fails the connect; disable it — play_url + basic control (rate/stop) don't need it.
-    try:
-        gs = st.get_settings(config)
-        settings = await gs if asyncio.iscoroutine(gs) else gs
-        settings.protocols.airplay.mrp_tunnel = MrpTunnel.Disable
-    except Exception:
-        pass
+    # Serve/proxy the media over local HTTP so https, cookies, and referers are handled
+    # host-side and the receiver just fetches a plain URL (same media server as DLNA).
+    serve, _ct = _dlna_media_url(url, str(config.address) if getattr(config, "address", None) else None)
+    # The pinned fork speaks modern AirPlay 2 video with default settings — no MRP-tunnel
+    # workaround, and playback state comes from the event channel (no /playback-info 500).
     atv = await pyatv.connect(config, _cast_loop(), storage=st)
     _CAST["atv"] = atv
     _CAST["device_id"] = device_id
-    # play_url can block for the whole playback → run it as its own task; surface errors.
-    task = asyncio.ensure_future(atv.stream.play_url(url))
+    _CAST["kind"] = "airplay"
+    task = asyncio.ensure_future(atv.stream.play_url(serve))
     def _done(t):
-        exc = None
         try:
             exc = t.exception()
         except Exception:
             exc = None
-        # tvOS returns HTTP 500 on /playback-info AFTER playback has started — not a
-        # failure. Only surface real errors (auth, connection, unreachable media).
-        if exc and "500" not in str(exc) and "playback-info" not in str(exc).lower():
+        if exc and not isinstance(exc, asyncio.CancelledError):
+            # play_url returns when playback ends; a real error before that is worth showing.
             send({"type": "cast-error", "error": _cast_err(str(exc))})
     task.add_done_callback(_done)
     _CAST["play_task"] = task
@@ -2869,12 +2931,11 @@ async def _cast_status_once():
     atv = _CAST.get("atv")
     if not atv:
         return {"state": "idle"}
-    try:
-        pl = await atv.metadata.playing()
-        return {"state": (pl.device_state.name.lower() if pl.device_state else "unknown"),
-                "position": pl.position or 0, "duration": pl.total_time or 0, "title": pl.title or ""}
-    except Exception:
-        return {"state": "playing"}
+    pl = await atv.metadata.playing()
+    raw = pl.device_state.name.lower() if pl.device_state else ""
+    state = "idle" if raw in ("idle", "stopped", "") else ("playing" if raw == "seeking" else raw)
+    return {"state": state, "position": pl.position or 0,
+            "duration": pl.total_time or 0, "title": pl.title or ""}
 
 
 async def _cast_control(action, value=None):
@@ -2910,6 +2971,7 @@ async def _cast_teardown():
             pass
     _CAST["atv"] = None
     _CAST["device_id"] = None
+    _CAST["kind"] = None
 
 
 def _cast_err(s):
@@ -2926,20 +2988,44 @@ def _cast_err(s):
     return "Casting failed: " + (s or "")[:180]
 
 
-def _cast_start_poller():
+def _cast_start_poller(device_id, device_name, title):
     _cast_stop_poller()
     stop = threading.Event()
     _CAST["poll"] = stop
 
     def loop():
+        misses = 0
+        idles = 0
+        ticks = 0
+        started = False       # has the stream ever actually played?
         while not stop.is_set():
+            ticks += 1
             try:
                 st = _cast_run(_cast_status_once(), timeout=10)
-                st["type"] = "cast-status"
-                st["id"] = _CAST.get("device_id")
-                send(st)
+                if st["state"] in ("playing", "paused"):
+                    started = True
+                    idles = 0
+                elif st["state"] == "idle":
+                    idles += 1
+                # Before playback truly begins the TV reports idle while buffering — show
+                # "loading" instead, and never treat that startup idle as end-of-playback.
+                out = dict(st)
+                out["state"] = st["state"] if started else "loading"
+                out.update({"type": "cast-status", "id": device_id,
+                            "device": device_name, "title": title or st.get("title", ""),
+                            "protocol": "airplay"})
+                send(out)
+                misses = 0
+                if started and st["state"] == "idle" and idles >= 2:
+                    break        # played, then stopped/ended
+                if not started and ticks > 25:
+                    send({"type": "cast-status", "state": "idle"})   # never started in ~25s
+                    break
             except Exception:
-                pass
+                misses += 1
+                if misses > 5:
+                    send({"type": "cast-status", "state": "idle"})   # device gone
+                    break
             stop.wait(1.0)
     threading.Thread(target=loop, daemon=True).start()
 
@@ -2950,54 +3036,75 @@ def _cast_stop_poller():
         _CAST["poll"] = None
 
 
+def _cast_stop_active():
+    """Tear down whatever is currently casting (either protocol) before a new cast
+    or an explicit stop. Without this, switching between an AirPlay TV and a DLNA TV
+    orphaned the previous session and left control/stop routed at the wrong one."""
+    _cast_stop_poller()
+    if _CAST.get("kind") == "airplay":
+        try:
+            _cast_run(_cast_teardown(), timeout=15)
+        except Exception:
+            pass
+    elif _DLNA.get("ctrl"):
+        try:
+            _dlna_control("stop")
+        except Exception:
+            pass
+        _DLNA["ctrl"] = None
+        _DLNA["rctrl"] = None
+    _CAST["kind"] = None
+
+
 def handle_cast(req):
-    """Run a cast:* subcommand on a worker thread. DLNA is the working video path
-    (pure stdlib). AirPlay devices are listed but flagged unsupported for video —
-    pyatv's play_url is inert on modern receivers (tvOS 17+/webOS; pyatv#2774,
-    #2393) until upstream PR #2846 lands."""
+    """Run a cast:* subcommand on a worker thread. Two protocols: DLNA/UPnP (pure
+    stdlib, id prefix "dlna:") and AirPlay (via the pinned pyatv fork, any other id).
+    The popup pairs an AirPlay device (PIN) before casting if it isn't paired yet."""
     def worker():
         sub = req.get("sub")
         reqid = req.get("reqId")
         did = req.get("id") or ""
         dlna = did.startswith("dlna:")
+        dname = req.get("device", "")
+        title = req.get("title", "")
         try:
             if sub == "discover":
-                devices = _dlna_discover(req.get("timeout", 5))
-                # AirPlay listing is informational only (video unsupported upstream).
-                if os.path.isdir(_PYLIBS) and ensure_pyatv():
-                    try:
-                        for d in _cast_run(_cast_discover(4), timeout=20):
-                            if any(x["address"] == d["address"] for x in devices):
-                                continue   # same TV already reachable via DLNA
-                            d["unsupported"] = True
-                            devices.append(d)
-                    except Exception:
-                        pass
-                send({"type": "cast-devices", "reqId": reqid, "devices": devices})
+                # Deterministic + stable: DLNA preferred over AirPlay per device,
+                # AirPlay limited to Apple TVs, union of recent scans (see helper).
+                send({"type": "cast-devices", "reqId": reqid,
+                      "devices": _cast_merged_discover(req.get("timeout", 5))})
             elif sub == "start":
-                if not dlna:
-                    send({"type": "cast-error", "reqId": reqid, "error":
-                          "AirPlay video casting isn't possible yet (a pending pyatv fix is needed) — "
-                          "cast to this TV via DLNA if it's listed, or use a DLNA-capable TV."})
-                    return
-                _cast_stop_poller()   # silence the old session's poller BEFORE the new
-                                      # cast starts, so its statuses can't clobber ours
-                _dlna_start(did, req.get("url") or "", req.get("title") or "")
-                send({"type": "cast-status", "state": "loading", "id": did,
-                      "device": req.get("device", ""), "title": req.get("title", ""), "protocol": "dlna"})
-                _dlna_start_poller(did, req.get("device", ""), req.get("title", ""))
+                _cast_stop_active()   # tear down ANY current session (either protocol) first
+                if dlna:
+                    _dlna_start(did, req.get("url") or "", title)
+                    _CAST["kind"] = "dlna"
+                    send({"type": "cast-status", "state": "loading", "id": did,
+                          "device": dname, "title": title, "protocol": "dlna"})
+                    _dlna_start_poller(did, dname, title)
+                else:
+                    if not ensure_pyatv():
+                        send({"type": "cast-error", "reqId": reqid, "error": "Couldn't set up AirPlay support."})
+                        return
+                    _cast_run(_cast_start(did, req.get("url") or ""), timeout=40)   # sets kind=airplay
+                    send({"type": "cast-status", "state": "loading", "id": did,
+                          "device": dname, "title": title, "protocol": "airplay"})
+                    _cast_start_poller(did, dname, title)
             elif sub == "control":
-                _dlna_control(req.get("action"), req.get("value"))
+                if _CAST.get("kind") == "airplay":
+                    _cast_run(_cast_control(req.get("action"), req.get("value")), timeout=15)
+                else:
+                    _dlna_control(req.get("action"), req.get("value"))
             elif sub == "stop":
-                _cast_stop_poller()
+                _cast_stop_active()
+                send({"type": "cast-status", "state": "idle"})
+            elif sub == "pairCancel":
                 try:
-                    _dlna_control("stop")
+                    _cast_run(_cast_pair_cancel(), timeout=10)
                 except Exception:
                     pass
-                send({"type": "cast-status", "state": "idle"})
             elif sub == "pair":
                 if not ensure_pyatv():
-                    send({"type": "cast-error", "reqId": reqid, "error": "Pairing needs pyatv — install failed."})
+                    send({"type": "cast-error", "reqId": reqid, "error": "Pairing needs AirPlay support — install failed."})
                     return
                 needs = _cast_run(_cast_pair_begin(did), timeout=30)
                 send({"type": "cast-pair", "reqId": reqid, "id": did, "needsPin": needs})

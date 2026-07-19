@@ -873,6 +873,7 @@ let castState = { state: "idle" };
 let scrubbing = false;          // true while the user drags the position or volume slider
 let castVolume = 100;           // last volume the user chose — survives the 1 Hz rebuilds
 let castPickerGen = 0;          // invalidates in-flight discovery when the picker reopens
+let pendingCast = null;         // {d, item, title} held across an AirPlay pairing handshake
 
 function fmtClock(sec) {
   sec = Math.max(0, Math.round(sec || 0));
@@ -1011,14 +1012,8 @@ async function buildCastPicker(item, btn) {
     for (const d of devices) {
       const row = h("button", {
         class: "pop-row",
-        title: d.unsupported
-          ? "AirPlay-only device — video casting needs a pending pyatv fix; not available yet"
-          : (item ? "Cast to " + d.name : "Use a stream's Cast button to pick what to send"),
-        onClick: (d.unsupported || !item) ? null : async () => {
-          closePops();
-          await send({ type: "cast-start", deviceId: d.id, deviceName: d.name,
-                       url: item.url, title: title });
-        },
+        title: item ? "Cast to " + d.name : "Use a stream's Cast button to pick what to send",
+        onClick: !item ? null : () => castTo(d, item, title),
       }, [
         h("span", { class: "l" }, [
           h("b", { text: d.name }),
@@ -1038,10 +1033,55 @@ async function buildCastPicker(item, btn) {
 }
 function openCastPicker(item, btn) {
   if (!popCast) return;
+  if (pendingCast) { send({ type: "cast-pair-cancel" }); pendingCast = null; }  // abandon any half-done pairing
   const wasOpen = popCast.classList.contains("open") && popAnchor === btn;
   closePops();
   if (wasOpen) return;
   buildCastPicker(item, btn);
+}
+
+// Cast to a chosen device. AirPlay devices that aren't paired yet need a one-time
+// PIN handshake first (code shown on the TV); DLNA and already-paired devices start
+// immediately.
+function castTo(d, item, title) {
+  if (d.protocol === "airplay" && !d.paired) {
+    pendingCast = { d, item, title };
+    send({ type: "cast-pair", deviceId: d.id });   // host begins pairing → code on TV
+    // Defer: this same click is still bubbling, and showPinDialog's replaceChildren()
+    // detaches the clicked row, so the document outside-click handler would then close
+    // the popover (its e.target is no longer inside .popover). Let the click finish.
+    setTimeout(() => showPinDialog(d), 0);
+    return;
+  }
+  closePops();
+  send({ type: "cast-start", deviceId: d.id, deviceName: d.name, url: item.url, title });
+}
+
+function showPinDialog(d, err) {
+  if (!popCast) return;
+  const input = h("input", { class: "pin-input", type: "text", inputmode: "numeric",
+    maxlength: "6", placeholder: "0000", "aria-label": "Pairing code" });
+  const submit = h("button", { class: "q-btn", text: "Pair", onClick: () => {
+    const pin = input.value.trim();
+    if (!pin) { input.focus(); return; }
+    send({ type: "cast-pairPin", deviceId: d.id, pin });
+    input.disabled = true; submit.disabled = true; submit.textContent = "Pairing…";
+  } });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit.click(); });
+  popCast.replaceChildren(
+    h("div", { class: "pop-head" }, ["Pair with " + d.name, h("b", { text: "Enter the code shown on the TV" })]),
+    err ? h("div", { class: "pin-err", text: err }) : null,
+    h("div", { class: "pin-row" }, [input, submit]),
+    h("div", { class: "pop-foot" }, [
+      h("span", { text: "A code appears on the TV screen" }),
+      h("button", { type: "button", text: "Cancel", onClick: () => { pendingCast = null; send({ type: "cast-pair-cancel" }); closePops(); } }),
+    ])
+  );
+  // Force the popover open + positioned (it may have been closed by the click that
+  // opened this dialog, or by a wrong-PIN re-show after closePops nulled the anchor).
+  if (popAnchor) positionPop(popCast, popAnchor);
+  else popCast.classList.add("open");
+  setTimeout(() => input.focus(), 30);
 }
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".popover") && !e.target.closest(".cast-btn") && !e.target.closest("#hdr-cast")) closePops();
@@ -1067,7 +1107,25 @@ api.runtime.onMessage.addListener((msg) => {
     if (castUiReady) renderCastSlot();
     // flashStatus owns its own reset timer — using refreshTimer here would fight
     // the media-updated debounce (either killing the error or refreshing early).
-    if (msg.error) flashStatus(msg.error);
+    if (msg.error) { pendingCast = null; flashStatus(msg.error); }
+  } else if (msg.type === "cast-pair") {
+    // Ignore replies for a device we're no longer pairing (stale/other selection).
+    if (!pendingCast || (msg.id && msg.id !== pendingCast.d.id)) return;
+    // Some devices don't show a code (needsPin false) — pair straight through.
+    if (!msg.needsPin) send({ type: "cast-pairPin", deviceId: pendingCast.d.id, pin: "" });
+  } else if (msg.type === "cast-paired") {
+    if (!pendingCast || (msg.id && msg.id !== pendingCast.d.id)) return;   // stale/other device
+    if (msg.ok) {
+      const { d, item, title } = pendingCast;
+      pendingCast = null; d.paired = true;
+      closePops();
+      send({ type: "cast-start", deviceId: d.id, deviceName: d.name, url: item.url, title });
+    } else {
+      // Wrong code: the host closed that pairing handler, so a plain retry would hit a
+      // dead session. Begin a fresh pairing (new code on the TV) before re-showing.
+      send({ type: "cast-pair", deviceId: pendingCast.d.id });
+      showPinDialog(pendingCast.d, "That code didn't work — a new code is on the TV. Try again.");
+    }
   } else if (msg.type === "media-updated" && msg.tabId === currentTabId) {
     // A stream was detected or a manifest finished parsing — re-render soon.
     // Debounced so bursts of detections don't cause flicker.

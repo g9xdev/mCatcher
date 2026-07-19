@@ -295,6 +295,14 @@ function onNativeMessage(msg) {
     broadcast({ type: "cast-update", cast: castState });
     return;
   }
+  if (msg.type === "cast-pair") {
+    broadcast({ type: "cast-pair", id: msg.id, needsPin: msg.needsPin });
+    return;
+  }
+  if (msg.type === "cast-paired") {
+    broadcast({ type: "cast-paired", id: msg.id, ok: msg.ok });
+    return;
+  }
   if (msg.type === "cast-error") {
     mclog("warn", "cast: " + (msg.error || "unknown error"));
     // A failed discover carries its reqId — settle the waiting promise so the
@@ -2148,6 +2156,15 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           mclog("info", "cast: " + (msg.title || msg.url) + " → " + (msg.deviceName || msg.deviceId));
           sendResponse({ ok: true });
         }
+      } else if (msg.type === "cast-pair") {
+        if (nativePort) nativePort.postMessage({ cmd: "cast", sub: "pair", id: msg.deviceId });
+        sendResponse({ ok: !!nativePort, error: nativePort ? undefined : "Casting needs the native helper." });
+      } else if (msg.type === "cast-pairPin") {
+        if (nativePort) nativePort.postMessage({ cmd: "cast", sub: "pairPin", id: msg.deviceId, pin: msg.pin });
+        sendResponse({ ok: !!nativePort });
+      } else if (msg.type === "cast-pair-cancel") {
+        if (nativePort) nativePort.postMessage({ cmd: "cast", sub: "pairCancel" });
+        sendResponse({ ok: true });
       } else if (msg.type === "cast-control") {
         if (nativePort) nativePort.postMessage({ cmd: "cast", sub: "control", action: msg.action, value: msg.value });
         sendResponse({ ok: !!nativePort });

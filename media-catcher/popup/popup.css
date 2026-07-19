@@ -1092,6 +1092,17 @@ input.scrub:disabled { opacity: 0.7; cursor: default; }
 .pop-row.sel .r, .pop-row.sel svg { color: var(--accent); stroke: var(--accent); }
 .pop-empty { padding: 14px 12px; color: var(--text-tertiary); font-size: 11px; line-height: 1.55; text-align: center; }
 .pop-empty b { display: block; color: var(--text-secondary); margin-bottom: 3px; }
+.pin-row { display: flex; gap: 7px; padding: 4px 10px 8px; }
+.pin-input {
+  flex: 1; min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--stroke); border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.24); color: var(--text);
+  font-family: var(--font-mono); font-size: 15px; letter-spacing: 0.22em; text-align: center;
+}
+.pin-input:focus { outline: none; border-color: var(--accent); background: rgba(0, 0, 0, 0.32); }
+.pin-row .q-btn { flex: none; min-height: 34px; padding: 4px 14px; }
+.pin-err { padding: 2px 10px 6px; color: var(--danger); font-size: 10.5px; line-height: 1.5; }
 .pop-foot {
   margin-top: 4px; padding: 7px 10px 5px;
   border-top: 1px solid var(--stroke);
