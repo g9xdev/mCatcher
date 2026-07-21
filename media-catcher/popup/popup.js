@@ -637,10 +637,14 @@ function renderLiveProgress(el, dl) {
       text: "Browser save — Firefox may ask where to put it (its “Always ask” setting). Enable the helper for silent saves to your folder." }));
   } else if (dl.status === "done") {
     const path = dl.savedPath || "";
-    children.push(h("div", { class: "savedchip", role: "status" }, [
+    const chip = h("div", { class: "savedchip" + (path ? " openable" : ""), role: "status",
+      title: path ? path + " — click to open" : "" }, [
       h("span", { class: "check", text: "✓" }), "Saved",
       path ? h("span", { class: "path", text: path, title: path }) : null,
-    ]));
+    ]);
+    if (path) chip.onclick = () => openDlFile(dl);
+    children.push(chip);
+    children.push(fileActionRow(dl));
     if (dl.convert) children.push(h("div", { class: "note", text: h265Note(dl.convert) }));
   } else if (dl.status === "discarded") {
     children.push(h("div", { class: "note", text: "Discarded." }));
@@ -718,6 +722,13 @@ function renderProgress(el, dl) {
 
   el.querySelector(".slot").replaceChildren(h("div", { class: "progress" }, children));
 
+  // A finished download must stay ACTIONABLE from its card — Open / Folder /
+  // Cast for the produced file (user report: "Saved ✓" alone dead-ends).
+  if (dl.status === "done") {
+    const acts = fileActionRow(dl);
+    if (acts) el.querySelector(".slot").appendChild(acts);
+  }
+
   // On completion of a separate-audio job, surface the merge command.
   if (dl.status === "done" && dl.mergeCommand) {
     const slot = el.querySelector(".slot");
@@ -779,6 +790,50 @@ function queueSpec(dl) {
   return [kind, qualityLabel(dl)].filter(Boolean).join(" · ");
 }
 
+// Open the produced file with the OS default player. Helper-saved files go
+// through the native host; browser-API saves use downloads.open (which needs
+// this click's user-input context — that's why the popup calls it directly).
+function openDlFile(dl) {
+  if (dl.savedPath && helperOn()) send({ type: "open-file", path: dl.savedPath });
+  else if (dl.downloadId != null) {
+    const p = api.downloads.open && api.downloads.open(dl.downloadId);
+    if (p && p.catch) p.catch(() => { try { api.downloads.show(dl.downloadId); } catch (e) {} });
+  }
+}
+
+function helperOn() {
+  return helperStatus.state === "ready" || helperStatus.state === "no-ffmpeg";
+}
+
+// File actions for a download that has (or is producing) a file on disk. The
+// queue card and the item card both use this so starting a download NEVER
+// strands the user without Open / Folder / Cast for that file.
+function fileActionRow(dl, opts) {
+  const row = h("div", { class: "dl-actions" });
+  const canFile = (dl.savedPath && helperOn()) || dl.downloadId != null;
+  if (canFile) {
+    row.appendChild(h("button", { class: "btn ghost sm", text: "▶ Open",
+      title: "Open the file in your default player",
+      onClick: () => openDlFile(dl) }));
+    row.appendChild(h("button", { class: "btn ghost sm", text: "Folder",
+      title: "Show the file in its folder",
+      onClick: () => {
+        if (dl.savedPath && helperOn()) send({ type: "reveal-file", path: dl.savedPath });
+        else { try { api.downloads.show(dl.downloadId); } catch (e) {} }
+      } }));
+  }
+  if (castUiReady && dl.savedPath) {
+    row.appendChild(h("button", { class: "btn cast-btn sm", text: "Cast",
+      title: "Cast this file to a TV on your network",
+      onClick: (e) => openCastPicker({ url: dl.savedPath, name: dl.name, pageTitle: dl.name, kind: "direct" }, e.currentTarget) }));
+  }
+  if (opts && opts.dismiss) {
+    row.appendChild(h("button", { class: "btn ghost sm", text: "Dismiss",
+      onClick: () => { send({ type: "dismiss-download", id: dl.id }); downloadState.delete(dl.id); renderQueue(); } }));
+  }
+  return row.childElementCount ? row : null;
+}
+
 function renderQueueItem(dl) {
   const p = dl.progress || {};
   const card = h("div", { class: "rail-card dl", dataset: { id: String(dl.id) } });
@@ -786,12 +841,16 @@ function renderQueueItem(dl) {
   if (dl.status === "done") {
     const size = dl.recorded && dl.recorded.bytes ? humanSize(dl.recorded.bytes)
       : (p.total && p.unit === "bytes" ? humanSize(p.total) : "");
+    const name = h("div", { class: "dl-name openable", title: (dl.savedPath || dl.name) + " — click to open",
+      text: dl.name, onClick: () => openDlFile(dl) });
     card.appendChild(h("div", { class: "dl-done-row" }, [
       h("span", { class: "dl-check", text: "✓" }),
-      h("div", { class: "dl-name", title: dl.savedPath || dl.name, text: dl.name }),
+      name,
     ]));
     card.appendChild(h("div", { class: "progress-label done", text: "Done" + (size ? " · " + size : "") }));
     if (dl.convert) card.appendChild(h("div", { class: "note", text: h265Note(dl.convert) }));
+    const acts = fileActionRow(dl, { dismiss: true });
+    if (acts) card.appendChild(acts);
     return card;
   }
 
@@ -817,6 +876,19 @@ function renderQueueItem(dl) {
     h("div", { class: "dl-name", title: dl.name, text: dl.name }),
   ]);
   if (!recording) {
+    // Pause/resume exists only for downloads the BROWSER transports (a
+    // downloads-API id) — segment fetchers and native yt-dlp/pget jobs have no
+    // pause mechanism, so no button is shown rather than a dead one.
+    if (dl.downloadId != null && dl.status === "downloading") {
+      const pb = h("button", { class: "dl-ic", title: "Pause download", text: "⏸" });
+      pb.onclick = async () => {
+        try {
+          if (pb.textContent === "⏸") { await api.downloads.pause(dl.downloadId); pb.textContent = "⏵"; pb.title = "Resume download"; }
+          else { await api.downloads.resume(dl.downloadId); pb.textContent = "⏸"; pb.title = "Pause download"; }
+        } catch (e) { /* download already finished/interrupted — next update corrects the card */ }
+      };
+      top.appendChild(pb);
+    }
     top.appendChild(h("button", { class: "dl-ic", title: "Cancel download", text: "✕",
       onClick: () => send({ type: "cancel", id: dl.id }) }));
   }

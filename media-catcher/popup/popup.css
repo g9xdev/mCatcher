@@ -1113,3 +1113,9 @@ input.scrub:disabled { opacity: 0.7; cursor: default; }
 .pop-foot button:hover { text-decoration: underline; }
 
 @keyframes castpulse { 50% { box-shadow: 0 0 0 3px rgba(96, 205, 255, 0.28); } }
+
+/* Click-to-open affordance on finished downloads (queue name / saved chip),
+   and room for the file-action buttons on narrow rail cards. */
+.dl-name.openable, .savedchip.openable { cursor: pointer; }
+.dl-name.openable:hover, .savedchip.openable:hover .path { text-decoration: underline; }
+.rail-card .dl-actions { flex-wrap: wrap; }

@@ -450,7 +450,7 @@ function onNativeMessage(msg) {
     broadcast({ type: "download-update", download: dl });
     addHistory({ name: dl.name || "YouTube", kind: "youtube", ts: Date.now() });
     notifyDone(dl.name || "YouTube video", fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
-    setTimeout(() => activeDownloads.delete(dl.id), 120000);
+    setTimeout(() => activeDownloads.delete(dl.id), DONE_RETAIN_MS);
   } else if (msg.type === "ytdl-error") {
     dl.status = "error"; dl.error = msg.error || "YouTube download failed"; dl.errReason = msg.reason || "";
     broadcast({ type: "download-update", download: dl });
@@ -460,7 +460,7 @@ function onNativeMessage(msg) {
     addHistory({ name: dl.name || "recording", kind: "hls-live", ts: Date.now() });
     const extra = msg.convert ? convertSummary(msg.convert) : (msg.file || null);
     notifyDone(dl.name || "recording", extra, msg.file ? { path: msg.file } : null);
-    setTimeout(() => activeDownloads.delete(dl.id), 120000);
+    setTimeout(() => activeDownloads.delete(dl.id), DONE_RETAIN_MS);
   } else if (msg.type === "save-cancelled") {
     dl.status = "stopped";   // user cancelled Save-As — keep it ready to save
     broadcast({ type: "download-update", download: dl });
@@ -1367,6 +1367,26 @@ function pickVariant(variants, chosenUri) {
   return variants[0]; // highest (variants are sorted desc)
 }
 
+// Finished downloads stay in the queue long enough to be USED (open / reveal /
+// cast from the popup) — the old 2-minute eviction stranded the user with no way
+// back to the file once the toast was gone. Discard timers stay short; error
+// flows keep whatever timer they already had (their cards carry Dismiss).
+const DONE_RETAIN_MS = 30 * 60 * 1000;
+
+// Remember the browser-download identity on a queue entry so the popup can
+// open/reveal/cast the produced file later. Native-helper flows learn savedPath
+// from the helper's own messages; browser-API flows only hold a downloads-API id
+// until we search it for the on-disk filename.
+async function recordSavedFile(dl, downloadId) {
+  if (dl == null || downloadId == null) return;
+  dl.downloadId = downloadId;
+  try {
+    const res = await api.downloads.search({ id: downloadId });
+    if (res && res[0] && res[0].filename) dl.savedPath = res[0].filename;
+  } catch (e) { /* filename unknown — Open/Folder still work via the id */ }
+  broadcast({ type: "download-update", download: dl });
+}
+
 async function saveBytes(bytes, mime, filename, ext, opts) {
   opts = opts || {};
   const saveAs = opts.saveAs !== false;   // default: show the Save-As dialog
@@ -1458,6 +1478,7 @@ async function downloadHls(item, tabId, filename, chosenVariantUrl) {
 
     dl.status = "done";
     broadcast({ type: "download-update", download: dl });
+    recordSavedFile(dl, videoDlId);
     addHistory({ name: base, kind: "hls", ts: Date.now() });
     notifyDone(base, mergeCmd ? "Saved video + audio separately — run the merge command." : null,
       videoDlId != null ? { downloadId: videoDlId } : null);
@@ -1466,7 +1487,7 @@ async function downloadHls(item, tabId, filename, chosenVariantUrl) {
     dl.error = e.message || String(e);
     broadcast({ type: "download-update", download: dl });
   } finally {
-    setTimeout(() => activeDownloads.delete(id), 120000);
+    setTimeout(() => activeDownloads.delete(id), DONE_RETAIN_MS);
   }
 }
 
@@ -1640,13 +1661,13 @@ async function saveRecording(id, opts) {
     return; // keep it cached so the user can retry
   }
   pendingSaves.delete(id);
-  if (dl) { dl.status = "done"; broadcast({ type: "download-update", download: dl }); }
+  if (dl) { dl.status = "done"; broadcast({ type: "download-update", download: dl }); recordSavedFile(dl, mainId); }
   addHistory({ name: pend.base, kind: "hls-live", ts: Date.now() });
   notifyDone(pend.base, pend.mergeCmd
     ? "Saved as video + audio — run the merge command."
     : "Recording saved.",
     mainId != null ? { downloadId: mainId } : null);
-  setTimeout(() => activeDownloads.delete(id), 120000);
+  setTimeout(() => activeDownloads.delete(id), DONE_RETAIN_MS);
 }
 
 // Throw away a held recording without saving (explicit Discard, or tab closed).
@@ -1736,6 +1757,7 @@ async function downloadDash(item, tabId, filename, chosenVariantId) {
 
     dl.status = "done";
     broadcast({ type: "download-update", download: dl });
+    recordSavedFile(dl, videoDlId);
     addHistory({ name: base, kind: "dash", ts: Date.now() });
     notifyDone(base, mergeCmd ? "Saved video + audio separately — run the merge command." : null,
       videoDlId != null ? { downloadId: videoDlId } : null);
@@ -1744,7 +1766,7 @@ async function downloadDash(item, tabId, filename, chosenVariantId) {
     dl.error = e.message || String(e);
     broadcast({ type: "download-update", download: dl });
   } finally {
-    setTimeout(() => activeDownloads.delete(id), 120000);
+    setTimeout(() => activeDownloads.delete(id), DONE_RETAIN_MS);
   }
 }
 
@@ -2189,6 +2211,18 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "cancel") {
         const dl = activeDownloads.get(msg.id);
         if (dl) dl.status = "cancelled";
+        sendResponse({ ok: true });
+      } else if (msg.type === "open-file") {
+        // Popup "Open" on a helper-saved file. Browser-API saves are opened by
+        // the popup itself via downloads.open (that call needs the user-input
+        // context of the popup click).
+        if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "open", path: msg.path }); sendResponse({ ok: true }); }
+        else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "reveal-file") {
+        if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "reveal", path: msg.path }); sendResponse({ ok: true }); }
+        else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "dismiss-download") {
+        activeDownloads.delete(msg.id);
         sendResponse({ ok: true });
       } else if (msg.type === "clear") {
         mediaByTab.delete(msg.tabId);

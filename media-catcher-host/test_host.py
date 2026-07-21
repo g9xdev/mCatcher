@@ -15,6 +15,20 @@ def check(label, cond):
 
 
 # ---- Test A: native-messaging framing (spawn the host, ping -> pong) ----
+def read_reply(p, max_frames=10):
+    """Read the next NON-LOG frame. The host legitimately interleaves
+    {"type":"log"} frames (startup banner, async yt-dlp probe) with replies."""
+    for _ in range(max_frames):
+        raw = p.stdout.read(4)
+        if len(raw) < 4:
+            return None
+        (n,) = struct.unpack("@I", raw)
+        frame = json.loads(p.stdout.read(n).decode())
+        if frame.get("type") != "log":
+            return frame
+    return None
+
+
 def framing_test():
     p = subprocess.Popen([sys.executable, HOST], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -22,11 +36,9 @@ def framing_test():
         msg = json.dumps({"cmd": "ping"}).encode()
         p.stdin.write(struct.pack("@I", len(msg)) + msg)
         p.stdin.flush()
-        raw = p.stdout.read(4)
-        check("host replied to ping", len(raw) == 4)
-        if len(raw) == 4:
-            (n,) = struct.unpack("@I", raw)
-            reply = json.loads(p.stdout.read(n).decode())
+        reply = read_reply(p)
+        check("host replied to ping", reply is not None)
+        if reply is not None:
             check("reply is a pong", reply.get("type") == "pong")
             check("pong reports ffmpeg presence (bool)", isinstance(reply.get("ffmpeg"), bool))
             check("pong carries a version", bool(reply.get("version")))
@@ -35,9 +47,17 @@ def framing_test():
             # snapshot for an unknown recording -> graceful error (dispatch works)
             snap = json.dumps({"cmd": "snapshot", "id": 999}).encode()
             p.stdin.write(struct.pack("@I", len(snap)) + snap); p.stdin.flush()
-            (n2,) = struct.unpack("@I", p.stdout.read(4))
-            r2 = json.loads(p.stdout.read(n2).decode())
-            check("snapshot of unknown id returns an error", r2.get("type") == "error" and r2.get("id") == 999)
+            r2 = read_reply(p)
+            check("snapshot of unknown id returns an error",
+                  r2 is not None and r2.get("type") == "error" and r2.get("id") == 999)
+
+            # reveal dispatch is wired (missing file -> error echoing our id).
+            # Would hang/fail if the main-loop elif for "reveal" were absent.
+            rev = json.dumps({"cmd": "reveal", "path": os.path.join(HERE, "no-such-file.mp4"), "id": 7}).encode()
+            p.stdin.write(struct.pack("@I", len(rev)) + rev); p.stdin.flush()
+            r3 = read_reply(p)
+            check("reveal of missing file errors over the wire",
+                  r3 is not None and r3.get("type") == "error" and r3.get("id") == 7)
     finally:
         try: p.stdin.close()
         except Exception: pass
@@ -72,7 +92,46 @@ def cmd_test():
     check("no -map when single input", "-map" not in cmd1)
 
 
+# ---- Test C: reveal opens the CONTAINING FOLDER, not the file ----
+def reveal_test():
+    import importlib.util, tempfile
+    spec = importlib.util.spec_from_file_location("mc_host_reveal", HOST)
+    mc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mc)
+
+    fd, tmp = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    orig_popen = subprocess.Popen
+    try:
+        calls = []
+        def fake_popen(cmd, **kw):
+            calls.append(cmd)
+            return object()
+        mc.subprocess.Popen = fake_popen        # same module object — restored below
+        sent = []
+        mc.send = sent.append
+
+        mc.handle_reveal({"path": tmp})
+        if os.name == "nt":
+            check("reveal uses Explorer /select, on the file",
+                  len(calls) == 1 and isinstance(calls[0], str)
+                  and calls[0].startswith('explorer /select,"') and tmp in calls[0])
+        else:
+            check("reveal spawns one opener", len(calls) == 1)
+        check("reveal of existing file sends no error", not sent)
+
+        calls.clear(); sent.clear()
+        mc.handle_reveal({"path": tmp + ".nope", "id": 5})
+        check("reveal of missing file errors with the request id",
+              len(sent) == 1 and sent[0].get("type") == "error" and sent[0].get("id") == 5)
+        check("reveal of missing file spawns nothing", not calls)
+    finally:
+        mc.subprocess.Popen = orig_popen
+        os.unlink(tmp)
+
+
 framing_test()
 cmd_test()
+reveal_test()
 print("\n" + ("ALL PASSED" if ok else "SOME FAILED"))
 sys.exit(0 if ok else 1)

@@ -37,7 +37,7 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
 """
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # ---- stdio (bound in init_io so importing this module has no side effects) ----
 IN = None
@@ -1787,6 +1787,25 @@ def handle_open(req):
         send({"type": "error", "error": "open failed: %s" % e})
 
 
+def handle_reveal(req):
+    """Show a saved file in its containing folder (popup "Folder" button)."""
+    path = req.get("path")
+    if not path or not os.path.isfile(path):
+        send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
+        return
+    try:
+        if os.name == "nt":
+            # String form on purpose: explorer's "/select," argument must not be
+            # split/re-quoted by list2cmdline. '"' can't appear in a Windows path.
+            subprocess.Popen('explorer /select,"%s"' % path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
+    except Exception as e:
+        send({"type": "error", "error": "reveal failed: %s" % e})
+
+
 def handle_discard(req):
     jid = req.get("id")
     with JOBS_LOCK:
@@ -3172,6 +3191,8 @@ def main():
                 handle_pick_folder(msg)
             elif cmd == "open":
                 handle_open(msg)
+            elif cmd == "reveal":
+                handle_reveal(msg)
             elif cmd == "update":
                 handle_update(msg)
             elif cmd == "watch":
