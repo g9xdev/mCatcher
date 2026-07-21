@@ -1227,107 +1227,14 @@ def _cast_stop_active():
     _CAST["kind"] = None
 
 
-def handle_cast(req):
-    """Run a cast:* subcommand on a worker thread. Two protocols: DLNA/UPnP (pure
-    stdlib, id prefix "dlna:") and AirPlay (via the pinned pyatv fork, any other id).
-    The popup pairs an AirPlay device (PIN) before casting if it isn't paired yet."""
-    def worker():
-        sub = req.get("sub")
-        reqid = req.get("reqId")
-        did = req.get("id") or ""
-        dlna = did.startswith("dlna:")
-        dname = req.get("device", "")
-        title = req.get("title", "")
-        try:
-            if sub == "discover":
-                # Deterministic + stable: DLNA preferred over AirPlay per device,
-                # AirPlay limited to Apple TVs, union of recent scans (see helper).
-                if req.get("warm"):
-                    cached = _cast_seen_devices()
-                    send({"type": "cast-devices", "reqId": reqid, "warm": True,
-                          "devices": cached})
-                    # ALWAYS send the completion update, even when the rescan
-                    # THROWS (plan v4: an exception used to fall out to the
-                    # generic cast-error while the warm reply had already
-                    # consumed the picker's pending resolver — an empty picker
-                    # then spun on "Scanning…" forever). final:true is the
-                    # scan-complete signal; on error the devices payload is
-                    # the cached list plus an "error" string.
-                    fresh, err = cached, None
-                    try:
-                        # Bounded wait (review of cf5403d, Minor 2): a scan in
-                        # flight can hold the lock for 30s (AirPlay wait) or
-                        # even 600s (first-run pyatv install) — warm requests
-                        # must not pile up behind it. Can't get the lock soon
-                        # -> this request's freshness is deferred: its final
-                        # carries the cached list and the in-flight scan's own
-                        # final delivers the refresh. C4's dispatcher-level
-                        # coalescing replaces this with proper result fan-out.
-                        if _DISCOVER_LOCK.acquire(timeout=8):
-                            try:
-                                fresh = _cast_merged_discover(req.get("timeout", 5))
-                            finally:
-                                _DISCOVER_LOCK.release()
-                    except Exception as e:
-                        # Swallow, don't re-raise (review of 3eacdae, Important):
-                        # the final+error update below IS the failure signal; a
-                        # re-raise ALSO emitted the worker's generic cast-error,
-                        # which the extension treats as a SESSION error — it
-                        # cleared castState and could dismiss an active pairing
-                        # PIN dialog mid-entry.
-                        err = _cast_err(str(e))
-                        _hlog("warn", "cast: warm rescan failed: %s" % e)
-                    finally:
-                        upd = {"type": "cast-devices-update", "devices": fresh,
-                               "final": True}
-                        if err:
-                            upd["error"] = err
-                        send(upd)
-                    return
-                with _DISCOVER_LOCK:
-                    devices = _cast_merged_discover(req.get("timeout", 5))
-                send({"type": "cast-devices", "reqId": reqid, "devices": devices})
-            elif sub == "start":
-                _cast_stop_active()   # tear down ANY current session (either protocol) first
-                if dlna:
-                    _dlna_start(did, req.get("url") or "", title)
-                    _CAST["kind"] = "dlna"
-                    send({"type": "cast-status", "state": "loading", "id": did,
-                          "device": dname, "title": title, "protocol": "dlna"})
-                    _dlna_start_poller(did, dname, title)
-                else:
-                    if not ensure_pyatv():
-                        send({"type": "cast-error", "reqId": reqid, "error": "Couldn't set up AirPlay support."})
-                        return
-                    _cast_run(_cast_start(did, req.get("url") or ""), timeout=40)   # sets kind=airplay
-                    send({"type": "cast-status", "state": "loading", "id": did,
-                          "device": dname, "title": title, "protocol": "airplay"})
-                    _cast_start_poller(did, dname, title)
-            elif sub == "control":
-                if _CAST.get("kind") == "airplay":
-                    _cast_run(_cast_control(req.get("action"), req.get("value")), timeout=15)
-                else:
-                    _dlna_control(req.get("action"), req.get("value"))
-            elif sub == "stop":
-                _cast_stop_active()
-                send({"type": "cast-status", "state": "idle"})
-            elif sub == "pairCancel":
-                try:
-                    _cast_run(_cast_pair_cancel(), timeout=10)
-                except Exception:
-                    pass
-            elif sub == "pair":
-                if not ensure_pyatv():
-                    send({"type": "cast-error", "reqId": reqid, "error": "Pairing needs AirPlay support — install failed."})
-                    return
-                needs = _cast_run(_cast_pair_begin(did), timeout=30)
-                send({"type": "cast-pair", "reqId": reqid, "id": did, "needsPin": needs})
-            elif sub == "pairPin":
-                ok = _cast_run(_cast_pair_pin(req.get("pin")), timeout=30)
-                send({"type": "cast-paired", "reqId": reqid, "id": did, "ok": ok})
-        except Exception as e:
-            send({"type": "cast-error", "reqId": reqid, "error": _cast_err(str(e))})
-    threading.Thread(target=worker, daemon=True).start()
+# ==================== Casting — the CastBackend socket ====================
+# handle_cast moved to mchost/cast/__init__.py (Task C4): the dispatcher owns
+# the worker thread, the warm-discovery protocol, discovery coalescing (which
+# replaces the interim _DISCOVER_LOCK that used to live here), teardown
+# ordering, reply correlation and error normalization. The transport lives
+# behind CastBackend — LegacyBackend (mchost/cast/legacy.py) binds onto the
+# DLNA/AirPlay functions still in this file until Task C4 step 2 moves them.
+from mchost.cast import handle_cast   # noqa: E402,F401
 
 
 def main():
