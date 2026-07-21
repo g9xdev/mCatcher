@@ -113,11 +113,13 @@ def reveal_test():
 
         mc.handle_reveal({"path": tmp})
         if os.name == "nt":
-            check("reveal uses Explorer /select, on the file",
-                  len(calls) == 1 and isinstance(calls[0], str)
-                  and calls[0].startswith('explorer /select,"') and tmp in calls[0])
+            check("reveal uses Explorer /select, on the file (exact command)",
+                  calls == ['explorer /select,"%s"' % tmp])
+        elif sys.platform == "darwin":
+            check("reveal uses open -R on the file", calls == [["open", "-R", tmp]])
         else:
-            check("reveal spawns one opener", len(calls) == 1)
+            check("reveal xdg-opens the containing dir",
+                  calls == [["xdg-open", os.path.dirname(tmp)]])
         check("reveal of existing file sends no error", not sent)
 
         calls.clear(); sent.clear()
