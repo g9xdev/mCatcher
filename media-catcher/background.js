@@ -73,6 +73,7 @@ const pendingYtMeta = new Map();    // reqId -> resolver, settled by a host "ytm
 // popup renders that state and sends control actions. One session at a time.
 let castState = { state: "idle" };
 const pendingCastDiscover = new Map();   // reqId -> resolver, settled by "cast-devices"
+let lastCastDevices = [];                // retained list — warm picker opens answer from it instantly
 
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
@@ -278,8 +279,17 @@ function onNativeMessage(msg) {
     return;
   }
   if (msg.type === "cast-devices") {
+    lastCastDevices = msg.devices || [];
     const res = pendingCastDiscover.get(msg.reqId);
     if (res) { pendingCastDiscover.delete(msg.reqId); res(msg.devices || []); }
+    return;
+  }
+  if (msg.type === "cast-devices-update") {
+    // Unsolicited push after a warm rescan (final:true = scan complete; error rides
+    // along when the rescan failed). Keep the retained list fresh and let any open
+    // picker re-render live.
+    lastCastDevices = msg.devices || [];
+    broadcast({ type: "cast-devices-update", devices: msg.devices || [], final: msg.final, error: msg.error });
     return;
   }
   if (msg.type === "cast-status") {
@@ -2154,11 +2164,22 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "cast-discover") {
         if (!nativePort || !nativeReady) {
           sendResponse({ ok: false, error: "Casting needs the native helper — install/enable it first." });
+        } else if (msg.warm && lastCastDevices.length) {
+          // Warm open with a retained list: answer instantly (zero host round-trip)
+          // while STILL kicking the host's warm rescan. No resolver is registered,
+          // so the host's cached "cast-devices" reply can't double-settle this
+          // response — the refresh reaches the popup via the "cast-devices-update"
+          // broadcast instead.
+          const reqId = "cd" + (++downloadCounter);
+          try { nativePort.postMessage({ cmd: "cast", sub: "discover", reqId, warm: true }); } catch (e) {}
+          sendResponse({ ok: true, devices: lastCastDevices });
         } else {
           const reqId = "cd" + (++downloadCounter);
           const devices = await new Promise((resolve) => {
             pendingCastDiscover.set(reqId, resolve);
-            try { nativePort.postMessage({ cmd: "cast", sub: "discover", reqId }); }
+            const req = { cmd: "cast", sub: "discover", reqId };
+            if (msg.warm) req.warm = true;   // host replies from its cache, then rescans
+            try { nativePort.postMessage(req); }
             catch (e) { pendingCastDiscover.delete(reqId); resolve(null); }
             // Generous: SSDP (5s) + per-device description fetches + the AirPlay listing scan.
             setTimeout(() => { if (pendingCastDiscover.has(reqId)) { pendingCastDiscover.delete(reqId); resolve(null); } }, 45000);

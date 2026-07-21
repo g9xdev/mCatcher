@@ -946,6 +946,12 @@ let scrubbing = false;          // true while the user drags the position or vol
 let castVolume = 100;           // last volume the user chose — survives the 1 Hz rebuilds
 let castPickerGen = 0;          // invalidates in-flight discovery when the picker reopens
 let pendingCast = null;         // {d, item, title} held across an AirPlay pairing handshake
+let castPickerItem = null;      // what a device click casts — context for renderCastDevices
+let castPickerTitle = "";
+let castDevList = null;         // the open picker's device-list container (live re-render target)
+let castCountEl = null;         // the open picker's "N devices" foot counter
+let castPrefetched = false;     // one hover warm-discover per popover lifecycle (closePops resets)
+let castPrefetchTimer = null;
 
 function fmtClock(sec) {
   sec = Math.max(0, Math.round(sec || 0));
@@ -1044,6 +1050,7 @@ let popAnchor = null;
 function closePops() {
   if (popCast) popCast.classList.remove("open");
   popAnchor = null;
+  castPrefetched = false;        // next hover may prefetch again
 }
 function positionPop(pop, btn) {
   pop.classList.add("open");
@@ -1057,48 +1064,80 @@ function positionPop(pop, btn) {
   if (top + pop.offsetHeight > document.body.clientHeight - 8) top = (br.top - pr.top) - pop.offsetHeight - 6;
   pop.style.top = Math.max(8, top) + "px";
 }
+// Empty-state rows for the picker's device list. "Scanning network…" holds the
+// spot while the host's warm rescan runs; the final cast-devices-update replaces
+// it with devices, "No devices found", or the scan error.
+function castEmptyRow(bold, text) {
+  return h("div", { class: "pop-empty" }, [h("b", { text: bold }), text]);
+}
+function castScanningRow() { return castEmptyRow("Scanning network…", "Looking for TVs on your network."); }
+function castNoDevicesRow(err) {
+  return err ? castEmptyRow("Scan failed", err)
+             : castEmptyRow("No devices found", "Make sure the TV is on and on the same network as this PC.");
+}
+function updateCastCount(n) {
+  if (castCountEl && popCast.contains(castCountEl))
+    castCountEl.textContent = n + (n === 1 ? " device" : " devices");
+}
+// Render the device rows into the picker's list container. Context (which item a
+// click casts) comes from castPickerItem/castPickerTitle so live
+// cast-devices-update re-renders reuse it; the focused row is preserved (by
+// device id) across the rebuild for keyboard users.
+function renderCastDevices(list, devices) {
+  const item = castPickerItem, title = castPickerTitle;
+  const active = document.activeElement;
+  const focusId = active && active.classList && active.classList.contains("pop-row") && list.contains(active)
+    ? active.dataset.devId : null;
+  list.replaceChildren();
+  for (const d of devices) {
+    const row = h("button", {
+      class: "pop-row",
+      dataset: { devId: String(d.id) },
+      title: item ? "Cast to " + d.name : "Use a stream's Cast button to pick what to send",
+      onClick: !item ? null : () => castTo(d, item, title),
+    }, [
+      h("span", { class: "l" }, [
+        h("b", { text: d.name }),
+        h("span", { text: [d.model, d.protocol === "dlna" ? "DLNA" : "AirPlay"].filter(Boolean).join(" · ") }),
+      ]),
+      h("span", { class: "r", text: d.unsupported ? "soon" : "" }),
+    ]);
+    if (d.unsupported) { row.style.opacity = "0.45"; row.style.cursor = "default"; }
+    list.appendChild(row);
+    if (focusId != null && String(d.id) === focusId) row.focus();
+  }
+  updateCastCount(devices.length);
+}
 async function buildCastPicker(item, btn) {
   const myGen = ++castPickerGen;   // reopening for another item invalidates this build
   const title = item ? ((item.pageTitle || "").trim() || item.name || "this stream") : "";
+  castPickerItem = item; castPickerTitle = title;
+  castPrefetched = true;           // the open IS this lifecycle's warm discover
+  clearTimeout(castPrefetchTimer);
   const head = h("div", { class: "pop-head" }, ["Cast to", item ? h("b", { title: title, text: title }) : null]);
-  popCast.replaceChildren(head, h("div", { class: "pop-empty" }, [h("b", { text: "Scanning network…" }),
-    "Looking for TVs on your network."]));
+  castDevList = h("div", { class: "pop-devlist" }, [castScanningRow()]);
+  popCast.replaceChildren(head, castDevList);
   positionPop(popCast, btn);
 
-  const resp = await send({ type: "cast-discover" });
+  // Warm always: the background answers instantly from its retained list (or the
+  // host's cache) and the host rescans in the background — cast-devices-update
+  // broadcasts then re-render the open picker live.
+  const resp = await send({ type: "cast-discover", warm: true });
   // Stale build: closed while scanning, or reopened for a different item — that
   // newer build owns the popover now (else this one could cast the WRONG item).
   if (myGen !== castPickerGen || !popCast.classList.contains("open")) return;
   const devices = (resp && resp.devices) || [];
-  popCast.replaceChildren(head);
   if (!resp || resp.ok === false) {
-    popCast.appendChild(h("div", { class: "pop-empty" }, [
-      h("b", { text: "Scan failed" }), (resp && resp.error) || "Casting needs the native helper.",
-    ]));
-  } else if (!devices.length) {
-    popCast.appendChild(h("div", { class: "pop-empty" }, [
-      h("b", { text: "No TVs found" }),
-      "Make sure the TV is on and on the same network as this PC.",
-    ]));
-  } else {
-    for (const d of devices) {
-      const row = h("button", {
-        class: "pop-row",
-        title: item ? "Cast to " + d.name : "Use a stream's Cast button to pick what to send",
-        onClick: !item ? null : () => castTo(d, item, title),
-      }, [
-        h("span", { class: "l" }, [
-          h("b", { text: d.name }),
-          h("span", { text: [d.model, d.protocol === "dlna" ? "DLNA" : "AirPlay"].filter(Boolean).join(" · ") }),
-        ]),
-        h("span", { class: "r", text: d.unsupported ? "soon" : "" }),
-      ]);
-      if (d.unsupported) { row.style.opacity = "0.45"; row.style.cursor = "default"; }
-      popCast.appendChild(row);
-    }
+    castDevList.replaceChildren(castEmptyRow("Scan failed",
+      (resp && resp.error) || "Casting needs the native helper."));
+  } else if (devices.length) {
+    renderCastDevices(castDevList, devices);
   }
+  // An empty ok reply keeps the "Scanning network…" row — the host's rescan is
+  // still running and its final cast-devices-update resolves the row either way.
+  castCountEl = h("span", { text: devices.length + (devices.length === 1 ? " device" : " devices") });
   popCast.appendChild(h("div", { class: "pop-foot" }, [
-    h("span", { text: devices.length + (devices.length === 1 ? " device" : " devices") }),
+    castCountEl,
     h("button", { type: "button", text: "Rescan", onClick: () => buildCastPicker(item, btn) }),
   ]));
   positionPop(popCast, btn);   // re-measure after content changes
@@ -1180,6 +1219,20 @@ api.runtime.onMessage.addListener((msg) => {
     // flashStatus owns its own reset timer — using refreshTimer here would fight
     // the media-updated debounce (either killing the error or refreshing early).
     if (msg.error) { pendingCast = null; flashStatus(msg.error); }
+  } else if (msg.type === "cast-devices-update") {
+    // Live push from the host's warm rescan → refresh the open picker in place.
+    // Guard: the list must still be inside the popover (the pairing PIN view
+    // replaces the popover's children, and then this update must not clobber it).
+    if (popCast && popCast.classList.contains("open") && castDevList && popCast.contains(castDevList)) {
+      const devices = msg.devices || [];
+      if (devices.length) renderCastDevices(castDevList, devices);
+      else if (msg.final) {
+        // Scan complete and still nothing — clear the "Scanning network…" row.
+        castDevList.replaceChildren(castNoDevicesRow(msg.error));
+        updateCastCount(0);
+      }
+      if (popAnchor) positionPop(popCast, popAnchor);   // re-measure after content changes
+    }
   } else if (msg.type === "cast-pair") {
     // Ignore replies for a device we're no longer pairing (stale/other selection).
     if (!pendingCast || (msg.id && msg.id !== pendingCast.d.id)) return;
@@ -1235,6 +1288,26 @@ if (queueClearBtn) queueClearBtn.addEventListener("click", () => {
 
 // Header cast indicator → open the device picker (preview).
 if (hdrCastBtn) hdrCastBtn.addEventListener("click", () => openCastPicker(null, hdrCastBtn));
+
+// Hover prefetch: warm the host's device union (and the background's retained
+// list) BEFORE any click, so the picker opens onto a ready list. Debounced,
+// fire-and-forget, at most one warm discover per popover lifecycle (closePops
+// resets the flag; buildCastPicker's own warm request claims it on open).
+function prefetchCastDevices() {
+  if (castPrefetched || !castUiReady) return;
+  clearTimeout(castPrefetchTimer);
+  castPrefetchTimer = setTimeout(() => {
+    if (castPrefetched) return;
+    castPrefetched = true;
+    send({ type: "cast-discover", warm: true });   // fire-and-forget
+  }, 120);
+}
+if (hdrCastBtn) hdrCastBtn.addEventListener("mouseenter", prefetchCastDevices);
+// .cast-btn rows are rebuilt on every render — delegate. (mouseover bubbles;
+// mouseenter does not, so a document-level mouseenter listener would never fire.)
+document.addEventListener("mouseover", (e) => {
+  if (e.target && e.target.closest && e.target.closest(".cast-btn")) prefetchCastDevices();
+});
 
 // ---- one-click update from the popup (no about:addons needed) ----
 // Kicks the same GitHub check the settings page uses: the helper updates itself (guardian)
