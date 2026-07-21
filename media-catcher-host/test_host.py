@@ -213,3 +213,79 @@ def test_warm_discover_final_arrives_even_when_rescan_raises(monkeypatch):
         "final update never arrived after rescan exception"
     upd = [m for m in sent if m.get("type") == "cast-devices-update"][0]
     assert upd.get("final") is True and upd["devices"] == [] and upd.get("error")
+
+
+# ---- blind-check closures (review of cf5403d, Important 2) -----------------
+# Each test names the broken implementation it exists to kill.
+
+
+def test_warm_reply_is_sent_BEFORE_the_rescan_runs(monkeypatch):
+    # Kills: an implementation that scans first and answers "warm" from the
+    # scan result (the cached reply must not wait behind the network).
+    import threading
+    sent = []
+    order = []
+    monkeypatch.setattr(mc_host, "send", lambda m: (sent.append(m), order.append(m["type"]))[0])
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda now=None: [{"id": "x"}])
+    gate = threading.Event()
+
+    def _blocking_scan(timeout=5):
+        # the warm reply MUST already be out before the scan is allowed to run
+        assert "cast-devices" in order, "rescan started before the warm reply was sent"
+        gate.set()
+        return [{"id": "x"}]
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", _blocking_scan)
+    mc_host.handle_cast({"sub": "discover", "reqId": "o1", "warm": True})
+    assert wait_for(gate.is_set), "scan never ran"
+    assert wait_for(lambda: any(m.get("final") for m in sent))
+
+
+def test_warm_emits_exactly_one_reply_and_one_final(monkeypatch):
+    # Kills: duplicate warm/final emissions.
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda now=None: [])
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", lambda timeout=5: [])
+    mc_host.handle_cast({"sub": "discover", "reqId": "d1", "warm": True})
+    assert wait_for(lambda: any(m.get("type") == "cast-devices-update" for m in sent))
+    assert len([m for m in sent if m.get("type") == "cast-devices"]) == 1
+    assert len([m for m in sent if m.get("type") == "cast-devices-update"]) == 1
+
+
+def test_real_cast_seen_devices_prunes_ttl_and_formats(monkeypatch):
+    # Kills: broken TTL pruning/formatting in the REAL helper (earlier tests
+    # always faked it).
+    import time as _t
+    now = _t.time()
+    monkeypatch.setattr(mc_host, "_CAST_SEEN", {
+        "10.0.0.1": {"d": {"id": "fresh", "name": "A"}, "ts": now - 5},
+        "10.0.0.2": {"d": {"id": "stale", "name": "B"}, "ts": now - mc_host._CAST_SEEN_TTL - 1},
+    })
+    out = mc_host._cast_seen_devices()
+    assert out == [{"id": "fresh", "name": "A"}]
+    assert list(mc_host._CAST_SEEN) == ["10.0.0.1"], "expired entry not pruned"
+
+
+def test_concurrent_warm_discovers_never_scan_concurrently(monkeypatch):
+    # Kills: removing _DISCOVER_LOCK. Two warm requests with a slow scan:
+    # both must complete with finals, and the scans must never overlap.
+    import threading
+    sent, active, peak = [], [0], [0]
+    lk = threading.Lock()
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda now=None: [])
+
+    def _slow_scan(timeout=5):
+        with lk:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        import time as _t
+        _t.sleep(0.15)
+        with lk:
+            active[0] -= 1
+        return []
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", _slow_scan)
+    mc_host.handle_cast({"sub": "discover", "reqId": "c1", "warm": True})
+    mc_host.handle_cast({"sub": "discover", "reqId": "c2", "warm": True})
+    assert wait_for(lambda: len([m for m in sent if m.get("final")]) == 2, timeout=5)
+    assert peak[0] == 1, "scans overlapped — _DISCOVER_LOCK not honored"

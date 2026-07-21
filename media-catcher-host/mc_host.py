@@ -2825,14 +2825,18 @@ _DISCOVER_LOCK = threading.Lock()
 _CAST_SEEN_LOCK = threading.Lock()
 
 
-def _cast_seen_devices():
+def _cast_seen_devices(now=None):
     """The picker list from the recent-scan union cache ONLY — no network.
     Expired entries are pruned in passing. _CAST_SEEN_LOCK guards the prune
     (round-4 plan review I4): a warm request reads/prunes this dict while a
     concurrent scan (inside _DISCOVER_LOCK, which this call deliberately does
     NOT take — the warm reply must not wait behind a 5s scan) writes it; two
-    warm readers can also race deleting the same expired key."""
-    now = time.time()
+    warm readers can also race deleting the same expired key.
+    `now` lets _cast_merged_discover prune against the SAME timestamp it
+    stamped results with (review of cf5403d, Minor 1: re-capturing time here
+    could expire an entry the pre-extraction code retained)."""
+    if now is None:
+        now = time.time()
     out = []
     with _CAST_SEEN_LOCK:
         for addr in list(_CAST_SEEN):
@@ -2876,7 +2880,7 @@ def _cast_merged_discover(timeout=5):
     with _CAST_SEEN_LOCK:
         for addr, d in found.items():
             _CAST_SEEN[addr] = {"d": d, "ts": now}
-    return _cast_seen_devices()
+    return _cast_seen_devices(now)
 
 
 async def _cast_discover(timeout=6):
@@ -3126,8 +3130,19 @@ def handle_cast(req):
                     # the cached list plus an "error" string.
                     fresh, err = cached, None
                     try:
-                        with _DISCOVER_LOCK:
-                            fresh = _cast_merged_discover(req.get("timeout", 5))
+                        # Bounded wait (review of cf5403d, Minor 2): a scan in
+                        # flight can hold the lock for 30s (AirPlay wait) or
+                        # even 600s (first-run pyatv install) — warm requests
+                        # must not pile up behind it. Can't get the lock soon
+                        # -> this request's freshness is deferred: its final
+                        # carries the cached list and the in-flight scan's own
+                        # final delivers the refresh. C4's dispatcher-level
+                        # coalescing replaces this with proper result fan-out.
+                        if _DISCOVER_LOCK.acquire(timeout=8):
+                            try:
+                                fresh = _cast_merged_discover(req.get("timeout", 5))
+                            finally:
+                                _DISCOVER_LOCK.release()
                     except Exception as e:
                         err = _cast_err(str(e))
                         raise
