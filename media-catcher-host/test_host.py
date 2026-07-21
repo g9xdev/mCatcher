@@ -299,11 +299,29 @@ def test_warm_rescan_failure_emits_no_generic_cast_error(monkeypatch):
     monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
     monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda now=None: [])
 
+    # Review of b9043cd (Minor 2): JOIN the worker before asserting absence.
+    # The final is emitted BEFORE the worker's outer exception handler, so
+    # waiting on the final alone would let a reintroduced re-raise emit its
+    # cast-error after the assertion had already passed.
+    import threading as _threading
+    workers = []
+    _RealThread = _threading.Thread
+
+    class _CaptureThread(_RealThread):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            workers.append(self)
+    monkeypatch.setattr(mc_host.threading, "Thread", _CaptureThread)
+
     def _boom(timeout=5):
         raise RuntimeError("scan blew up")
     monkeypatch.setattr(mc_host, "_cast_merged_discover", _boom)
     mc_host.handle_cast({"sub": "discover", "reqId": "ne1", "warm": True})
-    assert wait_for(lambda: any(m.get("final") for m in sent))
+    assert workers, "handle_cast spawned no worker to join"
+    for w in workers:
+        w.join(timeout=5)
+        assert not w.is_alive(), "cast worker did not exit within 5s"
+    assert any(m.get("final") for m in sent), "final update never arrived"
     assert not [m for m in sent if m.get("type") == "cast-error"], \
         "warm rescan failure leaked a generic cast-error"
 
@@ -312,11 +330,44 @@ def test_warm_rescan_failure_emits_no_generic_cast_error(monkeypatch):
 def test_canonical_alias_loader_identity():
     # Review of b9043cd (Minor 1, pin b): the registered loader and the
     # canonical alias must agree — `import mc_host` anywhere resolves to the
-    # instance the tests patch. (Pin a: production __main__ identity is
-    # proven end-to-end by test_framing_ping_snapshot_reveal's round trip —
-    # the pong can only arrive through nm.py's OUT bound by the __main__
-    # instance's init_io.)
+    # instance the tests patch.
     import sys
     import mc_host as imported
     assert imported is mc_host
     assert sys.modules["mc_host"] is mc_host
+
+
+def test_canonical_alias_under_script_mode_main():
+    """Review of d71b84b (Important 1, pin a): production runs the shim as
+    __main__, so a package submodule's `import mc_host` must resolve to THAT
+    instance — two live shim objects would split patched/mutable state.
+
+    An earlier claim that the framing round trip proves this was WRONG: both
+    instances share mchost.nm's OUT, so a pong arrives either way.
+
+    Adversary-verified: with the alias line removed, this test FAILS. (A
+    first attempt compared `_config_path`, which is re-exported from
+    mchost.config and is therefore the SAME object in both instances —
+    blind. The sentinel below exists only on the executing __main__
+    instance, so a second shim object cannot fake it.)
+    """
+    driver = (
+        # `python -c` code runs in the real __main__ module, so exec-ing the
+        # shim here reproduces production (`python mc_host.py`) exactly:
+        # __name__ == '__main__' and registered in sys.modules. main() runs
+        # and returns immediately on stdin EOF (stdin=DEVNULL).
+        "import sys\n"
+        "sys.argv = ['mc_host.py']\n"
+        "src = open(%r, encoding='utf-8').read()\n"
+        "exec(compile(src, %r, 'exec'))\n"
+        "sys.modules['__main__'].SENTINEL_FROM_MAIN = 'unique-marker'\n"
+        "import mchost.config as cfg\n"
+        "shim = cfg._h()\n"
+        "assert getattr(shim, 'SENTINEL_FROM_MAIN', None) == 'unique-marker', \\\n"
+        "    'submodule resolved a DIFFERENT shim instance than __main__'\n"
+        "print('ALIAS-MAIN-OK')\n" % (HOST, HOST)
+    )
+    p = subprocess.run([sys.executable, "-c", driver], cwd=HERE,
+                       capture_output=True, text=True, timeout=60,
+                       stdin=subprocess.DEVNULL)
+    assert "ALIAS-MAIN-OK" in p.stdout, (p.stdout or "") + (p.stderr or "")
