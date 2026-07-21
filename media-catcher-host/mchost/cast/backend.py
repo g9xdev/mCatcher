@@ -34,7 +34,25 @@ class CastBackend:
     def seen_devices(self):                   # cache-only, no network
         raise NotImplementedError
 
-    def start(self, req):                     # full cast-start request dict
+    def start(self, req):
+        """Begin casting `req` (the full cast-start request dict; the
+        dispatcher has already resolved `req["protocol"]` and torn down any
+        previous session).
+
+        CONTRACT — every backend MUST, in this order:
+          1. perform its own dependency setup (the legacy backend's
+             ensure_pyatv; the engine backend's warmup gate) and raise
+             CastError on failure;
+          2. emit the `loading` cast-status through `self.events` BEFORE any
+             playback state can arrive — the popup shows nothing until it;
+          3. start whatever produces subsequent status events (the legacy
+             pollers; the engine's event stream).
+        Steps 2-3 live HERE, not in the dispatcher, because their ordering is
+        transport-specific (review of 54705df/4d26f8a: the loading status
+        must precede the first poller tick). A backend that skips step 2
+        leaves the picker silent — pinned by
+        test_cast_backend.py::test_start_emits_loading_before_poller.
+        """
         raise NotImplementedError
 
     def control(self, action, value=None):

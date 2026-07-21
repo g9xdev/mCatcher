@@ -105,3 +105,23 @@ def test_cast_error_is_an_exception_carrying_its_message():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
+
+
+def test_start_emits_loading_before_poller(monkeypatch):
+    """The start() CONTRACT (backend.py): dependency setup -> `loading`
+    status through events -> poller start, IN THAT ORDER. A backend that
+    skips the loading emission leaves the picker silent; one that starts its
+    poller first can deliver a playback status before the popup knows a cast
+    began. This pins the ordering for EVERY backend — the engine backend
+    (phase M) must satisfy it too.
+    """
+    order, events = [], []
+    be = LegacyBackend(lambda m: (events.append(m), order.append("event:" + m.get("state", "?")))[0])
+    # Neutralize the transport: we are testing ORDER, not DLNA I/O.
+    monkeypatch.setattr(mc_host, "_dlna_start", lambda *a, **kw: order.append("transport"))
+    monkeypatch.setattr(mc_host, "_dlna_start_poller", lambda *a, **kw: order.append("poller"))
+    be.start({"protocol": "dlna", "id": "dlna:192.0.2.10", "url": "http://x/v.mp4",
+              "device": "TV", "title": "T"})
+    assert "event:loading" in order, "start() emitted no loading status: %r" % order
+    assert order.index("event:loading") < order.index("poller"), \
+        "poller started before the loading status: %r" % order
