@@ -45,13 +45,18 @@ class CastBackend:
              CastError on failure;
           2. emit the `loading` cast-status through `self.events` BEFORE any
              playback state can arrive — the popup shows nothing until it;
-          3. start whatever produces subsequent status events (the legacy
+          3. make the TRANSPORT call (the legacy DLNA SetURI+Play / pyatv
+             play_url), which is the first thing that can produce a playback
+             event or an async error;
+          4. start whatever produces subsequent status events (the legacy
              pollers; the engine's event stream).
-        Steps 2-3 live HERE, not in the dispatcher, because their ordering is
+        Steps 2-4 live HERE, not in the dispatcher, because their ordering is
         transport-specific (review of 54705df/4d26f8a: the loading status
-        must precede the first poller tick). A backend that skips step 2
-        leaves the picker silent — pinned by
-        test_cast_backend.py::test_start_emits_loading_before_poller.
+        must precede the first poller tick; review of aedec78: it must
+        precede the TRANSPORT call too — an AirPlay play_url error callback
+        otherwise beat it to the popup). A backend that skips step 2 leaves
+        the picker silent — the full order is pinned, per protocol, by
+        test_cast_backend.py::test_start_emits_loading_before_transport_and_poller.
         """
         raise NotImplementedError
 

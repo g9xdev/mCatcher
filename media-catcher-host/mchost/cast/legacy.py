@@ -10,6 +10,22 @@ discovery coalescing, teardown ordering, reply correlation and error
 normalization. Unsolicited events go through the `events` sink handed to the
 constructor; user-visible failures are raised as CastError.
 
+EVENT SINK: every UNSOLICITED message (poller status pushes, the pyatv
+"installing" notice, playback errors) goes out through `_emit()`, which
+resolves the module-level `_EVENTS` sink at CALL time. `LegacyBackend.__init__`
+points `_EVENTS` at its own `self.events` via `set_events()`, so the moved
+poller/callback bodies — which used to call the shim's send() directly — reach
+whatever sink the dispatcher handed the backend (the resident's broadcast bus
+from phase R on; `_h().send` by default). SOLICITED replies are NOT emitted
+here at all: the dispatcher owns those (reqId correlation).
+
+_CAST_SEEN OWNERSHIP: the ONE effective binding is the SHIM's
+(`_h()._CAST_SEEN`) — the suite rebinds it there, so every read/write inside
+this module goes through `_seen_cache()`, never through this module's own
+global. The `_CAST_SEEN = {}` below exists ONLY to seed that shim binding at
+import time; after import nothing here reads it, and rebinding
+`mchost.cast.legacy._CAST_SEEN` has NO effect. Rebind the shim's.
+
 Cross-module/patched names (send, _hlog, _console_python, _no_window,
 _variant_key, and the shim-patched _cast_seen_devices/_CAST_SEEN) resolve
 through the mc_host shim at CALL time (`_h().<name>`) so monkeypatched fakes
@@ -39,6 +55,32 @@ def _h():
     """Call-time shim lookup — see mchost/updates.py for the full rationale."""
     import mc_host
     return mc_host
+
+
+# ---- the unsolicited-event sink -------------------------------------------
+# The moved poller/callback bodies are module-level functions, so they cannot
+# reach `self.events`. This indirection is that reach: LegacyBackend points it
+# at its own sink on construction, and _emit() resolves it at CALL time, so a
+# later rebind (phase R's broadcast bus) is honored by pollers already running.
+def _default_events(msg):
+    """Default sink: the shim's send(), looked up at call time."""
+    _h().send(msg)
+
+
+_EVENTS = _default_events
+
+
+def set_events(fn):
+    """Point the module's unsolicited-event sink at `fn` (None restores the
+    shim-send default). Called by LegacyBackend.__init__."""
+    global _EVENTS
+    _EVENTS = fn or _default_events
+
+
+def _emit(msg):
+    """Send one UNSOLICITED event. Never used for solicited replies — those
+    carry a reqId and belong to the dispatcher."""
+    _EVENTS(msg)
 
 
 # ==================== Casting — DLNA/UPnP (pure stdlib) ====================
@@ -455,6 +497,34 @@ def _dlna_control(action, value=None):
             % max(0, min(100, int(value))))
 
 
+def _cast_session_ended(stop):
+    """A poller loop has exited on its OWN terms (played to the end, startup
+    timeout, or the device disappeared) — clear the session fields so the
+    next admission check sees no live cast. Without this, `busy()` stayed
+    true forever after a normal end-of-playback and phase R's drain/update
+    admission would never reopen (review of 4d26f8a, Important 2).
+
+    `stop` is the poller's own stop Event and is the session identity: if it
+    is no longer the registered one, a re-cast (or an explicit stop, which
+    nulls the field itself) already superseded us and owns those fields —
+    touching them would clobber the NEW session. That guard is why this is
+    inert on the explicit-stop and teardown paths."""
+    if _CAST.get("poll") is not stop:
+        return
+    kind = _CAST.get("kind")
+    _CAST["poll"] = None
+    _CAST["kind"] = None
+    if kind == "airplay":
+        # Mirror the explicit-stop path (_cast_stop_active) so the pyatv
+        # connection isn't left open on a finished session. DLNA gets no
+        # such call on purpose: an end-of-playback Stop would be sent to a
+        # TV the user may already have moved on to something else.
+        try:
+            _cast_run(_cast_teardown(), timeout=15)
+        except Exception:
+            pass
+
+
 def _dlna_start_poller(device_id, device_name, title):
     _cast_stop_poller()
     stop = threading.Event()
@@ -486,7 +556,7 @@ def _dlna_start_poller(device_id, device_name, title):
                     idles = 0
                 st.update({"type": "cast-status", "id": device_id,
                            "device": device_name, "title": title, "protocol": "dlna"})
-                _h().send(st)
+                _emit(st)
                 misses = 0
                 if st["state"] == "idle" and idles >= 2 and ticks > 6:
                     break        # played to the end (or stopped on the TV)
@@ -494,9 +564,10 @@ def _dlna_start_poller(device_id, device_name, title):
                 misses += 1
                 if misses > 5:
                     if _DLNA.get("gen") == gen:   # only end OUR session, not a newer one
-                        _h().send({"type": "cast-status", "state": "idle"})   # TV gone
+                        _emit({"type": "cast-status", "state": "idle"})   # TV gone
                     break
             stop.wait(1.0)
+        _cast_session_ended(stop)
     threading.Thread(target=loop, daemon=True).start()
 
 
@@ -531,7 +602,7 @@ def ensure_pyatv():
     try:
         os.makedirs(_PYLIBS, exist_ok=True)
         _h()._hlog("info", "casting: installing AirPlay support (pyatv fork, first run ~45 MB)…")
-        _h().send({"type": "cast-status", "state": "installing"})
+        _emit({"type": "cast-status", "state": "installing"})
         cf, si = _h()._no_window()
         r = subprocess.run([py, "-m", "pip", "install", "--target", _PYLIBS, _PYATV_SRC],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -594,14 +665,24 @@ async def _find_config(device_id, timeout=6):
 # multicast) and mDNS are both lossy, so a single scan often misses a device that
 # was there last time; returning the union of the last ~90s of scans makes the
 # picker stable instead of flickering between the DLNA and AirPlay TVs.
+# SEED ONLY — the shim's re-export of this object is the single owner of the
+# cache (see the module docstring). Nothing below reads this global; every
+# access goes through _seen_cache(), so rebinding it HERE does nothing while
+# rebinding it on the shim (which the suite does) is honored.
 _CAST_SEEN = {}
 _CAST_SEEN_TTL = 90
 # _CAST_SEEN's own short lock (round-4 plan review I4): warm cache reads
 # deliberately bypass the dispatcher's scan coalescing (they must not wait
 # behind a live scan), so the dict itself needs guarding against read-prune
-# vs scan-write races. The lock is internal; the DICT is read through the
-# shim (_h()._CAST_SEEN) because the suite rebinds it there.
+# vs scan-write races. The lock is internal; the DICT is reached through
+# _seen_cache() (the shim's binding — the owner), never this module's global.
 _CAST_SEEN_LOCK = threading.Lock()
+
+
+def _seen_cache():
+    """The ONE effective binding of the recent-scan cache: the shim's. Read at
+    CALL time so a rebind there (the suite does exactly that) is honored."""
+    return _h()._CAST_SEEN
 
 
 def _cast_seen_devices(now=None):
@@ -618,7 +699,7 @@ def _cast_seen_devices(now=None):
     if now is None:
         now = time.time()
     out = []
-    seen = _h()._CAST_SEEN      # the shim's binding — the suite rebinds it there
+    seen = _seen_cache()        # the shim's binding — the ONE effective owner
     with _CAST_SEEN_LOCK:
         for addr in list(seen):
             if now - seen[addr]["ts"] > _CAST_SEEN_TTL:
@@ -658,7 +739,7 @@ def _cast_merged_discover(timeout=5):
         except Exception as e:
             _h()._hlog("warn", "cast: AirPlay scan failed: %s" % e)
     now = time.time()
-    seen = _h()._CAST_SEEN      # the shim's binding — the suite rebinds it there
+    seen = _seen_cache()        # the shim's binding — the ONE effective owner
     with _CAST_SEEN_LOCK:
         for addr, d in found.items():
             seen[addr] = {"d": d, "ts": now}
@@ -749,7 +830,7 @@ async def _cast_start(device_id, url):
             exc = None
         if exc and not isinstance(exc, asyncio.CancelledError):
             # play_url returns when playback ends; a real error before that is worth showing.
-            _h().send({"type": "cast-error", "error": _cast_err(str(exc))})
+            _emit({"type": "cast-error", "error": _cast_err(str(exc))})
     task.add_done_callback(_done)
     _CAST["play_task"] = task
     return True
@@ -842,19 +923,20 @@ def _cast_start_poller(device_id, device_name, title):
                 out.update({"type": "cast-status", "id": device_id,
                             "device": device_name, "title": title or st.get("title", ""),
                             "protocol": "airplay"})
-                _h().send(out)
+                _emit(out)
                 misses = 0
                 if started and st["state"] == "idle" and idles >= 2:
                     break        # played, then stopped/ended
                 if not started and ticks > 25:
-                    _h().send({"type": "cast-status", "state": "idle"})   # never started in ~25s
+                    _emit({"type": "cast-status", "state": "idle"})   # never started in ~25s
                     break
             except Exception:
                 misses += 1
                 if misses > 5:
-                    _h().send({"type": "cast-status", "state": "idle"})   # device gone
+                    _emit({"type": "cast-status", "state": "idle"})   # device gone
                     break
             stop.wait(1.0)
+        _cast_session_ended(stop)
     threading.Thread(target=loop, daemon=True).start()
 
 
@@ -887,6 +969,14 @@ def _cast_stop_active():
 class LegacyBackend(CastBackend):
     name = "legacy"
 
+    def __init__(self, events):
+        super().__init__(events)
+        # The moved poller/callback bodies are module-level and cannot see
+        # `self` — point the module sink at ours so THEIR unsolicited events
+        # reach the dispatcher's sink too (phase R: the broadcast bus),
+        # instead of the shim's raw send().
+        set_events(self.events)
+
     def discover(self, timeout=5):
         # The union-of-recent-scans merge of the DLNA and AirPlay scans.
         return _h()._cast_merged_discover(timeout)
@@ -896,24 +986,31 @@ class LegacyBackend(CastBackend):
         return _h()._cast_seen_devices()
 
     def start(self, req):
-        """The old handle_cast start arm, verbatim apart from the protocol
-        being TOLD to us (dispatcher-selected) instead of re-derived."""
+        """The old handle_cast start arm, with the protocol TOLD to us
+        (dispatcher-selected) instead of re-derived, and the CONTRACT order
+        of backend.py enforced: dependency setup -> `loading` -> transport ->
+        poller. The loading status must precede the TRANSPORT call, not just
+        the poller (review of aedec78, Important 1): play_url's error
+        callback and the DLNA start can both produce a cast event, so
+        emitting loading afterwards let a failure reach the popup before it
+        knew a cast had begun."""
         h = _h()
         did = req.get("id") or ""
         dname = req.get("device", "")
         title = req.get("title", "")
         if req.get("protocol") == "dlna":
-            h._dlna_start(did, req.get("url") or "", title)
-            h._CAST["kind"] = "dlna"
+            # No dependency setup for DLNA (pure stdlib) — loading goes first.
             self.events({"type": "cast-status", "state": "loading", "id": did,
                          "device": dname, "title": title, "protocol": "dlna"})
+            h._dlna_start(did, req.get("url") or "", title)
+            h._CAST["kind"] = "dlna"
             h._dlna_start_poller(did, dname, title)
         else:
-            if not h.ensure_pyatv():
+            if not h.ensure_pyatv():                                   # setup
                 raise CastError("Couldn't set up AirPlay support.")
-            h._cast_run(h._cast_start(did, req.get("url") or ""), timeout=40)   # sets kind=airplay
             self.events({"type": "cast-status", "state": "loading", "id": did,
                          "device": dname, "title": title, "protocol": "airplay"})
+            h._cast_run(h._cast_start(did, req.get("url") or ""), timeout=40)   # sets kind=airplay
             h._cast_start_poller(did, dname, title)
 
     def control(self, action, value=None):

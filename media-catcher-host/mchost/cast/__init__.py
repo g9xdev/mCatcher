@@ -10,8 +10,9 @@ is today's DLNA/AirPlay implementation. The split of duties:
   warm-discovery protocol (cached        session start / control / stop
     reply, ALWAYS a final:true update)   pairing transport
   discovery coalescing (one in-flight    protocol-specific pollers
-    scan, result fanned out to all
-    waiters — plan round-3 I6)
+    scan, result fanned out to ALL
+    waiters — including ones past
+    their bounded wait — round-3 I6)
   teardown-before-start ordering
   error normalization (CastError ->
     verbatim; anything else -> _cast_err)
@@ -40,22 +41,35 @@ def _h():
 # result (or its exception) — one network scan, N answers.
 _SCAN_LOCK = threading.Lock()
 _SCAN = {"current": None}
+# How long a WARM request waits on an in-flight scan before handing its final
+# over to the leader (see _coalesced_discover's `late`). A module constant so
+# the suite can shrink it instead of sleeping through the real bound.
+_WARM_WAIT = 8
 
 
 class DiscoverBusy(Exception):
     """A bounded wait for the in-flight scan expired (warm requests only)."""
 
 
-def _coalesced_discover(backend, timeout, wait=None):
+def _coalesced_discover(backend, timeout, wait=None, late=None):
     """One scan at a time, result fanned out. `wait` bounds how long a
     non-leader waits for the in-flight scan (None = wait indefinitely, which
-    is what a plain — non-warm — discover did under the old lock)."""
+    is what a plain — non-warm — discover did under the old lock).
+
+    `late` makes the fan-out UNCONDITIONAL: a bounded waiter that runs out of
+    time hands over `late(result, error)`, which the LEADER calls the moment
+    its scan finishes, and then raises DiscoverBusy. Without it, a warm
+    follower that timed out was relying on the leader publishing its own
+    unsolicited final — which a PLAIN (non-warm) leader never does, since its
+    only output is a reqId-correlated reply to ITS connection (review of
+    aedec78, Important 3). Every attached waiter gets the leader's devices,
+    or its exception, whatever kind the leader is."""
     with _SCAN_LOCK:
         scan = _SCAN["current"]
         leader = scan is None
         if leader:
-            scan = _SCAN["current"] = {"done": threading.Event(),
-                                       "result": None, "error": None}
+            scan = _SCAN["current"] = {"done": threading.Event(), "result": None,
+                                       "error": None, "late": []}
     if leader:
         try:
             scan["result"] = backend.discover(timeout)
@@ -64,9 +78,24 @@ def _coalesced_discover(backend, timeout, wait=None):
         finally:
             with _SCAN_LOCK:
                 _SCAN["current"] = None
-            scan["done"].set()
+                # done is set UNDER the lock, and the late list drained with
+                # it, so a waiter that loses the race between its expiring
+                # wait and this completion can't attach to a finished scan
+                # (it sees done and takes the result path instead).
+                scan["done"].set()
+                pending, scan["late"] = scan["late"], []
+            for cb in pending:
+                try:
+                    cb(scan["result"], scan["error"])
+                except Exception as e:      # a waiter must not kill the scan
+                    _h()._hlog("warn", "cast: discovery fan-out failed: %s" % e)
     elif not scan["done"].wait(wait):
-        raise DiscoverBusy()
+        with _SCAN_LOCK:
+            if not scan["done"].is_set():
+                if late is not None:
+                    scan["late"].append(late)
+                raise DiscoverBusy()
+        # It completed inside that gap — fall through to its result.
     if scan["error"] is not None:
         raise scan["error"]
     return scan["result"]
@@ -99,33 +128,48 @@ def handle_cast(req):
                     # then spun on "Scanning…" forever). final:true is the
                     # scan-complete signal; on error the devices payload is
                     # the cached list plus an "error" string.
-                    fresh, err = cached, None
-                    try:
-                        # Bounded wait: a scan in flight can run for 30s
-                        # (AirPlay wait) or even 600s (first-run pyatv
-                        # install) — warm requests must not pile up behind
-                        # it. Not served in time -> this request's freshness
-                        # is deferred: its final carries the cached list and
-                        # the in-flight scan's own final delivers the refresh.
-                        fresh = _coalesced_discover(backend, req.get("timeout", 5),
-                                                    wait=8)
-                    except DiscoverBusy:
-                        pass
-                    except Exception as e:
+                    def final(devices, error=None):
+                        upd = {"type": "cast-devices-update", "devices": devices,
+                               "final": True}
+                        if error:
+                            upd["error"] = error
+                        send(upd)
+
+                    def failed(e):
                         # Swallow, don't re-raise (review of 3eacdae, Important):
-                        # the final+error update below IS the failure signal; a
+                        # the final+error update IS the failure signal; a
                         # re-raise ALSO emitted the worker's generic cast-error,
                         # which the extension treats as a SESSION error — it
                         # cleared castState and could dismiss an active pairing
                         # PIN dialog mid-entry.
-                        err = _h()._cast_err(str(e))
                         _h()._hlog("warn", "cast: warm rescan failed: %s" % e)
-                    finally:
-                        upd = {"type": "cast-devices-update", "devices": fresh,
-                               "final": True}
-                        if err:
-                            upd["error"] = err
-                        send(upd)
+                        final(cached, _h()._cast_err(str(e)))
+
+                    def late(result, error):
+                        # Runs on the LEADER's thread once its scan finishes:
+                        # THIS request's final, delivered however long the scan
+                        # took. Deferred, never dropped.
+                        if error is not None:
+                            failed(error)
+                        else:
+                            final(result)
+
+                    try:
+                        # Bounded wait: a scan in flight can run for 30s
+                        # (AirPlay wait) or even 600s (first-run pyatv
+                        # install) — this worker must not sit on it. Past the
+                        # bound the final is handed to the leader (`late`)
+                        # rather than answered from cache, because the leader
+                        # may be a PLAIN discover whose only output is its own
+                        # solicited reply (review of aedec78, Important 3).
+                        fresh = _coalesced_discover(backend, req.get("timeout", 5),
+                                                    wait=_WARM_WAIT, late=late)
+                    except DiscoverBusy:
+                        return                     # `late` sends this final
+                    except Exception as e:
+                        failed(e)
+                    else:
+                        final(fresh)
                     return
                 devices = _coalesced_discover(backend, req.get("timeout", 5))
                 send({"type": "cast-devices", "reqId": reqid, "devices": devices})
