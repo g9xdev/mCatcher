@@ -130,6 +130,67 @@ def test_reveal_opens_containing_folder(monkeypatch, tmp_path):
     assert not calls, "reveal of missing file spawns nothing"
 
 
+# ---- Test D: warm cast discovery (cache-first reply + final rescan push) ----
+def test_warm_discover_replies_from_cache_and_pushes_update(monkeypatch):
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    # seed the union cache with one device; the "rescan" will find two
+    cached = [{"id": "dlna:192.0.2.10", "name": "TV-A", "protocol": "dlna",
+               "address": "192.0.2.10"}]
+    fresh = cached + [{"id": "AA:BB:CC:DD", "name": "ATV", "protocol": "airplay",
+                       "address": "192.0.2.11"}]
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda: list(cached))
+    rescans = []
+    monkeypatch.setattr(mc_host, "_cast_merged_discover",
+                        lambda timeout=5: rescans.append(1) or list(fresh))
+    mc_host.handle_cast({"sub": "discover", "reqId": "w1", "warm": True})
+    _join_cast_worker(lambda: any(m.get("type") == "cast-devices-update" for m in sent))
+    warm = [m for m in sent if m.get("type") == "cast-devices" and m.get("reqId") == "w1"]
+    assert warm and warm[0]["devices"] == cached and warm[0].get("warm") is True
+    push = [m for m in sent if m.get("type") == "cast-devices-update"]
+    assert rescans and push and push[0]["devices"] == fresh
+    assert push[0].get("final") is True
+
+
+def test_warm_discover_final_update_arrives_even_when_unchanged(monkeypatch):
+    # round-2 I1: final:true is the scan-complete signal — it ALWAYS follows the
+    # rescan, changed or not, so the picker can clear its "Scanning…" row.
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    same = [{"id": "dlna:192.0.2.10", "name": "TV-A", "protocol": "dlna",
+             "address": "192.0.2.10"}]
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda: list(same))
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", lambda timeout=5: list(same))
+    mc_host.handle_cast({"sub": "discover", "reqId": "w2", "warm": True})
+    _join_cast_worker(lambda: any(m.get("type") == "cast-devices-update" for m in sent))
+    push = [m for m in sent if m.get("type") == "cast-devices-update"]
+    assert push and push[0]["devices"] == same and push[0].get("final") is True
+
+
+def test_warm_discover_final_update_arrives_even_when_both_empty(monkeypatch):
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda: [])
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", lambda timeout=5: [])
+    mc_host.handle_cast({"sub": "discover", "reqId": "w3", "warm": True})
+    _join_cast_worker(lambda: any(m.get("type") == "cast-devices-update" for m in sent))
+    warm = [m for m in sent if m.get("type") == "cast-devices" and m.get("reqId") == "w3"]
+    assert warm and warm[0]["devices"] == [] and warm[0].get("warm") is True
+    push = [m for m in sent if m.get("type") == "cast-devices-update"]
+    assert push and push[0]["devices"] == [] and push[0].get("final") is True
+
+
+def test_plain_discover_unchanged(monkeypatch):
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", lambda timeout=5: [])
+    mc_host.handle_cast({"sub": "discover", "reqId": "p1"})
+    _join_cast_worker(lambda: any(m.get("type") == "cast-devices" for m in sent))
+    assert [m for m in sent if m.get("type") == "cast-devices" and m.get("reqId") == "p1"
+            and "warm" not in m]
+    assert not [m for m in sent if m.get("type") == "cast-devices-update"]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))

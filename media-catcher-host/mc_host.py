@@ -2815,6 +2815,19 @@ _CAST_SEEN = {}
 _CAST_SEEN_TTL = 90
 
 
+def _cast_seen_devices():
+    """The picker list from the recent-scan union cache ONLY — no network.
+    Expired entries are pruned in passing."""
+    now = time.time()
+    out = []
+    for addr in list(_CAST_SEEN):
+        if now - _CAST_SEEN[addr]["ts"] > _CAST_SEEN_TTL:
+            del _CAST_SEEN[addr]
+            continue
+        out.append(_CAST_SEEN[addr]["d"])
+    return out
+
+
 def _is_apple_tv(d):
     return "apple tv" in ((d.get("model") or "") + " " + (d.get("name") or "")).lower()
 
@@ -2847,13 +2860,7 @@ def _cast_merged_discover(timeout=5):
     now = time.time()
     for addr, d in found.items():
         _CAST_SEEN[addr] = {"d": d, "ts": now}
-    out = []
-    for addr in list(_CAST_SEEN):
-        if now - _CAST_SEEN[addr]["ts"] > _CAST_SEEN_TTL:
-            del _CAST_SEEN[addr]
-            continue
-        out.append(_CAST_SEEN[addr]["d"])
-    return out
+    return _cast_seen_devices()
 
 
 async def _cast_discover(timeout=6):
@@ -3090,6 +3097,20 @@ def handle_cast(req):
             if sub == "discover":
                 # Deterministic + stable: DLNA preferred over AirPlay per device,
                 # AirPlay limited to Apple TVs, union of recent scans (see helper).
+                if req.get("warm"):
+                    cached = _cast_seen_devices()
+                    send({"type": "cast-devices", "reqId": reqid, "warm": True,
+                          "devices": cached})
+                    fresh = _cast_merged_discover(req.get("timeout", 5))
+                    # ALWAYS send the completion update (round-2 review I1: an
+                    # empty warm reply + no-change rescan left the picker's
+                    # "Scanning…" spinning forever). final:true is the scan-
+                    # complete signal; the devices payload rides along whether
+                    # or not it changed (full-dict change detection is now the
+                    # POPUP's re-render optimization, not a send gate).
+                    send({"type": "cast-devices-update", "devices": fresh,
+                          "final": True})
+                    return
                 send({"type": "cast-devices", "reqId": reqid,
                       "devices": _cast_merged_discover(req.get("timeout", 5))})
             elif sub == "start":
