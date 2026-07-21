@@ -399,5 +399,28 @@ def test_the_shim_binding_is_the_only_effective_cast_seen(monkeypatch):
         "_cast_seen_devices did not read the shim's binding"
 
 
+def test_control_without_a_live_session_touches_no_transport(monkeypatch):
+    """A control arriving after a session ended must reach NEITHER protocol.
+    Before this fix `control` used an else-fallback to DLNA, so once `kind`
+    was cleared (natural end or explicit stop) a pause replayed against the
+    endpoint a PREVIOUS DLNA session left in _DLNA['ctrl'] — pausing the
+    wrong TV."""
+    calls = []
+    monkeypatch.setattr(mc_host, "_CAST", {"kind": None, "poll": None})
+    monkeypatch.setattr(mc_host, "_dlna_control", lambda *a, **kw: calls.append("dlna"))
+    monkeypatch.setattr(mc_host, "_cast_control", lambda *a, **kw: calls.append("airplay"))
+    monkeypatch.setattr(mc_host, "_cast_run", lambda *a, **kw: calls.append("airplay-run"))
+    LegacyBackend(lambda m: None).control("pause")
+    assert calls == [], "a control with no live session reached a transport: %r" % calls
+
+    # ...and it still routes correctly WHILE a session is live (both kinds).
+    mc_host._CAST["kind"] = "dlna"
+    LegacyBackend(lambda m: None).control("pause")
+    assert calls == ["dlna"], calls
+    mc_host._CAST["kind"] = "airplay"
+    LegacyBackend(lambda m: None).control("pause")
+    assert calls == ["dlna", "airplay", "airplay-run"], calls
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))

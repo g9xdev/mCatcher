@@ -1014,11 +1014,24 @@ class LegacyBackend(CastBackend):
             h._cast_start_poller(did, dname, title)
 
     def control(self, action, value=None):
+        """Route a transport command to the LIVE session's protocol.
+
+        The kind check is a positive test, not an else-fallback (review of
+        1ef3791, flagged by its own implementer): `kind` is None once a
+        session ends — naturally now, and always on explicit stop — and the
+        old `else` sent the command to _dlna_control, which would replay it
+        against whatever endpoint a PREVIOUS DLNA session left in
+        _DLNA["ctrl"]. A pause arriving after an AirPlay video finished
+        could therefore pause the DLNA TV instead. With no live session a
+        control is simply dropped: there is nothing to control."""
         h = _h()
-        if h._CAST.get("kind") == "airplay":
+        kind = h._CAST.get("kind")
+        if kind == "airplay":
             h._cast_run(h._cast_control(action, value), timeout=15)
-        else:
+        elif kind == "dlna":
             h._dlna_control(action, value)
+        else:
+            h._hlog("info", "cast: control %r ignored — no live session" % action)
 
     def stop(self):
         # Tears down whichever protocol is live, plus the status poller.
