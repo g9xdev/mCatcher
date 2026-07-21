@@ -1051,6 +1051,8 @@ function closePops() {
   if (popCast) popCast.classList.remove("open");
   popAnchor = null;
   castPrefetched = false;        // next hover may prefetch again
+  clearTimeout(castPrefetchTimer);  // a close within the 120ms debounce must not
+                                    // let the stale callback claim the NEXT lifecycle
 }
 function positionPop(pop, btn) {
   pop.classList.add("open");
@@ -1123,9 +1125,13 @@ async function buildCastPicker(item, btn) {
   // host's cache) and the host rescans in the background — cast-devices-update
   // broadcasts then re-render the open picker live.
   const resp = await send({ type: "cast-discover", warm: true });
-  // Stale build: closed while scanning, or reopened for a different item — that
-  // newer build owns the popover now (else this one could cast the WRONG item).
-  if (myGen !== castPickerGen || !popCast.classList.contains("open")) return;
+  // Stale build: closed while scanning, reopened for a different item (that
+  // newer build owns the popover now — else this one could cast the WRONG
+  // item), or the pairing PIN view replaced the popover's children (same
+  // DOM-ownership guard the live-update path uses; a prefetch can make rows
+  // clickable before this await resolves).
+  if (myGen !== castPickerGen || !popCast.classList.contains("open")
+      || !popCast.contains(castDevList)) return;
   const devices = (resp && resp.devices) || [];
   if (!resp || resp.ok === false) {
     castDevList.replaceChildren(castEmptyRow("Scan failed",
@@ -1225,7 +1231,12 @@ api.runtime.onMessage.addListener((msg) => {
     // replaces the popover's children, and then this update must not clobber it).
     if (popCast && popCast.classList.contains("open") && castDevList && popCast.contains(castDevList)) {
       const devices = msg.devices || [];
-      if (devices.length) renderCastDevices(castDevList, devices);
+      if (devices.length) {
+        renderCastDevices(castDevList, devices);
+        // A final that ALSO carries an error means these are cached rows and
+        // the refresh failed — say so instead of silently looking fresh.
+        if (msg.final && msg.error) flashStatus(msg.error);
+      }
       else if (msg.final) {
         // Scan complete and still nothing — clear the "Scanning network…" row.
         castDevList.replaceChildren(castNoDevicesRow(msg.error));
