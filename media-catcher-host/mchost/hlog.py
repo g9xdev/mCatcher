@@ -1,7 +1,7 @@
 """Structured logging + durable update history (moved verbatim from mc_host.py — Task C1).
 
 Patched/cross-module names (send, _hlog) resolve through the mc_host shim at
-CALL time (`_h.send`, `_h._hlog`) so monkeypatched fakes are always honored —
+CALL time (`_h().send`, `_h()._hlog`) so monkeypatched fakes are always honored —
 the splitting-modules-under-monkeypatch rule. _log_lock and the two path
 constants are owned here; nothing outside this module uses them.
 """
@@ -10,7 +10,13 @@ import os
 import threading
 import time
 
-import mc_host as _h
+def _h():
+    """Call-time shim lookup (review of b9043cd, Important): a module-level
+    `import mc_host` broke package-first import order (import mchost.hlog
+    before mc_host -> ImportError from the partially-initialised shim).
+    sys.modules caches the shim, so this is a dict hit per call."""
+    import mc_host
+    return mc_host
 from mchost.tools import HERE, TMPDIR
 
 # ---- diagnostics: structured logging + durable update history ------------
@@ -32,7 +38,7 @@ def _hlog(level, msg, src="host"):
     """Emit one structured log line: to the extension for the live console, and to
     a rolling on-disk file for after-the-fact inspection. Never raises."""
     try:
-        _h.send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": str(msg)})
+        _h().send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": str(msg)})
     except Exception:
         pass
     try:
@@ -72,12 +78,12 @@ def _log_event(component, outcome, frm=None, to=None, source=None, detail=None):
     except Exception:
         pass
     try:
-        _h.send({"type": "update-event", "event": rec})
+        _h().send({"type": "update-event", "event": rec})
     except Exception:
         pass
     bad = outcome in ("verify-failed", "reverted", "error", "guardian-did-not-run")
     arrow = (" %s→%s" % (frm or "?", to or "?")) if (frm or to) else ""
-    _h._hlog("error" if bad else "info",
+    _h()._hlog("error" if bad else "info",
              "update: %s %s%s%s%s" % (component, outcome, arrow,
                                       (" via %s" % source) if source else "",
                                       (" — %s" % detail) if detail else ""))

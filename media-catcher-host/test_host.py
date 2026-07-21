@@ -306,3 +306,17 @@ def test_warm_rescan_failure_emits_no_generic_cast_error(monkeypatch):
     assert wait_for(lambda: any(m.get("final") for m in sent))
     assert not [m for m in sent if m.get("type") == "cast-error"], \
         "warm rescan failure leaked a generic cast-error"
+
+
+
+def test_canonical_alias_loader_identity():
+    # Review of b9043cd (Minor 1, pin b): the registered loader and the
+    # canonical alias must agree — `import mc_host` anywhere resolves to the
+    # instance the tests patch. (Pin a: production __main__ identity is
+    # proven end-to-end by test_framing_ping_snapshot_reveal's round trip —
+    # the pong can only arrive through nm.py's OUT bound by the __main__
+    # instance's init_io.)
+    import sys
+    import mc_host as imported
+    assert imported is mc_host
+    assert sys.modules["mc_host"] is mc_host
