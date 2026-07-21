@@ -16,8 +16,15 @@ HOST = os.path.join(HERE, "mc_host.py")
 
 
 def load_host(name="mc_host"):
-    """Load mc_host.py fresh under `name`, registered in sys.modules first.
+    """Load mc_host.py under `name`, registered in sys.modules BEFORE exec —
+    and IDEMPOTENT per name: every test file gets the SAME instance. Two
+    loads under one name would leave sys.modules pointing at the second
+    while earlier files patch the first — the exact split-instance hazard
+    the canonical-alias rule exists to prevent (plan v4, round-2 C1). Tests
+    mutate state only via monkeypatch, so sharing is safe.
     Safe at collection time: the host defers io init to main()."""
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, HOST)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod          # register BEFORE exec_module (alias rule)

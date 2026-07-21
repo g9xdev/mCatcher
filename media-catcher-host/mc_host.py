@@ -2813,6 +2813,12 @@ async def _find_config(device_id, timeout=6):
 # picker stable instead of flickering between the DLNA and AirPlay TVs.
 _CAST_SEEN = {}
 _CAST_SEEN_TTL = 90
+# INTERIM serialization of full discovery scans (plan v4 round-3 I6): hover +
+# click can both trigger warm rescans, and two concurrent scans mutate
+# _CAST_SEEN mid-iteration. Phase C4's cast dispatcher takes ownership of
+# scan coalescing (single in-flight scan + result fan-out); until then this
+# lock makes concurrent discover requests queue instead of interleave.
+_DISCOVER_LOCK = threading.Lock()
 
 
 def _cast_seen_devices():
@@ -3101,18 +3107,30 @@ def handle_cast(req):
                     cached = _cast_seen_devices()
                     send({"type": "cast-devices", "reqId": reqid, "warm": True,
                           "devices": cached})
-                    fresh = _cast_merged_discover(req.get("timeout", 5))
-                    # ALWAYS send the completion update (round-2 review I1: an
-                    # empty warm reply + no-change rescan left the picker's
-                    # "Scanning…" spinning forever). final:true is the scan-
-                    # complete signal; the devices payload rides along whether
-                    # or not it changed (full-dict change detection is now the
-                    # POPUP's re-render optimization, not a send gate).
-                    send({"type": "cast-devices-update", "devices": fresh,
-                          "final": True})
+                    # ALWAYS send the completion update, even when the rescan
+                    # THROWS (plan v4: an exception used to fall out to the
+                    # generic cast-error while the warm reply had already
+                    # consumed the picker's pending resolver — an empty picker
+                    # then spun on "Scanning…" forever). final:true is the
+                    # scan-complete signal; on error the devices payload is
+                    # the cached list plus an "error" string.
+                    fresh, err = cached, None
+                    try:
+                        with _DISCOVER_LOCK:
+                            fresh = _cast_merged_discover(req.get("timeout", 5))
+                    except Exception as e:
+                        err = _cast_err(str(e))
+                        raise
+                    finally:
+                        upd = {"type": "cast-devices-update", "devices": fresh,
+                               "final": True}
+                        if err:
+                            upd["error"] = err
+                        send(upd)
                     return
-                send({"type": "cast-devices", "reqId": reqid,
-                      "devices": _cast_merged_discover(req.get("timeout", 5))})
+                with _DISCOVER_LOCK:
+                    devices = _cast_merged_discover(req.get("timeout", 5))
+                send({"type": "cast-devices", "reqId": reqid, "devices": devices})
             elif sub == "start":
                 _cast_stop_active()   # tear down ANY current session (either protocol) first
                 if dlna:

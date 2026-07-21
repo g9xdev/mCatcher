@@ -194,3 +194,22 @@ def test_plain_discover_unchanged(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
+
+
+def test_warm_discover_final_arrives_even_when_rescan_raises(monkeypatch):
+    # plan v4 (round-3 I1): the warm reply already consumed the picker's
+    # pending resolver, so a rescan exception must STILL produce the
+    # final:true update (cached devices + error string) or an empty picker
+    # spins on "Scanning..." forever.
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda: [])
+
+    def _boom(timeout=5):
+        raise RuntimeError("scan blew up")
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", _boom)
+    mc_host.handle_cast({"sub": "discover", "reqId": "we1", "warm": True})
+    assert wait_for(lambda: [m for m in sent if m.get("type") == "cast-devices-update"]), \
+        "final update never arrived after rescan exception"
+    upd = [m for m in sent if m.get("type") == "cast-devices-update"][0]
+    assert upd.get("final") is True and upd["devices"] == [] and upd.get("error")
