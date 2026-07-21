@@ -2819,18 +2819,27 @@ _CAST_SEEN_TTL = 90
 # scan coalescing (single in-flight scan + result fan-out); until then this
 # lock makes concurrent discover requests queue instead of interleave.
 _DISCOVER_LOCK = threading.Lock()
+# _CAST_SEEN's own short lock (round-4 plan review I4): warm cache reads
+# deliberately bypass _DISCOVER_LOCK (they must not wait behind a live scan),
+# so the dict itself needs guarding against read-prune vs scan-write races.
+_CAST_SEEN_LOCK = threading.Lock()
 
 
 def _cast_seen_devices():
     """The picker list from the recent-scan union cache ONLY — no network.
-    Expired entries are pruned in passing."""
+    Expired entries are pruned in passing. _CAST_SEEN_LOCK guards the prune
+    (round-4 plan review I4): a warm request reads/prunes this dict while a
+    concurrent scan (inside _DISCOVER_LOCK, which this call deliberately does
+    NOT take — the warm reply must not wait behind a 5s scan) writes it; two
+    warm readers can also race deleting the same expired key."""
     now = time.time()
     out = []
-    for addr in list(_CAST_SEEN):
-        if now - _CAST_SEEN[addr]["ts"] > _CAST_SEEN_TTL:
-            del _CAST_SEEN[addr]
-            continue
-        out.append(_CAST_SEEN[addr]["d"])
+    with _CAST_SEEN_LOCK:
+        for addr in list(_CAST_SEEN):
+            if now - _CAST_SEEN[addr]["ts"] > _CAST_SEEN_TTL:
+                del _CAST_SEEN[addr]
+                continue
+            out.append(_CAST_SEEN[addr]["d"])
     return out
 
 
@@ -2864,8 +2873,9 @@ def _cast_merged_discover(timeout=5):
         except Exception as e:
             _hlog("warn", "cast: AirPlay scan failed: %s" % e)
     now = time.time()
-    for addr, d in found.items():
-        _CAST_SEEN[addr] = {"d": d, "ts": now}
+    with _CAST_SEEN_LOCK:
+        for addr, d in found.items():
+            _CAST_SEEN[addr] = {"d": d, "ts": now}
     return _cast_seen_devices()
 
 
