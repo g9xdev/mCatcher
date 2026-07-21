@@ -35,73 +35,29 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
     {"type":"github-update","reached":bool,"latest":str?,"newer":bool?,"downloaded":[str]?}
     {"type":"error","id":N?,"error":str}
 """
+# Canonical-module alias (plan round-2 C1, MANDATORY first executable lines):
+# production runs this file as __main__ (mc_host.bat) and the tests spec-load
+# it registered as "mc_host" — either way, mchost/ submodules doing
+# `import mc_host` must resolve to THIS instance, never a second copy that
+# would split all patched/mutable state. The .get() guard covers loaders that
+# exec without registering __name__ at all.
+import sys as _sys
+_m = _sys.modules.get(__name__)
+if _m is not None:
+    _sys.modules.setdefault("mc_host", _m)
+
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
 VERSION = "1.8.1"
 
-# ---- stdio (bound in init_io so importing this module has no side effects) ----
-IN = None
-OUT = None
-_write_lock = threading.Lock()
+# ---- stdio framing: moved to mchost/nm.py (Task C1) ----------------------
+# The IN/OUT globals stay OWNED by nm (init_io rebinds them there; a shim copy
+# would go stale), so only the functions are re-exported here.
+from mchost.nm import init_io, send, read_message   # noqa: E402,F401
 
 
-def init_io():
-    """Bind fd 0/1 in binary mode. Works under pythonw where sys.stdin is None."""
-    global IN, OUT
-    if os.name == "nt":
-        import msvcrt
-        msvcrt.setmode(0, os.O_BINARY)
-        msvcrt.setmode(1, os.O_BINARY)
-    IN = os.fdopen(0, "rb", 0)
-    OUT = os.fdopen(1, "wb", 0)
-
-
-def send(msg):
-    data = json.dumps(msg).encode("utf-8")
-    with _write_lock:
-        OUT.write(struct.pack("@I", len(data)))
-        OUT.write(data)
-        OUT.flush()
-
-
-def read_message():
-    raw = IN.read(4)
-    if len(raw) < 4:
-        return None
-    (length,) = struct.unpack("@I", raw)
-    if length == 0:
-        return {}
-    data = IN.read(length)
-    if len(data) < length:
-        return None
-    return json.loads(data.decode("utf-8"))
-
-
-# ---- tool discovery ----
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def find_ffmpeg():
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    local = os.path.join(HERE, exe)
-    if os.path.isfile(local):
-        return local
-    return shutil.which("ffmpeg")
-
-
-FFMPEG = find_ffmpeg()
-TMPDIR = os.path.join(tempfile.gettempdir(), "media-catcher")
-os.makedirs(TMPDIR, exist_ok=True)
-
-
-def downloads_dir():
-    d = os.path.join(os.path.expanduser("~"), "Downloads")
-    return d if os.path.isdir(d) else os.path.expanduser("~")
-
-
-def sanitize(name):
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name or "recording").strip()
-    return (name[:120] or "recording")
+# ---- tool discovery: moved to mchost/tools.py (Task C1) ------------------
+from mchost.tools import HERE, TMPDIR, FFMPEG, find_ffmpeg, downloads_dir, sanitize   # noqa: E402,F401
 
 
 # ---- self-update ----------------------------------------------------------
@@ -109,114 +65,18 @@ def sanitize(name):
 EXT_ID = "{27383706-fb43-40dc-9e94-d2578818bd6a}"
 import zipfile, glob, configparser, concurrent.futures
 
-# Config is keyed per Firefox variant (Developer / Nightly / release) so several
-# Firefoxes sharing one native-host registration don't clobber each other's
-# settings. _variant_key() lives with the process-tree helpers below.
-def _config_path():
-    return os.path.join(HERE, "mc_config_%s.json" % _variant_key())
+# Per-variant config persistence: moved to mchost/config.py (Task C1).
+from mchost.config import _config_path, load_config, save_config   # noqa: E402,F401
 
 
-def load_config():
-    try:
-        with open(_config_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# ---- diagnostics: structured log + durable update history -----------------
+# Moved to mchost/hlog.py (Task C1). The guardian-monitoring / updater-
+# environment / archive-hash / version-parse helpers BELOW stay here until
+# updates.py lands (Task C2, round-2 I2 boundary). _last_avail is updater
+# dedup state and stays with that code.
+from mchost.hlog import _HOST_LOG, _HISTORY_PATH, _now_ms, _hlog, _log_event, _read_history   # noqa: E402,F401
 
-
-def save_config(cfg):
-    try:
-        with open(_config_path(), "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
-
-
-# ---- diagnostics: structured logging + durable update history ------------
-# Everything the Settings "Log console" and "Update history" panels show comes
-# from here. _hlog streams a line to the extension (live console) and appends to
-# a rolling file; _log_event records a durable history entry (what changed, when,
-# from where, and how it turned out) so a FAILED update explains itself instead of
-# vanishing silently — the gap that let the guardian bug hide for so long.
-_HOST_LOG = os.path.join(TMPDIR, "host.log")
-_HISTORY_PATH = os.path.join(HERE, "update-history.jsonl")
-_log_lock = threading.Lock()
 _last_avail = None   # last extension version we recorded as 'update-available' (dedup)
-
-
-def _now_ms():
-    return int(time.time() * 1000)
-
-
-def _hlog(level, msg, src="host"):
-    """Emit one structured log line: to the extension for the live console, and to
-    a rolling on-disk file for after-the-fact inspection. Never raises."""
-    try:
-        send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": str(msg)})
-    except Exception:
-        pass
-    try:
-        with _log_lock:
-            if os.path.exists(_HOST_LOG) and os.path.getsize(_HOST_LOG) > 512 * 1024:
-                # keep the last ~half when it grows past 512 KB
-                try:
-                    with open(_HOST_LOG, "r", encoding="utf-8", errors="replace") as f:
-                        tail = f.readlines()[-1500:]
-                    with open(_HOST_LOG, "w", encoding="utf-8") as f:
-                        f.writelines(tail)
-                except Exception:
-                    pass
-            with open(_HOST_LOG, "a", encoding="utf-8") as f:
-                f.write("%s  [%s/%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), src, level, msg))
-    except Exception:
-        pass
-
-
-def _log_event(component, outcome, frm=None, to=None, source=None, detail=None):
-    """Record a durable update-history entry and mirror it to the live console."""
-    rec = {"ts": _now_ms(), "component": component, "outcome": outcome,
-           "from": frm, "to": to, "source": source, "detail": detail}
-    try:
-        with _log_lock:
-            # Cap growth (repeated 'update-available' checks would otherwise append forever).
-            if os.path.exists(_HISTORY_PATH) and os.path.getsize(_HISTORY_PATH) > 256 * 1024:
-                try:
-                    with open(_HISTORY_PATH, "r", encoding="utf-8", errors="replace") as f:
-                        tail = f.readlines()[-1500:]
-                    with open(_HISTORY_PATH, "w", encoding="utf-8") as f:
-                        f.writelines(tail)
-                except Exception:
-                    pass
-            with open(_HISTORY_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
-    except Exception:
-        pass
-    try:
-        send({"type": "update-event", "event": rec})
-    except Exception:
-        pass
-    bad = outcome in ("verify-failed", "reverted", "error", "guardian-did-not-run")
-    arrow = (" %s→%s" % (frm or "?", to or "?")) if (frm or to) else ""
-    _hlog("error" if bad else "info",
-          "update: %s %s%s%s%s" % (component, outcome, arrow,
-                                   (" via %s" % source) if source else "",
-                                   (" — %s" % detail) if detail else ""))
-
-
-def _read_history(limit=200):
-    out = []
-    try:
-        with open(_HISTORY_PATH, "r", encoding="utf-8") as f:
-            for ln in f:
-                ln = ln.strip()
-                if ln:
-                    try:
-                        out.append(json.loads(ln))
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return out[-limit:]
 
 
 def _backup_root():
@@ -422,156 +282,11 @@ def _newest_zip(zip_dir, pattern):
 
 
 # ---- multi-instance: which Firefox launched this host? -------------------
-# Several Firefox variants share one native-host registration, so each spawns its
-# own host process. We identify OUR Firefox by walking up the process tree, key
-# the config per-variant, and (in the guardian) restart only our own Firefox.
-_FIREFOX_CACHE = "?"   # "?" = unresolved; None = not found
-
-
-def _proc_snapshot():
-    """pid -> (exe_name_lower, ppid) for all processes (Windows toolhelp)."""
-    import ctypes
-    from ctypes import wintypes
-
-    class PE(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
-                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
-    k32 = ctypes.windll.kernel32
-    snap = k32.CreateToolhelp32Snapshot(0x2, 0)
-    out = {}
-    try:
-        e = PE(); e.dwSize = ctypes.sizeof(e)
-        if k32.Process32FirstW(snap, ctypes.byref(e)):
-            while True:
-                out[int(e.th32ProcessID)] = (e.szExeFile.lower(), int(e.th32ParentProcessID))
-                if not k32.Process32NextW(snap, ctypes.byref(e)):
-                    break
-    finally:
-        k32.CloseHandle(snap)
-    return out
-
-
-def _pid_exe_path(pid):
-    import ctypes
-    from ctypes import wintypes
-    k32 = ctypes.windll.kernel32
-    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
-    if not h:
-        return ""
-    try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(1024)
-        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return buf.value
-    finally:
-        k32.CloseHandle(h)
-    return ""
-
-
-def launching_firefox():
-    """Full path of the firefox.exe that spawned this host (walking up past the
-    .bat/cmd wrapper). Cached for the process lifetime; None if not found."""
-    global _FIREFOX_CACHE
-    if _FIREFOX_CACHE != "?":
-        return _FIREFOX_CACHE
-    _FIREFOX_CACHE = None
-    if os.name == "nt":
-        try:
-            procs = _proc_snapshot()
-            pid = os.getpid()
-            for _ in range(8):
-                info = procs.get(pid)
-                if not info:
-                    break
-                name, ppid = info
-                if name == "firefox.exe":
-                    _FIREFOX_CACHE = _pid_exe_path(pid) or None
-                    break
-                pid = ppid
-        except Exception:
-            _FIREFOX_CACHE = None
-    return _FIREFOX_CACHE
-
-
-def _variant_key():
-    p = (launching_firefox() or "").lower()
-    if "nightly" in p:
-        return "nightly"
-    if "developer" in p or "aurora" in p:
-        return "dev"
-    if p.endswith("firefox.exe"):
-        return "release"
-    return "default"
-
-
-def find_firefox():
-    """Locate a firefox.exe — prefers the one that launched us, then registry,
-    then common install dirs (including Developer Edition)."""
-    if os.name == "nt":
-        ff = launching_firefox()
-        if ff and os.path.isfile(ff):
-            return ff
-    if os.name != "nt":
-        return shutil.which("firefox")
-    # App Paths registry
-    try:
-        import winreg
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                k = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe")
-                val, _ = winreg.QueryValueEx(k, None)
-                if val and os.path.isfile(val):
-                    return val
-            except Exception:
-                pass
-    except Exception:
-        pass
-    for p in [
-        r"C:\Program Files\Firefox Developer Edition\firefox.exe",
-        r"C:\Program Files\Mozilla Firefox\firefox.exe",
-        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
-        r"C:\Program Files (x86)\Firefox Developer Edition\firefox.exe",
-    ]:
-        if os.path.isfile(p):
-            return p
-    return None
-
-
-def find_profile():
-    """Best-effort: the Firefox profile directory in use (from profiles.ini)."""
-    base = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox")
-    ini = os.path.join(base, "profiles.ini")
-    if not os.path.isfile(ini):
-        return None
-    cp = configparser.ConfigParser()
-    try:
-        cp.read(ini)
-    except Exception:
-        return None
-
-    def resolve(path, is_rel):
-        return os.path.join(base, path) if str(is_rel) == "1" else path
-
-    # Prefer an [InstallXXChecksum] Default (the profile the last-used install opened).
-    for sec in cp.sections():
-        if sec.startswith("Install") and cp.has_option(sec, "Default"):
-            d = cp.get(sec, "Default")
-            cand = os.path.join(base, d)
-            if os.path.isdir(cand):
-                return cand
-    # Else a [ProfileN] with Default=1, else the first profile.
-    first = None
-    for sec in cp.sections():
-        if sec.startswith("Profile") and cp.has_option(sec, "Path"):
-            p = resolve(cp.get(sec, "Path"), cp.get(sec, "IsRelative", fallback="1"))
-            if first is None:
-                first = p
-            if cp.get(sec, "Default", fallback="0") == "1":
-                return p
-    return first
+# Moved to mchost/variant.py (Task C1; round-2 I2 — BEFORE config, which keys
+# off _variant_key). _FIREFOX_CACHE is owned by variant.py (launching_firefox
+# rebinds it there), so it is not re-exported here.
+from mchost.variant import (_proc_snapshot, _pid_exe_path, launching_firefox,   # noqa: E402,F401
+                            _variant_key, find_firefox, find_profile)
 
 
 def restart_firefox(firefox_path):
