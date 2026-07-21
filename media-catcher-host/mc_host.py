@@ -48,7 +48,7 @@ if _m is not None:
 
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 
 # ---- stdio framing: moved to mchost/nm.py (Task C1) ----------------------
 # The IN/OUT globals stay OWNED by nm (init_io rebinds them there; a shim copy
@@ -2859,8 +2859,14 @@ def handle_cast(req):
                             finally:
                                 _DISCOVER_LOCK.release()
                     except Exception as e:
+                        # Swallow, don't re-raise (review of 3eacdae, Important):
+                        # the final+error update below IS the failure signal; a
+                        # re-raise ALSO emitted the worker's generic cast-error,
+                        # which the extension treats as a SESSION error — it
+                        # cleared castState and could dismiss an active pairing
+                        # PIN dialog mid-entry.
                         err = _cast_err(str(e))
-                        raise
+                        _hlog("warn", "cast: warm rescan failed: %s" % e)
                     finally:
                         upd = {"type": "cast-devices-update", "devices": fresh,
                                "final": True}

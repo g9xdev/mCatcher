@@ -289,3 +289,20 @@ def test_concurrent_warm_discovers_never_scan_concurrently(monkeypatch):
     mc_host.handle_cast({"sub": "discover", "reqId": "c2", "warm": True})
     assert wait_for(lambda: len([m for m in sent if m.get("final")]) == 2, timeout=5)
     assert peak[0] == 1, "scans overlapped — _DISCOVER_LOCK not honored"
+
+
+def test_warm_rescan_failure_emits_no_generic_cast_error(monkeypatch):
+    # Review of 3eacdae (Important): the redundant worker-level cast-error made
+    # the extension clear castState (and an active pairing dialog). The
+    # final+error update is the ONLY failure signal a warm discover may emit.
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(m))
+    monkeypatch.setattr(mc_host, "_cast_seen_devices", lambda now=None: [])
+
+    def _boom(timeout=5):
+        raise RuntimeError("scan blew up")
+    monkeypatch.setattr(mc_host, "_cast_merged_discover", _boom)
+    mc_host.handle_cast({"sub": "discover", "reqId": "ne1", "warm": True})
+    assert wait_for(lambda: any(m.get("final") for m in sent))
+    assert not [m for m in sent if m.get("type") == "cast-error"], \
+        "warm rescan failure leaked a generic cast-error"
