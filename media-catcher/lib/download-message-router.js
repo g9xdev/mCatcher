@@ -817,10 +817,26 @@
       return { present: true, value: r.value };
     }
 
-    function readOptionalEffectiveDir(input) {
+    /**
+     * Snapshot and validate effectiveDestinationDirectory before dependency resolve.
+     * Absent → undefined. Present must be null or a nonblank primitive string
+     * (explicit undefined / blank / object / accessor invalid).
+     * When intent destination is non-null, a present non-null effective must equal it.
+     * When intent destination is null, present non-null effective may supply fallback.
+     */
+    function readOptionalEffectiveDir(input, intentDestinationDirectory) {
       var r = readOptionalOwnValue(input, "effectiveDestinationDirectory");
       if (!r.present) return undefined;
-      return r.value;
+      var effective = r.value;
+      if (effective === null) return null;
+      if (!isNonblankPrimitiveString(effective)) throw genericTypeError();
+      if (
+        intentDestinationDirectory !== null &&
+        effective !== intentDestinationDirectory
+      ) {
+        throw genericTypeError();
+      }
+      return effective;
     }
 
     function requireProviderGeneration(input) {
@@ -880,7 +896,11 @@
 
       var intentRaw = requireOwnData(input, "intent");
       var intent = readExactSixKeyIntent(intentRaw);
-      var effectiveDir = readOptionalEffectiveDir(input);
+      // Validate destination override before any file-sink dependency resolve.
+      var effectiveDir = readOptionalEffectiveDir(
+        input,
+        intent.destinationDirectory
+      );
 
       if (kind === "pget") {
         var url = requireOwnData(input, "url");

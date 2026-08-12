@@ -2830,6 +2830,119 @@ test("buildNativeStartPayload validates fully before dependency resolve; malform
     thrown = e;
   }
   assert.equal(thrown, depErr);
+
+  // Malformed effectiveDestinationDirectory must fail generically before dependency
+  // resolve (blank / object / explicit undefined / conflict) across start kinds.
+  const intentDefault = saveAsIntent({
+    destinationDirectory: null,
+    saveMode: "default",
+  });
+  const intentSave = saveAsIntent({ destinationDirectory: "D:\\\\Vids" });
+  const badEffectiveCases = [
+    { label: "blank", effectiveDestinationDirectory: "" },
+    { label: "whitespace", effectiveDestinationDirectory: "  " },
+    { label: "object", effectiveDestinationDirectory: { path: "E:\\\\x" } },
+    { label: "explicit-undefined", effectiveDestinationDirectory: undefined },
+  ];
+  const startKinds = [
+    {
+      kind: "pget",
+      base: {
+        kind: "pget",
+        jobId: "j",
+        attemptToken: "a",
+        intent: intentDefault,
+        url: "https://cdn/x.mp4",
+        maxConnections: 2,
+        providerGeneration: 1,
+      },
+    },
+    {
+      kind: "pget-single",
+      base: {
+        kind: "pget-single",
+        jobId: "j",
+        attemptToken: "a",
+        intent: intentDefault,
+        url: "https://cdn/x.mp4",
+        providerGeneration: 1,
+      },
+    },
+    {
+      kind: "file-open",
+      base: {
+        kind: "file-open",
+        jobId: "j",
+        attemptToken: "a",
+        intent: intentDefault,
+      },
+    },
+  ];
+  for (const sk of startKinds) {
+    for (const bad of badEffectiveCases) {
+      resolveHits = 0;
+      generic(() =>
+        api.buildNativeStartPayload(
+          Object.assign({}, sk.base, {
+            effectiveDestinationDirectory: bad.effectiveDestinationDirectory,
+          })
+        )
+      );
+      assert.equal(
+        resolveHits,
+        0,
+        `${sk.kind} effective=${bad.label} must not resolve dependency`
+      );
+    }
+    // Conflicting non-null override vs intent destination.
+    resolveHits = 0;
+    generic(() =>
+      api.buildNativeStartPayload(
+        Object.assign({}, sk.base, {
+          intent: intentSave,
+          effectiveDestinationDirectory: "E:\\\\Other",
+        })
+      )
+    );
+    assert.equal(
+      resolveHits,
+      0,
+      `${sk.kind} conflicting effective dest must not resolve dependency`
+    );
+  }
+
+  // Valid effective fallback (intent null + nonblank dir) still propagates dependency.
+  let thrownEff = null;
+  try {
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: intentDefault,
+      url: "https://cdn/x.mp4",
+      maxConnections: 2,
+      providerGeneration: 1,
+      effectiveDestinationDirectory: "E:\\\\DefaultFolder",
+    });
+  } catch (e) {
+    thrownEff = e;
+  }
+  assert.equal(thrownEff, depErr);
+
+  // Present null effective remains allowed and still reaches dependency.
+  let thrownNullEff = null;
+  try {
+    api.buildNativeStartPayload({
+      kind: "file-open",
+      jobId: "j",
+      attemptToken: "a",
+      intent: intentSave,
+      effectiveDestinationDirectory: null,
+    });
+  } catch (e) {
+    thrownNullEff = e;
+  }
+  assert.equal(thrownNullEff, depErr);
 });
 
 test("buildNativeStartPayload HTTP context rejects present null/undefined/controls including C1", () => {
