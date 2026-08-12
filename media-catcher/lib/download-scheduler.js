@@ -1618,6 +1618,63 @@
     }
 
     /**
+     * Park a live job when the native helper transport disconnects.
+     * Applies only to running | pausing_provider | waiting_provider.
+     * One needs_user transition (single stateVersion bump), release held slot once,
+     * clear queues / retry deadline / live attempt token, zero native opens on the
+     * job and its ProviderGate, preserve intent/mode/concurrency/retries/ephemeral.
+     * Authenticated saturated/recovering owners complete ownership with no recovery
+     * successor and do not wake same-provider waiters. Independent-provider capacity
+     * is drained. No retry charge, no Firefox, no popup proof. Duplicate/unknown/
+     * non-eligible → false no-op.
+     */
+    function onTransportUnavailable(jobId) {
+      var job = jobs.get(jobId);
+      if (!job) return false;
+      if (
+        job.state !== "running" &&
+        job.state !== "pausing_provider" &&
+        job.state !== "waiting_provider"
+      ) {
+        return false;
+      }
+
+      // Zero native opens on job + gate without maybeQuiesce (would detour pausing
+      // into waiting_provider before needs_user). Disconnect is terminal for this
+      // helper generation of opens.
+      job.nativeOpenConnections = 0;
+      var gate = getGate(job.providerKey);
+      try {
+        gate.noteNativeOpen(job.id, 0);
+      } catch (errNative) {
+        // Gate observation must not block the park transaction.
+      }
+
+      // Authenticated saturated/recovering owner: release ownership with no recovery
+      // successor. Do not authorize/wake same-provider waiters on helper disconnect.
+      var snap = gate.snapshot();
+      if (
+        (snap.state === "saturated" || snap.state === "recovering") &&
+        snap.ownerJobId === job.id
+      ) {
+        try {
+          gate.completeOwner({
+            jobId: job.id,
+            recoveryOwnerJobId: null,
+          });
+        } catch (errOwner) {
+          // Ownership release best-effort; job still parks needs_user below.
+        }
+      }
+
+      // Single stateVersion bump, slot release, queue/token/deadline clear; ephemeral
+      // retained for manualRetry after reconnection.
+      if (!enterNeedsUser(job)) return false;
+      drain();
+      return true;
+    }
+
+    /**
      * Manual retry from needs_user only. New explicit generation: reset configured
      * automatic budget and retry-use counter, clear deadline, preserve immutable
      * intent/filename and reduced concurrency/mode, queue via central drain.
@@ -2115,13 +2172,14 @@
       }
     }
 
-    // Public surface — stable method names for Tasks 9–11.
+    // Public surface — stable method names for Tasks 9–11 (+ transport park).
     return {
       createJob: createJob,
       enqueue: enqueue,
       setMaxConcurrent: setMaxConcurrent,
       cancel: cancel,
       onTransportResult: onTransportResult,
+      onTransportUnavailable: onTransportUnavailable,
       onCapabilitySwitch: onCapabilitySwitch,
       getJob: getJob,
       getSnapshot: getSnapshot,
