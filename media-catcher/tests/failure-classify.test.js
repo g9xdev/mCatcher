@@ -72,6 +72,34 @@ test("normalizeBrowserError cancellation beats generic abort/network wording", (
   assert.equal(cancelRequested.category, "cancelled");
 });
 
+test("normalizeBrowserError explicit cancellation flags beat TimeoutError name", () => {
+  // Review finding: TimeoutError carve-out must not override cancelled/cancelRequested.
+  const cancelRequestedTimeout = FC.normalizeBrowserError({
+    name: "TimeoutError",
+    cancelRequested: true,
+  });
+  assert.equal(cancelRequestedTimeout.category, "cancelled");
+  assert.equal(cancelRequestedTimeout.retryable, false);
+
+  const cancelledTimeout = FC.normalizeBrowserError({
+    name: "TimeoutError",
+    cancelled: true,
+  });
+  assert.equal(cancelledTimeout.category, "cancelled");
+  assert.equal(cancelledTimeout.retryable, false);
+
+  // Carve-out still applies only to free-form abort/cancel wording without flags.
+  assert.equal(
+    FC.normalizeBrowserError({
+      name: "TimeoutError",
+      message: "The operation was aborted due to timeout",
+    }).category,
+    "timeout"
+  );
+  assert.equal(FC.normalizeBrowserError({ name: "TimeoutError" }).category, "timeout");
+  assert.equal(FC.normalizeBrowserError({ name: "TimeoutError" }).retryable, true);
+});
+
 test("normalizeBrowserError handles null, strings, status coercion, and range flags without throwing", () => {
   assert.deepEqual(FC.normalizeBrowserError(null), { category: "permanent", retryable: false });
   assert.deepEqual(FC.normalizeBrowserError(undefined), { category: "permanent", retryable: false });
@@ -143,6 +171,28 @@ test("normalizeNativeFailure handles case, nested fields, and safe permanent fal
   assert.equal(FC.normalizeNativeFailure({ failureCategory: "not_a_real_category" }).category, "permanent");
   assert.equal(FC.normalizeNativeFailure({ reason: "ECONNRESET" }).retryable, true);
   assert.equal(FC.normalizeNativeFailure({ reason: "disk full" }).retryable, false);
+});
+
+test("normalizeNativeFailure cancellation flags override known failureCategory", () => {
+  // Review finding: match browser path — cancelled/cancelRequested beat known categories.
+  const timeoutCancelled = FC.normalizeNativeFailure({
+    failureCategory: "timeout",
+    cancelRequested: true,
+  });
+  assert.equal(timeoutCancelled.category, "cancelled");
+  assert.equal(timeoutCancelled.retryable, false);
+
+  const rateLimitedCancelled = FC.normalizeNativeFailure({
+    failureCategory: "http_429",
+    cancelled: true,
+  });
+  assert.equal(rateLimitedCancelled.category, "cancelled");
+  assert.equal(rateLimitedCancelled.retryable, false);
+
+  // Without flags, known failureCategory still wins.
+  assert.equal(FC.normalizeNativeFailure({ failureCategory: "timeout" }).category, "timeout");
+  assert.equal(FC.normalizeNativeFailure({ failureCategory: "timeout" }).retryable, true);
+  assert.equal(FC.normalizeNativeFailure({ failureCategory: "http_429" }).category, "http_429");
 });
 
 test("queued or needs_user sibling does not satisfy active-sibling predicate", () => {
@@ -313,6 +363,105 @@ test("hasActiveSibling tolerates malformed input, empty providerKey, and does no
   assert.equal(r.siblingJobId, "run");
   assert.equal(JSON.stringify(jobs), before);
   assert.equal(jobs[0].marker, "keep");
+});
+
+test("hasActiveSibling requires non-empty excludeJobId and ignores blank candidate ids", () => {
+  // Review finding: must prove a different job; missing/null/blank excludeJobId is not ok.
+  const active = {
+    id: "run",
+    providerKey: "florenfile.com",
+    state: "running",
+    inFlightPermits: 1,
+    nativeOpenConnections: 0,
+    cancelRequested: false,
+  };
+
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com" }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: null }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: undefined }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: "" }),
+    { ok: false, siblingJobId: null }
+  );
+
+  // Candidates with missing/null/blank id never count as siblings.
+  const blankIdJobs = [
+    {
+      id: null,
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      id: "",
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 2,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+  ];
+  assert.deepEqual(
+    FC.hasActiveSibling({
+      jobs: blankIdJobs,
+      providerKey: "florenfile.com",
+      excludeJobId: "failed",
+    }),
+    { ok: false, siblingJobId: null }
+  );
+
+  // After skipping blank ids, first real qualifying sibling still wins (exact-id exclude).
+  const mixed = [
+    {
+      id: "",
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      id: "failed",
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      id: "hit",
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+  ];
+  const r = FC.hasActiveSibling({
+    jobs: mixed,
+    providerKey: "florenfile.com",
+    excludeJobId: "failed",
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.siblingJobId, "hit");
 });
 
 test("hasActiveSibling returns first qualifying sibling among mixed jobs", () => {

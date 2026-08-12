@@ -73,17 +73,19 @@
     opts = opts || {};
     var s = lower(text);
 
-    // 1) Cancellation always wins over network/abort phrasing.
+    // 1) Explicit cancellation flags always win (including over TimeoutError name).
+    if (opts.cancelled === true || opts.cancelRequested === true) {
+      return "cancelled";
+    }
+
+    // Free-form abort/cancel wording: cancelled unless TimeoutError carve-out.
+    // TimeoutError + abort/cancel text may still be a timeout (no explicit flags).
     if (
-      opts.cancelled === true ||
-      opts.cancelRequested === true ||
       opts.name === "aborterror" ||
       /\bcancel(?:led|ed|lation)?\b/.test(s) ||
       /\baborted\b/.test(s) ||
       /\babort\b/.test(s)
     ) {
-      // AbortError / cancelled flags are cancelled. Free-form "abort" without
-      // TimeoutError context is also cancelled (user/host stop).
       if (opts.name !== "timeouterror") {
         return "cancelled";
       }
@@ -261,6 +263,13 @@
 
       if (typeof reasonStringOrObject !== "object") return result("permanent");
 
+      var cancelled = truthyFlag(reasonStringOrObject, "cancelled");
+      var cancelRequested = truthyFlag(reasonStringOrObject, "cancelRequested");
+      // Explicit cancellation flags override known failureCategory (match browser path).
+      if (cancelled || cancelRequested) {
+        return result("cancelled");
+      }
+
       var failureCategory = lower(reasonStringOrObject.failureCategory);
       if (KNOWN_CATEGORIES[failureCategory]) {
         return result(failureCategory);
@@ -278,8 +287,8 @@
         shortRead: truthyFlag(reasonStringOrObject, "shortRead"),
         rangeUnsupported: truthyFlag(reasonStringOrObject, "rangeUnsupported"),
         rangeIgnored: truthyFlag(reasonStringOrObject, "rangeIgnored"),
-        cancelled: truthyFlag(reasonStringOrObject, "cancelled"),
-        cancelRequested: truthyFlag(reasonStringOrObject, "cancelRequested")
+        cancelled: cancelled,
+        cancelRequested: cancelRequested
       };
       var category = classifyText(text, opts);
       return result(category || "permanent");
@@ -306,17 +315,23 @@
       if (!Array.isArray(jobs)) {
         return { ok: false, siblingJobId: null };
       }
+      // Must prove a different job: require non-empty excludeJobId.
       var excludeJobId = input.excludeJobId;
+      if (excludeJobId == null || excludeJobId === "") {
+        return { ok: false, siblingJobId: null };
+      }
 
       for (var i = 0; i < jobs.length; i++) {
         var job = jobs[i];
         if (!job || typeof job !== "object") continue;
+        // Ignore candidates with missing/null/blank id.
+        if (job.id == null || job.id === "") continue;
         if (job.providerKey !== providerKey) continue;
-        if (excludeJobId != null && job.id === excludeJobId) continue;
+        if (job.id === excludeJobId) continue;
         if (job.state !== "running" && job.state !== "pausing_provider") continue;
         if (job.cancelRequested === true) continue;
         if (!positiveNumber(job.inFlightPermits) && !positiveNumber(job.nativeOpenConnections)) continue;
-        return { ok: true, siblingJobId: job.id == null ? null : job.id };
+        return { ok: true, siblingJobId: job.id };
       }
       return { ok: false, siblingJobId: null };
     } catch (e) {
