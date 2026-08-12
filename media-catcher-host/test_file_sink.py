@@ -1286,35 +1286,84 @@ def test_cleanup_is_idempotent(tmp_path, monkeypatch):
         assert fs._BINDINGS == {}
 
 
+def test_cleanup_close_error_still_removes_bound_part(tmp_path, monkeypatch):
+    """Close raising after releasing the handle must not skip that sink's .part.
+
+    The existing dual-fault test pairs close failure with a deliberate remove
+    failure, so it cannot observe a close-only skip of bound-part removal.
+    """
+    import mchost.filesink as fs
+
+    sent = []
+    opened = _open(tmp_path, monkeypatch, sent, job="jcl", token="t1", name="cl.mp4")
+    assert opened
+    sink = opened["sinkId"]
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "jcl", "attemptToken": "t1", "seq": 0,
+        "dataB64": _b64(b"close-part"), "length": 10,
+    })
+    part = tmp_path / "cl.mp4.part"
+    assert part.exists()
+
+    with fs._LOCK:
+        s = fs._SINKS[sink]
+    real = s.handle
+
+    class BoomClose:
+        def write(self, data):
+            return real.write(data)
+
+        def flush(self):
+            return real.flush()
+
+        def fileno(self):
+            return real.fileno()
+
+        def close(self):
+            # Release the underlying file so os.remove can succeed, then raise.
+            try:
+                real.close()
+            except Exception:
+                pass
+            raise OSError(errno.EIO, "close failed")
+
+    with s.lock:
+        s.handle = BoomClose()
+
+    # Surface close failures past the helper so cleanup-loop independence is
+    # what guarantees .part removal (shared try around close+remove skips it).
+    def close_then_raise(sink_obj):
+        h = sink_obj.handle
+        sink_obj.handle = None
+        if h is not None:
+            h.close()  # closes real file, then raises
+        raise OSError(errno.EIO, "close failed")
+
+    monkeypatch.setattr(fs, "_close_handle_unlocked", close_then_raise)
+
+    n = len(sent)
+    fs.cleanup_file_sinks()  # must not raise
+    # Exact bound .part removed even though close raised.
+    assert not part.exists()
+    assert not (tmp_path / "cl.mp4").exists()
+    with fs._LOCK:
+        assert fs._SINKS == {}
+        assert fs._PART_OWNERS == {}
+        assert fs._BINDINGS == {}
+    assert s.handle is None
+    assert sent[n:] == []
+
+
 def test_cleanup_fault_on_one_does_not_block_other(tmp_path, monkeypatch):
+    """Remove failure on one sink must not block its close/detach or peers."""
     import mchost.filesink as fs
 
     sent = []
     part_a, part_b, (s1, s2) = _two_open_partials(tmp_path, monkeypatch, sent)
     with fs._LOCK:
         sink_a = fs._SINKS[s1]
-    real_a = sink_a.handle
+        sink_b = fs._SINKS[s2]
     boom_path = os.path.realpath(str(part_a))
-
-    class BoomClose:
-        def write(self, data):
-            return real_a.write(data)
-
-        def flush(self):
-            return real_a.flush()
-
-        def fileno(self):
-            return real_a.fileno()
-
-        def close(self):
-            try:
-                real_a.close()
-            except Exception:
-                pass
-            raise OSError(errno.EIO, "close failed")
-
-    with sink_a.lock:
-        sink_a.handle = BoomClose()
 
     real_remove = fs.os.remove
 
@@ -1329,15 +1378,22 @@ def test_cleanup_fault_on_one_does_not_block_other(tmp_path, monkeypatch):
         return real_remove(path)
 
     monkeypatch.setattr(fs.os, "remove", selective_remove)
-    # Must not raise even when one sink's close/remove fails.
+    n = len(sent)
+    # Must not raise even when one sink's remove fails.
     fs.cleanup_file_sinks()
-    # Other sink still cleaned; registries empty (detach is atomic).
+    # Faulted sink is still closed and detached; do not require its .part gone
+    # when os.remove is deliberately failing for that path only.
+    assert sink_a.handle is None
+    assert sink_b.handle is None
     assert not part_b.exists()
+    assert not (tmp_path / "a.mp4").exists()
+    assert not (tmp_path / "b.mp4").exists()
     with fs._LOCK:
         assert fs._SINKS == {}
         assert fs._PART_OWNERS == {}
         assert fs._BINDINGS == {}
         assert s1 not in fs._SINKS and s2 not in fs._SINKS
+    assert sent[n:] == []
 
 
 def test_cleanup_emits_no_frames(tmp_path, monkeypatch):

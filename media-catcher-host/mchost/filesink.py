@@ -58,9 +58,18 @@ def cleanup_file_sinks():
                 with s.lock:
                     if s.state == "open":
                         s.state = "terminal"
-                    _close_handle_unlocked(s)
-                    # Only the exact bound .part — never the final path.
-                    _remove_part_unlocked(s)
+                    # Close and remove are independent best-effort steps: a
+                    # close exception must not skip this sink's exact .part,
+                    # and a remove exception must not block later sinks.
+                    try:
+                        _close_handle_unlocked(s)
+                    except Exception:
+                        pass
+                    try:
+                        # Only the exact bound .part — never the final path.
+                        _remove_part_unlocked(s)
+                    except Exception:
+                        pass
             except Exception:
                 pass
     except Exception:
