@@ -438,73 +438,78 @@ def main():
             start_github_poll()
     except Exception:
         pass
-    while True:
-        try:
-            msg = read_message()
-        except Exception as e:
-            send({"type": "error", "error": "read failed: %s" % e})
-            break
-        if msg is None:
-            break
-        cmd = msg.get("cmd")
-        try:
-            if cmd == "ping":
-                send({"type": "pong", "ffmpeg": bool(FFMPEG), "ffmpegPath": FFMPEG or "", "version": VERSION,
-                      "ytdlp": bool(_downloads.YTDLP), "ytdlpVersion": ytdlp_version_cached(),
-                      "node": bool(_downloads.NODE), "deno": bool(_downloads.DENO), "pot": _pot_alive(),
-                      "cast": True})   # DLNA casting is stdlib — always available
-            elif cmd == "ytdl":
-                handle_ytdl(msg)
-            elif cmd == "ytmeta":
-                handle_ytmeta(msg)
-            elif cmd == "cast":
-                handle_cast(msg)
-            elif cmd == "ytdlUpdate":
-                threading.Thread(target=ytdlp_update, daemon=True).start()
-            elif cmd == "record":
-                handle_record(msg)
-            elif cmd == "stop":
-                handle_stop(msg)
-            elif cmd == "snapshot":
-                handle_snapshot(msg)
-            elif cmd == "save":
-                handle_save(msg)
-            elif cmd == "saveAs":
-                handle_save_as(msg)
-            elif cmd == "pickFolder":
-                handle_pick_folder(msg)
-            elif cmd == "open":
-                handle_open(msg)
-            elif cmd == "reveal":
-                handle_reveal(msg)
-            elif cmd == "update":
-                handle_update(msg)
-            elif cmd == "watch":
-                handle_watch(msg)
-            elif cmd == "checkGithub":
-                handle_check_github(msg)
-            elif cmd == "discard":
-                handle_discard(msg)
-            elif cmd == "pget":
-                handle_pget(msg)
-            elif cmd == "pget-single":
-                handle_pget_single(msg)
-            elif cmd == "pget-set-limit":
-                handle_pget_set_limit(msg)
-            elif cmd == "getReport":
-                handle_get_report(msg)
-            elif cmd == "pget-cancel":
-                _pget_cancel(msg)
-            elif cmd == "file-open":
-                handle_file_open(msg)
-            elif cmd == "file-chunk":
-                handle_file_chunk(msg)
-            elif cmd == "file-commit":
-                handle_file_commit(msg)
-            elif cmd == "file-abort":
-                handle_file_abort(msg)
-        except Exception as e:
-            send({"type": "error", "id": msg.get("id"), "error": str(e)})
+    try:
+        while True:
+            try:
+                msg = read_message()
+            except Exception as e:
+                send({"type": "error", "error": "read failed: %s" % e})
+                break
+            if msg is None:
+                break
+            cmd = msg.get("cmd")
+            try:
+                if cmd == "ping":
+                    send({"type": "pong", "ffmpeg": bool(FFMPEG), "ffmpegPath": FFMPEG or "", "version": VERSION,
+                          "ytdlp": bool(_downloads.YTDLP), "ytdlpVersion": ytdlp_version_cached(),
+                          "node": bool(_downloads.NODE), "deno": bool(_downloads.DENO), "pot": _pot_alive(),
+                          "cast": True})   # DLNA casting is stdlib — always available
+                elif cmd == "ytdl":
+                    handle_ytdl(msg)
+                elif cmd == "ytmeta":
+                    handle_ytmeta(msg)
+                elif cmd == "cast":
+                    handle_cast(msg)
+                elif cmd == "ytdlUpdate":
+                    threading.Thread(target=ytdlp_update, daemon=True).start()
+                elif cmd == "record":
+                    handle_record(msg)
+                elif cmd == "stop":
+                    handle_stop(msg)
+                elif cmd == "snapshot":
+                    handle_snapshot(msg)
+                elif cmd == "save":
+                    handle_save(msg)
+                elif cmd == "saveAs":
+                    handle_save_as(msg)
+                elif cmd == "pickFolder":
+                    handle_pick_folder(msg)
+                elif cmd == "open":
+                    handle_open(msg)
+                elif cmd == "reveal":
+                    handle_reveal(msg)
+                elif cmd == "update":
+                    handle_update(msg)
+                elif cmd == "watch":
+                    handle_watch(msg)
+                elif cmd == "checkGithub":
+                    handle_check_github(msg)
+                elif cmd == "discard":
+                    handle_discard(msg)
+                elif cmd == "pget":
+                    handle_pget(msg)
+                elif cmd == "pget-single":
+                    handle_pget_single(msg)
+                elif cmd == "pget-set-limit":
+                    handle_pget_set_limit(msg)
+                elif cmd == "getReport":
+                    handle_get_report(msg)
+                elif cmd == "pget-cancel":
+                    _pget_cancel(msg)
+                elif cmd == "file-open":
+                    handle_file_open(msg)
+                elif cmd == "file-chunk":
+                    handle_file_chunk(msg)
+                elif cmd == "file-commit":
+                    handle_file_commit(msg)
+                elif cmd == "file-abort":
+                    handle_file_abort(msg)
+            except Exception as e:
+                send({"type": "error", "id": msg.get("id"), "error": str(e)})
+    finally:
+        # Bound .part files from this process must not block a retry after
+        # native-messaging EOF / read failure. No frames — stdout may be gone.
+        cleanup_file_sinks()
 
 
 # ---- parallel multi-mirror direct download --------------------------------
@@ -523,7 +528,8 @@ from mchost.downloads import (_pget_open, _pget_probe, _pget_segment,   # noqa: 
 # there; handlers re-exported so monkeypatch.setattr(mc_host, "send", ...) is
 # honored via filesink's call-time _h() lookup.
 from mchost.filesink import (handle_file_open, handle_file_chunk,   # noqa: E402,F401
-                             handle_file_commit, handle_file_abort)
+                             handle_file_commit, handle_file_abort,
+                             cleanup_file_sinks)
 
 
 if __name__ == "__main__":

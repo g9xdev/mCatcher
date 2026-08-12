@@ -38,20 +38,38 @@ def _h():
     return mc_host
 
 
+def cleanup_file_sinks():
+    """Detach and close every live file sink without emitting native frames.
+
+    Used on native-messaging EOF / host exit so this process's bound .part
+    files cannot block retry. Atomically empties the registries under _LOCK,
+    then closes handles and removes only each detached sink's exact .part
+    path outside the registry lock. Never removes final paths, never emits
+    frames (stdout may be unavailable), and never raises.
+    """
+    try:
+        with _LOCK:
+            sinks = list(_SINKS.values())
+            _SINKS.clear()
+            _PART_OWNERS.clear()
+            _BINDINGS.clear()
+        for s in sinks:
+            try:
+                with s.lock:
+                    if s.state == "open":
+                        s.state = "terminal"
+                    _close_handle_unlocked(s)
+                    # Only the exact bound .part — never the final path.
+                    _remove_part_unlocked(s)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _reset_for_tests():
     """Close handles, drop partials, clear registries (test isolation only)."""
-    with _LOCK:
-        sinks = list(_SINKS.values())
-        _SINKS.clear()
-        _PART_OWNERS.clear()
-        _BINDINGS.clear()
-    for s in sinks:
-        try:
-            with s.lock:
-                _close_handle_unlocked(s)
-                _remove_part_unlocked(s)
-        except Exception:
-            pass
+    cleanup_file_sinks()
 
 
 class _Sink:
