@@ -391,8 +391,68 @@
     }
 
     /**
+     * Terminalize a waiting_provider job exactly once: remove from wait/provider
+     * queues, release a held slot only if present, clear attempt token + ephemeral,
+     * and close the wait epoch so it cannot be re-woken.
+     */
+    function terminalizeWaitingJob(job, nextState) {
+      if (!job || job.state !== "waiting_provider") return false;
+      removeFromWaitQueue(job);
+      removeFromQueue(job);
+      releaseSlotIfHeld(job);
+      job.state = nextState;
+      job.stateVersion += 1;
+      job.attemptToken = null;
+      job.consumeRetryOnWake = false;
+      job.wakeRetryConsumed = true;
+      job.wakeAuthorized = true;
+      if (
+        nextState === "completed" ||
+        nextState === "failed" ||
+        nextState === "cancelled"
+      ) {
+        clearEphemeralOnce(job);
+      }
+      return true;
+    }
+
+    /** Failed waiter with zero retry budget must not requeue forever. */
+    function isExhaustedFailedWaiter(job) {
+      return (
+        !!job &&
+        job.state === "waiting_provider" &&
+        job.consumeRetryOnWake === true &&
+        job.retryRemaining <= 0
+      );
+    }
+
+    /**
+     * After a job becomes waiting_provider (including late quiesce), authorize
+     * progress only when the gate can accept work: recovering-blocked with no
+     * owner, or normal after recovery. Never admit directly — wake → queued → drain.
+     * Active saturated/recovering owners leave the waiter parked.
+     */
+    function maybeAuthorizeReadyWaiter(job) {
+      if (!job || job.state !== "waiting_provider") return;
+      var gate = getGate(job.providerKey);
+      var snap = gate.snapshot();
+      if (snap.state === "recovering" && snap.ownerJobId == null) {
+        // Prefer oldest eligible (skips/terminalizes exhausted FIFO heads).
+        var next = oldestEligibleWaiter(job.providerKey);
+        if (next) authorizeWake(next);
+        return;
+      }
+      if (snap.state === "normal") {
+        authorizeWake(job);
+      }
+      // saturated with drain owner, or recovering with active owner: remain parked.
+    }
+
+    /**
      * Shared quiesce edge: pausing_provider → waiting_provider exactly once when
      * total permits and native opens are both zero. State guard only (single-threaded).
+     * Late quiesce after owner completion / recovery-to-normal auto-authorizes wake
+     * when the gate is recovering-blocked or normal (never while an owner is active).
      */
     function maybeQuiesce(job) {
       if (!job) return;
@@ -403,6 +463,7 @@
       job.attemptToken = null;
       releaseSlotIfHeld(job);
       appendWaitFifo(job);
+      maybeAuthorizeReadyWaiter(job);
       drain();
     }
 
@@ -701,13 +762,34 @@
       return true;
     }
 
+    /**
+     * Oldest eligible waiting_provider for recovery/wake selection.
+     * Exhausted failed waiters are terminalized in FIFO order (bounded, non-recursive)
+     * so they never become recovery owners or requeue forever. Paused-only waiters
+     * at zero budget remain eligible.
+     */
     function oldestEligibleWaiter(providerKey) {
       var w = providerWaitQueues.get(providerKey) || [];
-      for (var i = 0; i < w.length; i++) {
+      var i = 0;
+      while (i < w.length) {
         var j = jobs.get(w[i]);
-        if (!j) continue;
-        if (j.state !== "waiting_provider") continue;
-        if (j.cancelRequested === true) continue;
+        if (!j) {
+          i += 1;
+          continue;
+        }
+        if (j.state !== "waiting_provider") {
+          i += 1;
+          continue;
+        }
+        if (j.cancelRequested === true) {
+          i += 1;
+          continue;
+        }
+        if (isExhaustedFailedWaiter(j)) {
+          // Removes from wait queue; next candidate shifts into index i.
+          terminalizeWaitingJob(j, "failed");
+          continue;
+        }
         return j;
       }
       return null;
@@ -717,6 +799,7 @@
      * Single authorized wake of a waiting_provider job back to queued for the
      * current wait epoch. Late duplicates in the same epoch no-op.
      * Failed waiters consume at most one retry per epoch; paused-only consume none.
+     * Exhausted failed waiters terminalize instead of requeueing.
      * Never bypasses global admission — appends wait-FIFO order into provider FIFO,
      * then central drain applies global cap / round-robin.
      */
@@ -724,6 +807,13 @@
       if (!job || job.state !== "waiting_provider") return false;
       // Per wait-epoch idempotence (not job lifetime).
       if (job.wakeAuthorized) return false;
+
+      // Exhausted failed waiter: terminalize exactly once; do not requeue.
+      if (isExhaustedFailedWaiter(job)) {
+        terminalizeWaitingJob(job, "failed");
+        return false;
+      }
+
       job.wakeAuthorized = true;
       job.autoWakeCount += 1;
       // Failed saturation waiter: consume retry budget exactly once per epoch at wake.
@@ -980,6 +1070,9 @@
       var job = jobs.get(jobId);
       if (!job) return;
       // Observation adapter only — never touches wrapper-owned or raw permits.
+      // Ignore late observations outside the live permit lifetime so waiting /
+      // terminal jobs cannot re-inflate counts and block a later cycle.
+      if (job.state !== "running" && job.state !== "pausing_provider") return;
       job.observedPermits += 1;
     }
 
