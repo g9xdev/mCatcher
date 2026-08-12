@@ -201,25 +201,38 @@ def _contained_final(dir_real, filename):
 
 
 def _close_handle_unlocked(sink):
+    """Best-effort close for paths that already report another failure."""
     h = sink.handle
     sink.handle = None
     if h is None:
-        return
+        return True
     try:
         h.close()
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _remove_part_unlocked(sink):
+    """Best-effort .part removal. FileNotFound counts as already removed."""
     path = sink.part_path
     if not path:
-        return
+        return True
     try:
-        if os.path.isfile(path):
-            os.remove(path)
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        # Race: gone between checks / concurrent delete still counts clean.
+        try:
+            if not os.path.isfile(path):
+                return True
+        except Exception:
+            pass
+        return False
     except Exception:
-        pass
+        return False
 
 
 def _unregister_unlocked(sink):
@@ -241,6 +254,7 @@ def _terminalize_cleanup(sink, reason):
 
     Returns True if this call performed the first terminalization.
     Caller must NOT hold _LOCK. Emits nothing — caller sends the error.
+    Best-effort close/remove (reason already selected by caller).
     """
     with sink.lock:
         if sink.state != "open":
@@ -518,30 +532,30 @@ def handle_file_commit(req):
             try:
                 if handle is not None:
                     handle.flush()
-                    try:
-                        os.fsync(handle.fileno())
-                    except Exception:
-                        # fsync not supported / already closed — continue
-                        pass
+                    # Skip fsync only when the platform lacks the capability.
+                    # A real OSError from fsync is a durability failure — fail closed.
+                    if hasattr(os, "fsync"):
+                        try:
+                            os.fsync(handle.fileno())
+                        except NotImplementedError:
+                            pass
                     handle.close()
                 os.replace(part, final_path)
             except Exception:
-                # Close already done; remove partial when possible; never
-                # remove a successfully replaced final.
-                try:
-                    if handle is not None:
-                        try:
-                            handle.close()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                try:
-                    if part and os.path.isfile(part):
+                # Close if still open; remove partial when possible; never
+                # remove a successfully replaced final; never claim committed.
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+                if part:
+                    try:
                         os.remove(part)
-                except Exception:
-                    pass
-                # If replace somehow left neither (or only final), leave final alone.
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        pass
                 fail_reason = "commit-failed"
                 final_path = None
 
@@ -550,7 +564,7 @@ def handle_file_commit(req):
                attempt_token=sink.attempt_token)
         return
 
-    # Unregister after terminal claim (success or failure).
+    # Unregister after terminal claim (success or failure) exactly once.
     with _LOCK:
         if _SINKS.get(sink_id) is sink:
             _unregister_unlocked(sink)
@@ -594,21 +608,31 @@ def handle_file_abort(req):
         if sink.state != "open":
             # Already terminal — cannot produce a second success.
             already = True
+            cleanup_ok = False
         else:
             already = False
+            # Claim terminal first, then attempt required close + .part removal.
             sink.state = "terminal"
-            _close_handle_unlocked(sink)
             # Abort must never remove an already committed final file.
-            _remove_part_unlocked(sink)
+            close_ok = _close_handle_unlocked(sink)
+            remove_ok = _remove_part_unlocked(sink)
+            cleanup_ok = close_ok and remove_ok
 
     if already:
         _error("terminal-sink", sink_id=sink_id, job_id=sink.job_id,
                attempt_token=sink.attempt_token)
         return
 
+    # Unregister exactly once after terminal claim (success or cleanup failure).
     with _LOCK:
         if _SINKS.get(sink_id) is sink:
             _unregister_unlocked(sink)
+
+    if not cleanup_ok:
+        # Real close/remove failure: one bounded local_io, never file-aborted.
+        _error("abort-failed", sink_id=sink_id, job_id=sink.job_id,
+               attempt_token=sink.attempt_token)
+        return
 
     _send({
         "type": "file-aborted",

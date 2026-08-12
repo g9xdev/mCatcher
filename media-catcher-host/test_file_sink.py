@@ -928,6 +928,191 @@ def test_replace_failure_cleans_up_local_io_no_fallback(tmp_path, monkeypatch):
     assert not (tmp_path / "rf.mp4.part").exists()
 
 
+def test_abort_remove_failure_no_false_success(tmp_path, monkeypatch):
+    """Matching abort must not emit file-aborted when .part deletion fails."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    import mchost.filesink as fs
+
+    mc.handle_file_open({
+        "jobId": "jarm", "attemptToken": "a1",
+        "requestedFilename": "arm.mp4", "dir": str(tmp_path),
+    })
+    sink = [m for m in sent if m.get("type") == "file-opened"][0]["sinkId"]
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "jarm", "attemptToken": "a1", "seq": 0,
+        "dataB64": _b64(b"partial-bytes"), "length": 13,
+    })
+    part = tmp_path / "arm.mp4.part"
+    assert part.exists()
+
+    def boom_remove(path):
+        raise OSError(errno.EPERM, "remove denied")
+
+    monkeypatch.setattr(fs.os, "remove", boom_remove)
+    n = len(sent)
+    mc.handle_file_abort({
+        "sinkId": sink, "jobId": "jarm", "attemptToken": "a1",
+    })
+
+    assert not any(m.get("type") == "file-aborted" for m in sent[n:])
+    assert not any(m.get("type") == "file-committed" for m in sent[n:])
+    assert not (tmp_path / "arm.mp4").exists()
+    # Deletion failed → partial truthfully remains.
+    assert part.exists()
+    errs = [m for m in sent[n:] if m.get("type") == "file-error"]
+    assert len(errs) == 1
+    assert errs[0]["failureCategory"] == "local_io"
+    assert isinstance(errs[0].get("reason"), str) and errs[0]["reason"]
+    assert "remove denied" not in errs[0]["reason"]
+    assert "Traceback" not in errs[0]["reason"]
+    assert "EPERM" not in errs[0]["reason"]
+    assert not any(m.get("type") == "pget-fallback" for m in sent)
+    # Terminal + unregistered: late matching frames cannot succeed.
+    with fs._LOCK:
+        assert sink not in fs._SINKS
+    n2 = len(sent)
+    mc.handle_file_commit({
+        "sinkId": sink, "jobId": "jarm", "attemptToken": "a1",
+    })
+    mc.handle_file_abort({
+        "sinkId": sink, "jobId": "jarm", "attemptToken": "a1",
+    })
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "jarm", "attemptToken": "a1", "seq": 1,
+        "dataB64": _b64(b"x"), "length": 1,
+    })
+    assert not any(
+        m.get("type") in ("file-committed", "file-aborted", "file-chunk-ack")
+        for m in sent[n2:]
+    )
+    assert all(m.get("type") == "file-error" for m in sent[n2:])
+    _assert_frames_safe(sent)
+
+
+def test_abort_close_failure_no_false_success(tmp_path, monkeypatch):
+    """Matching abort must not emit file-aborted when handle close() fails."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    import mchost.filesink as fs
+
+    mc.handle_file_open({
+        "jobId": "jac", "attemptToken": "a1",
+        "requestedFilename": "ac.mp4", "dir": str(tmp_path),
+    })
+    sink = [m for m in sent if m.get("type") == "file-opened"][0]["sinkId"]
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "jac", "attemptToken": "a1", "seq": 0,
+        "dataB64": _b64(b"close-me"), "length": 8,
+    })
+    part = tmp_path / "ac.mp4.part"
+    assert part.exists()
+
+    with fs._LOCK:
+        s = fs._SINKS[sink]
+    real = s.handle
+
+    class BoomClose:
+        def write(self, data):
+            return real.write(data)
+
+        def flush(self):
+            return real.flush()
+
+        def fileno(self):
+            return real.fileno()
+
+        def close(self):
+            # Close the real handle first so .part cleanup can still run.
+            try:
+                real.close()
+            except Exception:
+                pass
+            raise OSError(errno.EIO, "close failed")
+
+    with s.lock:
+        s.handle = BoomClose()
+
+    n = len(sent)
+    mc.handle_file_abort({
+        "sinkId": sink, "jobId": "jac", "attemptToken": "a1",
+    })
+
+    assert not any(m.get("type") == "file-aborted" for m in sent[n:])
+    assert not any(m.get("type") == "file-committed" for m in sent[n:])
+    assert not (tmp_path / "ac.mp4").exists()
+    errs = [m for m in sent[n:] if m.get("type") == "file-error"]
+    assert len(errs) == 1
+    assert errs[0]["failureCategory"] == "local_io"
+    assert isinstance(errs[0].get("reason"), str) and errs[0]["reason"]
+    assert "close failed" not in errs[0]["reason"]
+    assert "Traceback" not in errs[0]["reason"]
+    assert not any(m.get("type") == "pget-fallback" for m in sent)
+    with fs._LOCK:
+        assert sink not in fs._SINKS
+    # Wrapper closed the real handle so .part cleanup can succeed when remove works.
+    assert not part.exists()
+    assert s.handle is None
+    n2 = len(sent)
+    mc.handle_file_commit({
+        "sinkId": sink, "jobId": "jac", "attemptToken": "a1",
+    })
+    assert not any(m.get("type") == "file-committed" for m in sent[n2:])
+    assert all(
+        m.get("type") == "file-error" and m.get("failureCategory") == "local_io"
+        for m in sent[n2:]
+    )
+    _assert_frames_safe(sent)
+
+
+def test_commit_fsync_failure_no_false_success(tmp_path, monkeypatch):
+    """Real os.fsync OSError must fail closed — never promote or file-committed."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    import mchost.filesink as fs
+
+    mc.handle_file_open({
+        "jobId": "jfs", "attemptToken": "a1",
+        "requestedFilename": "fs.mp4", "dir": str(tmp_path),
+    })
+    sink = [m for m in sent if m.get("type") == "file-opened"][0]["sinkId"]
+    data = b"need-durability"
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "jfs", "attemptToken": "a1", "seq": 0,
+        "dataB64": _b64(data), "length": len(data),
+    })
+
+    def boom_fsync(_fd):
+        raise OSError(errno.EIO, "fsync failed")
+
+    monkeypatch.setattr(fs.os, "fsync", boom_fsync)
+    n = len(sent)
+    mc.handle_file_commit({
+        "sinkId": sink, "jobId": "jfs", "attemptToken": "a1",
+    })
+
+    assert not any(m.get("type") == "file-committed" for m in sent[n:])
+    assert not any(m.get("type") == "file-aborted" for m in sent[n:])
+    assert not (tmp_path / "fs.mp4").exists()
+    # Partial removed when cleanup succeeds.
+    assert not (tmp_path / "fs.mp4.part").exists()
+    errs = [m for m in sent[n:] if m.get("type") == "file-error"]
+    assert len(errs) == 1
+    assert errs[0]["failureCategory"] == "local_io"
+    assert isinstance(errs[0].get("reason"), str) and errs[0]["reason"]
+    assert "fsync failed" not in errs[0]["reason"]
+    assert "Traceback" not in errs[0]["reason"]
+    assert not any(m.get("type") == "pget-fallback" for m in sent)
+    with fs._LOCK:
+        assert sink not in fs._SINKS
+    n2 = len(sent)
+    mc.handle_file_commit({
+        "sinkId": sink, "jobId": "jfs", "attemptToken": "a1",
+    })
+    assert not any(m.get("type") == "file-committed" for m in sent[n2:])
+    _assert_frames_safe(sent)
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher / re-export identity
 # ---------------------------------------------------------------------------
