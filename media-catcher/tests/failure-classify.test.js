@@ -464,6 +464,126 @@ test("hasActiveSibling requires non-empty excludeJobId and ignores blank candida
   assert.equal(r.siblingJobId, "hit");
 });
 
+test("hasActiveSibling rejects whitespace-only and non-string excludeJobId/candidate ids", () => {
+  // Review gap: non-empty/non-blank means string with trim().length > 0.
+  // Do not trim usable IDs — only blankness check uses trim.
+  const active = {
+    id: "run",
+    providerKey: "florenfile.com",
+    state: "running",
+    inFlightPermits: 1,
+    nativeOpenConnections: 0,
+    cancelRequested: false,
+  };
+
+  // Whitespace-only excludeJobId is blank.
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: "   " }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: "\t" }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: " \n " }),
+    { ok: false, siblingJobId: null }
+  );
+
+  // Non-string excludeJobId is rejected.
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: 42 }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: true }),
+    { ok: false, siblingJobId: null }
+  );
+  assert.deepEqual(
+    FC.hasActiveSibling({ jobs: [active], providerKey: "florenfile.com", excludeJobId: { id: "x" } }),
+    { ok: false, siblingJobId: null }
+  );
+
+  // Whitespace-only / non-string candidate ids are ignored (not siblings).
+  const junkIdJobs = [
+    {
+      id: "   ",
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      id: "\t",
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 2,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      id: 99,
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+    {
+      id: true,
+      providerKey: "florenfile.com",
+      state: "running",
+      inFlightPermits: 1,
+      nativeOpenConnections: 0,
+      cancelRequested: false,
+    },
+  ];
+  assert.deepEqual(
+    FC.hasActiveSibling({
+      jobs: junkIdJobs,
+      providerKey: "florenfile.com",
+      excludeJobId: "failed",
+    }),
+    { ok: false, siblingJobId: null }
+  );
+
+  // Usable IDs are not trimmed before exact comparison/return.
+  const padded = {
+    id: " run ",
+    providerKey: "florenfile.com",
+    state: "running",
+    inFlightPermits: 1,
+    nativeOpenConnections: 0,
+    cancelRequested: false,
+  };
+  const rExact = FC.hasActiveSibling({
+    jobs: [padded],
+    providerKey: "florenfile.com",
+    excludeJobId: "failed",
+  });
+  assert.equal(rExact.ok, true);
+  assert.equal(rExact.siblingJobId, " run ");
+
+  // Exact exclude still works with padded ids (no normalization).
+  assert.deepEqual(
+    FC.hasActiveSibling({
+      jobs: [padded],
+      providerKey: "florenfile.com",
+      excludeJobId: " run ",
+    }),
+    { ok: false, siblingJobId: null }
+  );
+  // Different padding is a different id.
+  const rDiffPad = FC.hasActiveSibling({
+    jobs: [padded],
+    providerKey: "florenfile.com",
+    excludeJobId: "run",
+  });
+  assert.equal(rDiffPad.ok, true);
+  assert.equal(rDiffPad.siblingJobId, " run ");
+});
+
 test("hasActiveSibling returns first qualifying sibling among mixed jobs", () => {
   const jobs = [
     { id: "queued", providerKey: "florenfile.com", state: "queued", inFlightPermits: 0, nativeOpenConnections: 0, cancelRequested: false },

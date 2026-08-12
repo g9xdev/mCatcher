@@ -315,17 +315,17 @@
       if (!Array.isArray(jobs)) {
         return { ok: false, siblingJobId: null };
       }
-      // Must prove a different job: require non-empty excludeJobId.
+      // Must prove a different job: require non-empty/non-blank string excludeJobId.
       var excludeJobId = input.excludeJobId;
-      if (excludeJobId == null || excludeJobId === "") {
+      if (typeof excludeJobId !== "string" || excludeJobId.trim().length === 0) {
         return { ok: false, siblingJobId: null };
       }
 
       for (var i = 0; i < jobs.length; i++) {
         var job = jobs[i];
         if (!job || typeof job !== "object") continue;
-        // Ignore candidates with missing/null/blank id.
-        if (job.id == null || job.id === "") continue;
+        // Ignore candidates unless id is a non-empty/non-blank string (do not normalize).
+        if (typeof job.id !== "string" || job.id.trim().length === 0) continue;
         if (job.providerKey !== providerKey) continue;
         if (job.id === excludeJobId) continue;
         if (job.state !== "running" && job.state !== "pausing_provider") continue;
