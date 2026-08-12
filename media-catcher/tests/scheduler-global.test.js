@@ -591,7 +591,7 @@ test("wrong or stale attempt tokens are no-ops", () => {
   assertSlotInvariant(s);
 });
 
-test("minimal failed terminal path releases slot without inventing retry policy", () => {
+test("no-sibling saturation candidate enters retry_backoff and releases slot (Task 10 bounded-policy placeholder)", () => {
   const s = makeScheduler({ maxConcurrent: 1 });
   s.createJob({
     id: "1",
@@ -614,8 +614,10 @@ test("minimal failed terminal path releases slot without inventing retry policy"
     status: "failed",
     failureCategory: "timeout",
   });
-  // Task 9: terminal failed only — no retry_backoff / needs_user policy yet.
-  assert.equal(s.getJob("1").state, "failed");
+  // Task 10: saturation-candidate with no viable same-provider sibling → retry_backoff.
+  // Slot released; not waiting_provider; retry budget deferred to Task 11 timer path.
+  assert.equal(s.getJob("1").state, "retry_backoff");
+  assert.notEqual(s.getJob("1").state, "waiting_provider");
   assert.equal(s.getJob("1").holdsGlobalSlot, false);
   assert.equal(s.getJob("1").retryRemaining, before);
   assert.equal(s.getJob("2").state, "running");
