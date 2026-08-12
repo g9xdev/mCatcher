@@ -1153,9 +1153,14 @@ class _PgetError(Exception):
         super().__init__(category)
 
 
-def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState):
-    """Emit exactly one structured terminal pget-result (caller enforces once)."""
-    _h().send({
+def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState,
+                      file=None, bytes=None):
+    """Emit exactly one structured terminal pget-result (caller enforces once).
+
+    file/bytes are an optional pair only on completed/committed terminals.
+    Failed/cancelled keep the exact seven-field base shape.
+    """
+    msg = {
         "type": "pget-result",
         "id": id,
         "attemptToken": attemptToken,
@@ -1163,7 +1168,72 @@ def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState
         "mode": mode,
         "failureCategory": failureCategory,
         "partState": partState,
-    })
+    }
+    if (
+        status == "completed"
+        and partState == "committed"
+        and file is not None
+        and bytes is not None
+        and not isinstance(bytes, bool)
+    ):
+        try:
+            msg["file"] = file
+            msg["bytes"] = int(bytes)
+        except (TypeError, ValueError, OverflowError):
+            # Metadata pair is best-effort; never alter the terminal status.
+            msg.pop("file", None)
+            msg.pop("bytes", None)
+    _h().send(msg)
+
+
+_PGET_NAME_MAX = 150
+_PGET_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|]+')
+
+
+def _pget_safe_filename(name):
+    """Pget-local basename normalizer capped at 150 characters.
+
+    Already-safe basenames of length <=150 are preserved exactly. Invalid
+    path characters are replaced like the legacy host sanitizer; empty
+    results fall back to "download". Does not call or mutate tools.sanitize.
+    """
+    raw = name if isinstance(name, str) else ("" if name is None else str(name))
+    cleaned = _PGET_UNSAFE_NAME.sub("_", raw or "download").strip()
+    if not cleaned:
+        cleaned = "download"
+    if len(cleaned) <= _PGET_NAME_MAX:
+        return cleaned
+    root, ext = os.path.splitext(cleaned)
+    if ext and len(ext) < _PGET_NAME_MAX:
+        keep = _PGET_NAME_MAX - len(ext)
+        root = root[:keep]
+        cleaned = (root + ext) if root else cleaned[:_PGET_NAME_MAX]
+    else:
+        cleaned = cleaned[:_PGET_NAME_MAX]
+    return cleaned or "download"
+
+
+def _pget_terminal_file_bytes(op):
+    """Best-effort (file, bytes) for a committed op final path. Never raises.
+
+    Returns (None, None) when the path is missing, unreadable, or size is not a
+    valid integer (bool is treated as invalid). Metadata failure never revokes
+    an already-committed success — callers still emit completed/committed.
+    """
+    if not isinstance(op, dict):
+        return None, None
+    path = op.get("final_path")
+    if not path or not isinstance(path, str):
+        return None, None
+    try:
+        if not os.path.isfile(path):
+            return None, None
+        sz = os.path.getsize(path)
+        if isinstance(sz, bool):
+            return None, None
+        return path, int(sz)
+    except Exception:
+        return None, None
 
 
 def _pget_open(url, referer, ua, range_header=None, timeout=30):
@@ -1362,6 +1432,8 @@ def _pget_make_op(req, stop, single=False):
         "lease": initial_cap,
         "n": 0,
         "final_path": None,
+        # Immutable start attempt token (fencing for cancel / set-limit).
+        "attemptToken": req.get("attemptToken") if isinstance(req, dict) else None,
         "kind": "pget-single" if single else "pget",
     }
 
@@ -1619,6 +1691,12 @@ def _pget_cancel(req):
     j = _pget_registry_get(req.get("id"))
     if not j:
         return
+    # When attemptToken is present on the command, require exact equality to the
+    # stored start token. Stale / null / different tokens are no-ops. Omitted
+    # property preserves legacy id-only cancel.
+    if isinstance(req, dict) and "attemptToken" in req:
+        if req.get("attemptToken") != j.get("attemptToken"):
+            return
     j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
@@ -1746,6 +1824,13 @@ def handle_pget_set_limit(req):
     if not op or op.get("lease_cv") is None:
         return
 
+    # Attempt-token fence: when the property is present, require exact equality
+    # to the stored start token. Stale / null / different → no mutate, no ack.
+    # Omitted property preserves legacy id-only set-limit.
+    if isinstance(req, dict) and "attemptToken" in req:
+        if req.get("attemptToken") != op.get("attemptToken"):
+            return
+
     ack_lock = op.get("ack_lock")
     if ack_lock is None:
         ack_lock = threading.RLock()
@@ -1762,6 +1847,10 @@ def handle_pget_set_limit(req):
             with cv:
                 if _PGET.get(jid) is not op:
                     return
+                # Re-check token under identity fence in case of same-id replace.
+                if isinstance(req, dict) and "attemptToken" in req:
+                    if req.get("attemptToken") != op.get("attemptToken"):
+                        return
                 _pget_apply_limit_locked(op, gen, lim)
 
         # Re-entered from an in-flight outer send: apply only; outer drains ack.
@@ -1780,11 +1869,13 @@ def handle_pget_set_limit(req):
                 last_gen = op.get("last_sent_gen")
                 if last_gen is not None and live_gen < int(last_gen):
                     return
+                # Echo the STORED active token, never request-controlled input.
                 msg = {
                     "type": "pget-limit-ack",
                     "id": jid,
                     "maxConnections": live_lim,
                     "providerGeneration": live_gen,
+                    "attemptToken": op.get("attemptToken"),
                 }
                 # Claim before send so concurrent waiters cannot emit lower gens.
                 op["last_sent_gen"] = live_gen
@@ -1820,19 +1911,31 @@ def handle_pget(req):
     completed/committed; optional progress/convert work is best-effort.
     """
     jid = req.get("id")
-    attempt = req.get("attemptToken")
     mode = "multi-range"
     terminal = {"sent": False}
     stop = threading.Event()
     op = _pget_make_op(req, stop, single=False)
+    # Immutable start token captured on the op (fencing + progress identity).
+    attempt = op.get("attemptToken")
 
     def finish(status, failure_category, part_state):
         if terminal["sent"]:
             return
         # Mark before send so a send-side failure cannot double-terminal later.
         terminal["sent"] = True
+        file_path = None
+        file_bytes = None
+        if status == "completed" and part_state == "committed":
+            file_path, file_bytes = _pget_terminal_file_bytes(op)
+        # Unregister this exact op before the terminal so a synchronous same-id
+        # fallback (range→single) can register. Identity-safe: never pops a
+        # different owner. Final finally-block unregister remains harmless cleanup.
+        _pget_unregister(jid, op)
         try:
-            _pget_send_result(jid, attempt, status, mode, failure_category, part_state)
+            _pget_send_result(
+                jid, attempt, status, mode, failure_category, part_state,
+                file=file_path, bytes=file_bytes,
+            )
         except Exception:
             # Terminal intent already recorded; never leak raw send errors.
             pass
@@ -1857,7 +1960,7 @@ def handle_pget(req):
             urls = [u for u in (req.get("urls") or []) if u]
             referer = req.get("referer") or ""
             ua = req.get("userAgent") or ""
-            name = _h().sanitize(req.get("name") or "download")
+            name = _pget_safe_filename(req.get("name") or "download")
             out_dir = req.get("dir") or _h().downloads_dir()
 
             if op.get("cancel_requested") or stop.is_set():
@@ -1919,6 +2022,7 @@ def handle_pget(req):
                         _h().send({
                             "type": "pget-progress",
                             "id": jid,
+                            "attemptToken": attempt,
                             "bytes": sum(seg_done),
                             "total": size,
                         })
@@ -2013,7 +2117,13 @@ def handle_pget(req):
             # Late cancel after successful replace loses: retain completed.
             # Optional progress / convert is best-effort and must not void commit.
             try:
-                _h().send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
+                _h().send({
+                    "type": "pget-progress",
+                    "id": jid,
+                    "attemptToken": attempt,
+                    "bytes": size,
+                    "total": size,
+                })
             except Exception:
                 pass
             try:
@@ -2087,6 +2197,8 @@ def handle_pget(req):
                         except Exception:
                             pass
                     finish("failed", "permanent", _honest_part_state(final_path, n))
+            # Identity-safe cleanup: no-op if finish already unregistered this op
+            # or a same-id replacement now owns the slot.
             _pget_unregister(jid, op)
 
     try:
@@ -2109,19 +2221,28 @@ def handle_pget_single(req):
     connection lease is released (openConnections == 0 at observation).
     """
     jid = req.get("id")
-    attempt = req.get("attemptToken")
     mode = "single-connection"
     terminal = {"sent": False}
     stop = threading.Event()
     op = _pget_make_op(req, stop, single=True)
+    attempt = op.get("attemptToken")
     n = 1
 
     def finish(status, failure_category, part_state):
         if terminal["sent"]:
             return
         terminal["sent"] = True
+        file_path = None
+        file_bytes = None
+        if status == "completed" and part_state == "committed":
+            file_path, file_bytes = _pget_terminal_file_bytes(op)
+        # Unregister before terminal so same-id re-entry can register.
+        _pget_unregister(jid, op)
         try:
-            _pget_send_result(jid, attempt, status, mode, failure_category, part_state)
+            _pget_send_result(
+                jid, attempt, status, mode, failure_category, part_state,
+                file=file_path, bytes=file_bytes,
+            )
         except Exception:
             pass
 
@@ -2143,7 +2264,7 @@ def handle_pget_single(req):
             urls = [u for u in (req.get("urls") or []) if u]
             referer = req.get("referer") or ""
             ua = req.get("userAgent") or ""
-            name = _h().sanitize(req.get("name") or "download")
+            name = _pget_safe_filename(req.get("name") or "download")
             out_dir = req.get("dir") or _h().downloads_dir()
 
             if op.get("cancel_requested") or stop.is_set():
@@ -2213,6 +2334,7 @@ def handle_pget_single(req):
                             _h().send({
                                 "type": "pget-progress",
                                 "id": jid,
+                                "attemptToken": attempt,
                                 "bytes": got,
                                 "total": expected if expected is not None else got,
                             })
@@ -2275,6 +2397,7 @@ def handle_pget_single(req):
                     _h().send({
                         "type": "pget-progress",
                         "id": jid,
+                        "attemptToken": attempt,
                         "bytes": got,
                         "total": total,
                     })
@@ -2369,6 +2492,7 @@ def handle_pget_single(req):
                         except Exception:
                             pass
                     finish("failed", "permanent", _honest_part_state(final_path))
+            # Identity-safe cleanup if finish already unregistered this op.
             _pget_unregister(jid, op)
 
     try:
