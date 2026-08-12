@@ -663,6 +663,16 @@
         .then(function (v) { return v; }, function () { return null; });
     }
 
+    function markBoundItem(url, item) {
+      boundUrls.add(url);
+      delete unboundItems[url];
+      // lastYtId is set only once the current YouTube item is bound so a
+      // prior unbound emit cannot suppress the required snapshot retry.
+      if (item && item.kind === "youtube" && typeof item.videoId === "string") {
+        lastYtId = item.videoId;
+      }
+    }
+
     function flushUnboundRetries(snap) {
       if (!snap) return;
       var urls = Object.keys(unboundItems);
@@ -674,7 +684,7 @@
         }
         var item = unboundItems[url];
         delete unboundItems[url];
-        boundUrls.add(url);
+        markBoundItem(url, item);
         var msg = attachMediaEvidence({ type: "content-media", item: item });
         msg.snapshot = copySnapshot(snap);
         safeSend(msg);
@@ -762,31 +772,18 @@
       return msg;
     }
 
-    function report(url) {
-      if (!url || boundUrls.has(url)) return Promise.resolve();
-      if (
-        url.indexOf("blob:") === 0 ||
-        url.indexOf("mediasource:") === 0 ||
-        url.indexOf("data:") === 0
-      ) {
-        return Promise.resolve();
-      }
+    // Shared bounded reporter: at most one unbound emit per URL, then one
+    // snapshot-bound retry via unboundItems/flushUnboundRetries, then dedupe
+    // through boundUrls + reportInflight (no extra maps).
+    function reportContentItem(url, item) {
+      if (!url || !item || boundUrls.has(url)) return Promise.resolve();
       if (reportInflight[url]) return reportInflight[url];
-
-      var item = {
-        url: url,
-        kind: /\.m3u8(\?|#|$)/i.test(url) ? "hls" : "direct",
-        source: "video-element",
-        pageTitle: pageTitleHint(),
-        ts: Date.now(),
-      };
 
       var p = ensureSnapshot()
         .then(function (snap) {
           if (boundUrls.has(url)) return;
           if (snap) {
-            boundUrls.add(url);
-            delete unboundItems[url];
+            markBoundItem(url, item);
             var boundMsg = attachMediaEvidence({ type: "content-media", item: item });
             boundMsg.snapshot = copySnapshot(snap);
             safeSend(boundMsg);
@@ -808,6 +805,25 @@
         function () { delete reportInflight[url]; }
       );
       return reportInflight[url];
+    }
+
+    function report(url) {
+      if (!url || boundUrls.has(url)) return Promise.resolve();
+      if (
+        url.indexOf("blob:") === 0 ||
+        url.indexOf("mediasource:") === 0 ||
+        url.indexOf("data:") === 0
+      ) {
+        return Promise.resolve();
+      }
+      var item = {
+        url: url,
+        kind: /\.m3u8(\?|#|$)/i.test(url) ? "hls" : "direct",
+        source: "video-element",
+        pageTitle: pageTitleHint(),
+        ts: Date.now(),
+      };
+      return reportContentItem(url, item);
     }
 
     function youtubeItem() {
@@ -853,17 +869,11 @@
     function reportYouTube() {
       if (!isTopFrame()) return Promise.resolve();
       var it = youtubeItem();
-      if (!it || it.videoId === lastYtId) return Promise.resolve();
-      lastYtId = it.videoId;
-      return ensureSnapshot()
-        .then(function (snap) {
-          var msg = attachMediaEvidence({ type: "content-media", item: it });
-          if (snap) msg.snapshot = copySnapshot(snap);
-          safeSend(msg);
-        })
-        .then(function () {}, function () {
-          safeSend(attachMediaEvidence({ type: "content-media", item: it }));
-        });
+      if (!it) return Promise.resolve();
+      // lastYtId is only set after bind; until then unboundItems/reportInflight
+      // suppress duplicate unbound emits while still allowing the retry.
+      if (it.videoId === lastYtId || boundUrls.has(it.url)) return Promise.resolve();
+      return reportContentItem(it.url, it);
     }
 
     function scan() {
@@ -899,7 +909,7 @@
         });
       var v = vids[0];
       if (!v) return null;
-      if (typeof root.document === "undefined" && !documentRef.createElement) return null;
+      if (!documentRef || typeof documentRef.createElement !== "function") return null;
       var scale = Math.min(1, 320 / v.videoWidth);
       var c;
       try {
@@ -941,6 +951,7 @@
       reportInflight = Object.create(null);
       lastYtId = "";
       lastTitleSent = "";
+      lastThumbSent = "";
       lastSnapshotFp = "";
       currentSnapshot = null;
       contextRetryAt = 0;
@@ -955,8 +966,11 @@
           sendPageInfo();
           sendThumb();
           if (!navigated) {
+            // Keep the 12s page/title/thumb/YouTube refresh, and also scan so a
+            // quiet currentSrc change (no mutation/loadstart) is eventually seen.
+            // boundUrls / reportInflight suppress duplicates.
             return refreshSnapshot(false).then(function () {
-              return reportYouTube();
+              return scan();
             });
           }
           return null;

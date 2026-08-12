@@ -1594,3 +1594,365 @@ test("unbound content-media is retried once after context success then deduped",
     "SPA reset allows re-report"
   );
 });
+
+// ---------------------------------------------------------------------------
+// Fix2 regressions: YouTube context retry, thumb SPA reset, tick scan, no-doc
+// ---------------------------------------------------------------------------
+
+function makeYouTubeInstallRoot(opts) {
+  opts = opts || {};
+  const videoId = opts.videoId || "dQw4w9WgXcQ";
+  const ytUrl = "https://www.youtube.com/watch?v=" + videoId;
+  const root = makeInstallRoot({
+    href: ytUrl,
+    // blob media is skipped so YouTube is the only content-media signal
+    mediaUrl: opts.mediaUrl || "blob:https://www.youtube.com/ms-xyz",
+    topLevelPageUrl: ytUrl,
+    title: opts.title || "Sample Clip - YouTube",
+    contextHandler: opts.contextHandler,
+  });
+  root.location.hostname = "www.youtube.com";
+  root.location.pathname = "/watch";
+  root.location.search = "?v=" + videoId;
+  root.location.origin = "https://www.youtube.com";
+  root._ytVideoId = videoId;
+  root._ytUrl = ytUrl;
+  return root;
+}
+
+function youtubeMediaMessages(root) {
+  return root._messages.filter(
+    (m) => m.type === "content-media" && m.item && m.item.kind === "youtube"
+  );
+}
+
+test("YouTube context failure then success: one unbound, one bound retry; ticks/scans do not duplicate", async () => {
+  const api = loadContent();
+  let allowContext = false;
+  const videoId = "dQw4w9WgXcQ";
+  const ytUrl = "https://www.youtube.com/watch?v=" + videoId;
+  const root = makeYouTubeInstallRoot({
+    videoId,
+    contextHandler: () => {
+      if (!allowContext) return { ok: false };
+      return {
+        ok: true,
+        tabId: 5,
+        frameId: 0,
+        documentId: null,
+        topLevelPageUrl: ytUrl,
+      };
+    },
+  });
+
+  api.install(root);
+  await flushMicrotasks();
+
+  let yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 1, "exactly one unbound YouTube on context failure");
+  assert.equal(yt[0].item.videoId, videoId);
+  assert.equal(yt[0].item.url, ytUrl);
+  assert.equal(yt[0].snapshot, undefined);
+  assert.equal(root._messages.some((m) => m.type === "page-snapshot"), false);
+
+  const interval = root._timers.find((t) => t.type === "interval");
+  assert.ok(interval, "12s refresh timer required");
+
+  // Repeat tick while still unbound: must not re-emit.
+  await interval.fn();
+  await flushMicrotasks();
+  yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 1, "repeat tick must not duplicate unbound YouTube");
+
+  // Concurrent mutation-driven scan while still unbound.
+  const obs = root._observers[0];
+  if (obs && obs.cb) {
+    obs.cb([]);
+    obs.cb([]);
+    await flushMicrotasks();
+  }
+  yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 1, "repeat scan must not duplicate unbound YouTube");
+
+  // Context becomes available: exactly one bound retry with a fresh snapshot copy.
+  allowContext = true;
+  await interval.fn();
+  await flushMicrotasks();
+
+  yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 2, "exactly one snapshot-bound YouTube retry");
+  assert.equal(yt[1].item.videoId, videoId);
+  assert.equal(yt[1].item.url, ytUrl);
+  assert.ok(yt[1].snapshot, "bound retry must include snapshot");
+  assert.equal(yt[1].snapshot.tabId, 5);
+  assert.equal(yt[1].snapshot.pageUrl, ytUrl);
+  assert.ok(root._messages.some((m) => m.type === "page-snapshot"));
+
+  // Bound dedupe across further ticks and scans.
+  await interval.fn();
+  await flushMicrotasks();
+  if (obs && obs.cb) {
+    obs.cb([]);
+    obs.cb([]);
+    await flushMicrotasks();
+  }
+  yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 2, "no third YouTube after bound");
+});
+
+test("YouTube SPA navigation to a new video id re-reports after prior bind", async () => {
+  const api = loadContent();
+  let topUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+  const root = makeYouTubeInstallRoot({
+    videoId: "dQw4w9WgXcQ",
+    contextHandler: () => ({
+      ok: true,
+      tabId: 6,
+      frameId: 0,
+      documentId: null,
+      topLevelPageUrl: topUrl,
+    }),
+  });
+
+  api.install(root);
+  await flushMicrotasks();
+
+  let yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 1, "initial YouTube bound once");
+  assert.equal(yt[0].item.videoId, "dQw4w9WgXcQ");
+  assert.ok(yt[0].snapshot);
+
+  // Same video on subsequent ticks stays deduped.
+  const interval = root._timers.find((t) => t.type === "interval");
+  assert.ok(interval);
+  await interval.fn();
+  await flushMicrotasks();
+  yt = youtubeMediaMessages(root);
+  assert.equal(yt.length, 1, "same YouTube id remains one item");
+
+  // SPA to a new video id must re-arm reporting (one item per video id).
+  const videoId2 = "oHg5SJYRHA0";
+  topUrl = "https://www.youtube.com/watch?v=" + videoId2;
+  root.location.href = topUrl;
+  root.location.pathname = "/watch";
+  root.location.search = "?v=" + videoId2;
+
+  await interval.fn();
+  await flushMicrotasks();
+
+  yt = youtubeMediaMessages(root);
+  const ids = yt.map((m) => m.item.videoId);
+  assert.ok(ids.includes("dQw4w9WgXcQ"));
+  assert.ok(ids.includes(videoId2), "new SPA video id must emit");
+  assert.equal(
+    yt.filter((m) => m.item.videoId === videoId2).length,
+    1,
+    "exactly one message for the new YouTube id"
+  );
+  const second = yt.find((m) => m.item.videoId === videoId2);
+  assert.ok(second.snapshot, "new YouTube id should be snapshot-bound");
+
+  await interval.fn();
+  await flushMicrotasks();
+  yt = youtubeMediaMessages(root);
+  assert.equal(
+    yt.filter((m) => m.item.videoId === videoId2).length,
+    1,
+    "new YouTube id stays deduped after bind"
+  );
+});
+
+test("install without document does not throw on thumb/tick/scan paths", async () => {
+  const api = loadContent();
+  const messages = [];
+  const timers = [];
+  const root = {
+    // intentionally no document — documentRef is null in Node
+    location: {
+      href: "https://x.test/page",
+      hostname: "x.test",
+      pathname: "/page",
+      search: "",
+      origin: "https://x.test",
+    },
+    MutationObserver: class {
+      constructor() {}
+      observe() {}
+      disconnect() {}
+    },
+    setInterval(fn, ms) {
+      timers.push({ fn, ms, type: "interval" });
+      return timers.length;
+    },
+    setTimeout(fn, ms) {
+      timers.push({ fn, ms, type: "timeout" });
+      return timers.length;
+    },
+    clearInterval() {},
+    clearTimeout() {},
+    addEventListener() {},
+    browser: {
+      runtime: {
+        sendMessage(msg) {
+          messages.push(JSON.parse(JSON.stringify(msg)));
+          if (msg && msg.type === "page-snapshot-context") {
+            return Promise.resolve({
+              ok: true,
+              tabId: 1,
+              frameId: 0,
+              documentId: null,
+              topLevelPageUrl: "https://x.test/page",
+            });
+          }
+          return Promise.resolve(undefined);
+        },
+        onMessage: { addListener() {} },
+      },
+    },
+    _messages: messages,
+    _timers: timers,
+  };
+  root.window = root;
+  root.self = root;
+  root.top = root;
+
+  assert.doesNotThrow(() => {
+    api.install(root);
+  });
+  await flushMicrotasks();
+
+  const interval = timers.find((t) => t.type === "interval");
+  assert.ok(interval, "timer still registered without document");
+  await assert.doesNotReject(async () => {
+    await interval.fn();
+    await flushMicrotasks();
+  });
+  // No uncaught path; thumb/scan simply no-op without a document.
+  assert.equal(
+    messages.some((m) => m.type === "content-thumb"),
+    false
+  );
+});
+
+test("SPA navigation clears thumbnail dedupe so identical-looking thumb may re-emit", async () => {
+  const api = loadContent();
+  const fakeDataUrl = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAg";
+  const root = makeInstallRoot({
+    href: "https://site.example/page-a",
+    mediaUrl: "https://cdn.example/a.mp4",
+    topLevelPageUrl: "https://site.example/page-a",
+  });
+  root.location.hostname = "site.example";
+  root.location.pathname = "/page-a";
+  root.location.origin = "https://site.example";
+
+  const video = root.document.querySelectorAll("video")[0];
+  video.readyState = 2;
+  video.videoWidth = 320;
+  video.videoHeight = 180;
+  video.ended = false;
+
+  root.document.createElement = function (tag) {
+    if (String(tag).toLowerCase() === "canvas") {
+      return {
+        width: 0,
+        height: 0,
+        getContext() {
+          return { drawImage() {} };
+        },
+        toDataURL() {
+          return fakeDataUrl;
+        },
+      };
+    }
+    return el(tag, {});
+  };
+
+  api.install(root);
+  await flushMicrotasks();
+
+  const interval = root._timers.find((t) => t.type === "interval");
+  assert.ok(interval);
+  await interval.fn();
+  await flushMicrotasks();
+
+  let thumbs = root._messages.filter((m) => m.type === "content-thumb");
+  assert.equal(thumbs.length, 1, "first thumb emit");
+  assert.equal(thumbs[0].dataUrl, fakeDataUrl);
+
+  // Same page + same bytes: dedupe holds.
+  await interval.fn();
+  await flushMicrotasks();
+  thumbs = root._messages.filter((m) => m.type === "content-thumb");
+  assert.equal(thumbs.length, 1, "identical thumb suppressed on same page");
+
+  // SPA to a new page: lastThumbSent must clear so the same-looking frame can emit.
+  root.location.href = "https://site.example/page-b";
+  root.location.pathname = "/page-b";
+  await interval.fn();
+  await flushMicrotasks();
+
+  thumbs = root._messages.filter((m) => m.type === "content-thumb");
+  assert.equal(
+    thumbs.length,
+    2,
+    "SPA must allow re-emitting an identical-looking thumbnail"
+  );
+  assert.equal(thumbs[1].dataUrl, fakeDataUrl);
+});
+
+test("periodic tick scan detects currentSrc change without mutation or loadstart", async () => {
+  const api = loadContent();
+  const root = makeInstallRoot({
+    href: "https://site.example/player",
+    mediaUrl: "https://cdn.example/first.mp4",
+    topLevelPageUrl: "https://site.example/player",
+  });
+  root.location.hostname = "site.example";
+  root.location.pathname = "/player";
+  root.location.origin = "https://site.example";
+
+  api.install(root);
+  await flushMicrotasks();
+
+  let media = root._messages.filter((m) => m.type === "content-media");
+  assert.ok(
+    media.some((m) => m.item && m.item.url === "https://cdn.example/first.mp4"),
+    "initial media reported"
+  );
+
+  // Quietly swap currentSrc — no MutationObserver callback, no loadstart.
+  const video = root.document.querySelectorAll("video")[0];
+  video.currentSrc = "https://cdn.example/second.mp4";
+  video.src = "https://cdn.example/second.mp4";
+
+  const interval = root._timers.find((t) => t.type === "interval");
+  assert.ok(interval);
+  await interval.fn();
+  await flushMicrotasks();
+
+  media = root._messages.filter((m) => m.type === "content-media");
+  assert.ok(
+    media.some((m) => m.item && m.item.url === "https://cdn.example/second.mp4"),
+    "tick must scan and report changed currentSrc without mutation/loadstart"
+  );
+  assert.equal(
+    media.filter((m) => m.item && m.item.url === "https://cdn.example/second.mp4").length,
+    1,
+    "exactly one report for the new source"
+  );
+
+  // Existing bound/inflight sets suppress duplicates on the next tick.
+  await interval.fn();
+  await flushMicrotasks();
+  media = root._messages.filter((m) => m.type === "content-media");
+  assert.equal(
+    media.filter((m) => m.item && m.item.url === "https://cdn.example/second.mp4").length,
+    1
+  );
+  assert.equal(
+    media.filter((m) => m.item && m.item.url === "https://cdn.example/first.mp4").length,
+    1,
+    "original source stays single"
+  );
+});
