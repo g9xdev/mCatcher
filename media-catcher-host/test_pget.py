@@ -201,6 +201,18 @@ def _make_handler(state: ServerState):
                     except Exception:
                         pass
                     return
+            if mode == "hold-probe":
+                # Block only the capability probe so cancel-during-setup can race.
+                if rng == "bytes=0-0":
+                    if state.hold is not None and not state.hold.is_set():
+                        state.hold.wait(timeout=10.0)
+                    self._send_range(0, 0, payload)
+                    return
+                if rng.startswith("bytes="):
+                    a, b = rng.split("=", 1)[1].split("-")
+                    start, end = int(a), int(b)
+                    self._send_range(start, end, payload)
+                    return
             if mode in ("range", "redirect"):
                 if not rng:
                     # full GET without Range — not used by pget, but be safe
@@ -842,5 +854,294 @@ def test_preexisting_final_not_deleted_on_failure(tmp_path, monkeypatch):
         res = wait_result(sent)
         assert res["failureCategory"] == "http_429"
         assert marker.read_bytes() == b"keep-me"
+    finally:
+        shutdown_server(httpd)
+
+
+# ---------------------------------------------------------------------------
+# Fix-round races: early cancel, pre-commit cancel, post-commit terminal
+# ---------------------------------------------------------------------------
+
+def test_cancel_during_blocked_probe_before_segments(tmp_path, monkeypatch):
+    """Cancel immediately after handle_pget must win even while probe blocks.
+
+    Mutation: registry inserted only after probe/path prep loses this cancel.
+    """
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    hold = threading.Event()
+    httpd, state = run_server("hold-probe", hold=hold)
+    try:
+        url = server_url(httpd)
+        mc.handle_pget({
+            "id": "jobEarlyCan",
+            "attemptToken": "atk-early-can",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        # Caller can cancel as soon as handle_pget returns.
+        assert wait_for(
+            lambda: d._PGET.get("jobEarlyCan") is not None or state.probe_gets >= 1,
+            timeout=5,
+        )
+        mc._pget_cancel({"id": "jobEarlyCan"})
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] == "cancelled"
+        assert res["failureCategory"] == "cancelled"
+        assert res["attemptToken"] == "atk-early-can"
+        assert res["partState"] in ("empty", "partial")
+        assert state.segment_gets == 0
+        assert not (tmp_path / "clip.mp4").exists()
+        assert partish(leftovers(tmp_path)) == []
+        assert d._PGET.get("jobEarlyCan") is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_cancel_after_assembly_before_replace(tmp_path, monkeypatch):
+    """Cancel during assembly must recheck before os.replace and not commit."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    entered = threading.Event()
+    release = threading.Event()
+    replace_calls = []
+    orig_copy = d.shutil.copyfileobj
+    orig_replace = d.os.replace
+
+    def blocked_copy(fsrc, fdst, length=None):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        if length is None:
+            return orig_copy(fsrc, fdst)
+        return orig_copy(fsrc, fdst, length)
+
+    def tracking_replace(src, dst, *a, **k):
+        replace_calls.append((src, dst))
+        return orig_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(d.shutil, "copyfileobj", blocked_copy)
+    monkeypatch.setattr(d.os, "replace", tracking_replace)
+
+    httpd, _state = run_server("range")
+    try:
+        url = server_url(httpd)
+        mc.handle_pget({
+            "id": "jobAsmCan",
+            "attemptToken": "atk-asm-can",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: entered.is_set(), timeout=10)
+        mc._pget_cancel({"id": "jobAsmCan"})
+        release.set()
+        res = wait_result(sent, timeout=10)
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] == "cancelled"
+        assert res["failureCategory"] == "cancelled"
+        assert res["attemptToken"] == "atk-asm-can"
+        assert replace_calls == []
+        assert not (tmp_path / "clip.mp4").exists()
+        assert partish(leftovers(tmp_path)) == []
+        assert d._PGET.get("jobAsmCan") is None
+    finally:
+        release.set()
+        shutdown_server(httpd)
+
+
+def test_post_commit_progress_send_failure_still_completed(tmp_path, monkeypatch):
+    """After os.replace, a final progress-send failure must not void the commit."""
+    sent = []
+    import mchost.downloads as d
+
+    committed = {"ok": False}
+    orig_replace = d.os.replace
+
+    def arming_replace(src, dst, *a, **k):
+        r = orig_replace(src, dst, *a, **k)
+        committed["ok"] = True
+        return r
+
+    def flaky_send(msg):
+        m = dict(msg)
+        if committed["ok"] and m.get("type") == "pget-progress":
+            raise RuntimeError("progress send failed after commit")
+        sent.append(m)
+
+    monkeypatch.setattr(d.os, "replace", arming_replace)
+    monkeypatch.setattr(mc, "send", flaky_send)
+
+    httpd, _state = run_server("range")
+    try:
+        url = server_url(httpd)
+        mc.handle_pget({
+            "id": "jobProgFail",
+            "attemptToken": "atk-prog-fail",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] == "completed"
+        assert res["failureCategory"] is None
+        assert res["partState"] == "committed"
+        assert res["attemptToken"] == "atk-prog-fail"
+        assert (tmp_path / "clip.mp4").exists()
+        assert (tmp_path / "clip.mp4").stat().st_size == len(DEFAULT_PAYLOAD)
+        assert d._PGET.get("jobProgFail") is None
+    finally:
+        shutdown_server(httpd)
+
+
+def test_post_commit_convert_failure_still_completed(tmp_path, monkeypatch):
+    """Convert/notification failures after replace must still emit completed once."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    def boom_transcode(*_a, **_k):
+        raise RuntimeError("transcode exploded after commit")
+
+    monkeypatch.setattr(mc, "FFMPEG", "C:\\fake\\ffmpeg.exe")
+    monkeypatch.setattr(d, "transcode", boom_transcode)
+
+    httpd, _state = run_server("range")
+    try:
+        url = server_url(httpd)
+        mc.handle_pget({
+            "id": "jobConvFail",
+            "attemptToken": "atk-conv-fail",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+            "convert": {"codec": "h265", "quality": "visually-lossless", "encoder": "auto"},
+        })
+        res = wait_result(sent, timeout=10)
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] == "completed"
+        assert res["failureCategory"] is None
+        assert res["partState"] == "committed"
+        assert res["attemptToken"] == "atk-conv-fail"
+        assert (tmp_path / "clip.mp4").exists()
+        assert d._PGET.get("jobConvFail") is None
+        # No raw exception text in the terminal contract.
+        blob = str(res)
+        assert "transcode exploded" not in blob
+        assert "RuntimeError" not in blob
+    finally:
+        shutdown_server(httpd)
+
+
+def test_registered_precommit_exception_emits_structured_result(tmp_path, monkeypatch):
+    """Unexpected post-registration pre-commit failures must still terminalize."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    def boom_lease(*_a, **_k):
+        raise RuntimeError("lease setup boom")
+
+    monkeypatch.setattr(d, "_pget_lease", boom_lease)
+
+    httpd, _state = run_server("range")
+    try:
+        url = server_url(httpd)
+        mc.handle_pget({
+            "id": "jobLeaseBoom",
+            "attemptToken": "atk-lease-boom",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] in ("failed", "cancelled")
+        assert res["failureCategory"] in (
+            "permanent", "local_io", "cancelled", "timeout", "connection_reset"
+        )
+        assert res["partState"] in ("empty", "partial")
+        assert res["partState"] != "committed"
+        assert res["attemptToken"] == "atk-lease-boom"
+        assert not (tmp_path / "clip.mp4").exists()
+        assert d._PGET.get("jobLeaseBoom") is None
+        blob = str(res)
+        assert "lease setup boom" not in blob
+        assert "RuntimeError" not in blob
+    finally:
+        shutdown_server(httpd)
+
+
+def test_thread_start_failure_clears_registry_and_emits_result(tmp_path, monkeypatch):
+    """Thread.start() failure must not leave a permanent registry entry."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    # Start the fixture server before patching Thread: d.threading is the
+    # stdlib threading module, so the patch would otherwise break run_server.
+    httpd, _state = run_server("range")
+    try:
+        url = server_url(httpd)
+        real_thread = d.threading.Thread
+        starts = {"n": 0}
+
+        class BoomStartThread(real_thread):
+            def start(self):
+                starts["n"] += 1
+                # First Thread.start after the patch is handle_pget's worker.
+                if starts["n"] == 1:
+                    raise RuntimeError("thread start failed")
+                return real_thread.start(self)
+
+        monkeypatch.setattr(d.threading, "Thread", BoomStartThread)
+        mc.handle_pget({
+            "id": "jobStartFail",
+            "attemptToken": "atk-start-fail",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        # Synchronous terminal if feasible under the host contract.
+        assert wait_for(
+            lambda: any(m.get("type") == "pget-result" for m in sent)
+            or d._PGET.get("jobStartFail") is None,
+            timeout=5,
+        )
+        res = last_result(sent)
+        assert res is not None
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] in ("failed", "cancelled")
+        assert res["failureCategory"] in ("permanent", "local_io", "cancelled")
+        assert res["attemptToken"] == "atk-start-fail"
+        assert res["partState"] in ("empty", "partial")
+        assert d._PGET.get("jobStartFail") is None
+        assert not (tmp_path / "clip.mp4").exists()
     finally:
         shutdown_server(httpd)

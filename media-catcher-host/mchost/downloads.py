@@ -1477,80 +1477,125 @@ def handle_pget(req):
 
     Probe is conclusive before any worker/file write. Assembly uses a sibling
     .part path; os.replace is the commit point. Live pget-set-limit is Task 13.
+
+    Operation is registered before the worker thread starts so cancel works as
+    soon as handle_pget returns. Every registered exit emits exactly one
+    structured pget-result. After a successful os.replace the terminal is always
+    completed/committed; optional progress/convert work is best-effort.
     """
+    jid = req.get("id")
+    attempt = req.get("attemptToken")
+    mode = "multi-range"
+    terminal = {"sent": False}
+    stop = threading.Event()
+    op = {
+        "stop": stop,
+        "cancel_requested": False,
+        "lease": None,
+        "n": 0,
+        "final_path": None,
+    }
+
+    def finish(status, failure_category, part_state):
+        if terminal["sent"]:
+            return
+        # Mark before send so a send-side failure cannot double-terminal later.
+        terminal["sent"] = True
+        try:
+            _pget_send_result(jid, attempt, status, mode, failure_category, part_state)
+        except Exception:
+            # Terminal intent already recorded; never leak raw send errors.
+            pass
+
+    def _honest_part_state(final_path, n):
+        if not final_path:
+            return "empty"
+        return _pget_part_state(final_path, n)
+
+    # Register before the worker starts so pget-cancel after handle_pget returns
+    # is never a silent no-op during probe/path setup.
+    _PGET[jid] = op
+
     def worker():
-        jid = req.get("id")
-        attempt = req.get("attemptToken")
-        urls = [u for u in (req.get("urls") or []) if u]
-        referer = req.get("referer") or ""
-        ua = req.get("userAgent") or ""
-        name = _h().sanitize(req.get("name") or "download")
-        out_dir = req.get("dir") or _h().downloads_dir()
-        mode = "multi-range"
-        terminal = {"sent": False}
-        op = None
         final_path = None
         n = 0
+        committed = False
+        try:
+            urls = [u for u in (req.get("urls") or []) if u]
+            referer = req.get("referer") or ""
+            ua = req.get("userAgent") or ""
+            name = _h().sanitize(req.get("name") or "download")
+            out_dir = req.get("dir") or _h().downloads_dir()
 
-        def finish(status, failure_category, part_state):
-            if terminal["sent"]:
+            if op.get("cancel_requested") or stop.is_set():
+                finish("cancelled", "cancelled", "empty")
                 return
-            terminal["sent"] = True
-            _pget_send_result(jid, attempt, status, mode, failure_category, part_state)
 
-        if not urls:
-            finish("failed", "permanent", "empty")
-            return
+            if not urls:
+                finish("failed", "permanent", "empty")
+                return
 
-        try:
-            size, ok_urls, probe_fail = _pget_probe(urls, referer, ua)
-        except Exception as e:
-            size, ok_urls, probe_fail = None, [], _pget_classify_exc(e)
+            try:
+                size, ok_urls, probe_fail = _pget_probe(urls, referer, ua)
+            except Exception as e:
+                size, ok_urls, probe_fail = None, [], _pget_classify_exc(e)
 
-        if not size or not ok_urls:
-            finish("failed", probe_fail or "permanent", "empty")
-            return
+            # Cancel during/after a blocking probe must not start segments.
+            if op.get("cancel_requested") or stop.is_set():
+                finish("cancelled", "cancelled", "empty")
+                return
 
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            final_path = _dedup(os.path.join(out_dir, name))
-        except Exception:
-            finish("failed", "local_io", "empty")
-            return
+            if not size or not ok_urls:
+                finish("failed", probe_fail or "permanent", "empty")
+                return
 
-        _lease, n = _pget_lease(req, size)
-        seg = size // n
-        ranges = [
-            (i * seg, (size - 1 if i == n - 1 else (i + 1) * seg - 1))
-            for i in range(n)
-        ]
-        seg_done = [0] * n
-        stop = threading.Event()
-        op = {
-            "stop": stop,
-            "cancel_requested": False,
-            "lease": _lease,
-            "n": n,
-            "final_path": final_path,
-        }
-        _PGET[jid] = op
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                final_path = _dedup(os.path.join(out_dir, name))
+                op["final_path"] = final_path
+            except Exception:
+                if op.get("cancel_requested") or stop.is_set():
+                    finish("cancelled", "cancelled", "empty")
+                else:
+                    finish("failed", "local_io", "empty")
+                return
 
-        def monitor():
-            while not stop.is_set() and not terminal["sent"]:
-                _h().send({
-                    "type": "pget-progress",
-                    "id": jid,
-                    "bytes": sum(seg_done),
-                    "total": size,
-                })
-                if sum(seg_done) >= size:
-                    break
-                time.sleep(0.5)
+            if op.get("cancel_requested") or stop.is_set():
+                finish("cancelled", "cancelled", "empty")
+                return
 
-        threading.Thread(target=monitor, daemon=True).start()
+            _lease, n = _pget_lease(req, size)
+            op["lease"] = _lease
+            op["n"] = n
+            seg = size // n
+            ranges = [
+                (i * seg, (size - 1 if i == n - 1 else (i + 1) * seg - 1))
+                for i in range(n)
+            ]
+            seg_done = [0] * n
 
-        errors = []
-        try:
+            if op.get("cancel_requested") or stop.is_set():
+                finish("cancelled", "cancelled", "empty")
+                return
+
+            def monitor():
+                while not stop.is_set() and not terminal["sent"]:
+                    try:
+                        _h().send({
+                            "type": "pget-progress",
+                            "id": jid,
+                            "bytes": sum(seg_done),
+                            "total": size,
+                        })
+                    except Exception:
+                        pass
+                    if sum(seg_done) >= size:
+                        break
+                    time.sleep(0.5)
+
+            threading.Thread(target=monitor, daemon=True).start()
+
+            errors = []
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
                     futs = [
@@ -1574,9 +1619,10 @@ def handle_pget(req):
                 errors.append(_pget_classify_exc(exc))
                 stop.set()
 
+            # Prefer explicit user cancel over generic segment errors.
             if op.get("cancel_requested"):
                 _pget_cleanup_work(final_path, n)
-                finish("cancelled", "cancelled", _pget_part_state(final_path, n))
+                finish("cancelled", "cancelled", _honest_part_state(final_path, n))
                 return
 
             if errors:
@@ -1585,7 +1631,7 @@ def handle_pget(req):
                 cat = _pget_pick_category(errors)
                 # After cleanup for range_unsupported, partState must be empty
                 # when nothing remains; compute honestly either way.
-                finish("failed", cat, _pget_part_state(final_path, n))
+                finish("failed", cat, _honest_part_state(final_path, n))
                 return
 
             part_path, _segs = _pget_work_paths(final_path, n)
@@ -1602,48 +1648,108 @@ def handle_pget(req):
                         pass
                 if os.path.getsize(part_path) != size:
                     _pget_cleanup_work(final_path, n)
-                    finish("failed", "local_io", _pget_part_state(final_path, n))
+                    finish("failed", "local_io", _honest_part_state(final_path, n))
+                    return
+                # Cancel during assembly still wins if replace has not happened.
+                if op.get("cancel_requested"):
+                    _pget_cleanup_work(final_path, n)
+                    finish("cancelled", "cancelled", _honest_part_state(final_path, n))
                     return
                 # Commit point: atomic replace into the final deduplicated name.
                 os.replace(part_path, final_path)
+                committed = True
             except Exception:
                 stop.set()
-                _pget_cleanup_work(final_path, n)
-                if op.get("cancel_requested"):
-                    finish("cancelled", "cancelled", _pget_part_state(final_path, n))
-                else:
-                    finish("failed", "local_io", _pget_part_state(final_path, n))
-                return
+                if not committed:
+                    _pget_cleanup_work(final_path, n)
+                    if op.get("cancel_requested"):
+                        finish("cancelled", "cancelled", _honest_part_state(final_path, n))
+                    else:
+                        finish("failed", "local_io", _honest_part_state(final_path, n))
+                    return
+                # Replace already succeeded — fall through to completed.
 
-            if op.get("cancel_requested"):
-                # Cancel landed after commit — file is already final; report
-                # cancelled only if we have not committed result yet. Spec:
-                # committed result is sent only after replace succeeds; a late
-                # cancel after terminal is no-op. We still send completed.
+            # Late cancel after successful replace loses: retain completed.
+            # Optional progress / convert is best-effort and must not void commit.
+            try:
+                _h().send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
+            except Exception:
+                pass
+            try:
+                conv = req.get("convert")
+                if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
+                    codec = conv["codec"]
+                    try:
+                        _h().send({
+                            "type": "converting",
+                            "id": jid,
+                            "file": final_path,
+                            "codec": codec,
+                        })
+                    except Exception:
+                        pass
+                    try:
+                        tres = transcode(
+                            final_path, codec,
+                            conv.get("quality", "visually-lossless"),
+                            conv.get("encoder", "auto"),
+                            on_progress=lambda pct, j=jid, c=codec: _h().send(
+                                {"type": "convert-progress", "id": j, "pct": pct, "codec": c}
+                            ),
+                        )
+                        final_path = tres["path"]
+                        op["final_path"] = final_path
+                    except Exception:
+                        pass
+            except Exception:
                 pass
 
-            _h().send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
-            # Optional re-encode (H.265 / AV1) — same as recordings, kept only if smaller.
-            conv = req.get("convert")
-            if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
-                codec = conv["codec"]
-                _h().send({"type": "converting", "id": jid, "file": final_path, "codec": codec})
-                tres = transcode(
-                    final_path, codec,
-                    conv.get("quality", "visually-lossless"),
-                    conv.get("encoder", "auto"),
-                    on_progress=lambda pct, j=jid, c=codec: _h().send(
-                        {"type": "convert-progress", "id": j, "pct": pct, "codec": c}
-                    ),
-                )
-                final_path = tres["path"]
-
             finish("completed", None, "committed")
+        except Exception as e:
+            # Narrow escape hatch for unexpected registered failures.
+            if committed:
+                finish("completed", None, "committed")
+            elif op.get("cancel_requested"):
+                if final_path:
+                    _pget_cleanup_work(final_path, n)
+                finish("cancelled", "cancelled", _honest_part_state(final_path, n))
+            else:
+                if final_path:
+                    _pget_cleanup_work(final_path, n)
+                cat = _pget_classify_exc(e)
+                # Path-ish failures already use local_io elsewhere; unexpected
+                # internal errors stay structured and non-leaking.
+                if cat not in _PGET_FAIL_PRIORITY:
+                    cat = "permanent"
+                finish("failed", cat, _honest_part_state(final_path, n))
         finally:
             stop.set()
+            if not terminal["sent"]:
+                # Last-chance exactly-one terminal for any registered exit.
+                if committed:
+                    finish("completed", None, "committed")
+                elif op.get("cancel_requested"):
+                    if final_path:
+                        try:
+                            _pget_cleanup_work(final_path, n)
+                        except Exception:
+                            pass
+                    finish("cancelled", "cancelled", _honest_part_state(final_path, n))
+                else:
+                    if final_path:
+                        try:
+                            _pget_cleanup_work(final_path, n)
+                        except Exception:
+                            pass
+                    finish("failed", "permanent", _honest_part_state(final_path, n))
             _pget_unregister(jid, op)
 
-    threading.Thread(target=worker, daemon=True).start()
+    try:
+        threading.Thread(target=worker, daemon=True).start()
+    except Exception:
+        # Starting the worker must not leave a permanent registry entry.
+        _pget_unregister(jid, op)
+        finish("failed", "permanent", "empty")
 
 # yt-dlp tool discovery state (owned here; ensure_ytdlp/ensure_deno and the
 # shim main()'s _yt_probe rebind these). Initialised at the BOTTOM of the
