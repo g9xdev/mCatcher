@@ -591,7 +591,7 @@ test("wrong or stale attempt tokens are no-ops", () => {
   assertSlotInvariant(s);
 });
 
-test("no-sibling saturation candidate enters retry_backoff and releases slot (Task 10 bounded-policy placeholder)", () => {
+test("no-sibling saturation candidate enters retry_backoff, charges budget once, and releases slot", () => {
   const s = makeScheduler({ maxConcurrent: 1 });
   s.createJob({
     id: "1",
@@ -614,12 +614,12 @@ test("no-sibling saturation candidate enters retry_backoff and releases slot (Ta
     status: "failed",
     failureCategory: "timeout",
   });
-  // Task 10: saturation-candidate with no viable same-provider sibling → retry_backoff.
-  // Slot released; not waiting_provider; retry budget deferred to Task 11 timer path.
+  // Task 11: saturation-candidate with no viable same-provider sibling → retry_backoff.
+  // Slot released; not waiting_provider; automatic retry budget charged atomically on entry.
   assert.equal(s.getJob("1").state, "retry_backoff");
   assert.notEqual(s.getJob("1").state, "waiting_provider");
   assert.equal(s.getJob("1").holdsGlobalSlot, false);
-  assert.equal(s.getJob("1").retryRemaining, before);
+  assert.equal(s.getJob("1").retryRemaining, before - 1);
   assert.equal(s.getJob("2").state, "running");
   assertSlotInvariant(s);
 });
