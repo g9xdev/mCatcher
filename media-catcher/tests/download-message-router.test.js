@@ -2552,3 +2552,426 @@ test("range_unsupported single-switch and legacy pget-fallback remain unchanged"
   assert.equal(legacy.action, "ignore-legacy");
   assert.equal(legacy.invokeFirefox, false);
 });
+
+// ---------------------------------------------------------------------------
+// Task 20c audit gaps — generation fencing, validation order, exact id, mirrors
+// ---------------------------------------------------------------------------
+
+test("pget-progress and pget-limit-ack require exact own-data id; never fall back to jobId", () => {
+  const { routeNativeMessage } = loadRouter();
+
+  // jobId alone (even valid) must not route progress/limit-ack.
+  assert.deepEqual(
+    routeNativeMessage({
+      type: "pget-progress",
+      jobId: "job-only",
+      attemptToken: "atk",
+      bytes: 1,
+      total: 2,
+    }),
+    { action: "ignore", invokeFirefox: false }
+  );
+  assert.deepEqual(
+    routeNativeMessage({
+      type: "pget-limit-ack",
+      jobId: "job-only",
+      attemptToken: "atk",
+      providerGeneration: 1,
+      maxConnections: 0,
+    }),
+    { action: "ignore", invokeFirefox: false }
+  );
+
+  // Blank / missing / invalid id ignored even with valid jobId.
+  for (const id of ["", "  ", null, 12, true]) {
+    assert.deepEqual(
+      routeNativeMessage({
+        type: "pget-progress",
+        id,
+        jobId: "job-valid",
+        attemptToken: "atk",
+        bytes: 1,
+        total: 2,
+      }),
+      { action: "ignore", invokeFirefox: false },
+      `progress id=${String(id)}`
+    );
+    assert.deepEqual(
+      routeNativeMessage({
+        type: "pget-limit-ack",
+        id,
+        jobId: "job-valid",
+        attemptToken: "atk",
+        providerGeneration: 1,
+        maxConnections: 0,
+      }),
+      { action: "ignore", invokeFirefox: false },
+      `limit-ack id=${String(id)}`
+    );
+  }
+
+  // Accessor id must not be invoked or accepted even with valid jobId.
+  let hits = 0;
+  const accProgress = {
+    type: "pget-progress",
+    jobId: "job-valid",
+    attemptToken: "atk",
+    bytes: 1,
+    total: 2,
+  };
+  Object.defineProperty(accProgress, "id", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return "from-accessor";
+    },
+  });
+  assert.deepEqual(routeNativeMessage(accProgress), {
+    action: "ignore",
+    invokeFirefox: false,
+  });
+  assert.equal(hits, 0);
+
+  let hits2 = 0;
+  const accLimit = {
+    type: "pget-limit-ack",
+    jobId: "job-valid",
+    attemptToken: "atk",
+    providerGeneration: 1,
+    maxConnections: 0,
+  };
+  Object.defineProperty(accLimit, "id", {
+    enumerable: true,
+    get() {
+      hits2 += 1;
+      return "from-accessor";
+    },
+  });
+  assert.deepEqual(routeNativeMessage(accLimit), {
+    action: "ignore",
+    invokeFirefox: false,
+  });
+  assert.equal(hits2, 0);
+
+  // Exact nonblank id still works (jobId ignored for identity).
+  const ok = routeNativeMessage({
+    type: "pget-progress",
+    id: "wire-id",
+    jobId: "other-job",
+    attemptToken: "atk",
+    bytes: 3,
+    total: 9,
+  });
+  assert.equal(ok.action, "transport-progress");
+  assert.equal(ok.jobId, "wire-id");
+});
+
+test("buildNativeStartPayload validates fully before dependency resolve; malformed never leaks dependency errors", () => {
+  const abs = path.join(mediaCatcherRoot, "lib", "download-message-router.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const depErr = new Error("DEPENDENCY_SECRET");
+  let resolveHits = 0;
+  const root = {
+    McDownloadIntent: {
+      createDefaultIntent() {
+        throw depErr;
+      },
+    },
+    McFileSinkProtocol: {
+      buildPgetCmd() {
+        resolveHits += 1;
+        throw depErr;
+      },
+      buildPgetSingleCmd() {
+        resolveHits += 1;
+        throw depErr;
+      },
+      buildPgetSetLimitCmd() {
+        resolveHits += 1;
+        throw depErr;
+      },
+      buildPgetCancelCmd() {
+        resolveHits += 1;
+        throw depErr;
+      },
+      createFileSinkSession() {
+        resolveHits += 1;
+        throw depErr;
+      },
+    },
+  };
+  function selectiveRequire(id) {
+    if (String(id).indexOf("download-intent") !== -1) {
+      resolveHits += 1;
+      throw depErr;
+    }
+    if (String(id).indexOf("file-sink-protocol") !== -1) {
+      resolveHits += 1;
+      throw depErr;
+    }
+    return require(id);
+  }
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require: selectiveRequire,
+    console,
+    self: root,
+  };
+  sandbox.module.exports = sandbox.exports;
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  const api = sandbox.module.exports;
+
+  // VM-realm TypeError is not outer-realm instanceof; match by name+message.
+  const generic = (fn) => {
+    assert.throws(fn, (err) => {
+      assert.equal(err && err.name, "TypeError");
+      assert.equal(err.message, "invalid download message");
+      assert.equal(String(err.message).includes("SECRET"), false);
+      assert.notEqual(err, depErr);
+      return true;
+    });
+  };
+
+  // Malformed pget (bad maxConnections) must not resolve/call dependency.
+  resolveHits = 0;
+  generic(() =>
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: saveAsIntent(),
+      url: "https://cdn/x.mp4",
+      maxConnections: 0,
+      providerGeneration: 1,
+    })
+  );
+  assert.equal(resolveHits, 0);
+
+  // Missing generation.
+  resolveHits = 0;
+  generic(() =>
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: saveAsIntent(),
+      url: "https://cdn/x.mp4",
+      maxConnections: 2,
+    })
+  );
+  assert.equal(resolveHits, 0);
+
+  // Hostile mirrors index getter with secret — generic TypeError, no dependency.
+  resolveHits = 0;
+  const hostileMirrors = ["https://mirror/x.mp4"];
+  Object.defineProperty(hostileMirrors, "0", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      throw new Error("DEPENDENCY_SECRET_MIRROR");
+    },
+  });
+  generic(() =>
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: saveAsIntent(),
+      url: "https://cdn/x.mp4",
+      mirrors: hostileMirrors,
+      maxConnections: 2,
+      providerGeneration: 1,
+    })
+  );
+  assert.equal(resolveHits, 0);
+
+  // Present null referer rejects before dependency.
+  resolveHits = 0;
+  generic(() =>
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: saveAsIntent(),
+      url: "https://cdn/x.mp4",
+      maxConnections: 2,
+      providerGeneration: 1,
+      referer: null,
+    })
+  );
+  assert.equal(resolveHits, 0);
+
+  // Control command malformed generation before dependency.
+  resolveHits = 0;
+  generic(() =>
+    api.buildNativeStartPayload({
+      kind: "pget-set-limit",
+      jobId: "j",
+      attemptToken: "a",
+      maxConnections: 0,
+    })
+  );
+  assert.equal(resolveHits, 0);
+
+  // After full sanitization, dependency exceptions still propagate by identity.
+  let thrown = null;
+  try {
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: saveAsIntent(),
+      url: "https://cdn/x.mp4",
+      maxConnections: 2,
+      providerGeneration: 1,
+    });
+  } catch (e) {
+    thrown = e;
+  }
+  assert.equal(thrown, depErr);
+});
+
+test("buildNativeStartPayload HTTP context rejects present null/undefined/controls including C1", () => {
+  const { buildNativeStartPayload } = loadRouter();
+  const base = {
+    kind: "pget",
+    jobId: "j1",
+    attemptToken: "atk",
+    intent: saveAsIntent(),
+    url: "https://cdn/x.mp4",
+    maxConnections: 2,
+    providerGeneration: 1,
+  };
+
+  // Absent → empty strings on wire.
+  const absent = buildNativeStartPayload(base);
+  assert.equal(absent.referer, "");
+  assert.equal(absent.userAgent, "");
+
+  // Ordinary present strings accepted.
+  const ok = buildNativeStartPayload(
+    Object.assign({}, base, {
+      referer: "https://page.example/",
+      userAgent: "UA/1",
+    })
+  );
+  assert.equal(ok.referer, "https://page.example/");
+  assert.equal(ok.userAgent, "UA/1");
+
+  const generic = (fn) => {
+    assert.throws(fn, (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(err.message, "invalid download message");
+      return true;
+    });
+  };
+
+  generic(() =>
+    buildNativeStartPayload(Object.assign({}, base, { referer: null }))
+  );
+  generic(() =>
+    buildNativeStartPayload(Object.assign({}, base, { userAgent: null }))
+  );
+  generic(() =>
+    buildNativeStartPayload(Object.assign({}, base, { referer: undefined }))
+  );
+  generic(() =>
+    buildNativeStartPayload(Object.assign({}, base, { userAgent: undefined }))
+  );
+  for (const bad of ["a\nb", "a\rb", "a\u0000b", "a\u0085b", "a\u007fb"]) {
+    generic(() =>
+      buildNativeStartPayload(Object.assign({}, base, { referer: bad }))
+    );
+    generic(() =>
+      buildNativeStartPayload(Object.assign({}, base, { userAgent: bad }))
+    );
+  }
+
+  let hits = 0;
+  const acc = Object.assign({}, base);
+  Object.defineProperty(acc, "userAgent", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return "UA";
+    },
+  });
+  generic(() => buildNativeStartPayload(acc));
+  assert.equal(hits, 0);
+});
+
+test("buildNativeStartPayload snapshots mirrors descriptor-safely before dependency", () => {
+  const { buildNativeStartPayload } = loadRouter();
+  const primary = "https://cdn/x.mp4?sig=P";
+  const mirror = "https://mirror/x.mp4?sig=M";
+  const out = buildNativeStartPayload({
+    kind: "pget",
+    jobId: "j1",
+    attemptToken: "atk",
+    intent: saveAsIntent(),
+    url: primary,
+    mirrors: [mirror, primary, mirror, "", null],
+    maxConnections: 2,
+    providerGeneration: 1,
+  });
+  assert.deepEqual(out.urls, [primary, mirror]);
+  assert.equal(Object.isFrozen(out.urls), true);
+
+  // Sparse mirrors fail generically.
+  const sparse = [];
+  sparse.length = 1;
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: saveAsIntent(),
+        url: primary,
+        mirrors: sparse,
+        maxConnections: 2,
+        providerGeneration: 1,
+      }),
+    (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(err.message, "invalid download message");
+      return true;
+    }
+  );
+
+  // Hostile length via proxy trap — no secret leak (Array.length cannot be redefined).
+  const hostileLen = new Proxy([mirror], {
+    getOwnPropertyDescriptor(target, prop) {
+      if (prop === "length") {
+        return {
+          configurable: true,
+          enumerable: false,
+          get() {
+            throw new Error("DEPENDENCY_SECRET_LEN");
+          },
+        };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: saveAsIntent(),
+        url: primary,
+        mirrors: hostileLen,
+        maxConnections: 2,
+        providerGeneration: 1,
+      }),
+    (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(err.message, "invalid download message");
+      assert.equal(String(err.message).includes("SECRET"), false);
+      return true;
+    }
+  );
+});

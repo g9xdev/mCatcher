@@ -101,17 +101,65 @@
       return Object.prototype.hasOwnProperty.call(obj, key);
     }
 
-    /** Reject CR/LF/NUL and other control characters in HTTP-context strings. */
-    function isSafeHttpContextString(v) {
-      return typeof v === "string" && !/[\u0000-\u001f\u007f]/.test(v);
+    /**
+     * Descriptor-safe own data read. Never invokes accessors.
+     * Returns {ok:false} on missing/accessor/proxy failure without throwing.
+     */
+    function ownData(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { ok: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc || desc.get || desc.set || !("value" in desc)) {
+          return { ok: false };
+        }
+        return { ok: true, value: desc.value };
+      } catch (e) {
+        return { ok: false };
+      }
     }
 
-    function normalizeHttpContextField(v, label) {
-      if (v === undefined || v === null) return "";
-      if (!isSafeHttpContextString(v)) {
-        throw new TypeError(label + " must be a primitive string without control characters");
+    /**
+     * Own-key presence without invoking accessors.
+     * present+!data means accessor or non-data descriptor.
+     */
+    function ownKeyState(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { present: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc) return { present: false };
+        if (desc.get || desc.set || !("value" in desc)) {
+          return { present: true, data: false };
+        }
+        return { present: true, data: true, value: desc.value };
+      } catch (e) {
+        return { present: false };
       }
-      return v;
+    }
+
+    /** Reject C0, DEL, and C1 controls in HTTP-context strings. */
+    function isSafeHttpContextString(v) {
+      return typeof v === "string" && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+    }
+
+    /**
+     * Only ABSENT referer/userAgent normalize to "".
+     * Present values must be primitive strings without control characters.
+     * Present null/undefined/object/accessor are invalid.
+     */
+    function normalizeHttpContextField(input, key) {
+      var state = ownKeyState(input, key);
+      if (!state.present) return "";
+      if (!state.data) {
+        throw new TypeError(key + " must be a primitive string without control characters");
+      }
+      if (!isSafeHttpContextString(state.value)) {
+        throw new TypeError(key + " must be a primitive string without control characters");
+      }
+      return state.value;
     }
 
     function requireProviderGeneration(v) {
@@ -121,17 +169,25 @@
       return v;
     }
 
+    /**
+     * Require own-data nonnegative integer providerGeneration.
+     * Missing/undefined/null/accessor/bool/fractional/negative/object throw TypeError
+     * without invoking accessors. No silent default to 0.
+     */
     function readProviderGeneration(input) {
-      // Pre-generation callers omit the field; default 0. Explicit null/invalid throws.
-      if (!hasOwn(input, "providerGeneration") || input.providerGeneration === undefined) {
-        return 0;
+      var state = ownKeyState(input, "providerGeneration");
+      if (!state.present || !state.data) {
+        throw new TypeError("providerGeneration must be a nonnegative integer");
       }
-      return requireProviderGeneration(input.providerGeneration);
+      return requireProviderGeneration(state.value);
     }
 
     /**
-     * Primary URL first, then exact-string-deduped valid mirrors.
-     * Invalid mirror entries are skipped; never mutate caller arrays.
+     * Descriptor-safe mirrors snapshot.
+     * Primary URL first, then exact-string-deduped valid nonblank string mirrors.
+     * Own-data blank/non-string entries are omitted (closed skip contract).
+     * Sparse holes, accessors, hostile length, and non-array length semantics throw TypeError.
+     * Never mutates caller arrays; never invokes getters/proxy traps.
      */
     function buildUrlsList(url, mirrors) {
       requireNonblankString(url, "url");
@@ -140,8 +196,18 @@
       seen[url] = true;
       if (mirrors == null) return Object.freeze(out);
       if (!Array.isArray(mirrors)) return Object.freeze(out);
-      for (var i = 0; i < mirrors.length; i++) {
-        var m = mirrors[i];
+
+      var lenState = ownKeyState(mirrors, "length");
+      if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
+        throw new TypeError("mirrors must be a dense array of primitive strings");
+      }
+      var len = lenState.value;
+      for (var i = 0; i < len; i++) {
+        var entry = ownData(mirrors, String(i));
+        if (!entry.ok) {
+          throw new TypeError("mirrors must be a dense array of primitive strings");
+        }
+        var m = entry.value;
         if (typeof m !== "string" || !isNonblankString(m)) continue;
         if (seen[m]) continue;
         seen[m] = true;
@@ -197,19 +263,42 @@
       return { name: name, dir: dir };
     }
 
+    function readOptionalEffectiveDir(input) {
+      var effR = ownKeyState(input, "effectiveDestinationDirectory");
+      if (!effR.present) return undefined;
+      if (!effR.data) {
+        throw new TypeError(
+          "effectiveDestinationDirectory must be a nonblank primitive string when provided"
+        );
+      }
+      return effR.value;
+    }
+
+    function readOptionalMirrors(input) {
+      var mirrorsState = ownKeyState(input, "mirrors");
+      if (!mirrorsState.present) return null;
+      if (!mirrorsState.data) {
+        throw new TypeError("mirrors must be a dense array of primitive strings");
+      }
+      return mirrorsState.value;
+    }
+
     function buildPgetCmd(input) {
       input = input || {};
       var jobId = requireNonblankString(input.jobId, "jobId");
       var attemptToken = requireNonblankString(input.attemptToken, "attemptToken");
       var url = requireNonblankString(input.url, "url");
-      if (!isPositiveInt(input.maxConnections)) {
+      var maxR = ownData(input, "maxConnections");
+      if (!maxR.ok || !isPositiveInt(maxR.value)) {
         throw new TypeError("maxConnections must be a positive integer");
       }
       var providerGeneration = readProviderGeneration(input);
-      var referer = normalizeHttpContextField(input.referer, "referer");
-      var userAgent = normalizeHttpContextField(input.userAgent, "userAgent");
-      var bound = readIntentNameDir(input.intent, input.effectiveDestinationDirectory);
-      var urls = buildUrlsList(url, input.mirrors);
+      var referer = normalizeHttpContextField(input, "referer");
+      var userAgent = normalizeHttpContextField(input, "userAgent");
+      var intentR = ownData(input, "intent");
+      if (!intentR.ok) throw new TypeError("intent must be an object");
+      var bound = readIntentNameDir(intentR.value, readOptionalEffectiveDir(input));
+      var urls = buildUrlsList(url, readOptionalMirrors(input));
       return freezeCmd({
         cmd: "pget",
         id: jobId,
@@ -217,7 +306,7 @@
         urls: urls,
         name: bound.name,
         dir: bound.dir,
-        maxConnections: input.maxConnections,
+        maxConnections: maxR.value,
         providerGeneration: providerGeneration,
         referer: referer,
         userAgent: userAgent,
@@ -230,10 +319,12 @@
       var attemptToken = requireNonblankString(input.attemptToken, "attemptToken");
       var url = requireNonblankString(input.url, "url");
       var providerGeneration = readProviderGeneration(input);
-      var referer = normalizeHttpContextField(input.referer, "referer");
-      var userAgent = normalizeHttpContextField(input.userAgent, "userAgent");
-      var bound = readIntentNameDir(input.intent, input.effectiveDestinationDirectory);
-      var urls = buildUrlsList(url, input.mirrors);
+      var referer = normalizeHttpContextField(input, "referer");
+      var userAgent = normalizeHttpContextField(input, "userAgent");
+      var intentR = ownData(input, "intent");
+      if (!intentR.ok) throw new TypeError("intent must be an object");
+      var bound = readIntentNameDir(intentR.value, readOptionalEffectiveDir(input));
+      var urls = buildUrlsList(url, readOptionalMirrors(input));
       return freezeCmd({
         cmd: "pget-single",
         id: jobId,
@@ -252,8 +343,9 @@
       input = input || {};
       var jobId = requireNonblankString(input.jobId, "jobId");
       var attemptToken = requireNonblankString(input.attemptToken, "attemptToken");
-      var providerGeneration = requireProviderGeneration(input.providerGeneration);
-      if (!isNonnegInt(input.maxConnections)) {
+      var providerGeneration = readProviderGeneration(input);
+      var limR = ownData(input, "maxConnections");
+      if (!limR.ok || !isNonnegInt(limR.value)) {
         throw new TypeError("maxConnections must be a nonnegative integer");
       }
       return freezeCmd({
@@ -261,7 +353,7 @@
         id: jobId,
         attemptToken: attemptToken,
         providerGeneration: providerGeneration,
-        maxConnections: input.maxConnections,
+        maxConnections: limR.value,
       });
     }
 
