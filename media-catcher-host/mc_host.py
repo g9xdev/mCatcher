@@ -495,6 +495,14 @@ def main():
                 handle_get_report(msg)
             elif cmd == "pget-cancel":
                 _pget_cancel(msg)
+            elif cmd == "file-open":
+                handle_file_open(msg)
+            elif cmd == "file-chunk":
+                handle_file_chunk(msg)
+            elif cmd == "file-commit":
+                handle_file_commit(msg)
+            elif cmd == "file-abort":
+                handle_file_abort(msg)
         except Exception as e:
             send({"type": "error", "id": msg.get("id"), "error": str(e)})
 
@@ -508,6 +516,14 @@ from mchost.downloads import (_pget_open, _pget_probe, _pget_segment,   # noqa: 
                               handle_pget_single, handle_pget_set_limit,
                               _pget_send_result, _pget_classify_exc,
                               _pget_classify_http_status, _PGET)
+
+
+# ---- native JSON file sink (browser-fetched HLS/DASH bytes) ---------------
+# Owned by mchost/filesink.py (Task 15). Registry/mutable sink state lives
+# there; handlers re-exported so monkeypatch.setattr(mc_host, "send", ...) is
+# honored via filesink's call-time _h() lookup.
+from mchost.filesink import (handle_file_open, handle_file_chunk,   # noqa: E402,F401
+                             handle_file_commit, handle_file_abort)
 
 
 if __name__ == "__main__":
