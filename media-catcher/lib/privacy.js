@@ -126,10 +126,16 @@
     var SECRET_PARAM_RE =
       /[?#&](?:token|access_token|auth|authorization|key|api_key|session|cookie|sig|signature|policy|expires|expiry|x-amz-[^=&#\s]*)=/i;
 
+    function hasControlChars(s) {
+      // CR / LF / NUL and other C0 controls + DEL — never forward in allowlists.
+      return /[\u0000-\u001f\u007f]/.test(s);
+    }
+
     /**
-     * True when a popup-facing string carries URL query/fragment, userinfo, or
-     * secret-bearing header syntax. Allowlisted field names do not authorize
-     * forwarding this content.
+     * True when a popup-facing string carries network URL material, secret
+     * query/fragment params, or credential/header syntax. Allowlisted field
+     * names do not authorize forwarding this content. Popup projections must
+     * contain no media/page URLs at all (scheme:// or scheme-relative //host).
      */
     function isSuspiciousPopupString(s) {
       if (typeof s !== "string" || s.length === 0) return false;
@@ -140,13 +146,10 @@
       }
       // Secret-bearing params in absolute, scheme-relative, relative, or bare strings.
       if (SECRET_PARAM_RE.test(s)) return true;
-      // Scheme-relative network refs (//host/…, //user:pass@host/…) with
-      // userinfo, query, or fragment — same risk class as absolute URLs.
-      if (/\/\/[^/\s"'<>]*@/i.test(s)) return true;
-      if (/\/\/[^\s"'<>?#]*[?#]/i.test(s)) return true;
-      // Any absolute scheme:// with userinfo, query, or fragment material.
-      if (/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s"'<>]*@/i.test(s)) return true;
-      if (/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'<>?#]*[?#]/i.test(s)) return true;
+      // Any absolute scheme:// network URL reference (with or without query).
+      if (/[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return true;
+      // Any scheme-relative //host network reference (with or without query).
+      if (/\/\//.test(s)) return true;
       return false;
     }
 
@@ -160,6 +163,88 @@
       if (typeof s !== "string") return undefined;
       if (isSuspiciousPopupString(s)) return undefined;
       return s;
+    }
+
+    /**
+     * Safe history requestedFilename: ordinary filename only.
+     * Reject URL-like values, secret params, header syntax, controls, path seps.
+     * Never echo a rejected value.
+     */
+    function isSafeHistoryFilename(s) {
+      if (!isNonblankPrimitiveString(s)) return false;
+      if (hasControlChars(s)) return false;
+      if (/[/\\]/.test(s)) return false;
+      if (isSuspiciousPopupString(s)) return false;
+      return true;
+    }
+
+    /**
+     * Safe history providerKey: hostname-like site key (no normalize).
+     * alnum / dot / hyphen, optional :port. Reject URL/query/header/whitespace.
+     */
+    function isSafeHistoryProviderKey(s) {
+      if (typeof s !== "string" || s.length === 0 || s.length > 253) return false;
+      if (hasControlChars(s)) return false;
+      if (isSuspiciousPopupString(s)) return false;
+      // Single label or dotted host, optional numeric port. No underscore/space/path.
+      if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$/.test(s)) {
+        return false;
+      }
+      // Reject consecutive dots / leading-trailing dot labels loosely via simple checks.
+      if (s.indexOf("..") !== -1) return false;
+      var hostPart = s;
+      var colon = s.lastIndexOf(":");
+      if (colon !== -1 && /^\d{1,5}$/.test(s.slice(colon + 1))) {
+        hostPart = s.slice(0, colon);
+      }
+      if (hostPart.charAt(0) === "-" || hostPart.charAt(hostPart.length - 1) === "-") {
+        return false;
+      }
+      if (hostPart.charAt(0) === "." || hostPart.charAt(hostPart.length - 1) === ".") {
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * Safe history status: ordinary scheduler/status text.
+     * Reject URL-like, secret params, credential/header syntax, controls.
+     */
+    function isSafeHistoryStatus(s) {
+      if (!isNonblankPrimitiveString(s)) return false;
+      if (hasControlChars(s)) return false;
+      if (isSuspiciousPopupString(s)) return false;
+      return true;
+    }
+
+    /**
+     * Safe history ts: ordinary ISO/timestamp primitive strings.
+     * Reject URL-like, query/fragment/credential/header syntax, controls.
+     * Never invokes the clock.
+     */
+    function isSafeHistoryTs(s) {
+      if (!isNonblankPrimitiveString(s)) return false;
+      if (hasControlChars(s)) return false;
+      if (isSuspiciousPopupString(s)) return false;
+      // Bare query/fragment/userinfo markers are never valid timestamps.
+      if (/[?#@]/.test(s)) return false;
+      return true;
+    }
+
+    /**
+     * Popup id / downloadId: finite numbers, or conservative identifier strings.
+     * Omit invalid / suspicious values (never echo them).
+     */
+    function isSafePopupIdentifier(v) {
+      if (typeof v === "number") {
+        return isFiniteNumber(v);
+      }
+      if (typeof v !== "string" || v.length === 0 || v.length > 128) return false;
+      if (hasControlChars(v)) return false;
+      if (isSuspiciousPopupString(v)) return false;
+      // Common job ids / UUIDs: alnum plus . _ : -
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(v)) return false;
+      return true;
     }
 
     /**
@@ -216,42 +301,43 @@
 
       if (input != null && (typeof input === "object" || typeof input === "function")) {
         var topName = safeGet(input, "requestedFilename");
-        if (isNonblankPrimitiveString(topName)) {
+        if (isSafeHistoryFilename(topName)) {
           requestedFilename = topName;
         } else {
+          // Rejected/missing top-level: try intent (never echo rejected values).
           var intent = safeGet(input, "intent");
           if (intent != null && typeof intent === "object") {
             var intentName = safeGet(intent, "requestedFilename");
-            if (isNonblankPrimitiveString(intentName)) {
+            if (isSafeHistoryFilename(intentName)) {
               requestedFilename = intentName;
             }
           }
         }
 
         var pk = safeGet(input, "providerKey");
-        if (isNonblankPrimitiveString(pk)) providerKey = pk;
+        if (isSafeHistoryProviderKey(pk)) providerKey = pk;
 
         var st = safeGet(input, "status");
-        if (isNonblankPrimitiveString(st)) {
+        if (isSafeHistoryStatus(st)) {
           status = st;
         } else {
           var state = safeGet(input, "state");
-          if (isNonblankPrimitiveString(state)) status = state;
+          if (isSafeHistoryStatus(state)) status = state;
         }
 
         var b = safeGet(input, "bytes");
         if (isFiniteNonnegNumber(b)) bytes = b;
 
         var t = safeGet(input, "ts");
-        if (isNonblankPrimitiveString(t)) {
+        if (isSafeHistoryTs(t)) {
           ts = t;
         } else {
           var completedAt = safeGet(input, "completedAt");
-          if (isNonblankPrimitiveString(completedAt)) {
+          if (isSafeHistoryTs(completedAt)) {
             ts = completedAt;
           } else {
             var createdAt = safeGet(input, "createdAt");
-            if (isNonblankPrimitiveString(createdAt)) ts = createdAt;
+            if (isSafeHistoryTs(createdAt)) ts = createdAt;
           }
         }
       }
@@ -332,7 +418,7 @@
       var out = {};
 
       var id = safeGet(job, "id");
-      if (typeof id === "string" || typeof id === "number") out.id = id;
+      if (isSafePopupIdentifier(id)) out.id = id;
 
       var state = safeGet(job, "state");
       if (typeof state === "string") {
@@ -430,9 +516,7 @@
       }
 
       var downloadId = safeGet(job, "downloadId");
-      if (typeof downloadId === "string" || typeof downloadId === "number") {
-        out.downloadId = downloadId;
-      }
+      if (isSafePopupIdentifier(downloadId)) out.downloadId = downloadId;
 
       var snapshots = safeGet(job, "snapshots");
       if (isFiniteNonnegNumber(snapshots)) out.snapshots = snapshots;

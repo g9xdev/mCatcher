@@ -942,3 +942,281 @@ test("redactUrlForLog hardens scheme-relative URLs without leaking or coercing",
   assert.equal(P.redactUrlForLog({ href: "//cdn.example/f?token=SECRET_OBJ" }), "[redacted]");
   assert.equal(P.redactUrlForLog(["//x?token=SECRET_ARR"]), "[redacted]");
 });
+
+// --- Task-19 fix3: allowlist field values + string ID boundary ---
+
+test("projectSafeHistory sanitizes secret-bearing allowlist field values", () => {
+  // Controller probe: allowlisted keys must not forward secret-bearing values.
+  const h = P.projectSafeHistory({
+    requestedFilename: "https://cdn.example/f.mp4?token=SECRET_SIGNED",
+    providerKey: "Cookie: SECRET_COOKIE",
+    status: "Authorization: SECRET_AUTH",
+    ts: "?token=SECRET_TS",
+  });
+  assert.deepEqual(Object.keys(h), [
+    "requestedFilename",
+    "providerKey",
+    "status",
+    "bytes",
+    "ts",
+  ]);
+  assert.equal(h.requestedFilename, "download");
+  assert.equal(h.providerKey, "unknown");
+  assert.equal(h.status, "unknown");
+  assert.equal(h.bytes, 0);
+  assert.equal(h.ts, null);
+  assert.ok(Object.isFrozen(h));
+  const raw = JSON.stringify(h);
+  for (const s of [
+    "SECRET_SIGNED",
+    "SECRET_COOKIE",
+    "SECRET_AUTH",
+    "SECRET_TS",
+    "token=",
+    "cdn.example",
+    "Cookie:",
+    "Authorization:",
+  ]) {
+    assert.equal(raw.includes(s), false, "history leak: " + s);
+  }
+
+  // Nested intent requestedFilename + state/completedAt fallbacks.
+  const nested = P.projectSafeHistory({
+    intent: { requestedFilename: "https://cdn.example/f.mp4?token=SECRET_NESTED_FN" },
+    providerKey: "https://evil.example?token=SECRET_PK",
+    state: "Cookie: SECRET_STATE",
+    completedAt: "https://x/?token=SECRET_TS_NEST",
+    bytes: 5,
+  });
+  assert.equal(nested.requestedFilename, "download");
+  assert.equal(nested.providerKey, "unknown");
+  assert.equal(nested.status, "unknown");
+  assert.equal(nested.ts, null);
+  assert.equal(nested.bytes, 5);
+  assert.equal(JSON.stringify(nested).includes("SECRET"), false);
+
+  // Top-level rejected filename falls through to safe intent name.
+  const fallback = P.projectSafeHistory({
+    requestedFilename: "//cdn.example/f?token=SECRET_TOP_FN",
+    intent: { requestedFilename: "safe-from-intent.mp4" },
+    providerKey: "florenfile.com",
+    status: "needs_user",
+    ts: "2026-08-12T00:00:00.000Z",
+    bytes: 9,
+  });
+  assert.equal(fallback.requestedFilename, "safe-from-intent.mp4");
+  assert.equal(fallback.providerKey, "florenfile.com");
+  assert.equal(fallback.status, "needs_user");
+  assert.equal(fallback.ts, "2026-08-12T00:00:00.000Z");
+  assert.equal(fallback.bytes, 9);
+
+  // status rejects; state fallback accepted when safe.
+  const statusFallback = P.projectSafeHistory({
+    status: "Authorization: SECRET_STATUS",
+    state: "completed",
+  });
+  assert.equal(statusFallback.status, "completed");
+  assert.equal(JSON.stringify(statusFallback).includes("SECRET"), false);
+
+  // ts rejects; completedAt / createdAt fallbacks when safe.
+  const tsFallback = P.projectSafeHistory({
+    ts: "?token=SECRET_TS_TOP",
+    completedAt: "2026-08-12T01:00:00.000Z",
+  });
+  assert.equal(tsFallback.ts, "2026-08-12T01:00:00.000Z");
+  const tsCreated = P.projectSafeHistory({
+    ts: "https://x?token=SECRET_TS2",
+    completedAt: "Cookie: SECRET_CA",
+    createdAt: "2026-08-12T02:00:00.000Z",
+  });
+  assert.equal(tsCreated.ts, "2026-08-12T02:00:00.000Z");
+  assert.equal(JSON.stringify(tsCreated).includes("SECRET"), false);
+
+  // Valid Florenfile name, ordinary status, hostname provider preserved.
+  const ok = P.projectSafeHistory({
+    requestedFilename: "11238-makemebi.net.mp4",
+    providerKey: "florenfile.com",
+    status: "HTTP 429; retry later",
+    bytes: 0,
+    ts: "2026-08-12T00:00:00.000Z",
+  });
+  assert.equal(ok.requestedFilename, "11238-makemebi.net.mp4");
+  assert.equal(ok.providerKey, "florenfile.com");
+  assert.equal(ok.status, "HTTP 429; retry later");
+  assert.equal(ok.ts, "2026-08-12T00:00:00.000Z");
+
+  // Filename rejects path separators, controls, scheme-relative, header syntax.
+  for (const bad of [
+    "dir/secret.mp4",
+    "dir\\secret.mp4",
+    "name\rSECRET_CR.mp4",
+    "name\nSECRET_LF.mp4",
+    "name\0SECRET_NUL.mp4",
+    "ftp://host/f.mp4",
+    "//host/f.mp4",
+    "Cookie: SECRET_HDR_FN",
+  ]) {
+    const v = P.projectSafeHistory({ requestedFilename: bad });
+    assert.equal(v.requestedFilename, "download", bad);
+    assert.equal(JSON.stringify(v).includes("SECRET"), false, bad);
+  }
+
+  // providerKey rejects URL-like, whitespace, path, implausible keys.
+  for (const bad of [
+    "floren file.com",
+    "a/b",
+    "a\\b",
+    "host?x=1",
+    "host#frag",
+    "//evil",
+    "https://evil",
+    "Cookie: x",
+    "",
+    "   ",
+  ]) {
+    const v = P.projectSafeHistory({ providerKey: bad });
+    assert.equal(v.providerKey, "unknown", JSON.stringify(bad));
+  }
+});
+
+test("projectPopupJob omits URL-like string ids and network URLs in all string fields", () => {
+  // Controller probe: string ids currently bypass the string sanitizer.
+  const v = P.projectPopupJob({
+    id: "https://cdn.example/f.mp4?token=SECRET_SIGNED",
+    downloadId: "//cdn/f?token=SECRET_DOWNLOAD_ID",
+    requestedFilename: "ok.mp4",
+  });
+  assert.equal(v.requestedFilename, "ok.mp4");
+  assert.equal(Object.prototype.hasOwnProperty.call(v, "id"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(v, "downloadId"), false);
+  const probeRaw = JSON.stringify(v);
+  assert.equal(probeRaw.includes("SECRET_SIGNED"), false);
+  assert.equal(probeRaw.includes("SECRET_DOWNLOAD_ID"), false);
+  assert.equal(probeRaw.includes("cdn.example"), false);
+  assert.equal(probeRaw.includes("token="), false);
+
+  // Numeric finite ids remain allowed; NaN/Infinity rejected.
+  const nums = P.projectPopupJob({ id: 42, downloadId: 7, state: "running" });
+  assert.equal(nums.id, 42);
+  assert.equal(nums.downloadId, 7);
+  const badNums = P.projectPopupJob({ id: NaN, downloadId: Infinity, state: "running" });
+  assert.equal(Object.prototype.hasOwnProperty.call(badNums, "id"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(badNums, "downloadId"), false);
+  const negInf = P.projectPopupJob({ id: -Infinity, downloadId: Number.NaN });
+  assert.equal(Object.prototype.hasOwnProperty.call(negInf, "id"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(negInf, "downloadId"), false);
+
+  // Safe string job ids / UUIDs preserved.
+  const safeIds = P.projectPopupJob({
+    id: "j9",
+    downloadId: "550e8400-e29b-41d4-a716-446655440000",
+    state: "running",
+  });
+  assert.equal(safeIds.id, "j9");
+  assert.equal(safeIds.downloadId, "550e8400-e29b-41d4-a716-446655440000");
+
+  // Plain network URLs (no query) are suspicious in popup projections.
+  for (const bad of [
+    "https://cdn.example/f.mp4",
+    "http://cdn.example/a",
+    "//cdn.example/f.mp4",
+    "ftp://files.example/x",
+  ]) {
+    const errView = P.projectPopupJob({ id: "e", state: "failed", error: bad });
+    assert.equal(errView.error, "Download error", bad);
+    assert.equal(JSON.stringify(errView).includes("cdn.example"), false, bad);
+    assert.equal(JSON.stringify(errView).includes("files.example"), false, bad);
+
+    const nameView = P.projectPopupJob({ id: "n", state: "running", name: bad });
+    assert.equal(Object.prototype.hasOwnProperty.call(nameView, "name"), false, bad);
+  }
+
+  // Preserve Windows paths, ordinary filenames, hostnames, local ffmpeg (no network URL).
+  const preserved = P.projectPopupJob({
+    id: "ok",
+    state: "running",
+    providerKey: "florenfile.com",
+    requestedFilename: "clip.mp4",
+    savedPath: "C:\\Videos\\a.mp4",
+    error: "Helper unavailable",
+    mergeCommand: "ffmpeg -i in.mp4 -c copy out.mp4",
+  });
+  assert.equal(preserved.providerKey, "florenfile.com");
+  assert.equal(preserved.requestedFilename, "clip.mp4");
+  assert.equal(preserved.savedPath, "C:\\Videos\\a.mp4");
+  assert.equal(preserved.error, "Helper unavailable");
+  assert.equal(preserved.mergeCommand, "ffmpeg -i in.mp4 -c copy out.mp4");
+
+  // Table-driven: inject signed/URL/header sentinels through every string-bearing path.
+  const SENTINELS = [
+    "SECRET_SIGNED",
+    "SECRET_DOWNLOAD_ID",
+    "SECRET_HDR",
+    "SECRET_NEST",
+    "SECRET_NOTE",
+    "SECRET_LABEL",
+    "SECRET_CMD",
+  ];
+  const urlSentinel = "https://cdn.example/f.mp4?token=SECRET_SIGNED";
+  const schemeRelSentinel = "//cdn/f?token=SECRET_DOWNLOAD_ID";
+  const headerSentinel = "Cookie: SECRET_HDR";
+  const nestedUrl = "https://evil.example/x?token=SECRET_NEST";
+  const noteUrl = "//cdn.example/n?token=SECRET_NOTE";
+  const labelUrl = "https://cdn.example/l?token=SECRET_LABEL";
+  const cmdUrl = "ffmpeg -i https://cdn.example/a.mp4?token=SECRET_CMD -c copy o.mp4";
+
+  const poisoned = P.projectPopupJob({
+    id: urlSentinel,
+    downloadId: schemeRelSentinel,
+    state: headerSentinel,
+    status: urlSentinel,
+    providerKey: urlSentinel,
+    requestedFilename: urlSentinel,
+    destinationDirectory: schemeRelSentinel,
+    saveMode: headerSentinel,
+    createdAt: urlSentinel,
+    kind: schemeRelSentinel,
+    mode: headerSentinel,
+    mediaKind: urlSentinel,
+    error: urlSentinel,
+    name: schemeRelSentinel,
+    savedPath: urlSentinel,
+    convertCodec: headerSentinel,
+    mergeCommand: cmdUrl,
+    fixCommand: urlSentinel,
+    intent: {
+      requestedFilename: nestedUrl,
+      destinationDirectory: schemeRelSentinel,
+      saveMode: headerSentinel,
+      createdAt: nestedUrl,
+    },
+    progress: { unit: urlSentinel, stage: schemeRelSentinel, note: noteUrl, done: 1 },
+    quality: { label: labelUrl, codec: headerSentinel, width: 1 },
+    convert: { codec: urlSentinel, command: cmdUrl, note: noteUrl, pct: 1 },
+  });
+  assertPopupNoLeak(poisoned, SENTINELS.concat([
+    "token=",
+    "cdn.example",
+    "evil.example",
+    "Cookie:",
+  ]));
+  // Numeric-typed nested field still projected when finite.
+  assert.equal(poisoned.progress && poisoned.progress.done, 1);
+  assert.equal(poisoned.quality && poisoned.quality.width, 1);
+  assert.equal(poisoned.convert && poisoned.convert.pct, 1);
+  // Error becomes generic; other suspicious strings omitted.
+  if (Object.prototype.hasOwnProperty.call(poisoned, "error")) {
+    assert.equal(poisoned.error, "Download error");
+  }
+  for (const k of [
+    "id", "downloadId", "state", "status", "providerKey", "requestedFilename",
+    "destinationDirectory", "saveMode", "createdAt", "kind", "mode", "mediaKind",
+    "name", "savedPath", "convertCodec", "mergeCommand", "fixCommand",
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(poisoned, k) && typeof poisoned[k] === "string") {
+      for (const s of SENTINELS) {
+        assert.equal(String(poisoned[k]).includes(s), false, k + " holds " + s);
+      }
+    }
+  }
+});
