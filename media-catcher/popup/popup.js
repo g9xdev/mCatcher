@@ -619,11 +619,16 @@ async function handleDownload(item, el) {
   }
 }
 
-async function startDownload(item, el, selection, intent) {
+async function startDownload(item, el, selection, intent, options) {
   selection = selection || {};
+  options = options || {};
+  const preserveFormOnFailure = !!options.preserveFormOnFailure;
+  const statusText = item.kind === "direct" ? "Saving…" : "Starting…";
+
   if (!PopupUI) {
-    showLabel(el, "Download helper unavailable.", "error");
-    return;
+    const err = "Download helper unavailable.";
+    if (!preserveFormOnFailure) showLabel(el, err, "error");
+    return { ok: false, error: err };
   }
   let msg;
   try {
@@ -637,13 +642,28 @@ async function startDownload(item, el, selection, intent) {
       now: () => new Date().toISOString(),
     });
   } catch (e) {
-    showLabel(el, (e && e.message) || "Couldn't build download.", "error");
-    return;
+    const err = (e && e.message) || "Couldn't build download.";
+    if (!preserveFormOnFailure) showLabel(el, err, "error");
+    return { ok: false, error: err };
   }
-  showLabel(el, item.kind === "direct" ? "Saving…" : "Starting…", "");
-  const resp = await send(msg);
-  if (resp && resp.ok === false) {
-    showLabel(el, resp.error || "Download failed.", "error");
+
+  // Default Download shows status before send. Save-As Confirm keeps the form
+  // attached until enqueue is accepted, then replaces it once.
+  if (!preserveFormOnFailure) showLabel(el, statusText, "");
+
+  try {
+    const resp = await send(msg);
+    if (resp && resp.ok === false) {
+      const err = resp.error || "Download failed.";
+      if (!preserveFormOnFailure) showLabel(el, err, "error");
+      return { ok: false, error: err };
+    }
+    if (preserveFormOnFailure) showLabel(el, statusText, "");
+    return { ok: true, response: resp };
+  } catch (e) {
+    const err = (e && e.message) || "Download failed.";
+    if (!preserveFormOnFailure) showLabel(el, err, "error");
+    return { ok: false, error: err };
   }
 }
 
@@ -693,7 +713,9 @@ function openSaveAsForm(item, el, selection) {
     }
     folderBtn.disabled = true;
     try {
-      const resp = await send({ type: "pick-folder" });
+      // Pass current destination so the helper can open at that directory;
+      // first click uses "" (default), later clicks reuse a prior pick.
+      const resp = await send({ type: "pick-folder", dir: destinationDirectory || "" });
       if (resp && resp.ok && resp.dir) {
         destinationDirectory = resp.dir;
         folderText.textContent = "Folder: " + resp.dir;
@@ -701,12 +723,14 @@ function openSaveAsForm(item, el, selection) {
       } else if (resp && resp.ok === false) {
         setFeedback(resp.error || "Couldn't pick a folder.", "error");
       }
+      // Cancel / no-response: leave form and prior destination intact.
     } finally {
       folderBtn.disabled = false;
     }
   });
 
   confirmBtn.addEventListener("click", async () => {
+    if (confirmBtn.disabled) return; // prevent double-submit while pending
     const decision = PopupUI.decideSaveAsForm({
       action: "confirm",
       proposedFilename: proposal,
@@ -729,14 +753,16 @@ function openSaveAsForm(item, el, selection) {
     cancelBtn.disabled = true;
     folderBtn.disabled = true;
     input.disabled = true;
-    try {
-      await startDownload(item, el, selection, decision.intent);
-    } catch (e) {
+    const result = await startDownload(item, el, selection, decision.intent, {
+      preserveFormOnFailure: true,
+    });
+    if (!result || !result.ok) {
+      // Form stays attached; re-enable controls and surface error for another try.
       confirmBtn.disabled = false;
       cancelBtn.disabled = false;
       folderBtn.disabled = false;
       input.disabled = false;
-      setFeedback((e && e.message) || "Download failed.", "error");
+      setFeedback((result && result.error) || "Download failed.", "error");
     }
   });
 
@@ -901,9 +927,11 @@ function renderProgress(el, dl) {
   const schedLabel = formatJobStatusLabel(dl);
 
   // Scheduler-only states: surface exact labels (and needs_user actions on the item card).
+  // needs_user always takes this branch even when a prior progress.total is retained —
+  // otherwise Retry / Use Firefox / Cancel disappear behind a stale progress bar.
   if (sched && ["queued", "waiting_provider", "retry_backoff", "pausing_provider",
     "needs_user", "handing_off_firefox", "handed_to_firefox", "failed", "completed", "cancelled"].includes(sched)
-    && !(dl.progress && dl.progress.total)) {
+    && (sched === "needs_user" || !(dl.progress && dl.progress.total))) {
     const cls = (sched === "failed" || sched === "cancelled" || sched === "needs_user") ? "error"
       : (sched === "completed" || sched === "handed_to_firefox") ? "done" : "";
     const children = [
@@ -1092,49 +1120,68 @@ function fileActionRow(dl, opts) {
 
 function renderNeedsUserActions(dl, card) {
   const err = h("div", { class: "progress-label error", role: "status" });
-  const row = h("div", { class: "dl-actions" }, [
-    h("button", {
-      class: "btn amber sm", text: "Retry",
-      onClick: () => send({ type: "retry-download", id: dl.id }),
-    }),
-    h("button", {
-      class: "btn ghost sm", text: "Use Firefox instead",
-      onClick: () => {
-        // Never auto-invoke Firefox; only send on explicit click.
-        // Do not call browser downloads API from the popup path.
-        if (!DownloadIntent) {
-          err.textContent = "Firefox handoff unavailable.";
-          return;
-        }
-        const requested = (dl.requestedFilename || "").trim();
-        if (!requested) {
-          err.textContent = "Missing filename for Firefox handoff.";
-          return;
-        }
-        let intent;
-        try {
-          intent = DownloadIntent.createFirefoxIntent({
-            baseIntent: {
-              requestedFilename: requested,
-              destinationDirectory: dl.destinationDirectory == null ? null : dl.destinationDirectory,
-              saveMode: dl.saveMode === "save-as" ? "save-as" : "default",
-              userSelectedFirefox: false,
-              userActionToken: mintUserActionToken(),
-              createdAt: dl.createdAt || new Date().toISOString(),
-            },
-          });
-        } catch (e) {
-          err.textContent = (e && e.message) || "Couldn't build Firefox intent.";
-          return;
-        }
-        send({ type: "use-firefox", id: dl.id, intent });
-      },
-    }),
-    h("button", {
-      class: "btn ghost sm", text: "Cancel",
-      onClick: () => send({ type: "cancel", id: dl.id }),
-    }),
-  ]);
+  const retryBtn = h("button", {
+    class: "btn amber sm", text: "Retry",
+    onClick: () => send({ type: "retry-download", id: dl.id }),
+  });
+  // Named element so we can disable synchronously before token mint / send.
+  const fxBtn = h("button", {
+    class: "btn ghost sm", text: "Use Firefox instead",
+  });
+  const cancelBtn = h("button", {
+    class: "btn ghost sm", text: "Cancel",
+    onClick: () => send({ type: "cancel", id: dl.id }),
+  });
+
+  fxBtn.addEventListener("click", async () => {
+    if (fxBtn.disabled) return;
+    // Disable before mint/send so a double-click cannot mint two proof tokens.
+    fxBtn.disabled = true;
+    // Never auto-invoke Firefox; only send on explicit click.
+    // Do not call browser downloads API from the popup path.
+    if (!DownloadIntent) {
+      err.textContent = "Firefox handoff unavailable.";
+      fxBtn.disabled = false;
+      return;
+    }
+    const requested = (dl.requestedFilename || "").trim();
+    if (!requested) {
+      err.textContent = "Missing filename for Firefox handoff.";
+      fxBtn.disabled = false;
+      return;
+    }
+    let intent;
+    try {
+      intent = DownloadIntent.createFirefoxIntent({
+        baseIntent: {
+          requestedFilename: requested,
+          destinationDirectory: dl.destinationDirectory == null ? null : dl.destinationDirectory,
+          saveMode: dl.saveMode === "save-as" ? "save-as" : "default",
+          userSelectedFirefox: false,
+          userActionToken: mintUserActionToken(),
+          createdAt: dl.createdAt || new Date().toISOString(),
+        },
+      });
+    } catch (e) {
+      err.textContent = (e && e.message) || "Couldn't build Firefox intent.";
+      fxBtn.disabled = false;
+      return;
+    }
+    try {
+      const resp = await send({ type: "use-firefox", id: dl.id, intent });
+      if (!resp || resp.ok === false) {
+        err.textContent = (resp && resp.error) || "Firefox handoff failed.";
+        fxBtn.disabled = false;
+        return;
+      }
+      // Accepted handoff: keep disabled.
+    } catch (e) {
+      err.textContent = (e && e.message) || "Firefox handoff failed.";
+      fxBtn.disabled = false;
+    }
+  });
+
+  const row = h("div", { class: "dl-actions" }, [retryBtn, fxBtn, cancelBtn]);
   card.appendChild(row);
   card.appendChild(err);
 }

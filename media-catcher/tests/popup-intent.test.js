@@ -467,3 +467,420 @@ test("API surface is frozen and complete", () => {
     "validateSaveAsFilename",
   ]);
 });
+
+// ---------------------------------------------------------------------------
+// Task-18 fix regressions: extract popup.js slices and exercise with fakes.
+// ---------------------------------------------------------------------------
+
+function readPopupSource() {
+  return fs.readFileSync(path.join(mediaCatcherRoot, "popup", "popup.js"), "utf8");
+}
+
+function extractNamedFunction(source, name) {
+  const re = new RegExp("(?:async\\s+)?function\\s+" + name + "\\s*\\(");
+  const m = re.exec(source);
+  if (!m) throw new Error("function not found: " + name);
+  const start = m.index;
+  let i = source.indexOf("{", start);
+  if (i < 0) throw new Error("no body for " + name);
+  let depth = 0;
+  for (; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error("unbalanced braces for " + name);
+}
+
+function loadStartDownload(deps) {
+  const src = extractNamedFunction(readPopupSource(), "startDownload");
+  const sandbox = Object.assign(
+    {
+      PopupUI: null,
+      currentTabId: 1,
+      mintUserActionToken: () => "tok-test",
+      showLabel: () => {},
+      send: async () => ({ ok: true }),
+      Date,
+      console,
+    },
+    deps
+  );
+  vm.runInNewContext(src + "\nthis.__fn = startDownload;", sandbox);
+  return sandbox.__fn;
+}
+
+test("Save-As mode does not call showLabel before send; {ok:false} returns failure", async () => {
+  const showLabelCalls = [];
+  let resolveSend;
+  const sendPromise = new Promise((r) => {
+    resolveSend = r;
+  });
+  const sendCalls = [];
+  const startDownload = loadStartDownload({
+    PopupUI: {
+      buildDownloadMessage: () => ({ type: "download", intent: { saveMode: "save-as" } }),
+    },
+    showLabel: (_el, text, cls) => {
+      showLabelCalls.push({ text, cls });
+    },
+    send: async (msg) => {
+      sendCalls.push(msg);
+      return sendPromise;
+    },
+  });
+
+  const pending = startDownload(
+    { kind: "direct", url: "https://x/a.mp4", proposedFilename: "a.mp4" },
+    { id: "el" },
+    {},
+    { saveMode: "save-as", requestedFilename: "a.mp4" },
+    { preserveFormOnFailure: true }
+  );
+
+  assert.equal(sendCalls.length, 1, "send should fire while form is still visible");
+  assert.equal(showLabelCalls.length, 0, "Save-As must not replace the form before send resolves");
+
+  resolveSend({ ok: false, error: "provider queue full" });
+  const result = await pending;
+  assert.equal(result && result.ok, false);
+  assert.equal(result.error, "provider queue full");
+  assert.equal(
+    showLabelCalls.length,
+    0,
+    "on {ok:false} with preserveForm, caller restores controls — no status wipe"
+  );
+});
+
+test("Save-As accepted response calls success status exactly once", async () => {
+  const showLabelCalls = [];
+  const startDownload = loadStartDownload({
+    PopupUI: {
+      buildDownloadMessage: () => ({ type: "download", intent: { saveMode: "save-as" } }),
+    },
+    showLabel: (_el, text, cls) => {
+      showLabelCalls.push({ text, cls });
+    },
+    send: async () => ({ ok: true, id: 7 }),
+  });
+
+  const result = await startDownload(
+    { kind: "hls", url: "https://x/a.m3u8", proposedFilename: "a.mp4" },
+    { id: "el" },
+    {},
+    { saveMode: "save-as", requestedFilename: "a.mp4" },
+    { preserveFormOnFailure: true }
+  );
+
+  assert.equal(result && result.ok, true);
+  assert.equal(showLabelCalls.length, 1);
+  assert.equal(showLabelCalls[0].text, "Starting…");
+});
+
+test("default mode still reports status/error without unhandled rejection", async () => {
+  const showLabelCalls = [];
+  const startDownload = loadStartDownload({
+    PopupUI: {
+      buildDownloadMessage: () => ({ type: "download", intent: { saveMode: "default" } }),
+    },
+    mintUserActionToken: () => "tok-def",
+    showLabel: (_el, text, cls) => {
+      showLabelCalls.push({ text, cls });
+    },
+    send: async () => ({ ok: false, error: "disk full" }),
+  });
+
+  const result = await startDownload(
+    { kind: "direct", url: "https://x/a.mp4", proposedFilename: "a.mp4" },
+    { id: "el" },
+    {},
+    null
+  );
+
+  assert.equal(result && result.ok, false);
+  assert.equal(result.error, "disk full");
+  assert.equal(showLabelCalls.length, 2);
+  assert.equal(showLabelCalls[0].text, "Saving…");
+  assert.equal(showLabelCalls[1].text, "disk full");
+  assert.equal(showLabelCalls[1].cls, "error");
+
+  // Transport throw must not become an unhandled rejection for Download click.
+  const throws = loadStartDownload({
+    PopupUI: {
+      buildDownloadMessage: () => ({ type: "download" }),
+    },
+    showLabel: (_el, text, cls) => {
+      showLabelCalls.push({ text, cls });
+    },
+    send: async () => {
+      throw new Error("runtime gone");
+    },
+  });
+  const thrownResult = await throws(
+    { kind: "direct", url: "https://x/b.mp4", proposedFilename: "b.mp4" },
+    { id: "el2" },
+    {}
+  );
+  assert.equal(thrownResult && thrownResult.ok, false);
+  assert.match(String(thrownResult.error), /runtime gone/);
+});
+
+test("pick-folder message includes empty then selected dir", () => {
+  const popupJs = readPopupSource();
+  // Exact contract: first click uses "", subsequent clicks use destinationDirectory.
+  assert.match(
+    popupJs,
+    /send\(\s*\{\s*type:\s*["']pick-folder["']\s*,\s*dir:\s*destinationDirectory\s*\|\|\s*["']{2}\s*\}\s*\)/
+  );
+  // Executable check of the message expression used by the folder handler.
+  let destinationDirectory = null;
+  const msg1 = { type: "pick-folder", dir: destinationDirectory || "" };
+  assert.deepEqual(msg1, { type: "pick-folder", dir: "" });
+  destinationDirectory = "D:\\Vids";
+  const msg2 = { type: "pick-folder", dir: destinationDirectory || "" };
+  assert.deepEqual(msg2, { type: "pick-folder", dir: "D:\\Vids" });
+});
+
+function loadRenderProgressHarness() {
+  const popupJs = readPopupSource();
+  const needsUserCalls = [];
+  const slotKids = [];
+  const sandbox = {
+    SCHEDULER_STATES: new Set([
+      "queued",
+      "waiting_provider",
+      "running",
+      "retry_backoff",
+      "pausing_provider",
+      "needs_user",
+      "handing_off_firefox",
+      "handed_to_firefox",
+      "failed",
+      "completed",
+      "cancelled",
+    ]),
+    PopupUI: {
+      formatJobStatus: (j) => UI.formatJobStatus(j),
+    },
+    humanSize: () => "",
+    fileActionRow: () => null,
+    renderLiveProgress: () => {},
+    renderNeedsUserActions: (dl, wrap) => {
+      needsUserCalls.push({ dl, wrap });
+    },
+    h: (tag, props, children) => ({ tag, props, children }),
+    console,
+  };
+  const pieces = [
+    extractNamedFunction(popupJs, "schedulerStateOf"),
+    extractNamedFunction(popupJs, "formatJobStatusLabel"),
+    extractNamedFunction(popupJs, "renderProgress"),
+  ].join("\n");
+  vm.runInNewContext(pieces + "\nthis.renderProgress = renderProgress;", sandbox);
+  const el = {
+    querySelector(sel) {
+      if (sel !== ".slot") return null;
+      return {
+        replaceChildren() {
+          slotKids.length = 0;
+          for (let i = 0; i < arguments.length; i++) slotKids.push(arguments[i]);
+        },
+        appendChild(c) {
+          slotKids.push(c);
+          return c;
+        },
+      };
+    },
+  };
+  return {
+    renderProgress: sandbox.renderProgress,
+    needsUserCalls,
+    slotKids,
+    el,
+  };
+}
+
+test("needs_user with progress.total > 0 enters the action branch", () => {
+  const harness = loadRenderProgressHarness();
+  harness.renderProgress(harness.el, {
+    state: "needs_user",
+    error: "captcha required",
+    progress: { total: 5000, done: 1200, unit: "bytes" },
+    requestedFilename: "clip.mp4",
+  });
+  assert.equal(
+    harness.needsUserCalls.length,
+    1,
+    "needs_user must render Retry / Use Firefox / Cancel even with retained progress.total"
+  );
+  // Label path: progress-label should mention Needs attention (via formatJobStatus).
+  const blob = JSON.stringify(harness.slotKids);
+  assert.match(blob, /Needs attention/);
+});
+
+function loadRenderNeedsUserActions(deps) {
+  const src = extractNamedFunction(readPopupSource(), "renderNeedsUserActions");
+  const buttons = [];
+  function h(tag, props, children) {
+    const el = {
+      tagName: String(tag).toUpperCase(),
+      className: (props && props.class) || "",
+      textContent: (props && props.text) || "",
+      disabled: false,
+      title: (props && props.title) || "",
+      children: [],
+      listeners: Object.create(null),
+      childElementCount: 0,
+      appendChild(c) {
+        this.children.push(c);
+        this.childElementCount = this.children.length;
+        return c;
+      },
+      addEventListener(type, fn) {
+        if (!this.listeners[type]) this.listeners[type] = [];
+        this.listeners[type].push(fn);
+      },
+      click() {
+        const list = this.listeners.click || [];
+        return Promise.all(list.map((fn) => fn({ currentTarget: this })));
+      },
+    };
+    if (props) {
+      for (const k of Object.keys(props)) {
+        if (k.slice(0, 2) === "on" && typeof props[k] === "function") {
+          el.addEventListener(k.slice(2).toLowerCase(), props[k]);
+        }
+      }
+    }
+    if (tag === "button") buttons.push(el);
+    if (children != null) {
+      const arr = Array.isArray(children) ? children : [children];
+      for (const c of arr) {
+        if (c != null) el.appendChild(c);
+      }
+    }
+    return el;
+  }
+  const sandbox = Object.assign(
+    {
+      h,
+      DownloadIntent: {
+        createFirefoxIntent: (opts) => {
+          const base = opts.baseIntent || {};
+          return Object.assign({}, base, {
+            userSelectedFirefox: true,
+            userActionToken: base.userActionToken,
+          });
+        },
+      },
+      mintUserActionToken: () => "fx-tok-1",
+      send: async () => ({ ok: true }),
+      console,
+    },
+    deps
+  );
+  // Keep buttons list shared so tests can find the Firefox button.
+  sandbox.__buttons = buttons;
+  vm.runInNewContext(src + "\nthis.renderNeedsUserActions = renderNeedsUserActions;", sandbox);
+  return {
+    renderNeedsUserActions: sandbox.renderNeedsUserActions,
+    buttons,
+    h,
+  };
+}
+
+test("Use Firefox disables before send; two sync clicks produce one send/token; failure re-enables", async () => {
+  let tokenN = 0;
+  const sendCalls = [];
+  let resolveSend;
+  const sendPromise = new Promise((r) => {
+    resolveSend = r;
+  });
+  const { renderNeedsUserActions, buttons } = loadRenderNeedsUserActions({
+    mintUserActionToken: () => {
+      tokenN += 1;
+      return "fx-tok-" + tokenN;
+    },
+    send: async (msg) => {
+      sendCalls.push(msg);
+      return sendPromise;
+    },
+  });
+
+  const card = {
+    children: [],
+    appendChild(c) {
+      this.children.push(c);
+      return c;
+    },
+  };
+  renderNeedsUserActions(
+    {
+      id: 42,
+      requestedFilename: "clip.mp4",
+      destinationDirectory: null,
+      saveMode: "default",
+      createdAt: "2026-08-12T12:00:00.000Z",
+    },
+    card
+  );
+
+  const fxBtn = buttons.find((b) => b.textContent === "Use Firefox instead");
+  assert.ok(fxBtn, "Use Firefox instead button must exist");
+
+  // Fire two synchronous clicks before the first send resolves.
+  const p1 = fxBtn.click();
+  const p2 = fxBtn.click();
+  assert.equal(fxBtn.disabled, true, "button must be disabled before/during send");
+  assert.equal(sendCalls.length, 1, "only one use-firefox message");
+  assert.equal(tokenN, 1, "only one proof token minted");
+  assert.equal(sendCalls[0].type, "use-firefox");
+  assert.equal(sendCalls[0].id, 42);
+  assert.equal(sendCalls[0].intent.userActionToken, "fx-tok-1");
+
+  resolveSend({ ok: true });
+  await Promise.all([p1, p2]);
+  assert.equal(fxBtn.disabled, true, "accepted handoff keeps button disabled");
+
+  // Failure path: re-enable so the user can retry.
+  tokenN = 0;
+  sendCalls.length = 0;
+  const { renderNeedsUserActions: render2, buttons: buttons2 } = loadRenderNeedsUserActions({
+    mintUserActionToken: () => {
+      tokenN += 1;
+      return "fx-tok-" + tokenN;
+    },
+    send: async (msg) => {
+      sendCalls.push(msg);
+      return { ok: false, error: "handoff refused" };
+    },
+  });
+  const card2 = {
+    children: [],
+    appendChild(c) {
+      this.children.push(c);
+      return c;
+    },
+  };
+  render2(
+    {
+      id: 99,
+      requestedFilename: "clip.mp4",
+      destinationDirectory: "E:\\Media",
+      saveMode: "save-as",
+      createdAt: "2026-08-12T12:00:00.000Z",
+    },
+    card2
+  );
+  const fxBtn2 = buttons2.find((b) => b.textContent === "Use Firefox instead");
+  await fxBtn2.click();
+  assert.equal(sendCalls.length, 1);
+  assert.equal(fxBtn2.disabled, false, "failure must re-enable for retry");
+  // Second child is the status/error line (first is the action row).
+  const errEl = card2.children[1];
+  assert.ok(errEl);
+  assert.match(String(errEl.textContent), /handoff refused/);
+});
