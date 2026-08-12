@@ -487,6 +487,10 @@ def main():
                 handle_discard(msg)
             elif cmd == "pget":
                 handle_pget(msg)
+            elif cmd == "pget-single":
+                handle_pget_single(msg)
+            elif cmd == "pget-set-limit":
+                handle_pget_set_limit(msg)
             elif cmd == "getReport":
                 handle_get_report(msg)
             elif cmd == "pget-cancel":
@@ -501,6 +505,7 @@ def main():
 # downloads and not re-exported.
 from mchost.downloads import (_pget_open, _pget_probe, _pget_segment,   # noqa: E402,F401
                               _pget_cleanup, _pget_cancel, handle_pget,
+                              handle_pget_single, handle_pget_set_limit,
                               _pget_send_result, _pget_classify_exc,
                               _pget_classify_http_status, _PGET)
 

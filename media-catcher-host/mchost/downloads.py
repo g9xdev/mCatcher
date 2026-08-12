@@ -1234,7 +1234,88 @@ def _pget_close_resp(resp):
         pass
 
 
-def _pget_probe_one(url, referer, ua, timeout=30):
+def _pget_safe_int(val, default=0):
+    """Parse a finite integer; bool is never a valid generation/limit."""
+    if isinstance(val, bool) or val is None:
+        return default
+    try:
+        if isinstance(val, float):
+            import math
+            if not math.isfinite(val):
+                return default
+        return int(val)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _pget_initial_cap(req, single=False):
+    """Initial connection cap for an operation (single mode always 1)."""
+    if single:
+        return 1
+    raw = _pget_safe_int(req.get("maxConnections"), 1)
+    if raw < 1:
+        raw = 1
+    return max(1, min(_PGET_MAX_CONN, raw))
+
+
+def _pget_seed_generation(req):
+    gen = _pget_safe_int(req.get("providerGeneration"), 0)
+    if gen < 0:
+        gen = 0
+    return gen
+
+
+def _pget_lease_acquire(op):
+    """Acquire one connection slot under the live lease. False if cancelled.
+
+    At limit zero, wait without busy-spinning until a newer positive limit or
+    cancellation wakes the condition. Never exceed the current positive limit.
+    """
+    cv = op.get("lease_cv")
+    if cv is None:
+        return True
+    with cv:
+        while True:
+            if op.get("cancel_requested") or (op.get("stop") is not None and op["stop"].is_set()):
+                return False
+            limit = int(op.get("maxConnections") or 0)
+            open_n = int(op.get("openConnections") or 0)
+            if limit > 0 and open_n < limit:
+                op["openConnections"] = open_n + 1
+                return True
+            cv.wait(timeout=0.5)
+
+
+def _pget_lease_release(op):
+    """Release one connection slot exactly once for a prior successful acquire."""
+    cv = op.get("lease_cv")
+    if cv is None:
+        return
+    with cv:
+        op["openConnections"] = max(0, int(op.get("openConnections") or 0) - 1)
+        cv.notify_all()
+
+
+def _pget_make_op(req, stop, single=False):
+    """Build a pget operation record with a seeded live connection lease."""
+    initial_cap = _pget_initial_cap(req, single=single)
+    gen = _pget_seed_generation(req)
+    return {
+        "stop": stop,
+        "cancel_requested": False,
+        "lease_cv": threading.Condition(),
+        "initial_cap": initial_cap,
+        "maxConnections": initial_cap,
+        "providerGeneration": gen,
+        "openConnections": 0,
+        "lease": initial_cap,
+        "n": 0,
+        "final_path": None,
+        "kind": "pget-single" if single else "pget",
+    }
+
+
+def _pget_probe_one(url, referer, ua, timeout=30, op=None):
     """Probe a single mirror with Range: bytes=0-0 after redirects.
 
     Returns one of:
@@ -1245,7 +1326,12 @@ def _pget_probe_one(url, referer, ua, timeout=30):
     import urllib.error as _ue
 
     resp = None
+    acquired = False
     try:
+        if op is not None:
+            if not _pget_lease_acquire(op):
+                return ("fail", "cancelled", url)
+            acquired = True
         resp = _pget_open(url, referer, ua, "bytes=0-0", timeout=timeout)
         status = getattr(resp, "status", None) or getattr(resp, "code", None)
         if status == 206:
@@ -1277,9 +1363,11 @@ def _pget_probe_one(url, referer, ua, timeout=30):
         return ("fail", _pget_classify_exc(e), url)
     finally:
         _pget_close_resp(resp)
+        if acquired:
+            _pget_lease_release(op)
 
 
-def _pget_probe(urls, referer, ua, timeout=30):
+def _pget_probe(urls, referer, ua, timeout=30, op=None):
     """Probe every mirror. Return (size, ok_mirrors, failure_category_or_None).
 
     If at least one mirror proves valid ranges, ok_mirrors holds only valid
@@ -1293,7 +1381,12 @@ def _pget_probe(urls, referer, ua, timeout=30):
     fails = []
     saw_no_range = False
     for u in urls:
-        kind, total, _u = _pget_probe_one(u, referer, ua, timeout=timeout)
+        if op is not None and (
+            op.get("cancel_requested")
+            or (op.get("stop") is not None and op["stop"].is_set())
+        ):
+            return None, [], "cancelled"
+        kind, total, _u = _pget_probe_one(u, referer, ua, timeout=timeout, op=op)
         if kind == "ok":
             if size is None:
                 size = total
@@ -1316,11 +1409,13 @@ def _pget_probe(urls, referer, ua, timeout=30):
 
 
 def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
-                  seg_done, stop, timeout=30):
+                  seg_done, stop, timeout=30, op=None):
     """Download bytes [start, end] into part_path with mirror failover.
 
     Validates 206 + exact Content-Range, reads exactly the expected length, and
-    closes handles before returning. Raises _PgetError on failure.
+    closes handles before returning. Raises _PgetError on failure. Each HTTP
+    open acquires the operation lease immediately before _pget_open and releases
+    it exactly once after response close or open failure.
     """
     import urllib.error as _ue
 
@@ -1331,7 +1426,12 @@ def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
         if stop.is_set():
             raise _PgetError("cancelled")
         got = 0
+        acquired = False
         try:
+            if op is not None:
+                if not _pget_lease_acquire(op):
+                    raise _PgetError("cancelled")
+                acquired = True
             # Open response first; only create the segment file after headers OK
             # enough to begin streaming (status checked immediately).
             with _pget_open(u, referer, ua, "bytes=%d-%d" % (start, end),
@@ -1367,8 +1467,6 @@ def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
         except _PgetError as e:
             errors.append(e.category)
             if e.category == "range_unsupported":
-                # No point trying other mirrors for conclusive no-range on this
-                # resource shape; still record and continue only if others remain.
                 # Prefer reporting range_unsupported after all mirrors tried.
                 pass
             elif e.category == "cancelled":
@@ -1392,6 +1490,9 @@ def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
             errors.append(_pget_classify_exc(e))
         except Exception as e:
             errors.append(_pget_classify_exc(e))
+        finally:
+            if acquired:
+                _pget_lease_release(op)
         seg_done[idx] = 0
         # Remove partial segment before trying next mirror
         try:
@@ -1451,6 +1552,11 @@ def _pget_cancel(req):
         j["stop"].set()          # segmented pget: signal the workers
     if j.get("proc"):
         _safe_kill(j["proc"])    # yt-dlp job: kill the process
+    cv = j.get("lease_cv")
+    if cv is not None:
+        # Wake zero-limit waiters so they can observe cancel without busy-spin.
+        with cv:
+            cv.notify_all()
 
 
 def _pget_unregister(jid, op):
@@ -1461,9 +1567,15 @@ def _pget_unregister(jid, op):
 
 def _pget_lease(req, size):
     """Initial finite connection lease from maxConnections, clamped safely."""
-    try:
-        raw = int(req.get("maxConnections") or 1)
-    except (TypeError, ValueError):
+    raw_v = req.get("maxConnections")
+    if isinstance(raw_v, bool) or raw_v is None:
+        raw = 1
+    else:
+        try:
+            raw = int(raw_v)
+        except (TypeError, ValueError, OverflowError):
+            raw = 1
+    if raw < 1:
         raw = 1
     lease = max(1, min(_PGET_MAX_CONN, raw))
     # Segment count never exceeds lease, file size (bytes), or safe cap.
@@ -1472,14 +1584,91 @@ def _pget_lease(req, size):
     return lease, n
 
 
+def handle_pget_set_limit(req):
+    """Apply a live connection lease generation to a pget operation.
+
+    Linearized under the same condition lock used by openers. After the
+    acknowledgement is emitted, no replacement open may start contrary to the
+    applied generation/limit. Stale generations cannot overwrite newer leases;
+    same-generation updates are idempotent and cannot raise the limit. A newer
+    generation may resume from zero with a reduced positive limit, never above
+    the operation's initial cap. Does not acknowledge yt-dlp or unknown ids.
+    """
+    jid = req.get("id")
+    op = _PGET.get(jid)
+    # yt-dlp entries only carry proc; lack of lease_cv means non-pget.
+    if not op or op.get("lease_cv") is None:
+        return
+
+    gen_raw = req.get("providerGeneration")
+    lim_raw = req.get("maxConnections")
+    gen_ok = not isinstance(gen_raw, bool) and gen_raw is not None
+    lim_ok = not isinstance(lim_raw, bool) and lim_raw is not None
+    gen = None
+    lim = None
+    if gen_ok:
+        try:
+            if isinstance(gen_raw, float):
+                import math
+                if not math.isfinite(gen_raw):
+                    gen_ok = False
+                else:
+                    gen = int(gen_raw)
+            else:
+                gen = int(gen_raw)
+        except (TypeError, ValueError, OverflowError):
+            gen_ok = False
+    if lim_ok:
+        try:
+            if isinstance(lim_raw, float):
+                import math
+                if not math.isfinite(lim_raw):
+                    lim_ok = False
+                else:
+                    lim = int(lim_raw)
+            else:
+                lim = int(lim_raw)
+        except (TypeError, ValueError, OverflowError):
+            lim_ok = False
+
+    with op["lease_cv"]:
+        cur_gen = int(op.get("providerGeneration") or 0)
+        initial_cap = int(op.get("initial_cap") or 1)
+        if gen_ok and gen is not None and gen > cur_gen:
+            if lim_ok and lim is not None:
+                new_lim = max(0, min(initial_cap, lim))
+            else:
+                # Invalid limit on a newer generation: keep current live limit.
+                new_lim = int(op.get("maxConnections") or 0)
+            op["providerGeneration"] = gen
+            op["maxConnections"] = new_lim
+            op["lease_cv"].notify_all()
+        # gen < cur_gen: stale — no overwrite
+        # gen == cur_gen: idempotent — cannot raise
+        applied_gen = int(op.get("providerGeneration") or 0)
+        applied_lim = int(op.get("maxConnections") or 0)
+
+    # Send after the atomic lease update; never hold the lock across send().
+    try:
+        _h().send({
+            "type": "pget-limit-ack",
+            "id": jid,
+            "maxConnections": applied_lim,
+            "providerGeneration": applied_gen,
+        })
+    except Exception:
+        pass
+
+
 def handle_pget(req):
     """Multi-range native transfer with structured pget-result terminal contract.
 
     Probe is conclusive before any worker/file write. Assembly uses a sibling
-    .part path; os.replace is the commit point. Live pget-set-limit is Task 13.
+    .part path; os.replace is the commit point. Live pget-set-limit updates the
+    operation lease under the same lock used by openers.
 
-    Operation is registered before the worker thread starts so cancel works as
-    soon as handle_pget returns. Every registered exit emits exactly one
+    Operation is registered before the worker thread starts so cancel / set-limit
+    work as soon as handle_pget returns. Every registered exit emits exactly one
     structured pget-result. After a successful os.replace the terminal is always
     completed/committed; optional progress/convert work is best-effort.
     """
@@ -1488,13 +1677,7 @@ def handle_pget(req):
     mode = "multi-range"
     terminal = {"sent": False}
     stop = threading.Event()
-    op = {
-        "stop": stop,
-        "cancel_requested": False,
-        "lease": None,
-        "n": 0,
-        "final_path": None,
-    }
+    op = _pget_make_op(req, stop, single=False)
 
     def finish(status, failure_category, part_state):
         if terminal["sent"]:
@@ -1512,8 +1695,8 @@ def handle_pget(req):
             return "empty"
         return _pget_part_state(final_path, n)
 
-    # Register before the worker starts so pget-cancel after handle_pget returns
-    # is never a silent no-op during probe/path setup.
+    # Register before the worker starts so pget-cancel / pget-set-limit after
+    # handle_pget returns is never a silent no-op during probe/path setup.
     _PGET[jid] = op
 
     def worker():
@@ -1536,7 +1719,7 @@ def handle_pget(req):
                 return
 
             try:
-                size, ok_urls, probe_fail = _pget_probe(urls, referer, ua)
+                size, ok_urls, probe_fail = _pget_probe(urls, referer, ua, op=op)
             except Exception as e:
                 size, ok_urls, probe_fail = None, [], _pget_classify_exc(e)
 
@@ -1565,7 +1748,9 @@ def handle_pget(req):
                 return
 
             _lease, n = _pget_lease(req, size)
-            op["lease"] = _lease
+            # Keep initial_cap as the true ceiling; n never exceeds it.
+            n = max(1, min(n, op["initial_cap"]))
+            op["lease"] = op["initial_cap"]
             op["n"] = n
             seg = size // n
             ranges = [
@@ -1603,6 +1788,7 @@ def handle_pget(req):
                             _pget_segment,
                             "%s.part%d" % (final_path, i),
                             ok_urls, i, s, e, size, referer, ua, seg_done, stop,
+                            30, op,
                         )
                         for i, (s, e) in enumerate(ranges)
                     ]
@@ -1613,6 +1799,11 @@ def handle_pget(req):
                             cat = _pget_classify_exc(exc)
                             errors.append(cat)
                             stop.set()
+                            # Wake lease waiters so other workers can exit promptly.
+                            cv = op.get("lease_cv")
+                            if cv is not None:
+                                with cv:
+                                    cv.notify_all()
                     # Ensure all workers joined before any terminal classification
                     # (as_completed already waited; context manager shuts down).
             except Exception as exc:
@@ -1724,6 +1915,10 @@ def handle_pget(req):
                 finish("failed", cat, _honest_part_state(final_path, n))
         finally:
             stop.set()
+            cv = op.get("lease_cv")
+            if cv is not None:
+                with cv:
+                    cv.notify_all()
             if not terminal["sent"]:
                 # Last-chance exactly-one terminal for any registered exit.
                 if committed:
@@ -1748,6 +1943,269 @@ def handle_pget(req):
         threading.Thread(target=worker, daemon=True).start()
     except Exception:
         # Starting the worker must not leave a permanent registry entry.
+        _pget_unregister(jid, op)
+        finish("failed", "permanent", "empty")
+
+
+def handle_pget_single(req):
+    """Native single-connection full-body transfer with structured pget-result.
+
+    One full GET without a Range header. Writes a freshly truncated sibling
+    .part, validates Content-Length when present, and commits with os.replace.
+    Uses the same live connection lease as multi-range (cap always 1). Exactly
+    one intended pget-result on every registered/thread-start exit.
+    """
+    jid = req.get("id")
+    attempt = req.get("attemptToken")
+    mode = "single-connection"
+    terminal = {"sent": False}
+    stop = threading.Event()
+    op = _pget_make_op(req, stop, single=True)
+    n = 1
+
+    def finish(status, failure_category, part_state):
+        if terminal["sent"]:
+            return
+        terminal["sent"] = True
+        try:
+            _pget_send_result(jid, attempt, status, mode, failure_category, part_state)
+        except Exception:
+            pass
+
+    def _honest_part_state(final_path):
+        if not final_path:
+            return "empty"
+        return _pget_part_state(final_path, n)
+
+    _PGET[jid] = op
+
+    def worker():
+        final_path = None
+        committed = False
+        import urllib.error as _ue
+
+        try:
+            urls = [u for u in (req.get("urls") or []) if u]
+            referer = req.get("referer") or ""
+            ua = req.get("userAgent") or ""
+            name = _h().sanitize(req.get("name") or "download")
+            out_dir = req.get("dir") or _h().downloads_dir()
+
+            if op.get("cancel_requested") or stop.is_set():
+                finish("cancelled", "cancelled", "empty")
+                return
+
+            if not urls:
+                finish("failed", "permanent", "empty")
+                return
+
+            # Scheduler-issued single-connection: one selected candidate only.
+            url = urls[0]
+
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                final_path = _dedup(os.path.join(out_dir, name))
+                op["final_path"] = final_path
+                op["n"] = n
+            except Exception:
+                if op.get("cancel_requested") or stop.is_set():
+                    finish("cancelled", "cancelled", "empty")
+                else:
+                    finish("failed", "local_io", "empty")
+                return
+
+            if op.get("cancel_requested") or stop.is_set():
+                finish("cancelled", "cancelled", "empty")
+                return
+
+            part_path = final_path + ".part"
+            got = 0
+            expected = None
+            acquired = False
+            resp = None
+            try:
+                if not _pget_lease_acquire(op):
+                    raise _PgetError("cancelled")
+                acquired = True
+                if op.get("cancel_requested") or stop.is_set():
+                    raise _PgetError("cancelled")
+                resp = _pget_open(url, referer, ua, range_header=None, timeout=30)
+                status = getattr(resp, "status", None) or getattr(resp, "code", None)
+                if status != 200:
+                    raise _PgetError(_pget_classify_http_status(status or 0))
+                cl_hdr = resp.headers.get("Content-Length")
+                if cl_hdr is not None and str(cl_hdr).strip() != "":
+                    try:
+                        expected = int(cl_hdr)
+                        if expected < 0:
+                            expected = None
+                    except (TypeError, ValueError):
+                        expected = None
+
+                # wb truncates any pre-existing stale .part (never append).
+                with open(part_path, "wb") as f:
+                    while True:
+                        if op.get("cancel_requested") or stop.is_set():
+                            raise _PgetError("cancelled")
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        try:
+                            _h().send({
+                                "type": "pget-progress",
+                                "id": jid,
+                                "bytes": got,
+                                "total": expected if expected is not None else got,
+                            })
+                        except Exception:
+                            pass
+
+                if expected is not None and got != expected:
+                    raise _PgetError("short_read")
+
+                if op.get("cancel_requested") or stop.is_set():
+                    raise _PgetError("cancelled")
+
+                # Commit point.
+                os.replace(part_path, final_path)
+                committed = True
+            except _PgetError as e:
+                if not committed:
+                    _pget_cleanup_work(final_path, n)
+                if e.category == "cancelled" or op.get("cancel_requested"):
+                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                else:
+                    finish("failed", e.category, _honest_part_state(final_path))
+                return
+            except _ue.HTTPError as e:
+                try:
+                    cat = _pget_classify_http_status(e.code)
+                finally:
+                    _pget_close_resp(e)
+                if not committed:
+                    _pget_cleanup_work(final_path, n)
+                if op.get("cancel_requested"):
+                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                else:
+                    finish("failed", cat, _honest_part_state(final_path))
+                return
+            except OSError as e:
+                if not committed:
+                    _pget_cleanup_work(final_path, n)
+                if op.get("cancel_requested"):
+                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                else:
+                    # Path/write/replace failures are local_io.
+                    cat = "local_io"
+                    # Transport-ish OSError without filename may be reset/timeout.
+                    if not getattr(e, "filename", None):
+                        c2 = _pget_classify_exc(e)
+                        if c2 in ("timeout", "connection_reset"):
+                            cat = c2
+                    finish("failed", cat, _honest_part_state(final_path))
+                return
+            except Exception as e:
+                if not committed:
+                    _pget_cleanup_work(final_path, n)
+                if op.get("cancel_requested"):
+                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                else:
+                    cat = _pget_classify_exc(e)
+                    if cat not in _PGET_FAIL_PRIORITY:
+                        cat = "permanent"
+                    finish("failed", cat, _honest_part_state(final_path))
+                return
+            finally:
+                _pget_close_resp(resp)
+                if acquired:
+                    _pget_lease_release(op)
+
+            if not committed:
+                # Should have returned above; belt-and-suspenders.
+                _pget_cleanup_work(final_path, n)
+                finish("failed", "permanent", _honest_part_state(final_path))
+                return
+
+            # Late cancel after successful replace loses: retain completed.
+            try:
+                total = expected if expected is not None else got
+                _h().send({"type": "pget-progress", "id": jid, "bytes": got, "total": total})
+            except Exception:
+                pass
+            try:
+                conv = req.get("convert")
+                if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
+                    codec = conv["codec"]
+                    try:
+                        _h().send({
+                            "type": "converting",
+                            "id": jid,
+                            "file": final_path,
+                            "codec": codec,
+                        })
+                    except Exception:
+                        pass
+                    try:
+                        tres = transcode(
+                            final_path, codec,
+                            conv.get("quality", "visually-lossless"),
+                            conv.get("encoder", "auto"),
+                            on_progress=lambda pct, j=jid, c=codec: _h().send(
+                                {"type": "convert-progress", "id": j, "pct": pct, "codec": c}
+                            ),
+                        )
+                        final_path = tres["path"]
+                        op["final_path"] = final_path
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            finish("completed", None, "committed")
+        except Exception as e:
+            if committed:
+                finish("completed", None, "committed")
+            elif op.get("cancel_requested"):
+                if final_path:
+                    _pget_cleanup_work(final_path, n)
+                finish("cancelled", "cancelled", _honest_part_state(final_path))
+            else:
+                if final_path:
+                    _pget_cleanup_work(final_path, n)
+                cat = _pget_classify_exc(e)
+                if cat not in _PGET_FAIL_PRIORITY:
+                    cat = "permanent"
+                finish("failed", cat, _honest_part_state(final_path))
+        finally:
+            stop.set()
+            cv = op.get("lease_cv")
+            if cv is not None:
+                with cv:
+                    cv.notify_all()
+            if not terminal["sent"]:
+                if committed:
+                    finish("completed", None, "committed")
+                elif op.get("cancel_requested"):
+                    if final_path:
+                        try:
+                            _pget_cleanup_work(final_path, n)
+                        except Exception:
+                            pass
+                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                else:
+                    if final_path:
+                        try:
+                            _pget_cleanup_work(final_path, n)
+                        except Exception:
+                            pass
+                    finish("failed", "permanent", _honest_part_state(final_path))
+            _pget_unregister(jid, op)
+
+    try:
+        threading.Thread(target=worker, daemon=True).start()
+    except Exception:
         _pget_unregister(jid, op)
         finish("failed", "permanent", "empty")
 

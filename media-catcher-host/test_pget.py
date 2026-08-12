@@ -1145,3 +1145,826 @@ def test_thread_start_failure_clears_registry_and_emits_result(tmp_path, monkeyp
         assert not (tmp_path / "clip.mp4").exists()
     finally:
         shutdown_server(httpd)
+
+# ---------------------------------------------------------------------------
+# Task 13: native single-connection transfer + live connection lease
+# ---------------------------------------------------------------------------
+
+def _last_ack(sent, jid=None):
+    acks = [
+        m for m in sent
+        if m.get("type") == "pget-limit-ack" and (jid is None or m.get("id") == jid)
+    ]
+    return acks[-1] if acks else None
+
+
+def _wait_ack(sent, jid, timeout=5.0):
+    assert wait_for(
+        lambda: any(
+            m.get("type") == "pget-limit-ack" and m.get("id") == jid for m in sent
+        ),
+        timeout=timeout,
+    )
+    return _last_ack(sent, jid)
+
+
+def test_pget_single_writes_exact_filename_no_range(tmp_path, monkeypatch):
+    """pget-single: full-body GET (no Range), exact name, completed/single-connection."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    ranges_seen = []
+    payload = DEFAULT_PAYLOAD
+
+    class NoRangeTrack(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            ranges_seen.append(self.headers.get("Range"))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), NoRangeTrack)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        url = server_url(httpd)
+        mc.handle_pget_single({
+            "id": "jobS",
+            "attemptToken": "atk-s",
+            "urls": [url],
+            "name": "11238-makemebi.net.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["type"] == "pget-result"
+        assert res["id"] == "jobS"
+        assert res["status"] == "completed"
+        assert res["mode"] == "single-connection"
+        assert res["failureCategory"] is None
+        assert res["partState"] == "committed"
+        assert res["attemptToken"] == "atk-s"
+        final = tmp_path / "11238-makemebi.net.mp4"
+        assert final.is_file()
+        assert final.read_bytes() == payload
+        assert ranges_seen, "expected at least one GET"
+        assert all(r is None for r in ranges_seen)
+        assert not any(m.get("type") == "pget-fallback" for m in sent)
+        assert not any(m.get("type") == "pget-done" for m in sent)
+        assert partish(leftovers(tmp_path)) == []
+        import mchost.downloads as d
+        assert d._PGET.get("jobS") is None
+    finally:
+        shutdown_server(httpd)
+
+
+def test_pget_single_stale_part_truncated_and_short_read(tmp_path, monkeypatch):
+    """Pre-existing .part is truncated (wb); short Content-Length body is short_read."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    name = "clip.mp4"
+    part = tmp_path / (name + ".part")
+    part.write_bytes(b"STALE-JUNK-SHOULD-BE-GONE" * 8)
+    assert part.stat().st_size > 0
+
+    class ShortBody(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            # Claim 1000 bytes but send only 3
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b"abc")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ShortBody)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        url = server_url(httpd)
+        mc.handle_pget_single({
+            "id": "jobShort",
+            "attemptToken": "atk-short",
+            "urls": [url],
+            "name": name,
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "failed"
+        assert res["mode"] == "single-connection"
+        assert res["failureCategory"] == "short_read"
+        assert res["attemptToken"] == "atk-short"
+        assert res["partState"] == "empty"
+        assert not (tmp_path / name).exists()
+        assert partish(leftovers(tmp_path)) == []
+        import mchost.downloads as d
+        assert d._PGET.get("jobShort") is None
+    finally:
+        shutdown_server(httpd)
+
+
+def test_pget_single_http_categories_and_no_firefox(tmp_path, monkeypatch):
+    """Single 429 / 5xx / timeout / reset / local_io stay normalized; no fallback/done."""
+    import mchost.downloads as d
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    httpd, _ = run_server("429")
+    try:
+        mc.handle_pget_single({
+            "id": "s429", "attemptToken": "t429", "urls": [server_url(httpd)],
+            "name": "a.mp4", "dir": str(tmp_path), "maxConnections": 1,
+        })
+        res = wait_result(sent)
+        assert res["failureCategory"] == "http_429"
+        assert res["mode"] == "single-connection"
+        assert res["status"] == "failed"
+    finally:
+        shutdown_server(httpd)
+
+    sent.clear()
+    httpd, _ = run_server("503")
+    try:
+        mc.handle_pget_single({
+            "id": "s503", "attemptToken": "t503", "urls": [server_url(httpd)],
+            "name": "b.mp4", "dir": str(tmp_path), "maxConnections": 1,
+        })
+        res = wait_result(sent)
+        assert res["failureCategory"] == "http_5xx_temporary"
+    finally:
+        shutdown_server(httpd)
+
+    sent.clear()
+
+    def boom_timeout(*_a, **_k):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(d, "_pget_open", boom_timeout)
+    monkeypatch.setattr(mc, "_pget_open", boom_timeout)
+    mc.handle_pget_single({
+        "id": "sTO", "attemptToken": "tTO",
+        "urls": ["http://127.0.0.1:1/x"],
+        "name": "c.mp4", "dir": str(tmp_path), "maxConnections": 1,
+    })
+    res = wait_result(sent)
+    assert res["failureCategory"] == "timeout"
+    sent.clear()
+
+    def boom_reset(*_a, **_k):
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(d, "_pget_open", boom_reset)
+    monkeypatch.setattr(mc, "_pget_open", boom_reset)
+    mc.handle_pget_single({
+        "id": "sRS", "attemptToken": "tRS",
+        "urls": ["http://127.0.0.1:1/x"],
+        "name": "d.mp4", "dir": str(tmp_path), "maxConnections": 1,
+    })
+    res = wait_result(sent)
+    assert res["failureCategory"] == "connection_reset"
+    sent.clear()
+
+    # Restore open for local_io path via real server + bad makedirs
+    monkeypatch.undo()
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    httpd, _ = run_server("no-range")
+    try:
+        def bad_makedirs(*_a, **_k):
+            raise OSError(errno.EACCES, "denied")
+
+        monkeypatch.setattr(d.os, "makedirs", bad_makedirs)
+        mc.handle_pget_single({
+            "id": "sIO", "attemptToken": "tIO",
+            "urls": [server_url(httpd)],
+            "name": "e.mp4", "dir": str(tmp_path), "maxConnections": 1,
+        })
+        res = wait_result(sent)
+        assert res["failureCategory"] == "local_io"
+        assert res["partState"] != "committed"
+    finally:
+        shutdown_server(httpd)
+
+    assert not any(m.get("type") == "pget-fallback" for m in sent)
+    assert not any(m.get("type") == "pget-done" for m in sent)
+
+
+def test_pget_single_replace_failure_local_io(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+    httpd, _ = run_server("no-range")
+    try:
+        def bad_replace(*_a, **_k):
+            raise OSError(errno.EACCES, "replace denied")
+
+        monkeypatch.setattr(d.os, "replace", bad_replace)
+        mc.handle_pget_single({
+            "id": "sRep", "attemptToken": "tRep",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4", "dir": str(tmp_path), "maxConnections": 1,
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["failureCategory"] == "local_io"
+        assert res["status"] == "failed"
+        assert res["mode"] == "single-connection"
+        assert res["partState"] != "committed"
+        assert not (tmp_path / "clip.mp4").exists()
+    finally:
+        shutdown_server(httpd)
+
+
+def test_pget_single_cancel_and_thread_start_failure(tmp_path, monkeypatch):
+    """Early/midstream cancel and Thread.start failure each yield one terminal."""
+    import mchost.downloads as d
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    hold = threading.Event()
+    body_started = threading.Event()
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        payload = b"Z" * (512 * 1024)
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(self.payload)))
+            self.end_headers()
+            self.wfile.write(self.payload[:4096])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=10.0)
+            try:
+                self.wfile.write(self.payload[4096:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        mc.handle_pget_single({
+            "id": "sCan", "attemptToken": "tCan",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4", "dir": str(tmp_path), "maxConnections": 1,
+            "userAgent": "t",
+        })
+        assert wait_for(
+            lambda: body_started.is_set() or d._PGET.get("sCan") is not None,
+            timeout=5,
+        )
+        wait_for(lambda: body_started.is_set(), timeout=5)
+        mc._pget_cancel({"id": "sCan"})
+        res = wait_result(sent, timeout=10)
+        hold.set()
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 1
+        assert res["status"] == "cancelled"
+        assert res["failureCategory"] == "cancelled"
+        assert res["attemptToken"] == "tCan"
+        assert res["mode"] == "single-connection"
+        assert res["partState"] in ("empty", "partial")
+        assert not (tmp_path / "clip.mp4").exists()
+        assert d._PGET.get("sCan") is None
+        mc._pget_cancel({"id": "sCan"})
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-result"]) == 1
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+    sent.clear()
+    httpd2, _ = run_server("no-range")
+    try:
+        real_thread = d.threading.Thread
+        starts = {"n": 0}
+
+        class BoomStartThread(real_thread):
+            def start(self):
+                starts["n"] += 1
+                if starts["n"] == 1:
+                    raise RuntimeError("thread start failed")
+                return real_thread.start(self)
+
+        monkeypatch.setattr(d.threading, "Thread", BoomStartThread)
+        mc.handle_pget_single({
+            "id": "sStart", "attemptToken": "tStart",
+            "urls": [server_url(httpd2)],
+            "name": "clip.mp4", "dir": str(tmp_path), "maxConnections": 1,
+        })
+        assert wait_for(
+            lambda: any(m.get("type") == "pget-result" for m in sent)
+            or d._PGET.get("sStart") is None,
+            timeout=5,
+        )
+        res = last_result(sent)
+        assert res is not None
+        assert len([m for m in sent if m.get("type") == "pget-result"]) == 1
+        assert res["attemptToken"] == "tStart"
+        assert res["mode"] == "single-connection"
+        assert d._PGET.get("sStart") is None
+    finally:
+        shutdown_server(httpd2)
+
+
+def test_set_limit_zero_quiesces_replacement_opens_then_resumes(tmp_path, monkeypatch):
+    """Two mirrors: open A blocks, gen1/limit0 acks, A fails, B silent while zero,
+    gen2/limit1 resumes and completes. Event-driven — no arbitrary sleeps."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    payload = b"Q" * (2 * 1024 * 1024)
+    a_segment_held = threading.Event()
+    a_release_fail = threading.Event()
+    b_segment_opens = {"n": 0}
+    a_segment_opens = {"n": 0}
+    lock = threading.Lock()
+
+    def make_handler(name, fail_on_release=False):
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                rng = self.headers.get("Range") or ""
+                if rng == "bytes=0-0":
+                    self.send_response(206)
+                    self.send_header(
+                        "Content-Range", "bytes 0-0/%d" % len(payload)
+                    )
+                    self.send_header("Content-Length", "1")
+                    self.end_headers()
+                    self.wfile.write(payload[:1])
+                    return
+                if not rng.startswith("bytes="):
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                a, b = rng.split("=", 1)[1].split("-")
+                start, end = int(a), int(b)
+                chunk = payload[start:end + 1]
+                with lock:
+                    if name == "A":
+                        a_segment_opens["n"] += 1
+                    else:
+                        b_segment_opens["n"] += 1
+                if name == "A" and fail_on_release:
+                    self.send_response(206)
+                    self.send_header(
+                        "Content-Range",
+                        "bytes %d-%d/%d" % (start, end, len(payload)),
+                    )
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    mid = min(4096, len(chunk))
+                    self.wfile.write(chunk[:mid])
+                    self.wfile.flush()
+                    a_segment_held.set()
+                    a_release_fail.wait(timeout=15.0)
+                    try:
+                        self.connection.close()
+                    except Exception:
+                        pass
+                    return
+                self.send_response(206)
+                self.send_header(
+                    "Content-Range",
+                    "bytes %d-%d/%d" % (start, end, len(payload)),
+                )
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                self.wfile.write(chunk)
+
+        return H
+
+    httpd_a = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler("A", fail_on_release=True)
+    )
+    httpd_b = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler("B", fail_on_release=False)
+    )
+    ta = threading.Thread(target=httpd_a.serve_forever, daemon=True)
+    tb = threading.Thread(target=httpd_b.serve_forever, daemon=True)
+    ta.start()
+    tb.start()
+    try:
+        url_a = server_url(httpd_a)
+        url_b = server_url(httpd_b)
+        mc.handle_pget({
+            "id": "jobL",
+            "attemptToken": "atk-L",
+            "urls": [url_a, url_b],
+            "name": "big.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: a_segment_held.is_set(), timeout=10)
+        b_before_zero = b_segment_opens["n"]
+
+        mc.handle_pget_set_limit({
+            "id": "jobL", "maxConnections": 0, "providerGeneration": 1,
+        })
+        ack1 = _wait_ack(sent, "jobL", timeout=5)
+        assert ack1["maxConnections"] == 0
+        assert ack1["providerGeneration"] == 1
+        assert ack1["id"] == "jobL"
+
+        a_release_fail.set()
+
+        def a_released_and_stable():
+            op = d._PGET.get("jobL")
+            if op is None:
+                return True
+            cv = op.get("lease_cv")
+            if cv is None:
+                return op.get("openConnections", 0) == 0
+            with cv:
+                return op.get("openConnections", 0) == 0 or op.get("maxConnections") == 0
+
+        assert wait_for(a_released_and_stable, timeout=10)
+        assert b_segment_opens["n"] == b_before_zero
+
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            assert b_segment_opens["n"] == b_before_zero
+            if last_result(sent) is not None:
+                break
+            time.sleep(0.02)
+
+        assert b_segment_opens["n"] == b_before_zero
+        assert last_result(sent) is None
+
+        mc.handle_pget_set_limit({
+            "id": "jobL", "maxConnections": 1, "providerGeneration": 2,
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-limit-ack"
+                and m.get("id") == "jobL"
+                and m.get("providerGeneration") == 2
+                for m in sent
+            ),
+            timeout=5,
+        )
+        ack2 = [
+            m for m in sent
+            if m.get("type") == "pget-limit-ack"
+            and m.get("id") == "jobL"
+            and m.get("providerGeneration") == 2
+        ][-1]
+        assert ack2["maxConnections"] == 1
+        assert ack2["providerGeneration"] == 2
+
+        res = wait_result(sent, timeout=20)
+        assert res["status"] == "completed"
+        assert res["mode"] == "multi-range"
+        assert res["partState"] == "committed"
+        assert res["attemptToken"] == "atk-L"
+        assert (tmp_path / "big.mp4").read_bytes() == payload
+        assert b_segment_opens["n"] >= 1 or a_segment_opens["n"] >= 2
+        assert d._PGET.get("jobL") is None
+    finally:
+        a_release_fail.set()
+        shutdown_server(httpd_a)
+        shutdown_server(httpd_b)
+
+
+def test_set_limit_positive_lowering_caps_replacement_opens(tmp_path, monkeypatch):
+    """Lowering live lease never permits replacement opens above the new limit."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    payload = b"P" * (5 * 1024 * 1024)
+    hold = threading.Event()
+    active = {"n": 0, "max": 0}
+    lock = threading.Lock()
+    segment_phase = {"after_ack": False}
+
+    class HoldRange(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range") or ""
+            if rng == "bytes=0-0":
+                self.send_response(206)
+                self.send_header(
+                    "Content-Range", "bytes 0-0/%d" % len(payload)
+                )
+                self.send_header("Content-Length", "1")
+                self.end_headers()
+                self.wfile.write(payload[:1])
+                return
+            if rng.startswith("bytes="):
+                a, b = rng.split("=", 1)[1].split("-")
+                start, end = int(a), int(b)
+                chunk = payload[start:end + 1]
+                with lock:
+                    active["n"] += 1
+                    if active["n"] > active["max"]:
+                        active["max"] = active["n"]
+                try:
+                    self.send_response(206)
+                    self.send_header(
+                        "Content-Range",
+                        "bytes %d-%d/%d" % (start, end, len(payload)),
+                    )
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    hold.wait(timeout=10.0)
+                    self.wfile.write(chunk)
+                finally:
+                    with lock:
+                        active["n"] -= 1
+                return
+            self.send_response(500)
+            self.end_headers()
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), HoldRange)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        mc.handle_pget({
+            "id": "jobLow",
+            "attemptToken": "atk-low",
+            "urls": [server_url(httpd)],
+            "name": "big.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: active["n"] >= 2 or active["max"] >= 2, timeout=10)
+        observed_before = active["max"]
+        assert observed_before <= 2
+
+        mc.handle_pget_set_limit({
+            "id": "jobLow", "maxConnections": 1, "providerGeneration": 1,
+        })
+        ack = _wait_ack(sent, "jobLow")
+        assert ack["maxConnections"] == 1
+        assert ack["providerGeneration"] == 1
+        segment_phase["after_ack"] = True
+
+        hold.set()
+        res = wait_result(sent, timeout=30)
+        assert res["status"] == "completed"
+        assert active["max"] <= 2
+        assert d._PGET.get("jobLow") is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_set_limit_generation_monotonic_and_idempotent(tmp_path, monkeypatch):
+    """Stale/same gen cannot raise; newer positive gen can resume; ack is honest."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    hold = threading.Event()
+    httpd, state = run_server("hold-probe", hold=hold)
+    try:
+        mc.handle_pget({
+            "id": "jobGen",
+            "attemptToken": "atk-gen",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 4,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: d._PGET.get("jobGen") is not None, timeout=5)
+        op = d._PGET["jobGen"]
+
+        mc.handle_pget_set_limit({
+            "id": "jobGen", "maxConnections": 0, "providerGeneration": 5,
+        })
+        ack = _wait_ack(sent, "jobGen")
+        assert ack["providerGeneration"] == 5
+        assert ack["maxConnections"] == 0
+
+        mc.handle_pget_set_limit({
+            "id": "jobGen", "maxConnections": 4, "providerGeneration": 3,
+        })
+        assert wait_for(
+            lambda: len([m for m in sent if m.get("type") == "pget-limit-ack"]) >= 2,
+            timeout=3,
+        )
+        ack_stale = [m for m in sent if m.get("type") == "pget-limit-ack"][-1]
+        assert ack_stale["providerGeneration"] == 5
+        assert ack_stale["maxConnections"] == 0
+
+        mc.handle_pget_set_limit({
+            "id": "jobGen", "maxConnections": 3, "providerGeneration": 5,
+        })
+        assert wait_for(
+            lambda: len([m for m in sent if m.get("type") == "pget-limit-ack"]) >= 3,
+            timeout=3,
+        )
+        ack_same = [m for m in sent if m.get("type") == "pget-limit-ack"][-1]
+        assert ack_same["providerGeneration"] == 5
+        assert ack_same["maxConnections"] == 0
+
+        mc.handle_pget_set_limit({
+            "id": "jobGen", "maxConnections": True, "providerGeneration": True,
+        })
+        assert wait_for(
+            lambda: len([m for m in sent if m.get("type") == "pget-limit-ack"]) >= 4,
+            timeout=3,
+        )
+        ack_bool = [m for m in sent if m.get("type") == "pget-limit-ack"][-1]
+        assert ack_bool["providerGeneration"] == 5
+        assert ack_bool["maxConnections"] == 0
+
+        mc.handle_pget_set_limit({
+            "id": "jobGen", "maxConnections": 2, "providerGeneration": 6,
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-limit-ack"
+                and m.get("providerGeneration") == 6
+                for m in sent
+            ),
+            timeout=3,
+        )
+        ack_new = [
+            m for m in sent
+            if m.get("type") == "pget-limit-ack" and m.get("providerGeneration") == 6
+        ][-1]
+        assert ack_new["maxConnections"] == 2
+        assert ack_new["providerGeneration"] == 6
+
+        mc.handle_pget_set_limit({
+            "id": "jobGen", "maxConnections": 99, "providerGeneration": 7,
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-limit-ack"
+                and m.get("providerGeneration") == 7
+                for m in sent
+            ),
+            timeout=3,
+        )
+        ack_cap = [
+            m for m in sent
+            if m.get("type") == "pget-limit-ack" and m.get("providerGeneration") == 7
+        ][-1]
+        assert ack_cap["maxConnections"] == 4
+        assert op["maxConnections"] == 4
+
+        hold.set()
+        res = wait_result(sent, timeout=15)
+        assert res["status"] == "completed"
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_set_limit_unknown_and_ytdlp_no_ack_cancel_wakes_waiters(tmp_path, monkeypatch):
+    """Unknown id / yt-dlp registry entry do not claim application; cancel wakes waiters."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    mc.handle_pget_set_limit({
+        "id": "no-such-job", "maxConnections": 0, "providerGeneration": 1,
+    })
+    time.sleep(0.05)
+    assert not any(m.get("type") == "pget-limit-ack" for m in sent)
+
+    class FakeProc:
+        pass
+
+    d._PGET["yt1"] = {"proc": FakeProc()}
+    try:
+        mc.handle_pget_set_limit({
+            "id": "yt1", "maxConnections": 0, "providerGeneration": 1,
+        })
+        time.sleep(0.05)
+        assert not any(m.get("type") == "pget-limit-ack" for m in sent)
+    finally:
+        d._PGET.pop("yt1", None)
+
+    hold_body = threading.Event()
+    payload = b"W" * (256 * 1024)
+
+    class GateFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:1024])
+            self.wfile.flush()
+            hold_body.wait(timeout=10.0)
+            try:
+                self.wfile.write(payload[1024:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), GateFull)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        mc.handle_pget_single({
+            "id": "jobWake",
+            "attemptToken": "atk-wake",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: d._PGET.get("jobWake") is not None, timeout=5)
+        mc.handle_pget_set_limit({
+            "id": "jobWake", "maxConnections": 0, "providerGeneration": 1,
+        })
+        _wait_ack(sent, "jobWake")
+        mc._pget_cancel({"id": "jobWake"})
+        res = wait_result(sent, timeout=10)
+        hold_body.set()
+        assert res["status"] == "cancelled"
+        assert res["failureCategory"] == "cancelled"
+        assert d._PGET.get("jobWake") is None
+    finally:
+        hold_body.set()
+        shutdown_server(httpd)
+
+
+def test_mc_host_dispatch_and_reexports_task13():
+    """mc_host routes pget-single / pget-set-limit; reexports are canonical."""
+    import mchost.downloads as d
+    import inspect
+
+    assert mc.handle_pget_single is d.handle_pget_single
+    assert mc.handle_pget_set_limit is d.handle_pget_set_limit
+
+    src = inspect.getsource(mc.main)
+    assert 'cmd == "pget-single"' in src
+    assert 'cmd == "pget-set-limit"' in src
+    assert "handle_pget_single" in src
+    assert "handle_pget_set_limit" in src
+
+
+def test_pget_single_missing_content_length_completes(tmp_path, monkeypatch):
+    """Missing Content-Length may complete at EOF."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    payload = b"no-cl-body-bytes-ok"
+
+    class NoCL(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), NoCL)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        mc.handle_pget_single({
+            "id": "jobNoCL", "attemptToken": "atk-nocl",
+            "urls": [server_url(httpd)],
+            "name": "x.mp4", "dir": str(tmp_path), "maxConnections": 1,
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "completed"
+        assert res["mode"] == "single-connection"
+        assert res["partState"] == "committed"
+        assert (tmp_path / "x.mp4").read_bytes() == payload
+    finally:
+        shutdown_server(httpd)
