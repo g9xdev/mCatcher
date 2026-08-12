@@ -158,23 +158,35 @@
   }
 
   /**
-   * Pure synchronous download scheduler — global admission + provider saturation (Tasks 9–10).
+   * Pure synchronous download scheduler — global admission, provider saturation,
+   * finite retries, cancel drain, capability switch, and explicit Firefox handoff
+   * (Tasks 9–11).
    *
-   * Session memory only. No timers, no browser globals.
+   * Session memory only. No real timers, no browser globals.
    *
    * States: created | queued | running | pausing_provider | waiting_provider |
-   *         retry_backoff | completed | failed | cancelled
-   * (needs_user / handing_off_firefox / handed_to_firefox reserved for Task 11+)
+   *         retry_backoff | needs_user | handing_off_firefox | handed_to_firefox |
+   *         completed | failed | cancelled
    *
    * Slot contract: holdsGlobalSlot boolean token + stateVersion CAS.
    * globalRunning === count(holdsGlobalSlot === true) always.
    * pausing_provider is the only non-running state that may hold a slot.
+   * retry_backoff / waiting_provider / needs_user / handing_off_firefox /
+   * handed_to_firefox / terminal hold no slot.
    *
    * Fairness: FIFO within providerKey; round-robin across providers.
    * providerKey is always the captured key — never derived from mediaOrigin/CDN.
    *
    * ProviderGate is the sole internal permit/lease authority. Public surface exposes
    * only acquireProviderPermit (no raw gate / gate.acquire leakage).
+   *
+   * Firefox: requestFirefoxHandoff is the ONLY path that may invoke firefoxDownload.
+   * Automatic failures, saturation, range switch, cancel, tick, and local_io never call it.
+   *
+   * issueAttemptToken(jobId): returns the current live attempt token for a running
+   * job that already holds one. Never rotates the token, never mutates budget/slot,
+   * and throws when there is no live attempt (created/queued/backoff/needs_user/terminal).
+   * Fresh tokens are issued only by admitJob on actual admission.
    */
   function createDownloadScheduler(opts) {
     opts = opts || {};
@@ -182,13 +194,13 @@
     var now = opts.now == null ? function () { return Date.now(); } : requireFunction(opts.now, "now");
     var randomToken =
       opts.randomToken == null ? defaultRandomToken() : requireFunction(opts.randomToken, "randomToken");
-    // Optional forward-compat hook — automatic failures/saturation MUST NEVER call it.
+    // Guarded Firefox adapter hook — automatic failures/saturation MUST NEVER call it.
     var firefoxDownload = null;
     if (opts.firefoxDownload != null) {
       firefoxDownload = requireFunction(opts.firefoxDownload, "firefoxDownload");
     }
-    void firefoxDownload; // retained for requestFirefoxHandoff (later); never auto-invoked.
-    void now;
+    // One-time popup token store: Set of tokens, or Map jobId -> token (or Set of tokens).
+    var popupTokenStore = opts.popupTokenStore == null ? null : opts.popupTokenStore;
 
     var ProviderGateApi = resolveProviderGateApi();
     var FailureClassify = resolveFailureClassifyApi();
@@ -221,6 +233,8 @@
     var draining = false;
     // Monotonic token suffix when randomToken collides / blanks.
     var tokenGuard = 0;
+    // Last observed tick time (reject backward only as no-op for due checks).
+    var lastTickMs = null;
 
     function ensureProvider(providerKey) {
       if (!providerQueues.has(providerKey)) {
@@ -395,22 +409,61 @@
      * queues, release a held slot only if present, clear attempt token + ephemeral,
      * and close the wait epoch so it cannot be re-woken.
      */
+    function isTrulyTerminal(state) {
+      return (
+        state === "completed" ||
+        state === "failed" ||
+        state === "cancelled" ||
+        state === "handed_to_firefox"
+      );
+    }
+
+    function clearRetryDeadline(job) {
+      job.retryDeadlineMs = null;
+    }
+
+    /**
+     * Enter needs_user: release capacity, clear deadline/queues/token, keep ephemeral
+     * for a later manualRetry or explicit Firefox handoff. Never holds a slot.
+     */
+    function enterNeedsUser(job) {
+      if (!job) return false;
+      if (isTrulyTerminal(job.state) || job.state === "needs_user") {
+        if (job.state === "needs_user") {
+          clearRetryDeadline(job);
+          releaseSlotIfHeld(job);
+          removeFromQueue(job);
+          removeFromWaitQueue(job);
+        }
+        return false;
+      }
+      removeFromWaitQueue(job);
+      removeFromQueue(job);
+      releaseSlotIfHeld(job);
+      clearRetryDeadline(job);
+      job.state = "needs_user";
+      job.stateVersion += 1;
+      job.attemptToken = null;
+      job.consumeRetryOnWake = false;
+      job.wakeRetryConsumed = true;
+      job.wakeAuthorized = true;
+      // Keep ephemeral for manual retry / explicit Firefox.
+      return true;
+    }
+
     function terminalizeWaitingJob(job, nextState) {
       if (!job || job.state !== "waiting_provider") return false;
       removeFromWaitQueue(job);
       removeFromQueue(job);
       releaseSlotIfHeld(job);
+      clearRetryDeadline(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.attemptToken = null;
       job.consumeRetryOnWake = false;
       job.wakeRetryConsumed = true;
       job.wakeAuthorized = true;
-      if (
-        nextState === "completed" ||
-        nextState === "failed" ||
-        nextState === "cancelled"
-      ) {
+      if (isTrulyTerminal(nextState)) {
         clearEphemeralOnce(job);
       }
       return true;
@@ -458,6 +511,19 @@
       if (!job) return;
       if (job.state !== "pausing_provider") return;
       if (!isQuiescent(job)) return;
+      // Cancel-requested pausing work finishes as cancelled once quiescent.
+      if (job.cancelRequested === true) {
+        releaseSlotIfHeld(job);
+        removeFromWaitQueue(job);
+        removeFromQueue(job);
+        clearRetryDeadline(job);
+        job.state = "cancelled";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        clearEphemeralOnce(job);
+        drain();
+        return;
+      }
       job.state = "waiting_provider";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -716,26 +782,58 @@
       }
     }
 
-    function enterRetryBackoff(job, attemptToken) {
+    /**
+     * Ordinary transient failure with matching live token:
+     * - budget remaining: charge once, enter retry_backoff with deadline
+     * - budget exhausted: enter needs_user
+     * Duplicate/stale tokens no-op. Never Firefox.
+     */
+    function scheduleAutomaticRetry(job, attemptToken) {
       if (!job) return false;
       if (job.state !== "running") return false;
       if (!isNonblankString(attemptToken)) return false;
       if (job.attemptToken !== attemptToken) return false;
+      if (job.cancelRequested === true) {
+        // Cancel wins over retry: treat as cancelled terminalization.
+        return terminalizeRunning(job, attemptToken, "cancelled");
+      }
       assertRunningOwnsSlot(job);
+
+      if (job.retryRemaining <= 0) {
+        enterNeedsUser(job);
+        removeFromQueue(job);
+        drain();
+        return true;
+      }
+
+      // Charge budget exactly once under the matching attempt token.
+      job.retryRemaining -= 1;
+      job.retryUsed += 1;
+      // deadline = now + min(30000, 1000 * 2^automaticRetriesUsed)
+      var delay = Math.min(30000, 1000 * Math.pow(2, job.retryUsed));
+      var nowMs = now();
+      if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) nowMs = 0;
+      job.retryDeadlineMs = nowMs + delay;
+
       job.state = "retry_backoff";
       job.stateVersion += 1;
       job.attemptToken = null;
       releaseSlotIfHeld(job);
       removeFromQueue(job);
-      // Placeholder for Task 11 timers — slot released immediately; never Firefox.
       drain();
       return true;
+    }
+
+    function enterRetryBackoff(job, attemptToken) {
+      // Compatibility alias: ordinary transient path uses scheduleAutomaticRetry.
+      return scheduleAutomaticRetry(job, attemptToken);
     }
 
     /**
      * Terminalize a running job that presents the current attempt token.
      * Same transaction: release slot, bump stateVersion once, clear ephemeral
      * once when truly terminal, then drain. Late/duplicate/wrong-token → no-op.
+     * needs_user is non-terminal for ephemeral (manual retry / Firefox).
      */
     function terminalizeRunning(job, attemptToken, nextState) {
       if (!job) return false;
@@ -750,11 +848,8 @@
       job.holdsGlobalSlot = false;
       globalRunning -= 1;
       job.attemptToken = null;
-      if (
-        nextState === "completed" ||
-        nextState === "failed" ||
-        nextState === "cancelled"
-      ) {
+      clearRetryDeadline(job);
+      if (isTrulyTerminal(nextState)) {
         clearEphemeralOnce(job);
       }
       removeFromQueue(job);
@@ -786,8 +881,9 @@
           continue;
         }
         if (isExhaustedFailedWaiter(j)) {
+          // Exhausted failed waiters enter needs_user (final Task-11 rule).
           // Removes from wait queue; next candidate shifts into index i.
-          terminalizeWaitingJob(j, "failed");
+          terminalizeWaitingJob(j, "needs_user");
           continue;
         }
         return j;
@@ -799,7 +895,7 @@
      * Single authorized wake of a waiting_provider job back to queued for the
      * current wait epoch. Late duplicates in the same epoch no-op.
      * Failed waiters consume at most one retry per epoch; paused-only consume none.
-     * Exhausted failed waiters terminalize instead of requeueing.
+     * Exhausted failed waiters enter needs_user instead of requeueing.
      * Never bypasses global admission — appends wait-FIFO order into provider FIFO,
      * then central drain applies global cap / round-robin.
      */
@@ -808,9 +904,9 @@
       // Per wait-epoch idempotence (not job lifetime).
       if (job.wakeAuthorized) return false;
 
-      // Exhausted failed waiter: terminalize exactly once; do not requeue.
+      // Exhausted failed waiter: needs_user exactly once; do not requeue.
       if (isExhaustedFailedWaiter(job)) {
-        terminalizeWaitingJob(job, "failed");
+        terminalizeWaitingJob(job, "needs_user");
         return false;
       }
 
@@ -863,11 +959,8 @@
       job.holdsGlobalSlot = false;
       globalRunning -= 1;
       job.attemptToken = null;
-      if (
-        nextState === "completed" ||
-        nextState === "failed" ||
-        nextState === "cancelled"
-      ) {
+      clearRetryDeadline(job);
+      if (isTrulyTerminal(nextState)) {
         clearEphemeralOnce(job);
       }
       removeFromQueue(job);
@@ -1004,7 +1097,8 @@
       // Validate intent + mediaKind before any job store mutation.
       var intent = sanitizeIntent(input.intent);
       var mediaKind = sanitizeMediaKind(input.mediaKind);
-      var retryRemaining = clampRetries(input.retries);
+      var configuredRetries = clampRetries(input.retries);
+      var retryRemaining = configuredRetries;
 
       // mediaOrigin is accepted for forward compatibility but NEVER used as providerKey
       // and NEVER projected from getJob/getSnapshot.
@@ -1017,8 +1111,10 @@
         state: "created",
         stateVersion: 1,
         holdsGlobalSlot: false,
+        configuredRetries: configuredRetries,
         retryRemaining: retryRemaining,
         retryUsed: 0,
+        retryDeadlineMs: null,
         effectiveConcurrency: segmentConcurrency,
         intent: intent,
         attemptToken: null,
@@ -1028,6 +1124,7 @@
         ephemeral: ephemeral,
         autoWakeCount: 0,
         cancelRequested: false,
+        firefoxHandoffInFlight: false,
         // Separate wrapper-owned vs observation-adapter permit counts.
         // Projected inFlightPermits is their exact sum.
         wrapperPermits: 0,
@@ -1124,6 +1221,8 @@
       var job = jobs.get(jobId);
       if (!job) return null;
       if (job.state !== "running") return null;
+      if (job.cancelRequested === true) return null;
+      if (job.firefoxHandoffInFlight === true) return null;
       if (!isNonblankString(purpose)) {
         throw new TypeError("purpose must be a nonblank string");
       }
@@ -1210,38 +1309,56 @@
       result = result || {};
       var status = result.status;
 
-      if (status === "completed") {
-        // Successful recovery owner → recoverToNormal.
-        var gateC = getGate(job.providerKey);
-        var snapC = gateC.snapshot();
-        if (
-          snapC.state === "recovering" &&
-          snapC.ownerJobId === job.id &&
-          job.state === "running" &&
-          isNonblankString(attemptToken) &&
-          job.attemptToken === attemptToken
-        ) {
-          completeRecoverySuccess(job, attemptToken);
-          return;
-        }
-        // Saturated/recovering owner completion that is not a successful recovery
-        // end (e.g. saturated drain owner) wakes next waiter via completeOwner.
-        if (
-          (snapC.state === "saturated" || snapC.state === "recovering") &&
-          snapC.ownerJobId === job.id
-        ) {
-          // For recovering owner, completed means recovery success (handled above).
-          // Saturated owner completed → wake chain.
-          if (snapC.state === "saturated") {
-            completeProviderOwner(job, attemptToken, "completed");
-            return;
-          }
-        }
-        terminalizeRunning(job, attemptToken, "completed");
+      // Late results after needs_user / terminal / backoff with no live token: no-op.
+      if (
+        job.state === "needs_user" ||
+        job.state === "retry_backoff" ||
+        job.state === "handing_off_firefox" ||
+        job.state === "handed_to_firefox" ||
+        isTrulyTerminal(job.state)
+      ) {
         return;
       }
 
+      if (status === "completed") {
+        if (job.state !== "running") return;
+        if (!isNonblankString(attemptToken) || job.attemptToken !== attemptToken) return;
+
+        // cancelRequested: completion after cancel becomes cancelled (idempotent release).
+        if (job.cancelRequested === true) {
+          status = "cancelled";
+        } else {
+          // Successful recovery owner → recoverToNormal.
+          var gateC = getGate(job.providerKey);
+          var snapC = gateC.snapshot();
+          if (
+            snapC.state === "recovering" &&
+            snapC.ownerJobId === job.id
+          ) {
+            completeRecoverySuccess(job, attemptToken);
+            return;
+          }
+          // Saturated/recovering owner completion that is not a successful recovery
+          // end (e.g. saturated drain owner) wakes next waiter via completeOwner.
+          if (
+            (snapC.state === "saturated" || snapC.state === "recovering") &&
+            snapC.ownerJobId === job.id
+          ) {
+            // For recovering owner, completed means recovery success (handled above).
+            // Saturated owner completed → wake chain.
+            if (snapC.state === "saturated") {
+              completeProviderOwner(job, attemptToken, "completed");
+              return;
+            }
+          }
+          terminalizeRunning(job, attemptToken, "completed");
+          return;
+        }
+      }
+
       if (status === "cancelled") {
+        if (job.state !== "running") return;
+        if (!isNonblankString(attemptToken) || job.attemptToken !== attemptToken) return;
         var gateX = getGate(job.providerKey);
         var snapX = gateX.snapshot();
         if (
@@ -1260,29 +1377,62 @@
         if (!isNonblankString(attemptToken)) return;
         if (job.attemptToken !== attemptToken) return;
 
+        // cancelRequested wins over failure classification.
+        if (job.cancelRequested === true) {
+          var gateCancel = getGate(job.providerKey);
+          var snapCancel = gateCancel.snapshot();
+          if (
+            (snapCancel.state === "saturated" || snapCancel.state === "recovering") &&
+            snapCancel.ownerJobId === job.id
+          ) {
+            completeProviderOwner(job, attemptToken, "cancelled");
+            return;
+          }
+          terminalizeRunning(job, attemptToken, "cancelled");
+          return;
+        }
+
         var category = result.failureCategory;
         // Never call Firefox on automatic failures/saturation.
-        // firefoxDownload is intentionally unused here.
 
         var gateF = getGate(job.providerKey);
         var snapF = gateF.snapshot();
 
         // Owner failure while saturated/recovering: hand off via completeOwner
-        // (or bounded retry / terminal failed if no waiter).
+        // (or bounded retry / needs_user if no waiter).
         if (
           (snapF.state === "saturated" || snapF.state === "recovering") &&
           snapF.ownerJobId === job.id
         ) {
           var waiter = oldestEligibleWaiter(job.providerKey);
           if (waiter) {
+            // Owner ends; wake chain selects next. Permanent/transient both release owner.
             completeProviderOwner(job, attemptToken, "failed");
             return;
           }
-          // No waiter: inspect retryRemaining. Positive → retry_backoff + completeOwner(null).
-          // Zero → terminal failed + completeOwner(null). Never leave exhausted owner retrying.
+          // No waiter: ordinary bounded retry / needs_user. Never leave exhausted owner retrying.
+          if (category === "local_io") {
+            assertRunningOwnsSlot(job);
+            job.state = "needs_user";
+            job.stateVersion += 1;
+            job.attemptToken = null;
+            clearRetryDeadline(job);
+            releaseSlotIfHeld(job);
+            removeFromQueue(job);
+            gateF.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
+            drain();
+            return;
+          }
           if (FailureClassify.isSaturationCandidate(category)) {
             assertRunningOwnsSlot(job);
             if (job.retryRemaining > 0) {
+              // Charge + deadline then complete owner generation (no waiter).
+              job.retryRemaining -= 1;
+              job.retryUsed += 1;
+              var delayO = Math.min(30000, 1000 * Math.pow(2, job.retryUsed));
+              var nowO = now();
+              if (typeof nowO !== "number" || !Number.isFinite(nowO)) nowO = 0;
+              job.retryDeadlineMs = nowO + delayO;
               job.state = "retry_backoff";
               job.stateVersion += 1;
               job.attemptToken = null;
@@ -1292,17 +1442,24 @@
               drain();
               return;
             }
-            job.state = "failed";
+            job.state = "needs_user";
             job.stateVersion += 1;
             job.attemptToken = null;
+            clearRetryDeadline(job);
             releaseSlotIfHeld(job);
-            clearEphemeralOnce(job);
             removeFromQueue(job);
             gateF.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
             drain();
             return;
           }
+          // Permanent owner failure with no waiter.
           completeProviderOwner(job, attemptToken, "failed");
+          return;
+        }
+
+        // local_io: needs_user, never provider saturation, never Firefox.
+        if (category === "local_io") {
+          terminalizeRunning(job, attemptToken, "needs_user");
           return;
         }
 
@@ -1320,29 +1477,357 @@
             enterSaturation(job, owner);
             return;
           }
-          // No viable sibling: positive budget → retry_backoff; zero → terminal failed.
+          // No viable sibling: charge budget → retry_backoff or needs_user.
           // Never provider wait; never Firefox.
-          if (job.retryRemaining > 0) {
-            enterRetryBackoff(job, attemptToken);
-          } else {
-            terminalizeRunning(job, attemptToken, "failed");
-          }
+          scheduleAutomaticRetry(job, attemptToken);
           return;
         }
 
-        // Non-candidate permanent (or local_io / range_unsupported / cancelled category): terminal failed.
+        // Permanent (or range_unsupported without capability switch, cancelled category): terminal failed.
+        // range_unsupported is never Firefox; capability switch is a separate API.
         terminalizeRunning(job, attemptToken, "failed");
         return;
       }
       // Unknown status: no-op.
     }
 
-    // Public surface — stable method names for Tasks 10–11 extensions.
+    /**
+     * Move due retry_backoff jobs to queued, then central drain.
+     * Invalid / non-finite nowMs is a no-op. Duplicate ticks after admission
+     * cannot double-admit (state is no longer retry_backoff). No real timers.
+     */
+    function tick(nowMs) {
+      if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) return;
+      lastTickMs = nowMs;
+      jobs.forEach(function (job) {
+        if (job.state !== "retry_backoff") return;
+        if (job.retryDeadlineMs == null) return;
+        if (nowMs < job.retryDeadlineMs) return;
+        // Due: re-enter provider FIFO for central admission (fresh token on admit).
+        clearRetryDeadline(job);
+        job.state = "queued";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        ensureProvider(job.providerKey);
+        var q = providerQueues.get(job.providerKey);
+        if (q.indexOf(job.id) === -1) q.push(job.id);
+      });
+      drain();
+    }
+
+    /**
+     * Idempotent cancel. Immediate for work with no live transport attempt.
+     * Active running/pausing work records cancelRequested, denies new permits,
+     * preserves the attempt token until matching cancel/terminal acknowledgement,
+     * and releases the slot exactly once when acknowledged.
+     */
+    function cancel(jobId) {
+      var job = jobs.get(jobId);
+      if (!job) return;
+      if (isTrulyTerminal(job.state)) return;
+      if (job.state === "handing_off_firefox") return;
+
+      if (job.state === "running" || job.state === "pausing_provider") {
+        if (job.cancelRequested === true) return;
+        job.cancelRequested = true;
+        // If already quiescent in pausing_provider, finish cancel now.
+        if (job.state === "pausing_provider" && isQuiescent(job)) {
+          // Pausing with cancel: release slot, terminalize cancelled.
+          // If this job is not a provider owner, simple terminal path.
+          releaseSlotIfHeld(job);
+          removeFromWaitQueue(job);
+          removeFromQueue(job);
+          clearRetryDeadline(job);
+          job.state = "cancelled";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          clearEphemeralOnce(job);
+          drain();
+        }
+        // Running (or non-quiescent pausing): wait for matching transport/quiesce ack.
+        return;
+      }
+
+      // created / queued / waiting_provider / retry_backoff / needs_user: immediate.
+      removeFromQueue(job);
+      removeFromWaitQueue(job);
+      releaseSlotIfHeld(job);
+      clearRetryDeadline(job);
+      job.state = "cancelled";
+      job.stateVersion += 1;
+      job.attemptToken = null;
+      job.cancelRequested = true;
+      clearEphemeralOnce(job);
+      drain();
+    }
+
+    /**
+     * Multi-range → single-connection capability switch.
+     * Only a matching live running attempt may switch when mode is single-connection
+     * and partState is empty. Preserves job, slot, attempt token, filename, budget.
+     * Never Firefox. Invalid/non-running/cancelled/repeat → no-op.
+     */
+    function onCapabilitySwitch(jobId, info) {
+      var job = jobs.get(jobId);
+      if (!job) return;
+      if (job.state !== "running") return;
+      if (job.cancelRequested === true) return;
+      info = info || {};
+      if (info.mode !== "single-connection") return;
+      if (info.partState !== "empty") return;
+      if (job.mode === "single-connection") return; // repeat no-op
+      job.mode = "single-connection";
+      job.effectiveConcurrency = 1;
+      job.stateVersion += 1;
+      syncJobLimit(job);
+    }
+
+    /**
+     * Return the current live attempt token for a running job.
+     * Does not mint, rotate, charge budget, or release slots.
+     * Throws when there is no live attempt to share.
+     */
+    function issueAttemptToken(jobId) {
+      var job = jobs.get(jobId);
+      if (!job) {
+        throw new Error("unknown job: no live attempt token");
+      }
+      if (job.state !== "running" || !isNonblankString(job.attemptToken)) {
+        throw new Error("no live attempt token for job");
+      }
+      if (job.cancelRequested === true) {
+        throw new Error("no live attempt token for cancelled job");
+      }
+      return job.attemptToken;
+    }
+
+    /**
+     * Manual retry from needs_user only. New explicit generation: reset configured
+     * automatic budget and retry-use counter, clear deadline, preserve immutable
+     * intent/filename and reduced concurrency/mode, queue via central drain.
+     * Fresh token issued on admission. Outside needs_user → no-op.
+     */
+    function manualRetry(jobId) {
+      var job = jobs.get(jobId);
+      if (!job) return;
+      if (job.state !== "needs_user") return;
+      job.retryRemaining = job.configuredRetries;
+      job.retryUsed = 0;
+      clearRetryDeadline(job);
+      job.cancelRequested = false;
+      job.firefoxHandoffInFlight = false;
+      job.consumeRetryOnWake = false;
+      job.wakeRetryConsumed = false;
+      job.wakeAuthorized = false;
+      job.attemptToken = null;
+      job.state = "queued";
+      job.stateVersion += 1;
+      ensureProvider(job.providerKey);
+      var q = providerQueues.get(job.providerKey);
+      if (q.indexOf(job.id) === -1) q.push(job.id);
+      drain();
+    }
+
+    /**
+     * Consume a one-time popup token from Set or job-bound Map.
+     * Synchronous and exactly-once before any await.
+     * Set: has(token)/delete(token).
+     * Map: jobId -> token string, or jobId -> Set of tokens.
+     */
+    function consumePopupToken(jobId, token) {
+      if (!isNonblankString(token)) return false;
+      if (!popupTokenStore) return false;
+      // Map form (job-bound): native Map has get+set; Set has add, not get/set.
+      if (
+        typeof popupTokenStore.get === "function" &&
+        typeof popupTokenStore.set === "function" &&
+        typeof popupTokenStore.has === "function" &&
+        typeof popupTokenStore.delete === "function"
+      ) {
+        if (!popupTokenStore.has(jobId)) return false;
+        var bound = popupTokenStore.get(jobId);
+        if (typeof bound === "string") {
+          if (bound !== token) return false;
+          popupTokenStore.delete(jobId);
+          return true;
+        }
+        if (bound && typeof bound.has === "function" && typeof bound.delete === "function") {
+          if (!bound.has(token)) return false;
+          bound.delete(token);
+          if (typeof bound.size === "number" && bound.size === 0) {
+            popupTokenStore.delete(jobId);
+          }
+          return true;
+        }
+        return false;
+      }
+      // Set form (or Set-like): has/delete without Map get+set.
+      if (typeof popupTokenStore.has === "function" && typeof popupTokenStore.delete === "function") {
+        if (!popupTokenStore.has(token)) return false;
+        popupTokenStore.delete(token);
+        return true;
+      }
+      return false;
+    }
+
+    function intentsBindEqual(jobIntent, handoffIntent) {
+      if (!jobIntent || !handoffIntent) return false;
+      return (
+        jobIntent.requestedFilename === handoffIntent.requestedFilename &&
+        jobIntent.destinationDirectory === handoffIntent.destinationDirectory &&
+        jobIntent.saveMode === handoffIntent.saveMode
+      );
+    }
+
+    /**
+     * Explicit Firefox handoff — the scheduler's ONLY Firefox hook.
+     * Requires immutable intent with userSelectedFirefox === true, a nonblank
+     * popup token present in the one-time store, exact filename/destination/saveMode
+     * binding, and an eligible nonterminal job. Consumes the token synchronously
+     * once before the first await. Success → handed_to_firefox (ephemeral cleared).
+     * Adapter rejection → needs_user (token stays consumed, ephemeral retained).
+     */
+    async function requestFirefoxHandoff(jobId, handoffIntent) {
+      var job = jobs.get(jobId);
+      if (!job) {
+        throw new Error("unknown job for Firefox handoff");
+      }
+      if (!handoffIntent || typeof handoffIntent !== "object") {
+        throw new TypeError("Firefox handoff intent must be an object");
+      }
+      if (!Object.isFrozen(handoffIntent)) {
+        throw new TypeError("Firefox handoff intent must be immutable (frozen)");
+      }
+      if (handoffIntent.userSelectedFirefox !== true) {
+        throw new Error("Firefox handoff requires userSelectedFirefox === true");
+      }
+      if (!isNonblankString(handoffIntent.userActionToken)) {
+        throw new Error("Firefox handoff requires a nonblank userActionToken");
+      }
+      if (!intentsBindEqual(job.intent, handoffIntent)) {
+        throw new Error("Firefox handoff intent does not match job binding");
+      }
+      if (isTrulyTerminal(job.state)) {
+        throw new Error("Firefox handoff rejected: job is terminal");
+      }
+      if (job.state === "handing_off_firefox" || job.firefoxHandoffInFlight === true) {
+        throw new Error("Firefox handoff already in progress or completed for token");
+      }
+      // Eligible: needs_user, or safe live/quiescent path (running/queued/backoff/waiting/created without outstanding physical permits).
+      var eligible =
+        job.state === "needs_user" ||
+        job.state === "created" ||
+        job.state === "queued" ||
+        job.state === "retry_backoff" ||
+        job.state === "waiting_provider" ||
+        job.state === "running";
+      if (!eligible) {
+        throw new Error("Firefox handoff rejected: job state not eligible");
+      }
+      // Outstanding wrapper/observed permits or native opens: reject until safe.
+      // Preserve ProviderGate physical counters — do not pretend they vanished.
+      if (job.state === "running" || job.state === "pausing_provider") {
+        if (!isQuiescent(job)) {
+          throw new Error("Firefox handoff rejected: outstanding permits or native opens");
+        }
+      }
+      if (typeof firefoxDownload !== "function") {
+        throw new Error("Firefox handoff requires firefoxDownload hook");
+      }
+
+      // Consume token synchronously and exactly once before first await.
+      if (!consumePopupToken(jobId, handoffIntent.userActionToken)) {
+        throw new Error("Firefox handoff token missing, forged, or already consumed");
+      }
+
+      job.firefoxHandoffInFlight = true;
+      job.cancelRequested = true;
+
+      // Stop/mark mCatcher work: deny permits, clear retry deadline/queues, release slot.
+      removeFromQueue(job);
+      removeFromWaitQueue(job);
+      clearRetryDeadline(job);
+      // If this job is a saturated/recovering owner, wake next via completeOwner path.
+      var gateH = getGate(job.providerKey);
+      var snapH = gateH.snapshot();
+      var wasOwner =
+        job.state === "running" &&
+        (snapH.state === "saturated" || snapH.state === "recovering") &&
+        snapH.ownerJobId === job.id;
+
+      if (wasOwner) {
+        var waiterH = oldestEligibleWaiter(job.providerKey);
+        var recoveryIdH = waiterH ? waiterH.id : null;
+        job.state = "handing_off_firefox";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        releaseSlotIfHeld(job);
+        gateH.completeOwner({ jobId: job.id, recoveryOwnerJobId: recoveryIdH });
+        if (recoveryIdH) {
+          var nextH = jobs.get(recoveryIdH);
+          if (nextH && nextH.state === "waiting_provider") {
+            var afterH = gateH.snapshot();
+            if (afterH.reducedConcurrency != null) {
+              applyReducedConcurrency(nextH, afterH.reducedConcurrency);
+            }
+            authorizeWake(nextH);
+          }
+        }
+      } else {
+        job.state = "handing_off_firefox";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        releaseSlotIfHeld(job);
+      }
+      drain();
+
+      // Build guarded adapter input: only immutable intent + in-memory source handle.
+      // Never project/serialize media URLs, cookies, headers, or ephemeral objects.
+      var sourceHandle = null;
+      if (job.ephemeral && typeof job.ephemeral === "object") {
+        // Pass a closure/handle object without exposing raw URL fields via projection.
+        sourceHandle = job.ephemeral;
+      }
+      var adapterInput = Object.freeze({
+        filename: job.intent.requestedFilename,
+        saveAs: true,
+        intent: job.intent,
+        sourceHandle: sourceHandle,
+      });
+
+      try {
+        await firefoxDownload(adapterInput);
+        // Success → handed_to_firefox, clear ephemeral exactly once, terminal.
+        if (job.state === "handing_off_firefox") {
+          job.state = "handed_to_firefox";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          job.firefoxHandoffInFlight = false;
+          clearEphemeralOnce(job);
+        }
+        drain();
+      } catch (err) {
+        // Adapter rejection → needs_user, no slot, token remains consumed, ephemeral retained.
+        if (job.state === "handing_off_firefox") {
+          job.state = "needs_user";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          job.firefoxHandoffInFlight = false;
+          job.cancelRequested = false;
+          releaseSlotIfHeld(job);
+        }
+        drain();
+      }
+    }
+
+    // Public surface — stable method names for Tasks 9–11.
     return {
       createJob: createJob,
       enqueue: enqueue,
       setMaxConcurrent: setMaxConcurrent,
+      cancel: cancel,
       onTransportResult: onTransportResult,
+      onCapabilitySwitch: onCapabilitySwitch,
       getJob: getJob,
       getSnapshot: getSnapshot,
       notePermitAcquired: notePermitAcquired,
@@ -1352,8 +1837,10 @@
       noteNativeOpen: noteNativeOpen,
       nativeLeaseFor: nativeLeaseFor,
       userStatus: userStatus,
-      // Placeholders reserved so later tasks extend without reshaping the object:
-      // cancel, onCapabilitySwitch, issueAttemptToken, manualRetry, requestFirefoxHandoff, tick
+      issueAttemptToken: issueAttemptToken,
+      manualRetry: manualRetry,
+      requestFirefoxHandoff: requestFirefoxHandoff,
+      tick: tick,
     };
   }
 

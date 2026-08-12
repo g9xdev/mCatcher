@@ -1367,6 +1367,8 @@ test("paused-only waiter consumes no retry on authorize or recovery requeue", ()
 });
 
 test("zero-budget solo and owner saturation candidates fail terminally", () => {
+  // Task 11 migration: exhausted ordinary/saturated retry budget enters needs_user
+  // (not interim terminal failed). Permanent non-candidates remain failed.
   const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
   s.createJob({
     id: "solo",
@@ -1380,7 +1382,7 @@ test("zero-budget solo and owner saturation candidates fail terminally", () => {
     status: "failed",
     failureCategory: "timeout",
   });
-  assert.equal(s.getJob("solo").state, "failed");
+  assert.equal(s.getJob("solo").state, "needs_user");
   assert.equal(s.getJob("solo").holdsGlobalSlot, false);
   assertSlotInvariant(s);
 
@@ -1413,13 +1415,14 @@ test("zero-budget solo and owner saturation candidates fail terminally", () => {
     status: "completed",
     failureCategory: null,
   });
-  assert.equal(s2.getJob("B").state, "failed");
+  // Task 11 migration: exhausted failed waiter → needs_user (not failed).
+  assert.equal(s2.getJob("B").state, "needs_user");
   assert.equal(s2.getJob("B").holdsGlobalSlot, false);
   assert.equal(s2.getSnapshot().providers["r.com"].gate.state, "recovering");
   assert.equal(s2.getSnapshot().providers["r.com"].gate.ownerJobId, null);
   assertSlotInvariant(s2);
 
-  // Recovery owner that reaches zero budget with no further waiters fails terminally.
+  // Recovery owner that reaches zero budget with no further waiters → needs_user.
   const s3 = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
   s3.createJob({
     id: "O",
@@ -1454,7 +1457,8 @@ test("zero-budget solo and owner saturation candidates fail terminally", () => {
     status: "failed",
     failureCategory: "timeout",
   });
-  assert.equal(s3.getJob("R").state, "failed");
+  // Task 11 migration: exhausted recovery owner → needs_user (not failed).
+  assert.equal(s3.getJob("R").state, "needs_user");
   assert.equal(s3.getJob("R").holdsGlobalSlot, false);
   assert.equal(s3.getSnapshot().providers["s.com"].gate.state, "recovering");
   assert.equal(s3.getSnapshot().providers["s.com"].gate.ownerJobId, null);
@@ -2008,8 +2012,8 @@ test("exhausted failed waiter terminalizes; next eligible waiter becomes recover
     status: "completed",
     failureCategory: null,
   });
-  // Exhausted failed waiter must terminalize (not requeue forever).
-  assert.equal(s.getJob("exhausted").state, "failed");
+  // Task 11 migration: exhausted failed waiter → needs_user (not requeue, not failed).
+  assert.equal(s.getJob("exhausted").state, "needs_user");
   assert.equal(s.getJob("exhausted").holdsGlobalSlot, false);
   assert.equal(s.getJob("exhausted").autoWakeCount, 0);
   // Eligible paused-only zero-budget waiter progresses as recovery owner.
@@ -2052,7 +2056,8 @@ test("exhausted failed waiter as sole waiter terminalizes; gate recovers blocked
     status: "completed",
     failureCategory: null,
   });
-  assert.equal(s.getJob("exhausted").state, "failed");
+  // Task 11 migration: exhausted sole failed waiter → needs_user (not failed).
+  assert.equal(s.getJob("exhausted").state, "needs_user");
   assert.equal(s.getJob("exhausted").holdsGlobalSlot, false);
   assert.equal(s.getJob("exhausted").autoWakeCount, 0);
   assert.equal(s.getSnapshot().providers["p.com"].gate.state, "recovering");
