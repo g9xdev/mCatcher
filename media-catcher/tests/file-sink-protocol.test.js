@@ -162,8 +162,20 @@ test("dual-export assigns exact McFileSinkProtocol global identity", () => {
   assert.equal(typeof root.McFileSinkProtocol.createFileSinkSession, "function");
   assert.equal(typeof root.McFileSinkProtocol.buildPgetCmd, "function");
   assert.equal(typeof root.McFileSinkProtocol.buildPgetSingleCmd, "function");
+  assert.equal(typeof root.McFileSinkProtocol.buildPgetSetLimitCmd, "function");
+  assert.equal(typeof root.McFileSinkProtocol.buildPgetCancelCmd, "function");
   assert.equal(root.McFileSinkProtocol.MAX_UNACKED, 4);
   assert.equal(root.McFileSinkProtocol.MAX_CHUNK_BYTES, MAX_CHUNK);
+  assert.equal(Object.isFrozen(root.McFileSinkProtocol), true);
+  assert.deepEqual(Object.keys(root.McFileSinkProtocol).sort(), [
+    "MAX_CHUNK_BYTES",
+    "MAX_UNACKED",
+    "buildPgetCancelCmd",
+    "buildPgetCmd",
+    "buildPgetSetLimitCmd",
+    "buildPgetSingleCmd",
+    "createFileSinkSession",
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1135,8 +1147,9 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
   const { buildPgetCmd, buildPgetSingleCmd } = loadProtocol();
   let cookieTouches = 0;
   let headerTouches = 0;
-  let referrerTouches = 0;
+  let originTouches = 0;
   let pageTitleTouches = 0;
+  let userActionTokenTouches = 0;
   const intent = {
     requestedFilename: FLOREN,
     destinationDirectory: "D:\\\\Vids",
@@ -1159,10 +1172,10 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
       return { Authorization: "Bearer x", Cookie: "a=b" };
     },
   });
-  Object.defineProperty(intent, "referrer", {
+  Object.defineProperty(intent, "origin", {
     enumerable: true,
     get() {
-      referrerTouches++;
+      originTouches++;
       return "https://evil";
     },
   });
@@ -1180,14 +1193,46 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
       return { url: "https://cdn/other.mp4" };
     },
   });
-
-  const pget = buildPgetCmd({
+  const input = {
     jobId: "j1",
     attemptToken: "a1",
     intent,
     url: "https://cdn/x.mp4?sig=SECRET",
     maxConnections: 4,
+    providerGeneration: 3,
+    referer: "https://page.example/watch",
+    userAgent: "TestUA/1.0",
+  };
+  Object.defineProperty(input, "cookie", {
+    enumerable: true,
+    get() {
+      cookieTouches++;
+      return "session=SECRET";
+    },
   });
+  Object.defineProperty(input, "headers", {
+    enumerable: true,
+    get() {
+      headerTouches++;
+      return { Authorization: "Bearer SECRET" };
+    },
+  });
+  Object.defineProperty(input, "Authorization", {
+    enumerable: true,
+    get() {
+      headerTouches++;
+      return "Bearer SECRET";
+    },
+  });
+  Object.defineProperty(input, "userActionToken", {
+    enumerable: true,
+    get() {
+      userActionTokenTouches++;
+      return "must-not-touch";
+    },
+  });
+
+  const pget = buildPgetCmd(input);
   assertFrozenAllowlist(pget, [
     "cmd",
     "id",
@@ -1196,6 +1241,9 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
     "name",
     "dir",
     "maxConnections",
+    "providerGeneration",
+    "referer",
+    "userAgent",
   ]);
   assert.deepEqual(pget, {
     cmd: "pget",
@@ -1205,6 +1253,9 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
     name: FLOREN,
     dir: "D:\\\\Vids",
     maxConnections: 4,
+    providerGeneration: 3,
+    referer: "https://page.example/watch",
+    userAgent: "TestUA/1.0",
   });
   assert.equal(Object.isFrozen(pget.urls), true);
 
@@ -1213,6 +1264,7 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
     attemptToken: "a2",
     intent,
     url: "https://cdn/x.mp4?sig=SECRET",
+    providerGeneration: 0,
   });
   assertFrozenAllowlist(single, [
     "cmd",
@@ -1222,6 +1274,9 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
     "name",
     "dir",
     "maxConnections",
+    "providerGeneration",
+    "referer",
+    "userAgent",
   ]);
   assert.deepEqual(single, {
     cmd: "pget-single",
@@ -1231,12 +1286,16 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
     name: FLOREN,
     dir: "D:\\\\Vids",
     maxConnections: 1,
+    providerGeneration: 0,
+    referer: "",
+    userAgent: "",
   });
 
   assert.equal(cookieTouches, 0);
   assert.equal(headerTouches, 0);
-  assert.equal(referrerTouches, 0);
+  assert.equal(originTouches, 0);
   assert.equal(pageTitleTouches, 0);
+  assert.equal(userActionTokenTouches, 0);
 
   // Fresh objects each call
   const again = buildPgetCmd({
@@ -1245,6 +1304,9 @@ test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without t
     intent,
     url: "https://cdn/x.mp4?sig=SECRET",
     maxConnections: 4,
+    providerGeneration: 3,
+    referer: "https://page.example/watch",
+    userAgent: "TestUA/1.0",
   });
   assert.notEqual(again, pget);
   assert.notEqual(again.urls, pget.urls);
@@ -1262,6 +1324,7 @@ test("builders reject malformed identities/intent/url/concurrency", () => {
     intent: goodIntent,
     url: "https://cdn/x.mp4",
     maxConnections: 2,
+    providerGeneration: 0,
   };
 
   assert.throws(() => buildPgetCmd({ ...good, jobId: "" }));
@@ -1272,6 +1335,11 @@ test("builders reject malformed identities/intent/url/concurrency", () => {
   assert.throws(() => buildPgetCmd({ ...good, maxConnections: -1 }));
   assert.throws(() => buildPgetCmd({ ...good, maxConnections: 1.5 }));
   assert.throws(() => buildPgetCmd({ ...good, maxConnections: true }));
+  assert.throws(() => buildPgetCmd({ ...good, providerGeneration: -1 }));
+  assert.throws(() => buildPgetCmd({ ...good, providerGeneration: 1.5 }));
+  assert.throws(() => buildPgetCmd({ ...good, providerGeneration: "0" }));
+  assert.throws(() => buildPgetCmd({ ...good, providerGeneration: true }));
+  assert.throws(() => buildPgetCmd({ ...good, providerGeneration: null }));
   assert.throws(() =>
     buildPgetCmd({
       ...good,
@@ -1286,12 +1354,292 @@ test("builders reject malformed identities/intent/url/concurrency", () => {
   );
   assert.throws(() => buildPgetCmd({ ...good, intent: null }));
   assert.throws(() => buildPgetSingleCmd({ ...good, url: null }));
+  assert.throws(() => buildPgetCmd({ ...good, referer: "x\ny" }));
+  assert.throws(() => buildPgetCmd({ ...good, userAgent: "x\u0000y" }));
+  assert.throws(() => buildPgetCmd({ ...good, referer: 12 }));
+  assert.throws(() => buildPgetCmd({ ...good, userAgent: { v: "x" } }));
 
   const defaultDir = buildPgetCmd({
     ...good,
     intent: { requestedFilename: FLOREN },
   });
   assert.equal(defaultDir.dir, null);
+  assert.equal(defaultDir.providerGeneration, 0);
+  assert.equal(defaultDir.referer, "");
+  assert.equal(defaultDir.userAgent, "");
+});
+
+test("builders preserve primary+mirrors byte-for-byte with exact-string dedupe and freeze", () => {
+  const { buildPgetCmd, buildPgetSingleCmd } = loadProtocol();
+  const intent = {
+    requestedFilename: FLOREN,
+    destinationDirectory: null,
+  };
+  const primary = "https://cdn/x.mp4?sig=A&exp=1";
+  const mirrorSame = "https://cdn/x.mp4?sig=A&exp=1";
+  const mirrorB = "https://mirror/x.mp4?sig=B";
+  const mirrorC = "https://cdn/x.mp4?sig=C";
+  const pget = buildPgetCmd({
+    jobId: "j1",
+    attemptToken: "a1",
+    intent,
+    url: primary,
+    mirrors: [mirrorSame, mirrorB, "", "  ", null, 12, mirrorC, mirrorB, { u: mirrorC }],
+    maxConnections: 3,
+    providerGeneration: 2,
+  });
+  assert.deepEqual(pget.urls, [primary, mirrorB, mirrorC]);
+  assert.equal(pget.urls[0], primary);
+  assert.equal(Object.isFrozen(pget), true);
+  assert.equal(Object.isFrozen(pget.urls), true);
+  assert.throws(() => {
+    pget.urls.push("https://evil");
+  });
+
+  const single = buildPgetSingleCmd({
+    jobId: "j1",
+    attemptToken: "a2",
+    intent,
+    url: primary,
+    mirrors: [mirrorB, primary, mirrorB],
+    providerGeneration: 1,
+    referer: "https://ref",
+    userAgent: "UA",
+  });
+  assert.equal(single.maxConnections, 1);
+  assert.deepEqual(single.urls, [primary, mirrorB]);
+  assert.equal(single.providerGeneration, 1);
+  assert.equal(single.referer, "https://ref");
+  assert.equal(single.userAgent, "UA");
+});
+
+test("builders and file-open resolve effectiveDestinationDirectory without conflicting overrides", () => {
+  const {
+    buildPgetCmd,
+    buildPgetSingleCmd,
+    createFileSinkSession,
+  } = loadProtocol();
+  const intentNull = {
+    requestedFilename: FLOREN,
+    destinationDirectory: null,
+  };
+  const intentSave = {
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\Vids",
+  };
+
+  const fromEffective = buildPgetCmd({
+    jobId: "j1",
+    attemptToken: "a1",
+    intent: intentNull,
+    url: "https://cdn/x.mp4",
+    maxConnections: 2,
+    providerGeneration: 0,
+    effectiveDestinationDirectory: "E:\\\\Default",
+  });
+  assert.equal(fromEffective.dir, "E:\\\\Default");
+
+  // Non-null intent is authoritative when no effective override is supplied.
+  const intentOnly = buildPgetSingleCmd({
+    jobId: "j1",
+    attemptToken: "a2",
+    intent: intentSave,
+    url: "https://cdn/x.mp4",
+    providerGeneration: 0,
+  });
+  assert.equal(intentOnly.dir, "D:\\\\Vids");
+
+  // Matching non-null effective is accepted (no conflict).
+  const matching = buildPgetCmd({
+    jobId: "j1",
+    attemptToken: "a3",
+    intent: intentSave,
+    url: "https://cdn/x.mp4",
+    maxConnections: 1,
+    providerGeneration: 0,
+    effectiveDestinationDirectory: "D:\\\\Vids",
+  });
+  assert.equal(matching.dir, "D:\\\\Vids");
+
+  // Conflicting non-null overrides fail closed.
+  assert.throws(() =>
+    buildPgetCmd({
+      jobId: "j1",
+      attemptToken: "a4",
+      intent: intentSave,
+      url: "https://cdn/x.mp4",
+      maxConnections: 1,
+      providerGeneration: 0,
+      effectiveDestinationDirectory: "E:\\\\Other",
+    })
+  );
+  assert.throws(() =>
+    buildPgetCmd({
+      jobId: "j1",
+      attemptToken: "a5",
+      intent: intentNull,
+      url: "https://cdn/x.mp4",
+      maxConnections: 1,
+      providerGeneration: 0,
+      effectiveDestinationDirectory: "",
+    })
+  );
+  assert.throws(() =>
+    buildPgetCmd({
+      jobId: "j1",
+      attemptToken: "a6",
+      intent: intentNull,
+      url: "https://cdn/x.mp4",
+      maxConnections: 1,
+      providerGeneration: 0,
+      effectiveDestinationDirectory: "  ",
+    })
+  );
+  assert.throws(() =>
+    buildPgetCmd({
+      jobId: "j1",
+      attemptToken: "a7",
+      intent: intentNull,
+      url: "https://cdn/x.mp4",
+      maxConnections: 1,
+      providerGeneration: 0,
+      effectiveDestinationDirectory: { path: "E:\\\\x" },
+    })
+  );
+
+  const sinkEffective = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a8",
+    requestedFilename: FLOREN,
+    destinationDirectory: null,
+    effectiveDestinationDirectory: "F:\\\\Sink",
+  });
+  assert.equal(sinkEffective.destinationDirectory, "F:\\\\Sink");
+  assert.equal(sinkEffective.openCmd().dir, "F:\\\\Sink");
+
+  const sinkIntentOnly = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a9",
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\Vids",
+  });
+  assert.equal(sinkIntentOnly.destinationDirectory, "D:\\\\Vids");
+  assert.equal(sinkIntentOnly.openCmd().dir, "D:\\\\Vids");
+
+  const sinkMatching = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a9b",
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\Vids",
+    effectiveDestinationDirectory: "D:\\\\Vids",
+  });
+  assert.equal(sinkMatching.destinationDirectory, "D:\\\\Vids");
+
+  assert.throws(() =>
+    createFileSinkSession({
+      jobId: "j1",
+      attemptToken: "a10",
+      requestedFilename: FLOREN,
+      destinationDirectory: "D:\\\\Vids",
+      effectiveDestinationDirectory: "F:\\\\Other",
+    })
+  );
+  assert.throws(() =>
+    createFileSinkSession({
+      jobId: "j1",
+      attemptToken: "a11",
+      requestedFilename: FLOREN,
+      destinationDirectory: null,
+      effectiveDestinationDirectory: "",
+    })
+  );
+});
+
+test("control builders emit set-limit and cancel with exact attempt fencing", () => {
+  const { buildPgetSetLimitCmd, buildPgetCancelCmd } = loadProtocol();
+  const limit = buildPgetSetLimitCmd({
+    jobId: "j1",
+    attemptToken: "atk-live",
+    providerGeneration: 7,
+    maxConnections: 0,
+  });
+  assertFrozenAllowlist(limit, [
+    "cmd",
+    "id",
+    "attemptToken",
+    "providerGeneration",
+    "maxConnections",
+  ]);
+  assert.deepEqual(limit, {
+    cmd: "pget-set-limit",
+    id: "j1",
+    attemptToken: "atk-live",
+    providerGeneration: 7,
+    maxConnections: 0,
+  });
+
+  const limitPos = buildPgetSetLimitCmd({
+    jobId: "j1",
+    attemptToken: "atk-live",
+    providerGeneration: 0,
+    maxConnections: 3,
+  });
+  assert.equal(limitPos.maxConnections, 3);
+  assert.equal(limitPos.providerGeneration, 0);
+
+  const cancel = buildPgetCancelCmd({
+    jobId: "j1",
+    attemptToken: "atk-cancel",
+  });
+  assertFrozenAllowlist(cancel, ["cmd", "id", "attemptToken"]);
+  assert.deepEqual(cancel, {
+    cmd: "pget-cancel",
+    id: "j1",
+    attemptToken: "atk-cancel",
+  });
+
+  assert.throws(() =>
+    buildPgetSetLimitCmd({
+      jobId: "j1",
+      attemptToken: "a",
+      providerGeneration: -1,
+      maxConnections: 0,
+    })
+  );
+  assert.throws(() =>
+    buildPgetSetLimitCmd({
+      jobId: "j1",
+      attemptToken: "a",
+      providerGeneration: 1,
+      maxConnections: -1,
+    })
+  );
+  assert.throws(() =>
+    buildPgetSetLimitCmd({
+      jobId: "j1",
+      attemptToken: "a",
+      providerGeneration: 1,
+      maxConnections: 1.5,
+    })
+  );
+  assert.throws(() =>
+    buildPgetSetLimitCmd({
+      jobId: "",
+      attemptToken: "a",
+      providerGeneration: 1,
+      maxConnections: 0,
+    })
+  );
+  assert.throws(() =>
+    buildPgetSetLimitCmd({
+      jobId: "j1",
+      attemptToken: "  ",
+      providerGeneration: 1,
+      maxConnections: 0,
+    })
+  );
+  assert.throws(() => buildPgetCancelCmd({ jobId: "j1", attemptToken: "" }));
+  assert.throws(() => buildPgetCancelCmd({ jobId: "  ", attemptToken: "a" }));
 });
 
 // ---------------------------------------------------------------------------
@@ -1320,11 +1668,11 @@ test("file-sink-protocol source contains no downloads/firefox/storage/privacy le
     /rankFilename|filename-ranker|McFilenameRanker/,
     /cookie/i,
     /Authorization/,
-    /referr?er/i,
-    /userAgent/,
     /nativeMessaging|runtime\.connectNative|port\.postMessage/,
   ];
   for (const re of forbidden) {
     assert.equal(re.test(src), false, `forbidden pattern ${re} found in source`);
   }
+  // Explicit referer/userAgent HTTP-context fields are allowlisted; generic header bags are not.
+  assert.equal(/headers\s*[:=]/.test(src), false);
 });
