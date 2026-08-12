@@ -91,13 +91,31 @@
         if (proto === null || proto === Object.prototype) return true;
         // Realm-agnostic: accept plain objects from another VM/window Object.
         if (proto && Object.getPrototypeOf(proto) === null) {
-          // Another realm's Object.prototype ends the chain at null.
           return true;
         }
         return false;
       } catch (e) {
         return false;
       }
+    }
+
+    /** Stable host reason token: lowercase alnum plus _/- , max 64. */
+    function isStableHostReason(v) {
+      return typeof v === "string" && /^[a-z0-9_-]{1,64}$/.test(v);
+    }
+
+    /**
+     * Local filesystem path for file-committed. Rejects control chars,
+     * network scheme:// / scheme-relative URLs, and Cookie/Authorization syntax.
+     */
+    function isSafeLocalFilePath(v) {
+      if (!isNonblankPrimitiveString(v)) return false;
+      if (/[\u0000-\u001f\u007f]/.test(v)) return false;
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v)) return false;
+      if (/^\/\//.test(v)) return false;
+      if (/Cookie\s*:/i.test(v)) return false;
+      if (/Authorization\s*:/i.test(v)) return false;
+      return true;
     }
 
     /**
@@ -116,6 +134,26 @@
         return { ok: true, value: desc.value };
       } catch (e) {
         return { ok: false };
+      }
+    }
+
+    /**
+     * Own-key presence without invoking accessors. { present, data?, value? }
+     * present+!data means accessor or non-data descriptor.
+     */
+    function ownKeyState(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { present: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc) return { present: false };
+        if (desc.get || desc.set || !("value" in desc)) {
+          return { present: true, data: false };
+        }
+        return { present: true, data: true, value: desc.value };
+      } catch (e) {
+        return { present: false };
       }
     }
 
@@ -141,18 +179,21 @@
     ALLOWED_PART_STATES.partial = true;
     ALLOWED_PART_STATES.committed = true;
 
+    var KNOWN_FAILURE_CATEGORIES = Object.create(null);
+    KNOWN_FAILURE_CATEGORIES.timeout = true;
+    KNOWN_FAILURE_CATEGORIES.connection_reset = true;
+    KNOWN_FAILURE_CATEGORIES.short_read = true;
+    KNOWN_FAILURE_CATEGORIES.http_429 = true;
+    KNOWN_FAILURE_CATEGORIES.http_5xx_temporary = true;
+    KNOWN_FAILURE_CATEGORIES.range_unsupported = true;
+    KNOWN_FAILURE_CATEGORIES.local_io = true;
+    KNOWN_FAILURE_CATEGORIES.cancelled = true;
+    KNOWN_FAILURE_CATEGORIES.permanent = true;
+
     function readNonblankOwnString(obj, key) {
       var r = ownData(obj, key);
       if (!r.ok || !isNonblankPrimitiveString(r.value)) return null;
       return r.value;
-    }
-
-    function readPrimitiveOrNull(obj, key, predicate) {
-      var r = ownData(obj, key);
-      if (!r.ok) return { ok: false };
-      if (r.value === null) return { ok: true, value: null };
-      if (!predicate(r.value)) return { ok: false };
-      return { ok: true, value: r.value };
     }
 
     function cloneSixKeyIntent(intent, requireFirefoxTrue) {
@@ -193,6 +234,20 @@
       });
     }
 
+    /**
+     * Normalize pget failureCategory after status/mode/part are validated.
+     * rawCat is null or a primitive string (objects already rejected).
+     */
+    function normalizePgetFailureCategory(status, rawCat) {
+      if (status === "completed") return null;
+      if (status === "cancelled") return "cancelled";
+      // failed
+      if (isPrimitiveString(rawCat) && KNOWN_FAILURE_CATEGORIES[rawCat]) {
+        return rawCat;
+      }
+      return "permanent";
+    }
+
     function routePgetResult(message) {
       var id = readNonblankOwnString(message, "id");
       var attemptToken = readNonblankOwnString(message, "attemptToken");
@@ -202,30 +257,44 @@
       var modeR = ownData(message, "mode");
       var partR = ownData(message, "partState");
       if (!statusR.ok || !modeR.ok || !partR.ok) return ignoreDecision();
-      if (!ALLOWED_PGET_STATUSES[statusR.value]) return ignoreDecision();
-      if (!ALLOWED_PGET_MODES[modeR.value]) return ignoreDecision();
-      if (!ALLOWED_PART_STATES[partR.value]) return ignoreDecision();
 
-      var catR = ownData(message, "failureCategory");
-      // failureCategory may be absent only as null for completed-like terminals;
-      // require own data null or primitive string when present for allowlist copy.
-      var failureCategory;
-      if (!catR.ok) {
-        // Missing own data property — treat as absent/null only for structural copy.
-        failureCategory = null;
-      } else if (catR.value === null) {
-        failureCategory = null;
-      } else if (isPrimitiveString(catR.value)) {
-        failureCategory = catR.value;
+      // Primitive string only — never property-index with objects (no coercion).
+      var status = statusR.value;
+      var mode = modeR.value;
+      var partState = partR.value;
+      if (!isPrimitiveString(status) || !ALLOWED_PGET_STATUSES[status]) {
+        return ignoreDecision();
+      }
+      if (!isPrimitiveString(mode) || !ALLOWED_PGET_MODES[mode]) {
+        return ignoreDecision();
+      }
+      if (!isPrimitiveString(partState) || !ALLOWED_PART_STATES[partState]) {
+        return ignoreDecision();
+      }
+
+      // failureCategory: absent → null; present accessor/non-data → ignore;
+      // null or primitive string only — never coerce objects.
+      var catState = ownKeyState(message, "failureCategory");
+      var rawCategory;
+      if (!catState.present) {
+        rawCategory = null;
+      } else if (!catState.data) {
+        return ignoreDecision();
+      } else if (catState.value === null) {
+        rawCategory = null;
+      } else if (isPrimitiveString(catState.value)) {
+        rawCategory = catState.value;
       } else {
         return ignoreDecision();
       }
 
+      var failureCategory = normalizePgetFailureCategory(status, rawCategory);
+
       if (
-        statusR.value === "failed" &&
-        modeR.value === "multi-range" &&
+        status === "failed" &&
+        mode === "multi-range" &&
         failureCategory === "range_unsupported" &&
-        partR.value === "empty"
+        partState === "empty"
       ) {
         return deepFreeze({
           action: "start-single-connection",
@@ -244,10 +313,10 @@
         invokeFirefox: false,
         jobId: id,
         attemptToken: attemptToken,
-        status: statusR.value,
-        mode: modeR.value,
+        status: status,
+        mode: mode,
         failureCategory: failureCategory,
-        partState: partR.value,
+        partState: partState,
       });
     }
 
@@ -299,7 +368,7 @@
         var fileR = ownData(message, "file");
         var bytesR = ownData(message, "bytes");
         if (!sinkC) return ignoreDecision();
-        if (!fileR.ok || !isNonblankPrimitiveString(fileR.value)) return ignoreDecision();
+        if (!fileR.ok || !isSafeLocalFilePath(fileR.value)) return ignoreDecision();
         if (!bytesR.ok || !isNonnegInt(bytesR.value)) return ignoreDecision();
         out.sinkId = sinkC;
         out.file = fileR.value;
@@ -317,7 +386,7 @@
         var tokA = ownData(message, "attemptToken");
         if (tokA.ok && isNonblankPrimitiveString(tokA.value)) out.attemptToken = tokA.value;
         var reasonA = ownData(message, "reason");
-        if (reasonA.ok && isPrimitiveString(reasonA.value)) out.reason = reasonA.value;
+        if (reasonA.ok && isStableHostReason(reasonA.value)) out.reason = reasonA.value;
       } else if (type === "file-error") {
         var jobE = readNonblankOwnString(message, "jobId");
         var tokE = readNonblankOwnString(message, "attemptToken");
@@ -330,16 +399,15 @@
         if (jobE) out.jobId = jobE;
         if (tokE) out.attemptToken = tokE;
         if (sinkVal) out.sinkId = sinkVal;
+        // Only exact local_io category; omit invalid. No status/path/bytes.
         var catE = ownData(message, "failureCategory");
-        if (catE.ok && isPrimitiveString(catE.value)) out.failureCategory = catE.value;
+        if (catE.ok && catE.value === "local_io") {
+          out.failureCategory = "local_io";
+        }
         var reasonE = ownData(message, "reason");
-        if (reasonE.ok && isPrimitiveString(reasonE.value)) out.reason = reasonE.value;
-        var statusE = ownData(message, "status");
-        if (statusE.ok && isPrimitiveString(statusE.value)) out.status = statusE.value;
-        var pathE = ownData(message, "path");
-        if (pathE.ok && isPrimitiveString(pathE.value)) out.path = pathE.value;
-        var bytesE = ownData(message, "bytes");
-        if (bytesE.ok && isNonnegInt(bytesE.value)) out.bytes = bytesE.value;
+        if (reasonE.ok && isStableHostReason(reasonE.value)) {
+          out.reason = reasonE.value;
+        }
       } else {
         return ignoreDecision();
       }
@@ -387,13 +455,19 @@
       return r.value;
     }
 
+    /**
+     * Item field allowlist with per-field types.
+     * detectionId/tabId: finite nonnegative integers.
+     * live: boolean only.
+     * other allowlisted fields: null | primitive string | finite number.
+     * No booleans/objects for filename/URL/kind/provider fields.
+     */
     function normalizeItem(item) {
       if (!isPlainRecord(item)) throw genericTypeError();
 
       var out = {};
-      var keys = [
+      var stringOrNumberKeys = [
         "id",
-        "tabId",
         "kind",
         "mode",
         "url",
@@ -406,24 +480,40 @@
         "knownExtension",
         "sourceContextId",
       ];
-      for (var i = 0; i < keys.length; i++) {
-        var k = keys[i];
+      for (var i = 0; i < stringOrNumberKeys.length; i++) {
+        var k = stringOrNumberKeys[i];
         var r = ownData(item, k);
         if (!r.ok) continue;
         var v = r.value;
-        if (v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
-          // Reject non-finite numbers; keep primitive/null only.
-          if (typeof v === "number" && !isFinite(v)) throw genericTypeError();
+        if (v === null || isPrimitiveString(v)) {
+          out[k] = v;
+        } else if (isFiniteNumber(v)) {
           out[k] = v;
         } else {
           throw genericTypeError();
         }
       }
 
-      var liveR = ownData(item, "live");
-      if (liveR.ok) {
-        if (typeof liveR.value !== "boolean") throw genericTypeError();
-        out.live = liveR.value;
+      // tabId: finite nonnegative integer only when present as own data.
+      var tabState = ownKeyState(item, "tabId");
+      if (tabState.present) {
+        if (!tabState.data || !isNonnegInt(tabState.value)) throw genericTypeError();
+        out.tabId = tabState.value;
+      }
+
+      // detectionId: finite nonnegative integer; present invalid/accessor fails.
+      var detState = ownKeyState(item, "detectionId");
+      if (detState.present) {
+        if (!detState.data || !isNonnegInt(detState.value)) throw genericTypeError();
+        out.detectionId = detState.value;
+      }
+
+      var liveState = ownKeyState(item, "live");
+      if (liveState.present) {
+        if (!liveState.data || typeof liveState.value !== "boolean") {
+          throw genericTypeError();
+        }
+        out.live = liveState.value;
       }
 
       return deepFreeze(out);
@@ -483,108 +573,71 @@
     }
 
     function normalizeDownloadRequest(message) {
-      try {
-        if (!message || typeof message !== "object") throw genericTypeError();
+      // Input/reflection validation — always generic TypeError, no hostile text.
+      if (!message || typeof message !== "object") throw genericTypeError();
 
-        var type = requireOwnData(message, "type");
-        if (type !== "download" && type !== "save-as-download") {
-          throw genericTypeError();
-        }
-
-        var tabId = requireOwnData(message, "tabId");
-        if (!isNonnegInt(tabId)) throw genericTypeError();
-
-        var itemRaw = requireOwnData(message, "item");
-        var item = normalizeItem(itemRaw);
-
-        var intent;
-        var intentR = ownData(message, "intent");
-        if (!intentR.ok || intentR.value === null || intentR.value === undefined) {
-          var topToken = ownData(message, "userActionToken");
-          if (!topToken.ok || !isNonblankPrimitiveString(topToken.value)) {
-            throw genericTypeError();
-          }
-          var proposed = null;
-          if (isNonblankPrimitiveString(item.proposedFilename)) {
-            proposed = item.proposedFilename;
-          } else if (isNonblankPrimitiveString(item.name)) {
-            proposed = item.name;
-          } else {
-            throw genericTypeError();
-          }
-          var IntentApi = resolveDownloadIntent();
-          intent = IntentApi.createDefaultIntent({
-            proposedFilename: proposed,
-            userActionToken: topToken.value,
-            destinationDirectory: null,
-          });
-          // Fresh exact six-key clone so caller mutation of dependency output cannot alias.
-          intent = deepFreeze({
-            requestedFilename: intent.requestedFilename,
-            destinationDirectory:
-              intent.destinationDirectory === undefined
-                ? null
-                : intent.destinationDirectory,
-            saveMode: intent.saveMode,
-            userSelectedFirefox: intent.userSelectedFirefox,
-            userActionToken: intent.userActionToken,
-            createdAt: intent.createdAt,
-          });
-        } else {
-          intent = cloneSixKeyIntent(intentR.value, false);
-          if (!intent) throw genericTypeError();
-        }
-
-        var sel = normalizeSelectionFields(message);
-
-        return deepFreeze({
-          type: "download",
-          tabId: tabId,
-          item: item,
-          intent: intent,
-          variantUrl: sel.variantUrl,
-          variantId: sel.variantId,
-          ytHeight: sel.ytHeight,
-          ytAudioOnly: sel.ytAudioOnly,
-        });
-      } catch (e) {
-        if (e && e.name === "TypeError") {
-          // Propagate dependency TypeErrors that are already generic enough, but
-          // never rethrow hostile Proxy/trap text from accessors.
-          if (
-            e.message === "invalid download message" ||
-            (typeof e.message === "string" &&
-              e.message.indexOf("must be") !== -1 &&
-              e.message.indexOf("SECRET") === -1)
-          ) {
-            // Re-wrap dependency validation as generic unless it is our own.
-            if (e.message === "invalid download message") throw e;
-          }
-        }
-        // Dependency load failures (Error from require) must propagate unchanged.
-        if (
-          e &&
-          typeof e.message === "string" &&
-          (e.message.indexOf("simulated ") === 0 ||
-            e.message.indexOf("Cannot find module") !== -1 ||
-            e.message.indexOf("is required for DownloadMessageRouter") !== -1 ||
-            e.message.indexOf("McDownloadIntent") !== -1 ||
-            e.message.indexOf("McFilenameRanker") !== -1)
-        ) {
-          throw e;
-        }
-        if (e && e.name === "Error" && typeof e.message === "string") {
-          // Propagate plain dependency failures (createDefaultIntent validation, require).
-          if (
-            e.message.indexOf("proposedFilename") !== -1 ||
-            e.message.indexOf("userActionToken") !== -1 ||
-            e.message.indexOf("load failure") !== -1
-          ) {
-            throw e;
-          }
-        }
+      var type = requireOwnData(message, "type");
+      if (type !== "download" && type !== "save-as-download") {
         throw genericTypeError();
       }
+
+      var tabId = requireOwnData(message, "tabId");
+      if (!isNonnegInt(tabId)) throw genericTypeError();
+
+      var itemRaw = requireOwnData(message, "item");
+      var item = normalizeItem(itemRaw);
+
+      var sel = normalizeSelectionFields(message);
+
+      var intentR = ownData(message, "intent");
+      var intent;
+      if (!intentR.ok || intentR.value === null || intentR.value === undefined) {
+        var topToken = ownData(message, "userActionToken");
+        if (!topToken.ok || !isNonblankPrimitiveString(topToken.value)) {
+          throw genericTypeError();
+        }
+        var proposed = null;
+        if (isNonblankPrimitiveString(item.proposedFilename)) {
+          proposed = item.proposedFilename;
+        } else if (isNonblankPrimitiveString(item.name)) {
+          proposed = item.name;
+        } else {
+          throw genericTypeError();
+        }
+        // Sanitized inputs only — dependency load/runtime exceptions propagate by identity.
+        var IntentApi = resolveDownloadIntent();
+        var created = IntentApi.createDefaultIntent({
+          proposedFilename: proposed,
+          userActionToken: topToken.value,
+          destinationDirectory: null,
+        });
+        // Fresh exact six-key clone so caller mutation of dependency output cannot alias.
+        intent = deepFreeze({
+          requestedFilename: created.requestedFilename,
+          destinationDirectory:
+            created.destinationDirectory === undefined
+              ? null
+              : created.destinationDirectory,
+          saveMode: created.saveMode,
+          userSelectedFirefox: created.userSelectedFirefox,
+          userActionToken: created.userActionToken,
+          createdAt: created.createdAt,
+        });
+      } else {
+        intent = cloneSixKeyIntent(intentR.value, false);
+        if (!intent) throw genericTypeError();
+      }
+
+      return deepFreeze({
+        type: "download",
+        tabId: tabId,
+        item: item,
+        intent: intent,
+        variantUrl: sel.variantUrl,
+        variantId: sel.variantId,
+        ytHeight: sel.ytHeight,
+        ytAudioOnly: sel.ytAudioOnly,
+      });
     }
 
     function readExactSixKeyIntent(intent) {
@@ -627,79 +680,67 @@
     }
 
     function buildNativeStartPayload(input) {
-      try {
-        if (!input || typeof input !== "object") throw genericTypeError();
+      // Input/reflection validation — always generic TypeError.
+      if (!input || typeof input !== "object") throw genericTypeError();
 
-        var kind = requireOwnData(input, "kind");
-        if (kind !== "pget" && kind !== "pget-single" && kind !== "file-open") {
-          throw genericTypeError();
-        }
-
-        var jobId = requireOwnData(input, "jobId");
-        if (!isNonblankPrimitiveString(jobId)) throw genericTypeError();
-
-        var attemptToken = requireOwnData(input, "attemptToken");
-        if (!isNonblankPrimitiveString(attemptToken)) throw genericTypeError();
-
-        var intentRaw = requireOwnData(input, "intent");
-        var intent = readExactSixKeyIntent(intentRaw);
-
-        var Protocol = resolveFileSinkProtocol();
-
-        if (kind === "pget") {
-          var url = requireOwnData(input, "url");
-          if (!isNonblankPrimitiveString(url)) throw genericTypeError();
-          var maxConnections = requireOwnData(input, "maxConnections");
-          if (!isPositiveInt(maxConnections)) throw genericTypeError();
-          return Protocol.buildPgetCmd({
-            jobId: jobId,
-            attemptToken: attemptToken,
-            intent: intent,
-            url: url,
-            maxConnections: maxConnections,
-          });
-        }
-
-        if (kind === "pget-single") {
-          var urlSingle = requireOwnData(input, "url");
-          if (!isNonblankPrimitiveString(urlSingle)) throw genericTypeError();
-          return Protocol.buildPgetSingleCmd({
-            jobId: jobId,
-            attemptToken: attemptToken,
-            intent: intent,
-            url: urlSingle,
-          });
-        }
-
-        // file-open — never include media URL or userActionToken in host command.
-        var session = Protocol.createFileSinkSession({
-          jobId: jobId,
-          attemptToken: attemptToken,
-          requestedFilename: intent.requestedFilename,
-          destinationDirectory: intent.destinationDirectory,
-        });
-        var openCmd = session.openCmd();
-        if (!openCmd) throw genericTypeError();
-        return openCmd;
-      } catch (e) {
-        // Propagate dependency load failures unchanged.
-        if (
-          e &&
-          typeof e.message === "string" &&
-          (e.message.indexOf("simulated ") === 0 ||
-            e.message.indexOf("Cannot find module") !== -1 ||
-            e.message.indexOf("is required for DownloadMessageRouter") !== -1 ||
-            e.message.indexOf("McFileSinkProtocol") !== -1 ||
-            e.message.indexOf("load failure") !== -1)
-        ) {
-          throw e;
-        }
-        // Propagate protocol TypeErrors (missing filename, bad maxConnections, etc.).
-        if (e && e.name === "TypeError") {
-          throw e;
-        }
+      var kind = requireOwnData(input, "kind");
+      if (kind !== "pget" && kind !== "pget-single" && kind !== "file-open") {
         throw genericTypeError();
       }
+
+      var jobId = requireOwnData(input, "jobId");
+      if (!isNonblankPrimitiveString(jobId)) throw genericTypeError();
+
+      var attemptToken = requireOwnData(input, "attemptToken");
+      if (!isNonblankPrimitiveString(attemptToken)) throw genericTypeError();
+
+      var intentRaw = requireOwnData(input, "intent");
+      var intent = readExactSixKeyIntent(intentRaw);
+
+      var url = null;
+      var maxConnections = null;
+      if (kind === "pget") {
+        url = requireOwnData(input, "url");
+        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
+        maxConnections = requireOwnData(input, "maxConnections");
+        if (!isPositiveInt(maxConnections)) throw genericTypeError();
+      } else if (kind === "pget-single") {
+        url = requireOwnData(input, "url");
+        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
+      }
+
+      // Sanitized inputs only — dependency load/runtime exceptions propagate by identity.
+      var Protocol = resolveFileSinkProtocol();
+
+      if (kind === "pget") {
+        return Protocol.buildPgetCmd({
+          jobId: jobId,
+          attemptToken: attemptToken,
+          intent: intent,
+          url: url,
+          maxConnections: maxConnections,
+        });
+      }
+
+      if (kind === "pget-single") {
+        return Protocol.buildPgetSingleCmd({
+          jobId: jobId,
+          attemptToken: attemptToken,
+          intent: intent,
+          url: url,
+        });
+      }
+
+      // file-open — never include media URL or userActionToken in host command.
+      var session = Protocol.createFileSinkSession({
+        jobId: jobId,
+        attemptToken: attemptToken,
+        requestedFilename: intent.requestedFilename,
+        destinationDirectory: intent.destinationDirectory,
+      });
+      var openCmd = session.openCmd();
+      if (!openCmd) throw genericTypeError();
+      return openCmd;
     }
 
     return Object.freeze({

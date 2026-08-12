@@ -859,8 +859,18 @@ test("file-sink host messages route allowlisted fields without secret extras", (
   assert.equal(err.message.failureCategory, "local_io");
   assert.equal(err.message.reason, "write-failed");
   assert.equal(Object.prototype.hasOwnProperty.call(err.message, "cookie"), false);
-  // path is allowlisted when primitive; cookie is not
-  assert.equal(err.message.path, "C:\\\\secret\\\\path");
+  // file-error carries only type, optional sinkId, jobId, attemptToken, local_io, stable reason
+  assert.equal(Object.prototype.hasOwnProperty.call(err.message, "path"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(err.message, "status"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(err.message, "bytes"), false);
+  assert.deepEqual(Object.keys(err.message).sort(), [
+    "attemptToken",
+    "failureCategory",
+    "jobId",
+    "reason",
+    "sinkId",
+    "type",
+  ]);
 
   // Malformed identity → ignore
   for (const msg of [
@@ -1400,4 +1410,551 @@ test("module source has no downloads, storage, logging, random, spread, or input
   assert.equal(/for\s*\(\s*const\s+\w+\s+in\s+message\s*\)/.test(src), false);
   assert.equal(/Object\.keys\(\s*message\s*\)/.test(src), false);
   assert.equal(/Object\.assign\(\s*\{\s*\}\s*,\s*message\s*\)/.test(src), false);
+});
+
+// ---------------------------------------------------------------------------
+// Task 20a hardenings — enum poison, category normalize, secrets, detectionId
+// ---------------------------------------------------------------------------
+
+function makeCoercionPoison(returnValue) {
+  let hits = 0;
+  const poison = {
+    [Symbol.toPrimitive]() {
+      hits += 1;
+      return returnValue;
+    },
+    toString() {
+      hits += 1;
+      return String(returnValue);
+    },
+    valueOf() {
+      hits += 1;
+      return returnValue;
+    },
+  };
+  return {
+    poison,
+    hits() {
+      return hits;
+    },
+  };
+}
+
+test("pget-result enum fields reject hostile objects without coercion or indexing", () => {
+  const { routeNativeMessage } = loadRouter();
+  const fields = [
+    { key: "status", good: "completed" },
+    { key: "mode", good: "multi-range" },
+    { key: "partState", good: "committed" },
+    { key: "failureCategory", good: "timeout" },
+  ];
+  for (const field of fields) {
+    const { poison, hits } = makeCoercionPoison(field.good);
+    const msg = {
+      type: "pget-result",
+      id: "j",
+      attemptToken: "a",
+      status: "completed",
+      mode: "multi-range",
+      failureCategory: null,
+      partState: "committed",
+    };
+    msg[field.key] = poison;
+    const out = routeNativeMessage(msg);
+    assert.deepEqual(
+      out,
+      { action: "ignore", invokeFirefox: false },
+      `field=${field.key} must ignore hostile object`
+    );
+    assert.equal(hits(), 0, `field=${field.key} must not coerce`);
+    assert.equal(out.status, undefined);
+  }
+
+  // Accessors on enum fields must not be invoked.
+  for (const field of fields) {
+    let accessorHits = 0;
+    const msg = {
+      type: "pget-result",
+      id: "j",
+      attemptToken: "a",
+      status: "completed",
+      mode: "multi-range",
+      failureCategory: null,
+      partState: "committed",
+    };
+    Object.defineProperty(msg, field.key, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        accessorHits += 1;
+        return field.good;
+      },
+    });
+    const out = routeNativeMessage(msg);
+    assert.deepEqual(out, { action: "ignore", invokeFirefox: false });
+    assert.equal(accessorHits, 0, `field=${field.key} accessor must not run`);
+  }
+});
+
+test("pget-result normalizes failureCategory by status and known set only", () => {
+  const { routeNativeMessage } = loadRouter();
+  const base = {
+    type: "pget-result",
+    id: "j",
+    attemptToken: "a",
+    mode: "multi-range",
+    partState: "partial",
+  };
+
+  const completed = routeNativeMessage(
+    Object.assign({}, base, {
+      status: "completed",
+      failureCategory: "timeout",
+      partState: "committed",
+    })
+  );
+  assert.equal(completed.action, "transport-result");
+  assert.equal(completed.failureCategory, null);
+
+  const cancelled = routeNativeMessage(
+    Object.assign({}, base, {
+      status: "cancelled",
+      failureCategory: "timeout",
+    })
+  );
+  assert.equal(cancelled.action, "transport-result");
+  assert.equal(cancelled.failureCategory, "cancelled");
+
+  const known = [
+    "timeout",
+    "connection_reset",
+    "short_read",
+    "http_429",
+    "http_5xx_temporary",
+    "range_unsupported",
+    "local_io",
+    "cancelled",
+    "permanent",
+  ];
+  for (const cat of known) {
+    if (cat === "range_unsupported") continue; // empty multi-range switch covered elsewhere
+    const out = routeNativeMessage(
+      Object.assign({}, base, {
+        status: "failed",
+        failureCategory: cat,
+        partState: "partial",
+      })
+    );
+    assert.equal(out.action, "transport-result", cat);
+    assert.equal(out.failureCategory, cat, cat);
+  }
+
+  // empty multi-range range_unsupported switch remains exact
+  const switchOut = routeNativeMessage(
+    Object.assign({}, base, {
+      status: "failed",
+      failureCategory: "range_unsupported",
+      partState: "empty",
+    })
+  );
+  assert.equal(switchOut.action, "start-single-connection");
+  assert.equal(switchOut.failureCategory, "range_unsupported");
+
+  const unknownPrimitive = routeNativeMessage(
+    Object.assign({}, base, {
+      status: "failed",
+      failureCategory: "not_a_real_category",
+      partState: "partial",
+    })
+  );
+  assert.equal(unknownPrimitive.action, "transport-result");
+  assert.equal(unknownPrimitive.failureCategory, "permanent");
+
+  const nullFailed = routeNativeMessage(
+    Object.assign({}, base, {
+      status: "failed",
+      failureCategory: null,
+      partState: "partial",
+    })
+  );
+  assert.equal(nullFailed.action, "transport-result");
+  assert.equal(nullFailed.failureCategory, "permanent");
+
+  // malformed status/mode/part types ignore
+  for (const patch of [
+    { status: 1 },
+    { status: true },
+    { mode: 2 },
+    { partState: false },
+    { status: Object("completed") },
+  ]) {
+    const out = routeNativeMessage(
+      Object.assign(
+        {},
+        base,
+        {
+          status: "completed",
+          failureCategory: null,
+          partState: "committed",
+        },
+        patch
+      )
+    );
+    assert.deepEqual(out, { action: "ignore", invokeFirefox: false });
+  }
+});
+
+test("pget-result and file-error never raw-forward signed URL or header sentinels", () => {
+  const { routeNativeMessage } = loadRouter();
+  const secret =
+    "GET https://cdn/f?token=SECRET_SIGNED Cookie: SECRET_COOKIE";
+
+  const pget = routeNativeMessage({
+    type: "pget-result",
+    id: "j",
+    attemptToken: "a",
+    status: "failed",
+    mode: "multi-range",
+    failureCategory: secret,
+    partState: "partial",
+  });
+  assert.equal(pget.action, "transport-result");
+  assert.equal(pget.failureCategory, "permanent");
+  assertNoSecrets(pget);
+  assert.equal(JSON.stringify(pget).includes(secret), false);
+  assert.equal(JSON.stringify(pget).includes("SECRET_SIGNED"), false);
+  assert.equal(JSON.stringify(pget).includes("SECRET_COOKIE"), false);
+
+  const err = routeNativeMessage({
+    type: "file-error",
+    jobId: "j",
+    attemptToken: "a",
+    failureCategory: "local_io",
+    reason: secret,
+  });
+  assert.equal(err.action, "file-sink-message");
+  assert.equal(err.message.failureCategory, "local_io");
+  assert.equal(Object.prototype.hasOwnProperty.call(err.message, "reason"), false);
+  assertNoSecrets(err);
+  assert.equal(JSON.stringify(err).includes("SECRET_SIGNED"), false);
+  assert.equal(JSON.stringify(err).includes("SECRET_COOKIE"), false);
+
+  const badCat = routeNativeMessage({
+    type: "file-error",
+    jobId: "j",
+    attemptToken: "a",
+    failureCategory: secret,
+    reason: "write-failed",
+  });
+  assert.equal(badCat.action, "file-sink-message");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(badCat.message, "failureCategory"),
+    false
+  );
+  assert.equal(badCat.message.reason, "write-failed");
+  assertNoSecrets(badCat);
+
+  const injected = routeNativeMessage({
+    type: "file-error",
+    jobId: "j",
+    attemptToken: "a",
+    failureCategory: "local_io",
+    reason: "disk-full",
+    status: secret,
+    path: secret,
+    bytes: 9,
+    cookie: "SECRET_COOKIE",
+    headers: { Authorization: "Bearer SECRET" },
+  });
+  assert.equal(injected.action, "file-sink-message");
+  assert.deepEqual(Object.keys(injected.message).sort(), [
+    "attemptToken",
+    "failureCategory",
+    "jobId",
+    "reason",
+    "type",
+  ]);
+  assertNoSecrets(injected);
+});
+
+test("file-committed rejects unsafe file paths; file-aborted reason uses stable tokens", () => {
+  const { routeNativeMessage } = loadRouter();
+
+  const okWin = routeNativeMessage({
+    type: "file-committed",
+    sinkId: "s1",
+    file: "D:\\\\Vids\\\\out.mp4",
+    bytes: 10,
+  });
+  assert.equal(okWin.action, "file-sink-message");
+  assert.equal(okWin.message.file, "D:\\\\Vids\\\\out.mp4");
+
+  const okUnix = routeNativeMessage({
+    type: "file-committed",
+    sinkId: "s1",
+    file: "/home/user/media/out.mp4",
+    bytes: 10,
+  });
+  assert.equal(okUnix.action, "file-sink-message");
+  assert.equal(okUnix.message.file, "/home/user/media/out.mp4");
+
+  const rejects = [
+    "https://cdn/f?token=SECRET_SIGNED",
+    "//cdn/f?token=SECRET",
+    "file://host/path",
+    "out.mp4\nCookie: SECRET_COOKIE",
+    "path with Authorization: Bearer SECRET",
+    "bad\u0000null",
+    "line\r\nCookie: x",
+  ];
+  for (const file of rejects) {
+    const out = routeNativeMessage({
+      type: "file-committed",
+      sinkId: "s1",
+      file,
+      bytes: 1,
+    });
+    assert.deepEqual(
+      out,
+      { action: "ignore", invokeFirefox: false },
+      `file=${JSON.stringify(file)}`
+    );
+    assertNoSecrets(out);
+  }
+
+  const abortedOk = routeNativeMessage({
+    type: "file-aborted",
+    sinkId: "s1",
+    reason: "user-cancel",
+  });
+  assert.equal(abortedOk.action, "file-sink-message");
+  assert.equal(abortedOk.message.reason, "user-cancel");
+
+  const abortedBad = routeNativeMessage({
+    type: "file-aborted",
+    sinkId: "s1",
+    reason: "GET https://cdn/f?token=SECRET_SIGNED Cookie: SECRET_COOKIE",
+  });
+  assert.equal(abortedBad.action, "file-sink-message");
+  assert.equal(Object.prototype.hasOwnProperty.call(abortedBad.message, "reason"), false);
+  assertNoSecrets(abortedBad);
+
+  const abortedLong = routeNativeMessage({
+    type: "file-aborted",
+    sinkId: "s1",
+    reason: "a".repeat(65),
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(abortedLong.message, "reason"), false);
+});
+
+test("normalizeDownloadRequest preserves immutable detectionId and tightens item field types", () => {
+  const { normalizeDownloadRequest } = loadRouter();
+  const item = defaultItem({ detectionId: 123, tabId: 7, live: false });
+  const req = normalizeDownloadRequest({
+    type: "download",
+    tabId: 1,
+    item,
+    userActionToken: "tok",
+  });
+  assert.equal(req.item.detectionId, 123);
+  assert.equal(req.item.tabId, 7);
+  assert.equal(req.item.live, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(req.item, "detectionId"), true);
+  assertDeeplyFrozen(req.item);
+  item.detectionId = 999;
+  assert.equal(req.item.detectionId, 123);
+  assert.throws(() => {
+    req.item.detectionId = 456;
+  });
+
+  const generic = (fn) => {
+    assert.throws(fn, (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(err.message, "invalid download message");
+      assert.equal(String(err.message).includes("SECRET"), false);
+      return true;
+    });
+  };
+
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ detectionId: -1 }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ detectionId: 1.5 }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ detectionId: "123" }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ detectionId: Object(123) }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ detectionId: true }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ kind: true }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ url: false }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ proposedFilename: true }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ providerKey: {} }),
+    })
+  );
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: defaultItem({ tabId: -3 }),
+    })
+  );
+
+  let detHits = 0;
+  const accessorItem = defaultItem();
+  Object.defineProperty(accessorItem, "detectionId", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      detHits += 1;
+      return 123;
+    },
+  });
+  generic(() =>
+    normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: accessorItem,
+    })
+  );
+  assert.equal(detHits, 0);
+
+  // Runtime URL strings remain memory-only when provided as primitive strings.
+  const withUrl = normalizeDownloadRequest({
+    type: "download",
+    tabId: 1,
+    userActionToken: "tok",
+    item: defaultItem({ url: "https://cdn/x.mp4?token=SECRET_RUNTIME" }),
+  });
+  assert.equal(withUrl.item.url, "https://cdn/x.mp4?token=SECRET_RUNTIME");
+});
+
+test("dependency exceptions propagate by identity after sanitized inputs", () => {
+  const abs = path.join(mediaCatcherRoot, "lib", "download-message-router.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const depErr = new Error("exact dependency boom SECRET_SHOULD_PROPAGATE");
+  const protocolErr = new TypeError("protocol exact TypeError with SECRET");
+  const root = {
+    McDownloadIntent: {
+      createDefaultIntent() {
+        throw depErr;
+      },
+    },
+    McFileSinkProtocol: {
+      buildPgetCmd() {
+        throw protocolErr;
+      },
+      buildPgetSingleCmd() {
+        throw protocolErr;
+      },
+      createFileSinkSession() {
+        throw protocolErr;
+      },
+    },
+  };
+  function selectiveRequire(id) {
+    if (String(id).indexOf("download-intent") !== -1) {
+      return root.McDownloadIntent;
+    }
+    if (String(id).indexOf("file-sink-protocol") !== -1) {
+      return root.McFileSinkProtocol;
+    }
+    return require(id);
+  }
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require: selectiveRequire,
+    console,
+    self: root,
+  };
+  sandbox.module.exports = sandbox.exports;
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  const api = sandbox.module.exports;
+
+  let thrown = null;
+  try {
+    api.normalizeDownloadRequest({
+      type: "download",
+      tabId: 1,
+      userActionToken: "tok",
+      item: { proposedFilename: FLOREN, kind: "direct", url: "https://x/a.mp4" },
+    });
+  } catch (e) {
+    thrown = e;
+  }
+  assert.equal(thrown, depErr);
+
+  let thrown2 = null;
+  try {
+    api.buildNativeStartPayload({
+      kind: "pget",
+      jobId: "j",
+      attemptToken: "a",
+      intent: saveAsIntent(),
+      url: "https://cdn/x.mp4",
+      maxConnections: 1,
+    });
+  } catch (e) {
+    thrown2 = e;
+  }
+  assert.equal(thrown2, protocolErr);
 });
