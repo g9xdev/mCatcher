@@ -86,6 +86,46 @@
           return;
         }
         if (!job || typeof job !== "object") return;
+
+        // Pausing jobs authenticate privately via the draining API. Public
+        // attemptToken is null and must never be used as identity. Do not
+        // capability-switch or startSingleConnection while parked.
+        if (job.state === "pausing_provider") {
+          if (typeof scheduler.onDrainingTransportResult !== "function") return;
+          // Ordinary path requires mode match with the job's current mode.
+          if (mode !== job.mode) return;
+
+          var drainCategory;
+          if (status === "completed") {
+            if (partState !== "committed") return;
+            if (failureCategory !== null) return;
+            drainCategory = null;
+          } else if (status === "cancelled") {
+            drainCategory = "cancelled";
+          } else if (status === "failed") {
+            // Failed must never carry committed (invalid Task-13 terminal).
+            if (partState === "committed") return;
+            drainCategory = normalizeFailureCategory(failureCategory);
+          } else {
+            return;
+          }
+
+          var drainAllowlisted = {
+            status: status,
+            mode: mode,
+            failureCategory: drainCategory,
+            partState: partState
+          };
+
+          try {
+            // Pass the message token (private draining identity), never public null.
+            scheduler.onDrainingTransportResult(id, attemptToken, drainAllowlisted);
+          } catch (eDrain) {
+            return;
+          }
+          return;
+        }
+
         if (job.state !== "running") return;
         if (!isNonblankString(job.attemptToken)) return;
         if (job.attemptToken !== attemptToken) return;

@@ -266,7 +266,8 @@
     }
 
     function projectJob(job) {
-      // Safe allowlist — never ephemeral, cookies, headers, signed URLs, mediaOrigin.
+      // Safe allowlist — never ephemeral, cookies, headers, signed URLs, mediaOrigin,
+      // drainingAttemptToken, or pendingDrainTerminal.
       // inFlightPermits is the exact sum of wrapper-owned + observation-adapter counts.
       return deepFreeze({
         id: job.id,
@@ -285,6 +286,50 @@
         inFlightPermits: totalInFlightPermits(job),
         nativeOpenConnections: job.nativeOpenConnections,
       });
+    }
+
+    /** Scheduler-private only — never projected or echoed in errors. */
+    function clearDrainingState(job) {
+      if (!job) return;
+      job.drainingAttemptToken = null;
+      job.pendingDrainTerminal = null;
+    }
+
+    /**
+     * Confirm ProviderGate native-open zero without auto-quiescing.
+     * Mirrors onTransportUnavailable failure-atomicity: throw-before leaves
+     * gate/job coherent and retryable; mutate-then-throw may continue once.
+     * Returns true when zero is confirmed; rethrows throw-before faults.
+     */
+    function confirmNativeOpenZero(job) {
+      var gate = getGate(job.providerKey);
+      var nativeConfirmed = false;
+      try {
+        gate.noteNativeOpen(job.id, 0);
+        nativeConfirmed = true;
+      } catch (errNative) {
+        var openAfter = gate.snapshot().nativeOpen;
+        var gateOpens =
+          openAfter && Object.prototype.hasOwnProperty.call(openAfter, job.id)
+            ? openAfter[job.id]
+            : null;
+        if (gateOpens === 0) {
+          nativeConfirmed = true;
+        } else {
+          throw errNative;
+        }
+      }
+      if (!nativeConfirmed) return false;
+      var openSnap = gate.snapshot().nativeOpen;
+      if (
+        openSnap &&
+        Object.prototype.hasOwnProperty.call(openSnap, job.id) &&
+        openSnap[job.id] !== 0
+      ) {
+        return false;
+      }
+      job.nativeOpenConnections = 0;
+      return true;
     }
 
     function getJob(jobId) {
@@ -434,6 +479,7 @@
           releaseSlotIfHeld(job);
           removeFromQueue(job);
           removeFromWaitQueue(job);
+          clearDrainingState(job);
         }
         return false;
       }
@@ -441,6 +487,7 @@
       removeFromQueue(job);
       releaseSlotIfHeld(job);
       clearRetryDeadline(job);
+      clearDrainingState(job);
       job.state = "needs_user";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -457,6 +504,7 @@
       removeFromQueue(job);
       releaseSlotIfHeld(job);
       clearRetryDeadline(job);
+      clearDrainingState(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -502,8 +550,9 @@
     }
 
     /**
-     * Shared quiesce edge: pausing_provider → waiting_provider exactly once when
-     * total permits and native opens are both zero. State guard only (single-threaded).
+     * Shared quiesce edge: pausing_provider settles once when total permits and
+     * native opens are both zero. A stored draining terminal is dispatched before
+     * default pausing → waiting. State guard only (single-threaded).
      * Late quiesce after owner completion / recovery-to-normal auto-authorizes wake
      * when the gate is recovering-blocked or normal (never while an owner is active).
      */
@@ -511,7 +560,48 @@
       if (!job) return;
       if (job.state !== "pausing_provider") return;
       if (!isQuiescent(job)) return;
+      // Stored draining terminal settles before default pause-control waiting.
+      if (job.pendingDrainTerminal != null) {
+        settleDrainingTerminal(job);
+        return;
+      }
       // Cancel-requested pausing work finishes as cancelled once quiescent.
+      if (job.cancelRequested === true) {
+        releaseSlotIfHeld(job);
+        removeFromWaitQueue(job);
+        removeFromQueue(job);
+        clearRetryDeadline(job);
+        clearDrainingState(job);
+        job.state = "cancelled";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        clearEphemeralOnce(job);
+        drain();
+        return;
+      }
+      clearDrainingState(job);
+      job.state = "waiting_provider";
+      job.stateVersion += 1;
+      job.attemptToken = null;
+      releaseSlotIfHeld(job);
+      appendWaitFifo(job);
+      maybeAuthorizeReadyWaiter(job);
+      drain();
+    }
+
+    /**
+     * Apply a once-accepted private draining terminal after full permit/native
+     * quiescence. Pausing jobs are non-owners — never mutates ProviderGate ownership.
+     */
+    function settleDrainingTerminal(job) {
+      if (!job || job.state !== "pausing_provider") return false;
+      var outcome = job.pendingDrainTerminal;
+      if (!outcome || typeof outcome !== "object") return false;
+      // Consume pending exactly once.
+      job.pendingDrainTerminal = null;
+      job.drainingAttemptToken = null;
+
+      // User cancel wins over any stored native terminal.
       if (job.cancelRequested === true) {
         releaseSlotIfHeld(job);
         removeFromWaitQueue(job);
@@ -522,8 +612,99 @@
         job.attemptToken = null;
         clearEphemeralOnce(job);
         drain();
-        return;
+        return true;
       }
+
+      var status = outcome.status;
+
+      if (status === "completed") {
+        releaseSlotIfHeld(job);
+        removeFromWaitQueue(job);
+        removeFromQueue(job);
+        clearRetryDeadline(job);
+        job.state = "completed";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        job.consumeRetryOnWake = false;
+        clearEphemeralOnce(job);
+        drain();
+        return true;
+      }
+
+      if (status === "cancelled") {
+        // Pause-control ack: waiting_provider, no paused-only retry charge.
+        job.state = "waiting_provider";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        releaseSlotIfHeld(job);
+        appendWaitFifo(job);
+        maybeAuthorizeReadyWaiter(job);
+        drain();
+        return true;
+      }
+
+      if (status === "failed") {
+        var category = outcome.failureCategory;
+        var partState = outcome.partState;
+        var mode = outcome.mode;
+
+        // range_unsupported + empty multi-range → capability park (fresh token later).
+        if (
+          category === "range_unsupported" &&
+          mode === "multi-range" &&
+          partState === "empty"
+        ) {
+          job.mode = "single-connection";
+          job.effectiveConcurrency = 1;
+          syncJobLimit(job);
+          job.state = "waiting_provider";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          releaseSlotIfHeld(job);
+          appendWaitFifo(job);
+          maybeAuthorizeReadyWaiter(job);
+          drain();
+          return true;
+        }
+
+        // Non-empty range_unsupported follows permanent/needs_user handling.
+        if (category === "range_unsupported") {
+          enterNeedsUser(job);
+          clearDrainingState(job);
+          drain();
+          return true;
+        }
+
+        if (category === "local_io" || category === "permanent") {
+          enterNeedsUser(job);
+          clearDrainingState(job);
+          drain();
+          return true;
+        }
+
+        if (FailureClassify.isSaturationCandidate(category)) {
+          // Mark consume-on-wake idempotently; wake-time charges once per epoch.
+          if (job.wakeRetryConsumed !== true) {
+            job.consumeRetryOnWake = true;
+          }
+          job.state = "waiting_provider";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          releaseSlotIfHeld(job);
+          appendWaitFifo(job);
+          maybeAuthorizeReadyWaiter(job);
+          drain();
+          return true;
+        }
+
+        // Unknown/other permanent-class failures: needs_user, never Firefox.
+        enterNeedsUser(job);
+        clearDrainingState(job);
+        drain();
+        return true;
+      }
+
+      // Unknown status should never have been stored; fail closed as waiting.
       job.state = "waiting_provider";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -531,6 +712,122 @@
       appendWaitFifo(job);
       maybeAuthorizeReadyWaiter(job);
       drain();
+      return true;
+    }
+
+    var ALLOWED_DRAIN_STATUSES = {
+      completed: true,
+      cancelled: true,
+      failed: true,
+    };
+    var ALLOWED_DRAIN_MODES = {
+      "multi-range": true,
+      "single-connection": true,
+    };
+    var ALLOWED_DRAIN_PART_STATES = {
+      committed: true,
+      empty: true,
+      partial: true,
+    };
+    var KNOWN_DRAIN_FAILURE_CATEGORIES = {
+      range_unsupported: true,
+      timeout: true,
+      connection_reset: true,
+      short_read: true,
+      http_429: true,
+      http_5xx_temporary: true,
+      local_io: true,
+      cancelled: true,
+      permanent: true,
+    };
+
+    /**
+     * Validate a draining terminal result into a scheduler-owned allowlist.
+     * Never coerces hostile values; returns null when invalid.
+     */
+    function validateDrainingResult(result) {
+      if (!result || typeof result !== "object") return null;
+      var status = result.status;
+      var mode = result.mode;
+      var partState = result.partState;
+      var failureCategory = result.failureCategory;
+      if (typeof status !== "string" || !ALLOWED_DRAIN_STATUSES[status]) return null;
+      if (typeof mode !== "string" || !ALLOWED_DRAIN_MODES[mode]) return null;
+      if (typeof partState !== "string" || !ALLOWED_DRAIN_PART_STATES[partState]) {
+        return null;
+      }
+
+      var outCategory = null;
+      if (status === "completed") {
+        if (partState !== "committed") return null;
+        if (failureCategory !== null && failureCategory !== undefined) return null;
+        outCategory = null;
+      } else if (status === "cancelled") {
+        // Accept null/cancelled category; store canonical cancelled.
+        if (
+          failureCategory != null &&
+          failureCategory !== "cancelled" &&
+          typeof failureCategory === "string" &&
+          !KNOWN_DRAIN_FAILURE_CATEGORIES[failureCategory]
+        ) {
+          // Unknown non-null still normalizes only for cancelled status via adapter;
+          // scheduler accepts cancelled status with any partState.
+        }
+        outCategory = "cancelled";
+      } else if (status === "failed") {
+        if (partState === "committed") return null;
+        if (typeof failureCategory !== "string") return null;
+        if (!KNOWN_DRAIN_FAILURE_CATEGORIES[failureCategory]) return null;
+        outCategory = failureCategory;
+      } else {
+        return null;
+      }
+
+      return deepFreeze({
+        status: status,
+        mode: mode,
+        failureCategory: outCategory,
+        partState: partState,
+      });
+    }
+
+    /**
+     * Authenticate a late physical native terminal for a pausing_provider job
+     * against the private draining attempt token. Zeros native opens atomically,
+     * stores at most one allowlisted pending outcome, and settles when fully
+     * quiescent. Returns true only when the terminal is accepted.
+     */
+    function onDrainingTransportResult(jobId, oldAttemptToken, result) {
+      var job = jobs.get(jobId);
+      if (!job) return false;
+      if (job.state !== "pausing_provider") return false;
+      // Exact primitive built-in string identity — no String() / boxed coercion.
+      if (typeof oldAttemptToken !== "string") return false;
+      if (oldAttemptToken.trim().length === 0) return false;
+      if (typeof job.drainingAttemptToken !== "string") return false;
+      if (job.drainingAttemptToken !== oldAttemptToken) return false;
+      // Already accepted a terminal for this draining identity.
+      if (job.pendingDrainTerminal != null) return false;
+
+      var allowlisted = validateDrainingResult(result);
+      if (!allowlisted) return false;
+      // Mode must match the job's current mode (range switch is a settlement effect).
+      if (allowlisted.mode !== job.mode) return false;
+
+      // Reconcile native-open zero inside this API before consuming the terminal.
+      // Do NOT call public noteNativeOpen(0) — that would auto-quiesce and destroy auth.
+      if (!confirmNativeOpenZero(job)) return false;
+
+      // Accept: clear private auth token and freeze the pending outcome.
+      job.drainingAttemptToken = null;
+      job.pendingDrainTerminal = allowlisted;
+
+      if (isQuiescent(job)) {
+        settleDrainingTerminal(job);
+      }
+      // Else remain pausing_provider holding the global slot until wrapper/observed
+      // permits also reach zero; maybeQuiesce dispatches the stored terminal.
+      return true;
     }
 
     function releaseSlotIfHeld(job) {
@@ -655,6 +952,8 @@
       // Capacity known: designate/recover-owner commit immediately before slot.
       if (!commitProviderAdmission(job)) return false;
       var token = mintAttemptToken();
+      // Fresh physical attempt: old draining identity must never re-authenticate.
+      clearDrainingState(job);
       job.state = "running";
       job.stateVersion += 1;
       job.holdsGlobalSlot = true;
@@ -745,6 +1044,11 @@
       if (job.state !== "pausing_provider") {
         beginWaitEpoch(job);
       }
+      // Immediate waiting without a physical attempt (or after pause drain without
+      // a stored terminal) invalidates any private draining identity.
+      if (job.pendingDrainTerminal == null) {
+        clearDrainingState(job);
+      }
       job.state = "waiting_provider";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -764,6 +1068,16 @@
         return;
       }
       beginWaitEpoch(job);
+      // Capture the live physical attempt token before public nulling so a late
+      // native terminal can authenticate privately. Never overwrite an existing
+      // draining identity on repeat pause calls.
+      if (
+        job.drainingAttemptToken == null &&
+        typeof job.attemptToken === "string" &&
+        job.attemptToken.trim().length > 0
+      ) {
+        job.drainingAttemptToken = job.attemptToken;
+      }
       job.state = "pausing_provider";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -815,6 +1129,7 @@
       if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) nowMs = 0;
       job.retryDeadlineMs = nowMs + delay;
 
+      clearDrainingState(job);
       job.state = "retry_backoff";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -843,6 +1158,7 @@
 
       assertRunningOwnsSlot(job);
 
+      clearDrainingState(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.holdsGlobalSlot = false;
@@ -954,6 +1270,7 @@
       var recoveryId = waiter ? waiter.id : null;
 
       // Side-effect order: terminalize + release slot, then completeOwner, then wake, then drain.
+      clearDrainingState(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.holdsGlobalSlot = false;
@@ -1003,6 +1320,7 @@
 
       assertRunningOwnsSlot(job);
 
+      clearDrainingState(job);
       job.state = "completed";
       job.stateVersion += 1;
       job.holdsGlobalSlot = false;
@@ -1135,6 +1453,10 @@
         consumeRetryOnWake: false,
         wakeRetryConsumed: false,
         wakeAuthorized: false,
+        // Private draining identity for outstanding physical native attempts
+        // while public attemptToken is nulled in pausing_provider. Never projected.
+        drainingAttemptToken: null,
+        pendingDrainTerminal: null,
       };
       jobs.set(id, job);
       jobOrder.push(id);
@@ -1550,10 +1872,17 @@
         if (job.state === "pausing_provider" && isQuiescent(job)) {
           // Pausing with cancel: release slot, terminalize cancelled.
           // If this job is not a provider owner, simple terminal path.
+          // Prefer stored draining terminal settlement so cancel still wins via
+          // settleDrainingTerminal's cancelRequested branch.
+          if (job.pendingDrainTerminal != null) {
+            settleDrainingTerminal(job);
+            return;
+          }
           releaseSlotIfHeld(job);
           removeFromWaitQueue(job);
           removeFromQueue(job);
           clearRetryDeadline(job);
+          clearDrainingState(job);
           job.state = "cancelled";
           job.stateVersion += 1;
           job.attemptToken = null;
@@ -1569,6 +1898,7 @@
       removeFromWaitQueue(job);
       releaseSlotIfHeld(job);
       clearRetryDeadline(job);
+      clearDrainingState(job);
       job.state = "cancelled";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -1673,6 +2003,8 @@
         return false;
       }
       job.nativeOpenConnections = 0;
+      // Physical transport is gone: private draining identity is no longer valid.
+      clearDrainingState(job);
 
       // Authenticated saturated/recovering owner: confirmed release with no recovery
       // successor and no same-provider waiter authorization on helper disconnect.
@@ -1718,6 +2050,7 @@
       job.wakeRetryConsumed = false;
       job.wakeAuthorized = false;
       job.attemptToken = null;
+      clearDrainingState(job);
       job.state = "queued";
       job.stateVersion += 1;
       ensureProvider(job.providerKey);
@@ -1943,6 +2276,7 @@
       clearRetryDeadline(job);
       releaseSlotIfHeld(job);
       job.attemptToken = null;
+      clearDrainingState(job);
       job.firefoxHandoffInFlight = false;
 
       var release = {
@@ -2201,7 +2535,7 @@
       }
     }
 
-    // Public surface — stable method names for Tasks 9–11 (+ transport park).
+    // Public surface — stable method names for Tasks 9–11 (+ transport park / drain).
     return {
       createJob: createJob,
       enqueue: enqueue,
@@ -2209,6 +2543,7 @@
       cancel: cancel,
       onTransportResult: onTransportResult,
       onTransportUnavailable: onTransportUnavailable,
+      onDrainingTransportResult: onDrainingTransportResult,
       onCapabilitySwitch: onCapabilitySwitch,
       getJob: getJob,
       getSnapshot: getSnapshot,
