@@ -46,6 +46,7 @@ def test_framing_ping_snapshot_reveal():
         assert reply.get("type") == "pong", "reply is a pong"
         assert isinstance(reply.get("ffmpeg"), bool), "pong reports ffmpeg presence (bool)"
         assert reply.get("version"), "pong carries a version"
+        assert reply.get("ytdlProtocol") == 2, "pong advertises yt-dlp protocol v2"
 
         # snapshot for an unknown recording -> graceful error (dispatch works)
         snap = json.dumps({"cmd": "snapshot", "id": 999}).encode()
