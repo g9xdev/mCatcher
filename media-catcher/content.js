@@ -55,6 +55,32 @@
     return typeof v === "string";
   }
 
+  // Nonces: primitive string, nonblank, no whitespace or controls.
+  function isSafeNonce(v) {
+    return typeof v === "string" && v.length > 0 && !/[\s\u0000-\u001f\u007f]/.test(v);
+  }
+
+  function invalidSnapshotContext() {
+    return new TypeError("invalid snapshot context");
+  }
+
+  // Own data property only — never invoke accessors/proxies/get traps for value.
+  function ownDataProp(obj, key) {
+    var desc;
+    try {
+      if (obj === null || (typeof obj !== "object" && typeof obj !== "function")) {
+        return { state: "missing" };
+      }
+      desc = Object.getOwnPropertyDescriptor(obj, key);
+    } catch (e) {
+      return { state: "bad" };
+    }
+    if (!desc) return { state: "missing" };
+    if (desc.get !== undefined || desc.set !== undefined) return { state: "bad" };
+    if (!Object.prototype.hasOwnProperty.call(desc, "value")) return { state: "bad" };
+    return { state: "ok", value: desc.value };
+  }
+
   function sanitizeString(value, maxLen, keepEnd) {
     if (typeof value !== "string") return "";
     var s = value.replace(/^\s+|\s+$/g, "");
@@ -68,10 +94,39 @@
     return s;
   }
 
+  // Safe primitive-string property read; omit on throw/non-string (no coercion).
+  function readStringProp(el, name) {
+    if (!el) return "";
+    try {
+      var v = el[name];
+      return typeof v === "string" ? v : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   function qsa(root, sel) {
     if (!root || typeof root.querySelectorAll !== "function") return [];
     try {
-      return Array.prototype.slice.call(root.querySelectorAll(sel), 0);
+      var list = root.querySelectorAll(sel);
+      if (!list) return [];
+      var out = [];
+      var len;
+      try {
+        len = list.length;
+      } catch (eLen) {
+        return [];
+      }
+      if (typeof len !== "number" || !isFinite(len) || len < 0) return [];
+      var n = Math.floor(len);
+      for (var i = 0; i < n; i++) {
+        try {
+          out.push(list[i]);
+        } catch (eItem) {
+          // omit hostile index accessors
+        }
+      }
+      return out;
     } catch (e) {
       return [];
     }
@@ -99,16 +154,20 @@
     } catch (e) {}
     try {
       if (name === "download") {
-        return typeof el.download === "string" ? el.download : null;
+        var dl = el.download;
+        return typeof dl === "string" ? dl : null;
       }
       if (name === "href") {
-        return typeof el.href === "string" ? el.href : null;
+        var href = el.href;
+        return typeof href === "string" ? href : null;
       }
       if (name === "content") {
-        return typeof el.content === "string" ? el.content : null;
+        var content = el.content;
+        return typeof content === "string" ? content : null;
       }
       if (name === "title") {
-        return typeof el.title === "string" ? el.title : null;
+        var title = el.title;
+        return typeof title === "string" ? title : null;
       }
       if (name === "aria-label") {
         if (el.attributes && typeof el.attributes["aria-label"] === "string") {
@@ -182,32 +241,40 @@
   function metaBySelector(documentLike, selector) {
     var el = qs(documentLike, selector);
     if (!el) return "";
-    var c = el.content != null ? el.content : readAttr(el, "content");
+    var c = readAttr(el, "content");
+    if (c == null) c = readStringProp(el, "content");
     return typeof c === "string" ? c : "";
   }
 
   function valueFromFilenameEl(el) {
     if (!el) return null;
-    var dl = readAttr(el, "download");
-    if (typeof dl === "string" && dl.replace(/^\s+|\s+$/g, "")) {
-      return { kind: "download-attr", value: dl };
-    }
-    // Presence of empty download attr: fall through to other signals.
-    var dataFn = readAttr(el, "data-filename");
-    if (typeof dataFn === "string" && dataFn.replace(/^\s+|\s+$/g, "")) {
-      return { kind: "visible-filename", value: dataFn };
-    }
-    var text = typeof el.textContent === "string" ? el.textContent : "";
-    if (text && text.length <= MAX_FILENAME * 2) {
-      var t = text.replace(/^\s+|\s+$/g, "");
-      if (t && t.length <= MAX_FILENAME) {
-        return { kind: "visible-filename", value: t };
+    try {
+      var dl = readAttr(el, "download");
+      if (typeof dl === "string" && dl.replace(/^\s+|\s+$/g, "")) {
+        return { kind: "download-attr", value: dl };
       }
+      // Presence of empty download attr: fall through to other signals.
+      var dataFn = readAttr(el, "data-filename");
+      if (typeof dataFn === "string" && dataFn.replace(/^\s+|\s+$/g, "")) {
+        return { kind: "visible-filename", value: dataFn };
+      }
+      var text = readStringProp(el, "textContent");
+      if (text && text.length <= MAX_FILENAME * 2) {
+        var t = text.replace(/^\s+|\s+$/g, "");
+        if (t && t.length <= MAX_FILENAME) {
+          return { kind: "visible-filename", value: t };
+        }
+      }
+      var href = readAttr(el, "href");
+      if (href == null) {
+        var hrefProp = readStringProp(el, "href");
+        if (hrefProp) href = hrefProp;
+      }
+      var base = hrefBasename(typeof href === "string" ? href : "");
+      if (base) return { kind: "visible-filename", value: base };
+    } catch (e) {
+      return null;
     }
-    var href = readAttr(el, "href");
-    if (href == null && el && typeof el.href === "string") href = el.href;
-    var base = hrefBasename(typeof href === "string" ? href : "");
-    if (base) return { kind: "visible-filename", value: base };
     return null;
   }
 
@@ -235,7 +302,13 @@
       } catch (e) {
         container = null;
       }
-      if (!container) container = node && node.parent ? node.parent : null;
+      if (!container) {
+        try {
+          container = node && node.parent ? node.parent : null;
+        } catch (eParent) {
+          container = null;
+        }
+      }
       if (!container) continue;
       var near = qsa(container, FILENAME_SEL);
       for (var j = 0; j < near.length && out.length < MAX_NEARBY; j++) addEl(near[j]);
@@ -251,12 +324,7 @@
     var seen = Object.create(null);
     documentLike = documentLike || {};
 
-    var title = "";
-    try {
-      title = typeof documentLike.title === "string" ? documentLike.title : "";
-    } catch (e) {
-      title = "";
-    }
+    var title = readStringProp(documentLike, "title");
     pushCand(list, seen, "document-title", title, MAX_TITLE);
 
     pushCand(
@@ -278,9 +346,7 @@
     var headings = qsa(documentLike, "h1, h2");
     var hCount = 0;
     for (var hi = 0; hi < headings.length && hCount < MAX_HEADINGS; hi++) {
-      var hv = headings[hi] && typeof headings[hi].textContent === "string"
-        ? headings[hi].textContent
-        : "";
+      var hv = readStringProp(headings[hi], "textContent");
       var before = list.length;
       pushCand(list, seen, "heading", hv, MAX_TITLE);
       if (list.length > before) hCount += 1;
@@ -297,7 +363,10 @@
     for (var mi = 0; mi < mediaEls.length; mi++) {
       var mel = mediaEls[mi];
       var mt = readAttr(mel, "title");
-      if (mt == null && mel && typeof mel.title === "string") mt = mel.title;
+      if (mt == null) {
+        var titleProp = readStringProp(mel, "title");
+        if (titleProp) mt = titleProp;
+      }
       pushCand(list, seen, "media-metadata", mt, MAX_TITLE);
       pushCand(list, seen, "media-metadata", readAttr(mel, "aria-label"), MAX_TITLE);
     }
@@ -325,7 +394,7 @@
     try {
       if (cryptoLike && typeof cryptoLike.randomUUID === "function") {
         var u = cryptoLike.randomUUID();
-        if (typeof u === "string" && u) return u;
+        if (isSafeNonce(u)) return u;
       }
     } catch (e) {}
 
@@ -363,24 +432,43 @@
   }
 
   function buildPageSnapshot(context, env) {
-    context = context || {};
     env = env || {};
 
-    if (!isPrimitiveString(context.documentNonce) || !context.documentNonce) {
-      throw new Error("invalid snapshot context");
+    if (context === null || (typeof context !== "object" && typeof context !== "function")) {
+      throw invalidSnapshotContext();
     }
-    if (!isNonNegInt(context.tabId) || !isNonNegInt(context.frameId)) {
-      throw new Error("invalid snapshot context");
+
+    var nonceP = ownDataProp(context, "documentNonce");
+    if (nonceP.state !== "ok" || !isSafeNonce(nonceP.value)) {
+      throw invalidSnapshotContext();
     }
-    if (!isPrimitiveString(context.pageUrl) || !isPrimitiveString(context.topLevelPageUrl)) {
-      throw new Error("invalid snapshot context");
+    var tabP = ownDataProp(context, "tabId");
+    if (tabP.state !== "ok" || !isNonNegInt(tabP.value)) {
+      throw invalidSnapshotContext();
     }
+    var frameP = ownDataProp(context, "frameId");
+    if (frameP.state !== "ok" || !isNonNegInt(frameP.value)) {
+      throw invalidSnapshotContext();
+    }
+    var pageP = ownDataProp(context, "pageUrl");
+    if (pageP.state !== "ok" || !isPrimitiveString(pageP.value)) {
+      throw invalidSnapshotContext();
+    }
+    var topP = ownDataProp(context, "topLevelPageUrl");
+    if (topP.state !== "ok" || !isPrimitiveString(topP.value)) {
+      throw invalidSnapshotContext();
+    }
+
     var documentId = null;
-    if (context.documentId != null) {
-      if (!isPrimitiveString(context.documentId)) {
-        throw new Error("invalid snapshot context");
+    var docP = ownDataProp(context, "documentId");
+    if (docP.state === "bad") {
+      throw invalidSnapshotContext();
+    }
+    if (docP.state === "ok" && docP.value != null) {
+      if (!isPrimitiveString(docP.value)) {
+        throw invalidSnapshotContext();
       }
-      documentId = context.documentId;
+      documentId = docP.value;
     }
 
     var nowMs;
@@ -402,11 +490,11 @@
     return deepFreeze({
       type: "page-snapshot",
       documentId: documentId,
-      documentNonce: context.documentNonce,
-      tabId: context.tabId,
-      frameId: context.frameId,
-      pageUrl: context.pageUrl,
-      topLevelPageUrl: context.topLevelPageUrl,
+      documentNonce: nonceP.value,
+      tabId: tabP.value,
+      frameId: frameP.value,
+      pageUrl: pageP.value,
+      topLevelPageUrl: topP.value,
       candidates: candidates,
       capturedAt: capturedAt,
     });
@@ -446,10 +534,25 @@
 
   function snapshotFingerprint(snapshot) {
     if (!snapshot) return "";
-    var parts = [String(snapshot.pageUrl || "")];
+    var docId =
+      snapshot.documentId == null
+        ? ""
+        : typeof snapshot.documentId === "string"
+          ? snapshot.documentId
+          : "";
+    var parts = [
+      typeof snapshot.documentNonce === "string" ? snapshot.documentNonce : "",
+      docId,
+      isNonNegInt(snapshot.tabId) ? String(snapshot.tabId) : "",
+      isNonNegInt(snapshot.frameId) ? String(snapshot.frameId) : "",
+      typeof snapshot.pageUrl === "string" ? snapshot.pageUrl : "",
+      typeof snapshot.topLevelPageUrl === "string" ? snapshot.topLevelPageUrl : "",
+    ];
     var c = snapshot.candidates || [];
     for (var i = 0; i < c.length; i++) {
-      parts.push(String(c[i].kind) + ":" + String(c[i].value));
+      var kind = c[i] && typeof c[i].kind === "string" ? c[i].kind : "";
+      var value = c[i] && typeof c[i].value === "string" ? c[i].value : "";
+      parts.push(kind + ":" + value);
     }
     return parts.join("\0");
   }
@@ -471,7 +574,9 @@
       return Date.now();
     });
 
-    var reported = new Set();
+    var boundUrls = new Set();
+    var unboundItems = Object.create(null);
+    var reportInflight = Object.create(null);
     var lastTitleSent = "";
     var lastThumbSent = "";
     var lastYtId = "";
@@ -558,6 +663,24 @@
         .then(function (v) { return v; }, function () { return null; });
     }
 
+    function flushUnboundRetries(snap) {
+      if (!snap) return;
+      var urls = Object.keys(unboundItems);
+      for (var i = 0; i < urls.length; i++) {
+        var url = urls[i];
+        if (boundUrls.has(url)) {
+          delete unboundItems[url];
+          continue;
+        }
+        var item = unboundItems[url];
+        delete unboundItems[url];
+        boundUrls.add(url);
+        var msg = attachMediaEvidence({ type: "content-media", item: item });
+        msg.snapshot = copySnapshot(snap);
+        safeSend(msg);
+      }
+    }
+
     function refreshSnapshot(forceSend) {
       return requestSenderContext().then(function (ctx) {
         if (!ctx) {
@@ -582,6 +705,7 @@
           lastSnapshotFp = fp;
           safeSend(copySnapshot(snap));
         }
+        flushUnboundRetries(snap);
         return snap;
       });
     }
@@ -639,7 +763,7 @@
     }
 
     function report(url) {
-      if (!url || reported.has(url)) return Promise.resolve();
+      if (!url || boundUrls.has(url)) return Promise.resolve();
       if (
         url.indexOf("blob:") === 0 ||
         url.indexOf("mediasource:") === 0 ||
@@ -647,7 +771,8 @@
       ) {
         return Promise.resolve();
       }
-      reported.add(url);
+      if (reportInflight[url]) return reportInflight[url];
+
       var item = {
         url: url,
         kind: /\.m3u8(\?|#|$)/i.test(url) ? "hls" : "direct",
@@ -655,15 +780,34 @@
         pageTitle: pageTitleHint(),
         ts: Date.now(),
       };
-      return ensureSnapshot()
+
+      var p = ensureSnapshot()
         .then(function (snap) {
-          var msg = attachMediaEvidence({ type: "content-media", item: item });
-          if (snap) msg.snapshot = copySnapshot(snap);
-          safeSend(msg);
+          if (boundUrls.has(url)) return;
+          if (snap) {
+            boundUrls.add(url);
+            delete unboundItems[url];
+            var boundMsg = attachMediaEvidence({ type: "content-media", item: item });
+            boundMsg.snapshot = copySnapshot(snap);
+            safeSend(boundMsg);
+            return;
+          }
+          if (Object.prototype.hasOwnProperty.call(unboundItems, url)) return;
+          unboundItems[url] = item;
+          safeSend(attachMediaEvidence({ type: "content-media", item: item }));
         })
         .then(function () {}, function () {
+          if (boundUrls.has(url)) return;
+          if (Object.prototype.hasOwnProperty.call(unboundItems, url)) return;
+          unboundItems[url] = item;
           safeSend(attachMediaEvidence({ type: "content-media", item: item }));
         });
+
+      reportInflight[url] = p.then(
+        function () { delete reportInflight[url]; },
+        function () { delete reportInflight[url]; }
+      );
+      return reportInflight[url];
     }
 
     function youtubeItem() {
@@ -792,7 +936,9 @@
       }
       if (href === lastPageUrl) return Promise.resolve(false);
       lastPageUrl = href;
-      reported.clear();
+      boundUrls.clear();
+      unboundItems = Object.create(null);
+      reportInflight = Object.create(null);
       lastYtId = "";
       lastTitleSent = "";
       lastSnapshotFp = "";
@@ -830,12 +976,18 @@
         return scan().then(function () { sendPageInfo(); }, function () { sendPageInfo(); });
       });
 
+    function refreshThenScan() {
+      return refreshSnapshot(false)
+        .then(function () { return scan(); })
+        .then(function () {}, function () {});
+    }
+
     var MO = root.MutationObserver ||
       (typeof MutationObserver !== "undefined" ? MutationObserver : null);
     if (MO && documentRef && documentRef.documentElement) {
       try {
         var obs = new MO(function () {
-          scan().then(function () {}, function () {});
+          refreshThenScan();
         });
         obs.observe(documentRef.documentElement, { childList: true, subtree: true });
       } catch (eObs) {}
@@ -857,7 +1009,7 @@
 
     onDoc("loadstart", function (e) {
       if (e && e.target && e.target.tagName === "VIDEO") {
-        scan().then(function () {}, function () {});
+        refreshThenScan();
       }
     });
     onDoc("playing", function (e) {

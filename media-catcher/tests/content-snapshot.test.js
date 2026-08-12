@@ -1167,3 +1167,430 @@ test("browser path self-installs without CommonJS and does not set a persistent 
   assert.equal(sandbox.McContentSnapshot, undefined);
   assert.equal(typeof sandbox.module, "undefined");
 });
+
+// ---------------------------------------------------------------------------
+// Fix1 regressions: hostile getters, plain context, fingerprint, unbound retry
+// ---------------------------------------------------------------------------
+
+function flushMicrotasks(times) {
+  times = times == null ? 4 : times;
+  let p = Promise.resolve();
+  for (let i = 0; i < times; i++) {
+    p = p.then(() => new Promise((r) => setImmediate(r)));
+  }
+  return p;
+}
+
+test("hostile DOM getters and proxies fail closed without secret reflection", () => {
+  const api = loadContent();
+  const secrets = [
+    "SECRET_META",
+    "SECRET_HEADING",
+    "SECRET_FILENAME",
+    "SECRET_MEDIA",
+  ];
+  let coercionHits = 0;
+
+  function trap(label) {
+    return {
+      get content() {
+        throw new Error(label);
+      },
+      get textContent() {
+        throw new Error(label);
+      },
+      get title() {
+        throw new Error(label);
+      },
+      get parent() {
+        throw new Error(label);
+      },
+      getAttribute(name) {
+        if (name === "content" || name === "title" || name === "download" ||
+            name === "data-filename" || name === "href" || name === "aria-label") {
+          throw new Error(label);
+        }
+        return null;
+      },
+      closest() {
+        throw new Error(label);
+      },
+    };
+  }
+
+  function proxyReflect(label) {
+    return new Proxy(
+      {},
+      {
+        get(_t, prop) {
+          if (prop === "toString" || prop === "valueOf" || prop === Symbol.toPrimitive) {
+            coercionHits += 1;
+            return () => {
+              coercionHits += 1;
+              return label + "-coerced";
+            };
+          }
+          throw new Error(label);
+        },
+        getOwnPropertyDescriptor() {
+          throw new Error(label);
+        },
+        ownKeys() {
+          throw new Error(label);
+        },
+      }
+    );
+  }
+
+  const metaTrap = trap("SECRET_META");
+  const headingTrap = trap("SECRET_HEADING");
+  const filenameTrap = trap("SECRET_FILENAME");
+  filenameTrap.tagName = "A";
+  filenameTrap.className = "filename";
+  const mediaTrap = trap("SECRET_MEDIA");
+  mediaTrap.tagName = "VIDEO";
+
+  const doc = {
+    title: "Safe Title",
+    querySelector(sel) {
+      if (String(sel).includes("og:title")) return metaTrap;
+      if (String(sel).includes("twitter:title")) return proxyReflect("SECRET_META");
+      return null;
+    },
+    querySelectorAll(sel) {
+      const s = String(sel);
+      if (s.includes("h1") || s.includes("h2")) return [headingTrap, proxyReflect("SECRET_HEADING")];
+      if (s.includes("download") || s.includes("filename") || s.includes("href$")) {
+        return [filenameTrap, proxyReflect("SECRET_FILENAME")];
+      }
+      if (s.includes("video, audio, source") || s === "video,audio,source") {
+        return [mediaTrap, proxyReflect("SECRET_MEDIA")];
+      }
+      if (s.includes("video, audio") || s === "video,audio") {
+        return [mediaTrap];
+      }
+      return [];
+    },
+  };
+
+  let cands;
+  assert.doesNotThrow(() => {
+    cands = api.collectFilenameCandidates(
+      doc,
+      { href: "https://safe.example/path/ok.mp4.html?sig=SIGNED" },
+      "https://ref.example/r"
+    );
+  });
+
+  const blob = JSON.stringify(cands);
+  for (const s of secrets) {
+    assert.equal(blob.includes(s), false, "must not serialize " + s);
+  }
+  assert.equal(blob.includes("coerced"), false);
+  assert.equal(blob.includes("SIGNED"), false);
+  assert.equal(coercionHits, 0, "must not invoke toString/valueOf/toPrimitive");
+
+  assert.ok(cands.some((c) => c.kind === "document-title" && c.value === "Safe Title"));
+  assert.ok(cands.some((c) => c.kind === "page-url" && c.value === "/path/ok.mp4.html"));
+  assert.equal(cands.some((c) => c.kind === "og-title"), false);
+  assert.equal(cands.some((c) => c.kind === "twitter-title"), false);
+  assert.equal(cands.some((c) => c.kind === "heading"), false);
+  assert.equal(cands.some((c) => c.kind === "download-attr"), false);
+  assert.equal(cands.some((c) => c.kind === "visible-filename"), false);
+  assert.equal(cands.some((c) => c.kind === "media-metadata"), false);
+
+  // Ordinary DOM still works.
+  const normal = makeDocument({
+    title: "Normal",
+    headChildren: [
+      el("meta", {
+        attributes: { property: "og:title", content: "OG Normal" },
+        content: "OG Normal",
+      }),
+    ],
+    bodyChildren: [
+      el("h1", { textContent: "H1 Normal" }),
+      el("a", { className: "filename", textContent: "clip.mp4" }),
+    ],
+  });
+  const normalCands = api.collectFilenameCandidates(
+    normal,
+    { href: "https://x.test/p" },
+    ""
+  );
+  assert.ok(normalCands.some((c) => c.kind === "og-title" && c.value === "OG Normal"));
+  assert.ok(normalCands.some((c) => c.kind === "heading" && c.value === "H1 Normal"));
+  assert.ok(normalCands.some((c) => c.kind === "visible-filename" && c.value === "clip.mp4"));
+});
+
+test("buildPageSnapshot rejects accessor/proxy/blank/control context with stable TypeError", () => {
+  const api = loadContent();
+  const env = {
+    document: makeDocument({ title: "T", bodyChildren: [] }),
+    location: { href: "https://x.test/" },
+    referrer: "",
+    now: () => 0,
+  };
+
+  const keys = [
+    "documentNonce",
+    "tabId",
+    "frameId",
+    "pageUrl",
+    "topLevelPageUrl",
+    "documentId",
+  ];
+
+  for (const key of keys) {
+    const base = {
+      documentNonce: "nonce-ok",
+      tabId: 1,
+      frameId: 0,
+      pageUrl: "https://x.test/",
+      topLevelPageUrl: "https://top.test/",
+      documentId: null,
+    };
+    Object.defineProperty(base, key, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error("SECRET_" + key);
+      },
+    });
+    assert.throws(
+      () => api.buildPageSnapshot(base, env),
+      (err) => {
+        assert.ok(err instanceof TypeError, key + " must throw TypeError");
+        assert.equal(err.message, "invalid snapshot context");
+        assert.equal(String(err.message).includes("SECRET_"), false);
+        assert.equal(String(err.stack || "").includes("SECRET_"), false);
+        return true;
+      }
+    );
+  }
+
+  const proxy = new Proxy(
+    {
+      documentNonce: "nonce-ok",
+      tabId: 1,
+      frameId: 0,
+      pageUrl: "https://x.test/",
+      topLevelPageUrl: "https://top.test/",
+    },
+    {
+      getOwnPropertyDescriptor() {
+        throw new Error("SECRET_proxy_desc");
+      },
+      get(_t, prop) {
+        throw new Error("SECRET_proxy_" + String(prop));
+      },
+    }
+  );
+  assert.throws(
+    () => api.buildPageSnapshot(proxy, env),
+    (err) => {
+      assert.ok(err instanceof TypeError);
+      assert.equal(err.message, "invalid snapshot context");
+      assert.equal(String(err.message).includes("SECRET_"), false);
+      assert.equal(String(err.stack || "").includes("SECRET_"), false);
+      return true;
+    }
+  );
+
+  const blankControlNonces = ["", "   ", "\t", "\n", "a\u0001b", "\u0000uuid", "  uuid-ok  "];
+  for (const nonce of blankControlNonces) {
+    assert.throws(
+      () =>
+        api.buildPageSnapshot(
+          {
+            documentNonce: nonce,
+            tabId: 0,
+            frameId: 0,
+            pageUrl: "p",
+            topLevelPageUrl: "t",
+          },
+          env
+        ),
+      (err) => {
+        assert.ok(err instanceof TypeError);
+        assert.equal(err.message, "invalid snapshot context");
+        return true;
+      }
+    );
+  }
+
+  // createDocumentNonce must not accept whitespace/control randomUUID output.
+  const badUuid = api.createDocumentNonce(
+    { randomUUID: () => "  not-a-safe-nonce  " },
+    () => 1
+  );
+  assert.notEqual(badUuid, "  not-a-safe-nonce  ");
+  assert.equal(typeof badUuid, "string");
+  assert.ok(badUuid.length > 0);
+  assert.equal(/[\u0000-\u001f\u007f]/.test(badUuid), false);
+  assert.equal(/^\s|\s$/.test(badUuid), false);
+
+  const ctrlUuid = api.createDocumentNonce(
+    { randomUUID: () => "uuid\u0001bad" },
+    () => 2
+  );
+  assert.notEqual(ctrlUuid, "uuid\u0001bad");
+  assert.equal(/[\u0000-\u001f\u007f]/.test(ctrlUuid), false);
+
+  // Valid plain data-property context still works.
+  const ok = api.buildPageSnapshot(
+    {
+      documentNonce: "nonce-ok",
+      tabId: 2,
+      frameId: 3,
+      pageUrl: "https://x.test/a",
+      topLevelPageUrl: "https://top.test/a",
+      documentId: "doc-1",
+    },
+    env
+  );
+  assert.equal(ok.documentNonce, "nonce-ok");
+  assert.equal(ok.documentId, "doc-1");
+  assert.equal(ok.tabId, 2);
+  assert.equal(ok.frameId, 3);
+});
+
+test("topLevelPageUrl identity change resends one snapshot then suppresses identical", async () => {
+  const api = loadContent();
+  let topUrl = "https://top.example/outer-a";
+  const frameHref = "https://frame.example/embed/player";
+  const root = makeInstallRoot({
+    href: frameHref,
+    mediaUrl: "https://cdn.example/embed.mp4",
+    topLevelPageUrl: topUrl,
+    title: "Embed Title",
+    contextHandler: () => ({
+      ok: true,
+      tabId: 9,
+      frameId: 2,
+      documentId: "frame-doc",
+      topLevelPageUrl: topUrl,
+    }),
+  });
+  root.location.hostname = "frame.example";
+  root.location.pathname = "/embed/player";
+  root.location.origin = "https://frame.example";
+  // Cross-origin iframe: window !== top so topLevelPageUrl is sender-authoritative.
+  const otherTop = { name: "top-window" };
+  Object.defineProperty(root, "top", {
+    configurable: true,
+    get() {
+      return otherTop;
+    },
+  });
+
+  api.install(root);
+  await flushMicrotasks();
+
+  let snaps = root._messages.filter((m) => m.type === "page-snapshot");
+  assert.equal(snaps.length, 1, "initial snapshot once");
+  assert.equal(snaps[0].pageUrl, frameHref);
+  assert.equal(snaps[0].topLevelPageUrl, "https://top.example/outer-a");
+  assert.equal(snaps[0].documentId, "frame-doc");
+  assert.equal(snaps[0].frameId, 2);
+
+  topUrl = "https://top.example/outer-b";
+  const interval = root._timers.find((t) => t.type === "interval");
+  assert.ok(interval);
+  await interval.fn();
+  await flushMicrotasks();
+
+  snaps = root._messages.filter((m) => m.type === "page-snapshot");
+  assert.equal(
+    snaps.length,
+    2,
+    "topLevelPageUrl change must refresh snapshot exactly once"
+  );
+  assert.equal(snaps[1].pageUrl, frameHref);
+  assert.equal(snaps[1].topLevelPageUrl, "https://top.example/outer-b");
+  assert.equal(snaps[1].documentId, "frame-doc");
+
+  await interval.fn();
+  await flushMicrotasks();
+  snaps = root._messages.filter((m) => m.type === "page-snapshot");
+  assert.equal(snaps.length, 2, "identical subsequent context must stay suppressed");
+});
+
+test("unbound content-media is retried once after context success then deduped", async () => {
+  const api = loadContent();
+  let allowContext = false;
+  const mediaUrl = "https://cdn.example/retry-me.mp4";
+  const top = "https://site.example/watch";
+  const root = makeInstallRoot({
+    href: top,
+    mediaUrl,
+    topLevelPageUrl: top,
+    contextHandler: () => {
+      if (!allowContext) return { ok: false };
+      return {
+        ok: true,
+        tabId: 4,
+        frameId: 0,
+        documentId: null,
+        topLevelPageUrl: top,
+      };
+    },
+  });
+  root.location.hostname = "site.example";
+  root.location.pathname = "/watch";
+  root.location.origin = "https://site.example";
+
+  api.install(root);
+  await flushMicrotasks();
+
+  let media = root._messages.filter((m) => m.type === "content-media");
+  assert.equal(media.length, 1, "exactly one unbound media on context failure");
+  assert.equal(media[0].item.url, mediaUrl);
+  assert.equal(media[0].snapshot, undefined);
+  assert.equal(root._messages.some((m) => m.type === "page-snapshot"), false);
+
+  allowContext = true;
+  const interval = root._timers.find((t) => t.type === "interval");
+  assert.ok(interval);
+  await interval.fn();
+  await flushMicrotasks();
+
+  media = root._messages.filter((m) => m.type === "content-media");
+  assert.equal(media.length, 2, "exactly one snapshot-bound retry");
+  assert.equal(media[1].item.url, mediaUrl);
+  assert.ok(media[1].snapshot, "retry must include snapshot");
+  assert.equal(media[1].snapshot.tabId, 4);
+  assert.equal(media[1].snapshot.pageUrl, top);
+  assert.ok(root._messages.some((m) => m.type === "page-snapshot"));
+
+  await interval.fn();
+  await flushMicrotasks();
+  // MutationObserver scan path must also not triple-report.
+  const obs = root._observers[0];
+  if (obs && obs.cb) {
+    obs.cb([]);
+    await flushMicrotasks();
+  }
+  media = root._messages.filter((m) => m.type === "content-media");
+  assert.equal(media.length, 2, "no third duplicate after bound");
+
+  // Concurrent-ish double scan after bind still one bound total.
+  if (obs && obs.cb) {
+    obs.cb([]);
+    obs.cb([]);
+    await flushMicrotasks();
+  }
+  media = root._messages.filter((m) => m.type === "content-media");
+  assert.equal(media.length, 2);
+
+  // SPA URL change resets retry state so media can be reported again.
+  root.location.href = "https://site.example/watch-2";
+  root.location.pathname = "/watch-2";
+  await interval.fn();
+  await flushMicrotasks();
+  media = root._messages.filter((m) => m.type === "content-media");
+  assert.ok(
+    media.filter((m) => m.item.url === mediaUrl).length >= 3,
+    "SPA reset allows re-report"
+  );
+});
