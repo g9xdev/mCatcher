@@ -322,6 +322,8 @@
             wakeGeneration: gs ? gs.wakeGeneration : 0,
             ownerJobId: gs ? gs.ownerJobId : null,
             reducedConcurrency: gs ? gs.reducedConcurrency : null,
+            // Safe plain map of jobId → observed native open count (no live refs).
+            nativeOpen: gs && gs.nativeOpen ? Object.assign({}, gs.nativeOpen) : {},
           }),
         });
       }
@@ -1639,31 +1641,56 @@
         return false;
       }
 
-      // Zero native opens on job + gate without maybeQuiesce (would detour pausing
-      // into waiting_provider before needs_user). Disconnect is terminal for this
-      // helper generation of opens.
-      job.nativeOpenConnections = 0;
       var gate = getGate(job.providerKey);
+
+      // Confirm ProviderGate native-open zero BEFORE projecting the job counter.
+      // Never allow job.nativeOpenConnections=0 while the gate still records >0.
+      // maybeQuiesce is intentionally not invoked (would detour pausing → waiting).
+      var nativeConfirmed = false;
       try {
         gate.noteNativeOpen(job.id, 0);
+        nativeConfirmed = true;
       } catch (errNative) {
-        // Gate observation must not block the park transaction.
+        var openAfter = gate.snapshot().nativeOpen;
+        var gateOpens =
+          openAfter && Object.prototype.hasOwnProperty.call(openAfter, job.id)
+            ? openAfter[job.id]
+            : null;
+        if (gateOpens === 0) {
+          // Mutated then threw: zeros are confirmed; safe to continue the park.
+          nativeConfirmed = true;
+        } else {
+          // Throw-before-mutation: leave job/gate coherent and retryable.
+          throw errNative;
+        }
       }
+      if (!nativeConfirmed) return false;
+      var openSnap = gate.snapshot().nativeOpen;
+      if (
+        openSnap &&
+        Object.prototype.hasOwnProperty.call(openSnap, job.id) &&
+        openSnap[job.id] !== 0
+      ) {
+        // Gate retained a positive count — refuse a false success projection.
+        return false;
+      }
+      job.nativeOpenConnections = 0;
 
-      // Authenticated saturated/recovering owner: release ownership with no recovery
-      // successor. Do not authorize/wake same-provider waiters on helper disconnect.
+      // Authenticated saturated/recovering owner: confirmed release with no recovery
+      // successor and no same-provider waiter authorization on helper disconnect.
       var snap = gate.snapshot();
       if (
         (snap.state === "saturated" || snap.state === "recovering") &&
         snap.ownerJobId === job.id
       ) {
-        try {
-          gate.completeOwner({
-            jobId: job.id,
-            recoveryOwnerJobId: null,
-          });
-        } catch (errOwner) {
-          // Ownership release best-effort; job still parks needs_user below.
+        var release = reconcileProviderOwnerRelease(job, {
+          recoveryOwnerJobId: null,
+          authorizeRecovery: false,
+        });
+        if (release.stillOwner || !release.advanced) {
+          // Fail closed: do not park/return true while gate still names this owner.
+          if (release.error) throw release.error;
+          return false;
         }
       }
 
@@ -1793,11 +1820,15 @@
       var wasAuthenticatedOwner =
         (snap.state === "saturated" || snap.state === "recovering") &&
         snap.ownerJobId === job.id;
+      // Default true preserves Firefox/settlement paths; transport disconnect passes false.
+      var shouldAuthorize = options.authorizeRecovery !== false;
 
       if (!wasAuthenticatedOwner) {
         // Gate already advanced (or job was never owner): authorize exact named
         // recovery owner at most once; do not charge a different waiter.
-        var authorizedExisting = authorizeGateNamedRecoveryOwner(job.providerKey);
+        var authorizedExisting = shouldAuthorize
+          ? authorizeGateNamedRecoveryOwner(job.providerKey)
+          : false;
         return {
           wasAuthenticatedOwner: false,
           advanced: true,
@@ -1836,7 +1867,7 @@
       var advanced = !!(result && result.advanced === true) || (!stillOwner && err);
 
       var authorized = false;
-      if (advanced && !stillOwner) {
+      if (advanced && !stillOwner && shouldAuthorize) {
         // Authorize exact gate-named recovery owner (or the recovery we requested if
         // still waiting under that id). authorizeWake is per-epoch idempotent.
         if (after.ownerJobId) {
