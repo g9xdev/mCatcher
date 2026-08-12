@@ -160,7 +160,16 @@ test("createJob builds created job with clamped retries, no slot, no attempt tok
   assert.equal(view.attemptToken, null);
   assert.ok(view.stateVersion >= 1);
   assert.equal(view.mode, "multi-range");
-  assert.equal(view.intent, i);
+  // Brand-new allowlist intent (never caller identity / frozen passthrough).
+  assert.notEqual(view.intent, i);
+  assert.deepEqual(view.intent, {
+    requestedFilename: "a.mp4",
+    destinationDirectory: null,
+    saveMode: "default",
+    userSelectedFirefox: false,
+    userActionToken: "t",
+    createdAt: "t0",
+  });
   assert.equal(view.intent.requestedFilename, "a.mp4");
   // Never derive providerKey from mediaOrigin / CDN.
   assert.notEqual(view.providerKey, "cdn-should-not-become-provider");
@@ -732,4 +741,309 @@ test("download-scheduler dual-export assigns locked McDownloadScheduler global w
   assert.equal(typeof sandbox.module.exports.createDownloadScheduler, "function");
   assert.equal(typeof root.McDownloadScheduler.createDownloadScheduler, "function");
   assert.equal(root.McDownloadScheduler, sandbox.module.exports);
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1: privacy allowlist, atomic admission, shape contracts
+// ---------------------------------------------------------------------------
+
+test("pre-frozen intent with secrets never projects extras; caller mutation is ignored", () => {
+  // Mutation: Object.isFrozen passthrough stores signed URL / Cookie / nested secrets.
+  const s = makeScheduler({ maxConcurrent: 1 });
+  const nestedSecret = { Cookie: "session=evil-nested", token: "nested-sig" };
+  const dirty = Object.freeze({
+    requestedFilename: "safe.mp4",
+    destinationDirectory: null,
+    saveMode: "default",
+    userSelectedFirefox: false,
+    userActionToken: "t-action",
+    createdAt: "t0",
+    Cookie: "session=evil",
+    Authorization: "Bearer secret-token",
+    signedUrl: "https://cdn.example/x?sig=deadbeef",
+    query: { sig: "deadbeef" },
+    headers: Object.freeze({ Cookie: "x=1" }),
+    sourceContext: Object.freeze({ mediaOrigin: "https://secret-origin" }),
+    mediaOrigin: "https://cdn-secret",
+    nested: nestedSecret,
+  });
+  const view = s.createJob({
+    id: "priv",
+    providerKey: "p.com",
+    intent: dirty,
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+
+  // Brand-new exact allowlist — not the frozen caller graph.
+  assert.notEqual(view.intent, dirty);
+  assert.ok(Object.isFrozen(view.intent));
+  assert.deepEqual(Object.keys(view.intent).sort(), [
+    "createdAt",
+    "destinationDirectory",
+    "requestedFilename",
+    "saveMode",
+    "userActionToken",
+    "userSelectedFirefox",
+  ]);
+  assert.equal(view.intent.requestedFilename, "safe.mp4");
+  assert.equal(view.intent.userActionToken, "t-action");
+  assert.equal("Cookie" in view.intent, false);
+  assert.equal("Authorization" in view.intent, false);
+  assert.equal("signedUrl" in view.intent, false);
+  assert.equal("query" in view.intent, false);
+  assert.equal("headers" in view.intent, false);
+  assert.equal("sourceContext" in view.intent, false);
+  assert.equal("mediaOrigin" in view.intent, false);
+  assert.equal("nested" in view.intent, false);
+
+  // Mutating the caller graph after createJob must not alter scheduler view.
+  nestedSecret.Cookie = "session=mutated-after-create";
+  assert.equal(s.getJob("priv").intent.requestedFilename, "safe.mp4");
+  assert.equal("Cookie" in s.getJob("priv").intent, false);
+  assert.equal("nested" in s.getJob("priv").intent, false);
+
+  const json = JSON.stringify(s.getSnapshot());
+  assert.equal(json.includes("session=evil"), false);
+  assert.equal(json.includes("secret-token"), false);
+  assert.equal(json.includes("deadbeef"), false);
+  assert.equal(json.includes("cdn-secret"), false);
+  assert.equal(json.includes("secret-origin"), false);
+  assert.equal(json.includes("mutated-after-create"), false);
+  assertSlotInvariant(s);
+});
+
+test("object-shaped allowlisted intent fields and mediaKind are rejected before create", () => {
+  // Mutation: freeze/publish object requestedFilename or object mediaKind aliases.
+  const s = makeScheduler({ maxConcurrent: 1 });
+  const badFilename = Object.freeze({
+    requestedFilename: Object.freeze({ name: "evil.mp4", Cookie: "x" }),
+    destinationDirectory: null,
+    saveMode: "default",
+    userSelectedFirefox: false,
+    userActionToken: "t",
+    createdAt: "t0",
+  });
+  assert.throws(
+    () =>
+      s.createJob({
+        id: "bad-fn",
+        providerKey: "p.com",
+        intent: badFilename,
+        segmentConcurrency: 1,
+        retries: 1,
+      }),
+    TypeError
+  );
+  assert.equal(s.getJob("bad-fn"), null);
+
+  assert.throws(
+    () =>
+      s.createJob({
+        id: "bad-mk",
+        providerKey: "p.com",
+        intent: intent("a.mp4"),
+        segmentConcurrency: 1,
+        retries: 1,
+        mediaKind: Object.freeze({ kind: "video", secret: "nested-alias" }),
+      }),
+    TypeError
+  );
+  assert.equal(s.getJob("bad-mk"), null);
+
+  assert.throws(
+    () =>
+      s.createJob({
+        id: "blank-mk",
+        providerKey: "p.com",
+        intent: intent("a.mp4"),
+        segmentConcurrency: 1,
+        retries: 1,
+        mediaKind: "  ",
+      }),
+    TypeError
+  );
+  assert.equal(s.getJob("blank-mk"), null);
+
+  const ok = s.createJob({
+    id: "ok-mk",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+    mediaKind: "video",
+  });
+  assert.equal(ok.mediaKind, "video");
+  assert.equal(s.getJob("ok-mk").mediaKind, "video");
+  assert.equal(s.createJob({
+    id: "null-mk",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+    mediaKind: null,
+  }).mediaKind, null);
+});
+
+test("intent primitive contract rejects invalid types and blank required strings", () => {
+  const s = makeScheduler({ maxConcurrent: 1 });
+  function tryIntent(partial) {
+    const base = {
+      requestedFilename: "a.mp4",
+      destinationDirectory: null,
+      saveMode: "default",
+      userSelectedFirefox: false,
+      userActionToken: "t",
+      createdAt: "t0",
+    };
+    return s.createJob({
+      id: "x-" + Math.random().toString(36).slice(2, 10),
+      providerKey: "p.com",
+      intent: Object.assign(base, partial),
+      segmentConcurrency: 1,
+      retries: 1,
+    });
+  }
+  assert.throws(() => tryIntent({ requestedFilename: "" }), TypeError);
+  assert.throws(() => tryIntent({ requestedFilename: "  " }), TypeError);
+  assert.throws(() => tryIntent({ requestedFilename: ["a.mp4"] }), TypeError);
+  assert.throws(() => tryIntent({ userActionToken: "" }), TypeError);
+  assert.throws(() => tryIntent({ userActionToken: function () {} }), TypeError);
+  assert.throws(() => tryIntent({ destinationDirectory: "" }), TypeError);
+  assert.throws(
+    () => tryIntent({ destinationDirectory: Object.freeze({ path: "/tmp" }) }),
+    TypeError
+  );
+  assert.throws(() => tryIntent({ saveMode: "download" }), TypeError);
+  assert.throws(() => tryIntent({ saveMode: Object.freeze(["default"]) }), TypeError);
+  assert.throws(() => tryIntent({ userSelectedFirefox: "yes" }), TypeError);
+  assert.throws(() => tryIntent({ userSelectedFirefox: 1 }), TypeError);
+  assert.throws(() => tryIntent({ createdAt: 123 }), TypeError);
+  assert.throws(() => tryIntent({ createdAt: null }), TypeError);
+  assert.throws(() => tryIntent({ createdAt: Object.freeze({ iso: "t0" }) }), TypeError);
+  // No partial job creation on validation failure.
+  assert.equal(s.getSnapshot().jobs.length, 0);
+});
+
+test("throwing randomToken hook still admits with slot invariant and no lost queue", () => {
+  // Mutation: mint after state/queue mutation leaves running owner outside counter
+  // or drops FIFO entry when entropy hook throws.
+  let calls = 0;
+  const s = createDownloadScheduler({
+    maxConcurrent: 1,
+    now: () => 0,
+    randomToken: function () {
+      calls += 1;
+      throw new Error("entropy unavailable");
+    },
+  });
+  s.createJob({
+    id: "a",
+    providerKey: "a.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+  s.createJob({
+    id: "b",
+    providerKey: "b.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+
+  // Enqueue must not throw; admit a, keep b queued.
+  s.enqueue("a");
+  s.enqueue("b");
+  assert.ok(calls >= 1);
+  assert.equal(s.getJob("a").state, "running");
+  assert.equal(s.getJob("a").holdsGlobalSlot, true);
+  assert.ok(typeof s.getJob("a").attemptToken === "string");
+  assert.ok(s.getJob("a").attemptToken.trim().length > 0);
+  assert.equal(s.getJob("b").state, "queued");
+  assert.equal(s.getSnapshot().globalRunning, 1);
+  assert.deepEqual(s.getSnapshot().providers["b.com"].queued.slice(), ["b"]);
+  assertSlotInvariant(s);
+
+  // Complete and drain next — second admit also survives the throwing hook.
+  s.onTransportResult("a", s.getJob("a").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("b").state, "running");
+  assert.equal(s.getJob("b").holdsGlobalSlot, true);
+  assert.equal(s.getSnapshot().globalRunning, 1);
+  assert.ok(s.getJob("b").attemptToken.trim().length > 0);
+  assert.notEqual(s.getJob("b").attemptToken, s.getJob("a").attemptToken);
+  assertSlotInvariant(s);
+});
+
+test("constant blank and non-string randomToken still yield unique nonblank tokens", () => {
+  const blank = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: () => 0,
+    randomToken: () => "",
+  });
+  blank.createJob({
+    id: "1",
+    providerKey: "a.com",
+    intent: intent("1.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+  blank.createJob({
+    id: "2",
+    providerKey: "b.com",
+    intent: intent("2.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+  blank.enqueue("1");
+  blank.enqueue("2");
+  const t1 = blank.getJob("1").attemptToken;
+  const t2 = blank.getJob("2").attemptToken;
+  assert.ok(typeof t1 === "string" && t1.trim().length > 0);
+  assert.ok(typeof t2 === "string" && t2.trim().length > 0);
+  assert.notEqual(t1, t2);
+  assertSlotInvariant(blank);
+
+  const constant = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: () => 0,
+    randomToken: () => "same",
+  });
+  constant.createJob({
+    id: "c1",
+    providerKey: "a.com",
+    intent: intent("c1.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+  constant.createJob({
+    id: "c2",
+    providerKey: "b.com",
+    intent: intent("c2.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+  constant.enqueue("c1");
+  constant.enqueue("c2");
+  assert.notEqual(constant.getJob("c1").attemptToken, constant.getJob("c2").attemptToken);
+  assertSlotInvariant(constant);
+
+  const nonString = createDownloadScheduler({
+    maxConcurrent: 1,
+    now: () => 0,
+    randomToken: () => 42,
+  });
+  nonString.createJob({
+    id: "n1",
+    providerKey: "a.com",
+    intent: intent("n1.mp4"),
+    segmentConcurrency: 1,
+    retries: 1,
+  });
+  nonString.enqueue("n1");
+  assert.ok(nonString.getJob("n1").attemptToken.trim().length > 0);
+  assertSlotInvariant(nonString);
 });

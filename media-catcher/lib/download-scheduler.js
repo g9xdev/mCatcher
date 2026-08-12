@@ -9,13 +9,19 @@
   function () {
   "use strict";
 
+  /**
+   * Deep-freeze a scheduler-owned allowlist graph. Always traverse children
+   * even when a parent is already frozen. Callers must only pass objects the
+   * scheduler created — never untrusted caller graphs.
+   */
   function deepFreeze(o) {
-    if (!o || typeof o !== "object" || Object.isFrozen(o)) return o;
+    if (!o || typeof o !== "object") return o;
     Object.getOwnPropertyNames(o).forEach(function (k) {
       var v = o[k];
       if (v && typeof v === "object") deepFreeze(v);
     });
-    return Object.freeze(o);
+    if (!Object.isFrozen(o)) Object.freeze(o);
+    return o;
   }
 
   function isNonblankString(v) {
@@ -52,20 +58,51 @@
     return i;
   }
 
-  function freezeIntent(intent) {
+  /**
+   * Always mint a brand-new exact allowlist intent. Never passthrough a frozen
+   * caller object (secrets / signed URLs / nested aliases must not survive).
+   * Reject non-primitive values under allowlisted keys before job creation.
+   */
+  function sanitizeIntent(intent) {
     if (!intent || typeof intent !== "object") {
       throw new TypeError("intent must be an object");
     }
-    if (Object.isFrozen(intent)) return intent;
-    // Shallow-safe copy then freeze (intent fields are primitives / null).
+    if (!isNonblankString(intent.requestedFilename)) {
+      throw new TypeError("intent.requestedFilename must be a nonblank string");
+    }
+    var destinationDirectory =
+      intent.destinationDirectory === undefined ? null : intent.destinationDirectory;
+    if (destinationDirectory !== null && !isNonblankString(destinationDirectory)) {
+      throw new TypeError("intent.destinationDirectory must be null or a nonblank string");
+    }
+    if (intent.saveMode !== "default" && intent.saveMode !== "save-as") {
+      throw new TypeError('intent.saveMode must be "default" or "save-as"');
+    }
+    if (typeof intent.userSelectedFirefox !== "boolean") {
+      throw new TypeError("intent.userSelectedFirefox must be a boolean");
+    }
+    if (!isNonblankString(intent.userActionToken)) {
+      throw new TypeError("intent.userActionToken must be a nonblank string");
+    }
+    if (typeof intent.createdAt !== "string") {
+      throw new TypeError("intent.createdAt must be a string");
+    }
     return deepFreeze({
       requestedFilename: intent.requestedFilename,
-      destinationDirectory: intent.destinationDirectory === undefined ? null : intent.destinationDirectory,
+      destinationDirectory: destinationDirectory,
       saveMode: intent.saveMode,
       userSelectedFirefox: intent.userSelectedFirefox,
       userActionToken: intent.userActionToken,
       createdAt: intent.createdAt,
     });
+  }
+
+  function sanitizeMediaKind(value) {
+    if (value == null) return null;
+    if (!isNonblankString(value)) {
+      throw new TypeError("mediaKind must be null or a nonblank string");
+    }
+    return value;
   }
 
   function defaultRandomToken() {
@@ -187,9 +224,19 @@
       });
     }
 
+    /**
+     * Mint a unique nonblank attempt token without mutating job/slot state.
+     * A throwing / blank / non-string randomToken hook never fails admission:
+     * fall back to the scheduler's monotonic token so the queue cannot strand.
+     */
     function mintAttemptToken() {
       tokenGuard += 1;
-      var t = randomToken();
+      var t = null;
+      try {
+        t = randomToken();
+      } catch (err) {
+        t = null;
+      }
       if (!isNonblankString(t)) {
         t = "attempt-" + tokenGuard;
       } else {
@@ -216,14 +263,18 @@
      * Atomically admit a queued job into running: one slot token, fresh
      * attemptToken, single stateVersion bump. Caller already removed it
      * from the provider FIFO.
+     *
+     * Token is minted BEFORE any state/slot mutation so a bad entropy hook
+     * cannot leave a running owner outside the counter or drop the FIFO entry.
      */
     function admitJob(job) {
       if (job.state !== "queued") return false;
       if (globalRunning >= maxConcurrent) return false;
+      var token = mintAttemptToken();
       job.state = "running";
       job.stateVersion += 1;
       job.holdsGlobalSlot = true;
-      job.attemptToken = mintAttemptToken();
+      job.attemptToken = token;
       globalRunning += 1;
       return true;
     }
@@ -294,12 +345,14 @@
         throw new Error("duplicate job id: " + id);
       }
       var segmentConcurrency = requirePositiveInt(input.segmentConcurrency, "segmentConcurrency");
-      var intent = freezeIntent(input.intent);
+      // Validate intent + mediaKind before any job store mutation.
+      var intent = sanitizeIntent(input.intent);
+      var mediaKind = sanitizeMediaKind(input.mediaKind);
       var retryRemaining = clampRetries(input.retries);
 
-      // mediaOrigin is accepted for forward compatibility but NEVER used as providerKey.
+      // mediaOrigin is accepted for forward compatibility but NEVER used as providerKey
+      // and NEVER projected from getJob/getSnapshot.
       var mediaOrigin = input.mediaOrigin == null ? null : input.mediaOrigin;
-      var mediaKind = input.mediaKind == null ? null : input.mediaKind;
       var ephemeral = input.ephemeral == null ? null : input.ephemeral;
 
       var job = {
@@ -351,6 +404,10 @@
      * Terminalize a running job that presents the current attempt token.
      * Same transaction: release slot, bump stateVersion once, clear ephemeral
      * once, then drain. Late/duplicate/wrong-token → no-op.
+     *
+     * Slot ownership is asserted before any terminal mutation. A running job
+     * without a held slot (or a non-positive globalRunning) is an invariant
+     * failure — visible throw, no partial terminalize. No silent underflow clamp.
      */
     function terminalizeRunning(job, attemptToken, nextState) {
       if (!job) return false;
@@ -358,15 +415,16 @@
       if (!isNonblankString(attemptToken)) return false;
       if (job.attemptToken !== attemptToken) return false;
 
-      var held = job.holdsGlobalSlot === true;
+      if (job.holdsGlobalSlot !== true || globalRunning <= 0) {
+        throw new Error(
+          "slot invariant violation: running job must own a global slot with globalRunning > 0"
+        );
+      }
+
       job.state = nextState;
       job.stateVersion += 1;
-      if (held) {
-        job.holdsGlobalSlot = false;
-        if (globalRunning > 0) globalRunning -= 1;
-      } else {
-        job.holdsGlobalSlot = false;
-      }
+      job.holdsGlobalSlot = false;
+      globalRunning -= 1;
       clearEphemeralOnce(job);
       // Drop any lingering queue membership (should not be queued while running).
       var q = providerQueues.get(job.providerKey);
