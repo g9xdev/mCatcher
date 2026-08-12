@@ -453,7 +453,8 @@ def main():
                     send({"type": "pong", "ffmpeg": bool(FFMPEG), "ffmpegPath": FFMPEG or "", "version": VERSION,
                           "ytdlp": bool(_downloads.YTDLP), "ytdlpVersion": ytdlp_version_cached(),
                           "node": bool(_downloads.NODE), "deno": bool(_downloads.DENO), "pot": _pot_alive(),
-                          "cast": True})   # DLNA casting is stdlib — always available
+                          "cast": True,  # DLNA casting is stdlib — always available
+                          "ytdlProtocol": 2})
                 elif cmd == "ytdl":
                     handle_ytdl(msg)
                 elif cmd == "ytmeta":

@@ -1011,16 +1011,409 @@ def handle_ytmeta(req):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _ytdl_exact_nonblank_str(val):
+    """True only for a nonblank built-in str (rejects subclasses/wrappers)."""
+    return type(val) is str and bool(val.strip())
+
+
+def _ytdl_control_free_str(val):
+    """True when val is a built-in str with no C0/C1 control characters."""
+    if type(val) is not str:
+        return False
+    for ch in val:
+        o = ord(ch)
+        if o < 32 or o == 127:
+            return False
+    return True
+
+
+def _ytdl_default_outdir():
+    """Config saveFolder when set, otherwise the user's Downloads directory."""
+    try:
+        folder = (_h().load_config().get("saveFolder") or "") or ""
+    except Exception:
+        folder = ""
+    if folder:
+        return folder
+    return _h().downloads_dir()
+
+
+def _ytdl_escape_outtmpl(path):
+    """Escape % so yt-dlp does not treat user filename characters as templates."""
+    return (path or "").replace("%", "%%")
+
+
+def _ytdl_paths_same(a, b):
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except Exception:
+        return False
+
+
+def _ytdl_promote_to_target(src, target):
+    """Move src onto the preselected target when they differ.
+
+    Never overwrites an unrelated existing final. Returns the path that should
+    be reported on success, or None when promotion/validation fails.
+    """
+    if not src or not target:
+        return None
+    try:
+        if not os.path.isfile(src):
+            return None
+        if _ytdl_paths_same(src, target):
+            return target if os.path.isfile(target) else src
+        if os.path.exists(target) and not _ytdl_paths_same(src, target):
+            # Do not clobber an unrelated final path.
+            return None
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.replace(src, target)
+        return target if os.path.isfile(target) else None
+    except Exception:
+        return None
+
+
+def _ytdl_terminal_file_bytes(path):
+    """Return (path, size) only for a real file with a nonnegative built-in int size."""
+    if not path or type(path) is not str:
+        return None, None
+    try:
+        if not os.path.isfile(path):
+            return None, None
+        size = _pget_nonneg_int_bytes(os.path.getsize(path))
+        if size is None:
+            return None, None
+        return path, size
+    except Exception:
+        return None, None
+
+
+def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
+    cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--progress", "--no-warnings",
+           "--force-overwrites",
+           "-f", fmt, "--merge-output-format", "mp4",
+           "--cookies-from-browser", "firefox",
+           "-o", outtmpl,
+           # --print puts yt-dlp in quiet mode; --progress above forces the bar back on.
+           "--print", "after_move:@@FILE@@ %(filepath)s"]
+    if _h().FFMPEG:
+        cmd += ["--ffmpeg-location", os.path.dirname(_h().FFMPEG)]
+    if deno:     # solve the 'n' challenge -> unlocks the real (incl. 4K) formats
+        cmd += ["--js-runtimes", "deno:%s" % deno]
+    if pot:      # only when the optional PO-token provider is actually running
+        cmd += ["--extractor-args",
+                "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT]
+    cmd += [url]
+    return cmd
+
+
 def handle_ytdl(req):
-    """Download a YouTube (or other yt-dlp-supported) URL at the highest quality:
-    best video + best audio, merged to mp4 by yt-dlp+ffmpeg, using the PO-token
-    provider and Firefox cookies for reliability. Streams progress; maps failures
-    to explicit reasons instead of silently downgrading.
+    """Download a YouTube (or other yt-dlp-supported) URL via yt-dlp.
+
+    Two wire modes share the same command name:
+      - Legacy (attemptToken key ABSENT): title/ID output template and tokenless
+        event shapes for old extensions.
+      - Structured (attemptToken key PRESENT): token-fenced Save As protocol —
+        exact name/dir, pre-deduped target, % output-template escaping, and
+        attemptToken on every progress/terminal frame.
 
     yt-dlp entries share the pget registry under the same CAS helpers. They are
     tagged without lease_cv so pget-set-limit never acknowledges them. Cancel
     still kills the exact captured proc; unregister is identity-safe.
     """
+    if not isinstance(req, dict):
+        return
+
+    # KEY ABSENCE selects legacy protocol only. A present key never downgrades.
+    structured = "attemptToken" in req
+
+    if structured:
+        _handle_ytdl_structured(req)
+    else:
+        _handle_ytdl_legacy(req)
+
+
+def _handle_ytdl_structured(req):
+    """Token-bound Save As path: validate, register, then prepare asynchronously."""
+    token = req.get("attemptToken")
+    jid = req.get("id")
+    url = req.get("url")
+    name = req.get("name")
+
+    # Fail closed on invalid present token — never fall through to legacy.
+    if not _ytdl_exact_nonblank_str(token):
+        return
+
+    if not _ytdl_exact_nonblank_str(jid) or not _ytdl_exact_nonblank_str(url) \
+            or not _ytdl_exact_nonblank_str(name):
+        _h().send({
+            "type": "ytdl-error",
+            "id": jid if _ytdl_exact_nonblank_str(jid) else None,
+            "attemptToken": token,
+            "reason": "permanent",
+            "error": "Invalid download request.",
+        })
+        return
+
+    # Directory: absent / null / "" → default Downloads; else exact nonblank str.
+    if "dir" not in req or req.get("dir") is None or req.get("dir") == "":
+        outdir = None  # resolve default later (still token-bound on failure)
+        explicit_dir = False
+    else:
+        dval = req.get("dir")
+        if not _ytdl_exact_nonblank_str(dval):
+            _h().send({
+                "type": "ytdl-error",
+                "id": jid,
+                "attemptToken": token,
+                "reason": "permanent",
+                "error": "Invalid download request.",
+            })
+            return
+        outdir = dval
+        explicit_dir = True
+
+    # Format: omitted → default; present must be control-free built-in str.
+    if "format" not in req or req.get("format") is None:
+        fmt = "bv*+ba/b"
+    else:
+        fval = req.get("format")
+        if not _ytdl_control_free_str(fval):
+            _h().send({
+                "type": "ytdl-error",
+                "id": jid,
+                "attemptToken": token,
+                "reason": "permanent",
+                "error": "Invalid download request.",
+            })
+            return
+        fmt = fval or "bv*+ba/b"
+
+    safe_name = _pget_safe_filename(name)
+    if not safe_name:
+        _h().send({
+            "type": "ytdl-error",
+            "id": jid,
+            "attemptToken": token,
+            "reason": "permanent",
+            "error": "Invalid download request.",
+        })
+        return
+
+    # Register BEFORE async prep so matching cancel cannot race past setup.
+    op = {
+        "proc": None,
+        "kind": "ytdl",
+        "attemptToken": token,
+        "cancel_requested": False,
+    }
+    if not _pget_register(jid, op):
+        _h().send({
+            "type": "ytdl-error",
+            "id": jid,
+            "attemptToken": token,
+            "reason": "permanent",
+            "error": "Download id already in use.",
+        })
+        return
+
+    terminal = {"sent": False}
+
+    def emit(msg):
+        if terminal["sent"]:
+            return
+        terminal["sent"] = True
+        # Identity-unregister BEFORE the terminal so a synchronous same-id
+        # retry inside send() can register; finally CAS cleanup is a no-op then.
+        _pget_unregister(jid, op)
+        try:
+            _h().send(msg)
+        except Exception:
+            pass
+
+    def emit_error(reason, error):
+        emit({
+            "type": "ytdl-error",
+            "id": jid,
+            "attemptToken": token,
+            "reason": reason,
+            "error": error,
+        })
+
+    def emit_done(path, size):
+        emit({
+            "type": "ytdl-done",
+            "id": jid,
+            "attemptToken": token,
+            "file": path,
+            "bytes": size,
+        })
+
+    def progress_msg(**fields):
+        msg = {"type": "ytdl-progress", "id": jid, "attemptToken": token}
+        msg.update(fields)
+        try:
+            _h().send(msg)
+        except Exception:
+            pass
+
+    def cancelled():
+        return bool(op.get("cancel_requested"))
+
+    def worker():
+        target = None
+        try:
+            if cancelled():
+                emit_error("cancelled", "Cancelled.")
+                return
+
+            ytdlp = ensure_ytdlp()
+            if cancelled():
+                emit_error("cancelled", "Cancelled.")
+                return
+            if not ytdlp:
+                emit_error(
+                    "noytdlp",
+                    "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer.",
+                )
+                return
+
+            deno = ensure_deno()
+            if cancelled():
+                emit_error("cancelled", "Cancelled.")
+                return
+
+            if not explicit_dir:
+                try:
+                    out = _ytdl_default_outdir()
+                except Exception:
+                    emit_error("local_io", "Couldn't access the save folder.")
+                    return
+            else:
+                out = outdir
+
+            try:
+                os.makedirs(out, exist_ok=True)
+                if not os.path.isdir(out):
+                    raise OSError("not a directory")
+            except Exception:
+                # Explicit destination failure never silently falls back.
+                emit_error("local_io", "Couldn't create the save folder.")
+                return
+
+            if cancelled():
+                emit_error("cancelled", "Cancelled.")
+                return
+
+            try:
+                target = _dedup(os.path.join(out, safe_name))
+            except Exception:
+                emit_error("local_io", "Couldn't prepare the save path.")
+                return
+
+            pot = start_pot_provider()
+            if cancelled():
+                emit_error("cancelled", "Cancelled.")
+                return
+
+            outtmpl = _ytdl_escape_outtmpl(target)
+            cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
+            _h()._hlog("info", "yt-dlp: downloading (structured, pot=%s)" % ("on" if pot else "off"))
+            progress_msg(pct=0, stage="resolving", note="Preparing")
+
+            cf, si = _no_window()
+            try:
+                p = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                )
+            except Exception:
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                else:
+                    emit_error("spawn", "Couldn't start the download.")
+                return
+
+            op["proc"] = p
+            if cancelled():
+                _safe_kill(p)
+                emit_error("cancelled", "Cancelled.")
+                return
+
+            errbuf = []
+            filepath = None
+            last_pct = -1.0
+            last_note = ""
+            last_note_ts = 0.0
+            try:
+                for line in p.stdout:
+                    if cancelled():
+                        break
+                    s = line.strip() if isinstance(line, str) else str(line).strip()
+                    if not s:
+                        continue
+                    if s.startswith("@@FILE@@"):
+                        filepath = s[len("@@FILE@@"):].strip()
+                        continue
+                    if s.startswith("[download]"):
+                        prog = _parse_yt_progress(s)
+                        if prog:
+                            pct = prog.get("pct", 0.0)
+                            if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
+                                last_pct = pct
+                                progress_msg(**prog)
+                            continue
+                    errbuf.append(s)
+                    if "Merging formats" in s or s.startswith("[Merger]"):
+                        progress_msg(pct=99, stage="merging")
+                        continue
+                    if last_pct < 0:
+                        note = _yt_stage_note(s)
+                        now = time.time()
+                        if note and (note != last_note or now - last_note_ts > 0.5):
+                            last_note = note
+                            last_note_ts = now
+                            progress_msg(pct=0, stage="resolving", note=note)
+                p.wait()
+            except Exception:
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                    return
+                emit_error("permanent", "Download failed.")
+                return
+
+            # Matching cancel always wins over a late successful subprocess exit.
+            if cancelled():
+                emit_error("cancelled", "Cancelled.")
+                return
+
+            if p.returncode == 0 and filepath:
+                final_path = _ytdl_promote_to_target(filepath, target)
+                path, size = _ytdl_terminal_file_bytes(final_path)
+                if path is not None and size is not None:
+                    emit_done(path, size)
+                    _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(path))
+                    return
+                emit_error("local_io", "Download finished but the file could not be verified.")
+                return
+
+            reason, msg = _map_yt_error("\n".join(errbuf))
+            _h()._hlog(
+                "error",
+                "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]),
+            )
+            emit_error(reason, msg)
+        finally:
+            # CAS identity cleanup — no-op when emit already unregistered.
+            _pget_unregister(jid, op)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _handle_ytdl_legacy(req):
+    """Token-omitted path: preserve title/ID template and tokenless wire shapes."""
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
@@ -1039,19 +1432,7 @@ def handle_ytdl(req):
         outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
         # Optional format selector from the popup's quality picker; default = best.
         fmt = req.get("format") or "bv*+ba/b"
-        cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--progress", "--no-warnings", "--force-overwrites",
-               "-f", fmt, "--merge-output-format", "mp4",
-               "--cookies-from-browser", "firefox",
-               "-o", outtmpl,
-               # --print puts yt-dlp in quiet mode; --progress above forces the bar back on.
-               "--print", "after_move:@@FILE@@ %(filepath)s"]
-        if _h().FFMPEG:
-            cmd += ["--ffmpeg-location", os.path.dirname(_h().FFMPEG)]
-        if deno:     # solve the 'n' challenge -> unlocks the real (incl. 4K) formats
-            cmd += ["--js-runtimes", "deno:%s" % deno]
-        if pot:      # only when the optional PO-token provider is actually running
-            cmd += ["--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT]
-        cmd += [url]
+        cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
         _h()._hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
         _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": "Preparing"})
         cf, si = _no_window()
@@ -1062,7 +1443,8 @@ def handle_ytdl(req):
             _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return
         # Tagged yt-dlp op: same CAS registry as pget; no lease_cv so set-limit ignores it.
-        op = {"proc": p, "kind": "ytdl"}
+        # Legacy keeps spawn-then-register so a duplicate id still kills the new proc.
+        op = {"proc": p, "kind": "ytdl", "cancel_requested": False, "attemptToken": None}
         if not _pget_register(jid, op):
             # Duplicate id owns the registry — kill the just-spawned process, do not overwrite.
             _safe_kill(p)
@@ -1080,7 +1462,7 @@ def handle_ytdl(req):
         last_note_ts = 0.0
         try:
             for line in p.stdout:
-                s = line.strip()
+                s = line.strip() if isinstance(line, str) else str(line).strip()
                 if not s:
                     continue
                 if s.startswith("@@FILE@@"):
@@ -1108,9 +1490,20 @@ def handle_ytdl(req):
                         last_note_ts = now
                         _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": note})
             p.wait()
-            if p.returncode == 0 and filepath and os.path.isfile(filepath):
-                _h().send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": os.path.getsize(filepath)})
-                _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
+            if op.get("cancel_requested"):
+                _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled",
+                           "error": "Cancelled."})
+            elif p.returncode == 0 and filepath and os.path.isfile(filepath):
+                try:
+                    size = os.path.getsize(filepath)
+                except Exception:
+                    size = None
+                if type(size) is int and size >= 0:
+                    _h().send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": size})
+                    _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
+                else:
+                    reason, msg = _map_yt_error("\n".join(errbuf))
+                    _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             else:
                 reason, msg = _map_yt_error("\n".join(errbuf))
                 _h()._hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
