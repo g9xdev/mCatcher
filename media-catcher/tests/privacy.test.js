@@ -485,3 +485,239 @@ test("assertNoSentinels never echoes secrets and rejects malformed input", () =>
   assert.throws(() => P.assertNoSentinels("blob", [""]), TypeError);
   assert.throws(() => P.assertNoSentinels("blob", [1]), TypeError);
 });
+
+// --- Task-19 fix: hostile privacy projection escapes ---
+
+test("createEphemeral rejects own symbols accessors non-enumerable and non-string header shapes", () => {
+  const sym = Symbol("SECRET_SYMBOL");
+  const withSym = { A: "b" };
+  withSym[sym] = "SECRET_COOKIE";
+  assert.throws(() => P.createEphemeral(SIGNED, withSym), TypeError);
+
+  const nonEnum = {};
+  Object.defineProperty(nonEnum, "Cookie", {
+    enumerable: false,
+    value: "SECRET_COOKIE",
+    writable: true,
+    configurable: true,
+  });
+  assert.throws(() => P.createEphemeral(SIGNED, nonEnum), TypeError);
+
+  const withAccessor = {};
+  Object.defineProperty(withAccessor, "Cookie", {
+    enumerable: true,
+    configurable: true,
+    get() { return "SECRET_COOKIE"; },
+  });
+  assert.throws(() => P.createEphemeral(SIGNED, withAccessor), TypeError);
+
+  const nonStringVal = { Cookie: 123 };
+  assert.throws(() => P.createEphemeral(SIGNED, nonStringVal), TypeError);
+
+  // Only enumerable own primitive-string name/value pairs are copied.
+  const ok = P.createEphemeral(SIGNED, { Cookie: COOKIE, "X-Auth": "tok" });
+  assert.equal(ok.requestHeaders.Cookie, COOKIE);
+  assert.equal(ok.requestHeaders["X-Auth"], "tok");
+  assert.equal(Object.getPrototypeOf(ok.requestHeaders), null);
+});
+
+test("createEphemeral wraps hostile reflection traps with generic TypeError", () => {
+  const stages = [
+    {
+      name: "getPrototypeOf",
+      headers: new Proxy({}, {
+        getPrototypeOf() { throw new Error("SECRET_PROXY"); },
+      }),
+    },
+    {
+      name: "ownKeys",
+      headers: new Proxy({ A: "b" }, {
+        getPrototypeOf() { return Object.prototype; },
+        ownKeys() { throw new Error("SECRET_OWNKEYS"); },
+        getOwnPropertyDescriptor() {
+          return { configurable: true, enumerable: true, value: "b", writable: true };
+        },
+      }),
+    },
+    {
+      name: "getOwnPropertyDescriptor",
+      headers: new Proxy({ A: "b" }, {
+        getPrototypeOf() { return Object.prototype; },
+        ownKeys() { return ["A"]; },
+        getOwnPropertyDescriptor() { throw new Error("SECRET_GOPD"); },
+      }),
+    },
+  ];
+  for (const stage of stages) {
+    try {
+      P.createEphemeral(SIGNED, stage.headers);
+      assert.fail("expected TypeError for " + stage.name);
+    } catch (err) {
+      assert.ok(err instanceof TypeError, stage.name + " must be TypeError");
+      const msg = String(err && err.message);
+      assert.equal(msg.includes("SECRET"), false, stage.name + " leaked SECRET: " + msg);
+      assert.equal(msg.includes("PROXY"), false, stage.name);
+      assert.equal(msg.includes("OWNKEYS"), false, stage.name);
+      assert.equal(msg.includes("GOPD"), false, stage.name);
+    }
+  }
+});
+
+test("clearEphemeralOnTerminal never invokes clear getters and never leaks trap text", () => {
+  let gets = 0;
+  const eph = {
+    get clear() {
+      gets++;
+      throw new Error("SECRET_CLEAR_GETTER");
+    },
+  };
+  assert.equal(P.clearEphemeralOnTerminal({ ephemeral: eph }, "failed"), false);
+  assert.equal(gets, 0);
+
+  // Inherited clear getter must not be invoked.
+  let inheritedGets = 0;
+  const proto = {
+    get clear() {
+      inheritedGets++;
+      throw new Error("SECRET_INHERITED_CLEAR");
+    },
+  };
+  const inherited = Object.create(proto);
+  assert.equal(P.clearEphemeralOnTerminal({ ephemeral: inherited }, "completed"), false);
+  assert.equal(inheritedGets, 0);
+
+  // Malformed clear shapes return false without invoking accessors.
+  assert.equal(P.clearEphemeralOnTerminal({
+    ephemeral: Object.defineProperty({}, "clear", {
+      enumerable: true,
+      get() { throw new Error("SECRET_CLEAR_ACCESSOR"); },
+    }),
+  }, "cancelled"), false);
+
+  // Proxy traps: either false or generic cleanup error without hostile text.
+  try {
+    const r = P.clearEphemeralOnTerminal({
+      ephemeral: new Proxy({}, {
+        getOwnPropertyDescriptor() { throw new Error("SECRET_CLEAR_PROXY"); },
+        get() { throw new Error("SECRET_CLEAR_PROXY"); },
+      }),
+    }, "failed");
+    assert.equal(r, false);
+  } catch (err) {
+    const msg = String(err && err.message);
+    assert.equal(msg.includes("SECRET"), false);
+    assert.equal(msg.includes("PROXY"), false);
+    assert.match(msg, /cleanup failed|ephemeral/i);
+  }
+
+  // Throwing data-function clear is called at most once and rethrown generically.
+  let calls = 0;
+  const thrower = {
+    clear() {
+      calls += 1;
+      throw new Error("SECRET_CLEAR_THROW " + COOKIE);
+    },
+  };
+  assert.throws(() => P.clearEphemeralOnTerminal({ ephemeral: thrower }, "completed"), (err) => {
+    assert.equal(String(err.message).includes("SECRET"), false);
+    assert.equal(String(err.message).includes(COOKIE), false);
+    assert.match(String(err.message), /ephemeral cleanup failed/);
+    return true;
+  });
+  assert.equal(calls, 1);
+  assert.equal(P.clearEphemeralOnTerminal({ ephemeral: thrower }, "failed"), false);
+  assert.equal(calls, 1);
+});
+
+test("projectPopupJob redacts secret-bearing error and optional string fields", () => {
+  const view = P.projectPopupJob({
+    id: "j",
+    state: "failed",
+    error: "GET https://cdn.example/f.mp4?token=SECRET_SIGNED_QUERY_XYZ Cookie: SECRET_COOKIE",
+  });
+  const raw = JSON.stringify(view);
+  assert.equal(raw.includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(raw.includes("SECRET_COOKIE"), false);
+  assert.equal(raw.includes("cdn.example"), false);
+  if (Object.prototype.hasOwnProperty.call(view, "error")) {
+    assert.equal(view.error, "Download error");
+  }
+
+  // Friendly errors preserved.
+  const friendly = P.projectPopupJob({ id: "f", state: "failed", error: "HTTP 429; retry later" });
+  assert.equal(friendly.error, "HTTP 429; retry later");
+  const helper = P.projectPopupJob({ id: "h", state: "failed", error: "Helper unavailable" });
+  assert.equal(helper.error, "Helper unavailable");
+
+  // Authorization / Set-Cookie / credentials in error.
+  for (const bad of [
+    "Authorization: Bearer SECRET_TOKEN_XYZ",
+    "Set-Cookie: session=SECRET_COOKIE",
+    "Proxy-Authorization: Basic SECRET_BASIC",
+    "https://user:SECRET_PASS@cdn.example/f.mp4",
+    "https://cdn.example/f.mp4#SECRET_FRAG",
+  ]) {
+    const v = P.projectPopupJob({ id: "b", state: "failed", error: bad });
+    const s = JSON.stringify(v);
+    assert.equal(s.includes("SECRET"), false, bad);
+    if (Object.prototype.hasOwnProperty.call(v, "error")) {
+      assert.equal(v.error, "Download error");
+    }
+  }
+
+  // Optional popup strings that are not network URLs: redact/omit secret URL material.
+  const poisonedStrings = P.projectPopupJob({
+    id: "p",
+    state: "running",
+    name: "clip https://cdn.example/f.mp4?token=SECRET_SIGNED_QUERY_XYZ",
+    savedPath: "C:\\Videos\\ok.mp4",
+    mergeCommand: "ffmpeg -i https://cdn.example/a.mp4?token=SECRET_SIGNED_QUERY_XYZ -c copy out.mp4",
+    fixCommand: "Cookie: SECRET_COOKIE",
+    convertCodec: "h264",
+    providerKey: "florenfile.com",
+    requestedFilename: "my video.mp4",
+  });
+  const raw2 = JSON.stringify(poisonedStrings);
+  assert.equal(raw2.includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(raw2.includes("SECRET_COOKIE"), false);
+  // Legitimate values survive.
+  assert.equal(poisonedStrings.savedPath, "C:\\Videos\\ok.mp4");
+  assert.equal(poisonedStrings.providerKey, "florenfile.com");
+  assert.equal(poisonedStrings.requestedFilename, "my video.mp4");
+  assert.equal(poisonedStrings.convertCodec, "h264");
+});
+
+test("redactUrlForLog manual fallback never echoes secrets when URL is absent", () => {
+  const abs = path.join(mediaCatcherRoot, "lib", "privacy.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const root = {};
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require,
+    console,
+    self: root,
+    // URL intentionally absent so manual fallback runs.
+  };
+  sandbox.module.exports = sandbox.exports;
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  const R = sandbox.module.exports.redactUrlForLog;
+
+  const malformed = "https://user:SECRET_PASS@cdn.example/a.mp4?token=SECRET_SIGNED_QUERY_XYZ#frag";
+  const out = R(malformed);
+  assert.equal(String(out).includes("SECRET"), false);
+  assert.equal(String(out).includes("token="), false);
+  assert.equal(String(out).includes("#frag"), false);
+  assert.equal(String(out).includes("user:"), false);
+  // Either fully redacted or credential/query/fragment-free.
+  if (out !== "[redacted]") {
+    assert.equal(out.includes("?"), false);
+    assert.equal(out.includes("#"), false);
+    assert.equal(out.includes("@"), false);
+  }
+
+  // Also when URL exists but parse fails (malformed absolute).
+  const badAbs = P.redactUrlForLog("https://[invalid?token=SECRET_SIGNED_QUERY_XYZ#x");
+  assert.equal(String(badAbs).includes("SECRET"), false);
+  assert.equal(String(badAbs).includes("token="), false);
+});

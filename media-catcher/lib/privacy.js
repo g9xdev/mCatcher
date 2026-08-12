@@ -50,26 +50,51 @@
     function isPlainRecord(v) {
       if (v === null || typeof v !== "object") return false;
       if (Array.isArray(v)) return false;
-      var proto = Object.getPrototypeOf(v);
-      return proto === Object.prototype || proto === null;
+      try {
+        var proto = Object.getPrototypeOf(v);
+        return proto === Object.prototype || proto === null;
+      } catch (e) {
+        // Hostile Proxy getPrototypeOf — fail closed without echoing trap text.
+        return false;
+      }
     }
 
+    /**
+     * Copy only enumerable own primitive-string name/value pairs.
+     * Reject own symbols, accessors, non-enumerable props, non-string values,
+     * or any reflection failure. Never rethrows hostile trap messages.
+     */
     function ownDataStringProps(record) {
-      // Own enumerable string-named data properties only; reject accessors/symbols.
-      var names = Object.keys(record);
-      var out = Object.create(null);
-      for (var i = 0; i < names.length; i++) {
-        var k = names[i];
-        var desc = Object.getOwnPropertyDescriptor(record, k);
-        if (!desc || typeof desc.value !== "string" || desc.get || desc.set) {
-          throw new TypeError("requestHeaders entries must be own primitive strings");
+      try {
+        var symbols = Object.getOwnPropertySymbols(record);
+        if (symbols.length > 0) {
+          throw new TypeError("requestHeaders must not include symbol keys");
         }
-        if (typeof k !== "string") {
-          throw new TypeError("requestHeaders names must be primitive strings");
+        // All own string keys (incl. non-enumerable) — any non-enumerable/accessor rejects.
+        var names = Object.getOwnPropertyNames(record);
+        var out = Object.create(null);
+        for (var i = 0; i < names.length; i++) {
+          var k = names[i];
+          if (typeof k !== "string") {
+            throw new TypeError("requestHeaders names must be primitive strings");
+          }
+          var desc = Object.getOwnPropertyDescriptor(record, k);
+          if (!desc || desc.get || desc.set || !("value" in desc)) {
+            throw new TypeError("requestHeaders entries must be own primitive strings");
+          }
+          if (!desc.enumerable) {
+            throw new TypeError("requestHeaders entries must be enumerable own data");
+          }
+          if (typeof desc.value !== "string") {
+            throw new TypeError("requestHeaders entries must be own primitive strings");
+          }
+          out[k] = desc.value;
         }
-        out[k] = desc.value;
+        return out;
+      } catch (e) {
+        // Module-authored only — never rethrow Proxy/trap text.
+        throw new TypeError("requestHeaders must be a plain record of string pairs");
       }
-      return out;
     }
 
     function safeGet(obj, key) {
@@ -79,7 +104,7 @@
       try {
         var desc = Object.getOwnPropertyDescriptor(obj, key);
         if (desc) {
-          if (desc.get) return undefined;
+          if (desc.get || desc.set) return undefined;
           return desc.value;
         }
         // Ordinary inherited data props are not used (fail closed for secrets).
@@ -87,6 +112,38 @@
       } catch (e) {
         return undefined;
       }
+    }
+
+    /**
+     * True when a popup-facing string carries URL query/fragment, userinfo, or
+     * secret-bearing header syntax. Allowlisted field names do not authorize
+     * forwarding this content.
+     */
+    function isSuspiciousPopupString(s) {
+      if (typeof s !== "string" || s.length === 0) return false;
+      // Case-insensitive Cookie / Set-Cookie / Authorization / Proxy-Authorization header syntax.
+      if (/(?:^|[\r\n\t\s,;])(?:Cookie|Set-Cookie|Authorization|Proxy-Authorization)\s*:/i.test(s) ||
+          /^(?:Cookie|Set-Cookie|Authorization|Proxy-Authorization)\s*:/i.test(s)) {
+        return true;
+      }
+      // Absolute http(s) with userinfo, query, or fragment material.
+      if (/https?:\/\//i.test(s)) {
+        if (/https?:\/\/[^/\s"'<>]*@/i.test(s)) return true;
+        if (/https?:\/\/[^\s"'<>?#]*[?#]/i.test(s)) return true;
+      }
+      return false;
+    }
+
+    function sanitizePopupError(s) {
+      if (typeof s !== "string") return undefined;
+      if (isSuspiciousPopupString(s)) return "Download error";
+      return s;
+    }
+
+    function sanitizePopupOptionalString(s) {
+      if (typeof s !== "string") return undefined;
+      if (isSuspiciousPopupString(s)) return undefined;
+      return s;
     }
 
     /**
@@ -237,8 +294,11 @@
           out[k] = v;
           any = true;
         } else if (kind === "string" && typeof v === "string") {
-          out[k] = v;
-          any = true;
+          var cleaned = sanitizePopupOptionalString(v);
+          if (cleaned !== undefined) {
+            out[k] = cleaned;
+            any = true;
+          }
         } else if (kind === "boolean" && typeof v === "boolean") {
           out[k] = v;
           any = true;
@@ -259,46 +319,84 @@
       if (typeof id === "string" || typeof id === "number") out.id = id;
 
       var state = safeGet(job, "state");
-      if (typeof state === "string") out.state = state;
+      if (typeof state === "string") {
+        var stateOk = sanitizePopupOptionalString(state);
+        if (stateOk !== undefined) out.state = stateOk;
+      }
 
       var status = safeGet(job, "status");
-      if (typeof status === "string") out.status = status;
+      if (typeof status === "string") {
+        var statusOk = sanitizePopupOptionalString(status);
+        if (statusOk !== undefined) out.status = statusOk;
+      }
 
       var providerKey = safeGet(job, "providerKey");
-      if (typeof providerKey === "string") out.providerKey = providerKey;
+      if (typeof providerKey === "string") {
+        var pkOk = sanitizePopupOptionalString(providerKey);
+        if (pkOk !== undefined) out.providerKey = pkOk;
+      }
 
       var requestedFilename = readBindString(job, "requestedFilename");
-      if (requestedFilename !== undefined) out.requestedFilename = requestedFilename;
+      if (requestedFilename !== undefined) {
+        var rfOk = sanitizePopupOptionalString(requestedFilename);
+        if (rfOk !== undefined) out.requestedFilename = rfOk;
+      }
 
       var destinationDirectory = readBindDestination(job);
-      if (destinationDirectory !== undefined) out.destinationDirectory = destinationDirectory;
+      if (destinationDirectory === null) {
+        out.destinationDirectory = null;
+      } else if (destinationDirectory !== undefined) {
+        var ddOk = sanitizePopupOptionalString(destinationDirectory);
+        if (ddOk !== undefined) out.destinationDirectory = ddOk;
+      }
 
       var saveMode = readBindString(job, "saveMode");
-      if (saveMode !== undefined) out.saveMode = saveMode;
+      if (saveMode !== undefined) {
+        var smOk = sanitizePopupOptionalString(saveMode);
+        if (smOk !== undefined) out.saveMode = smOk;
+      }
 
       var createdAt = readBindString(job, "createdAt");
-      if (createdAt !== undefined) out.createdAt = createdAt;
+      if (createdAt !== undefined) {
+        var caOk = sanitizePopupOptionalString(createdAt);
+        if (caOk !== undefined) out.createdAt = caOk;
+      }
 
       var kind = safeGet(job, "kind");
-      if (typeof kind === "string") out.kind = kind;
+      if (typeof kind === "string") {
+        var kindOk = sanitizePopupOptionalString(kind);
+        if (kindOk !== undefined) out.kind = kindOk;
+      }
 
       var mode = safeGet(job, "mode");
-      if (typeof mode === "string") out.mode = mode;
+      if (typeof mode === "string") {
+        var modeOk = sanitizePopupOptionalString(mode);
+        if (modeOk !== undefined) out.mode = modeOk;
+      }
 
       var mediaKind = safeGet(job, "mediaKind");
-      if (typeof mediaKind === "string") out.mediaKind = mediaKind;
+      if (typeof mediaKind === "string") {
+        var mkOk = sanitizePopupOptionalString(mediaKind);
+        if (mkOk !== undefined) out.mediaKind = mkOk;
+      }
 
       var reduced = safeGet(job, "reduced");
       if (typeof reduced === "boolean") out.reduced = reduced;
 
       var error = safeGet(job, "error");
-      if (typeof error === "string") out.error = error;
+      if (typeof error === "string") {
+        var errOk = sanitizePopupError(error);
+        if (errOk !== undefined) out.error = errOk;
+      }
 
       var bytes = safeGet(job, "bytes");
       if (isFiniteNonnegNumber(bytes)) out.bytes = bytes;
 
       var name = safeGet(job, "name");
-      if (typeof name === "string") out.name = name;
+      if (typeof name === "string") {
+        var nameOk = sanitizePopupOptionalString(name);
+        if (nameOk !== undefined) out.name = nameOk;
+      }
 
       var live = safeGet(job, "live");
       if (typeof live === "boolean") out.live = live;
@@ -310,7 +408,10 @@
       if (typeof hasAudio === "boolean") out.hasAudio = hasAudio;
 
       var savedPath = safeGet(job, "savedPath");
-      if (typeof savedPath === "string") out.savedPath = savedPath;
+      if (typeof savedPath === "string") {
+        var spOk = sanitizePopupOptionalString(savedPath);
+        if (spOk !== undefined) out.savedPath = spOk;
+      }
 
       var downloadId = safeGet(job, "downloadId");
       if (typeof downloadId === "string" || typeof downloadId === "number") {
@@ -321,16 +422,25 @@
       if (isFiniteNonnegNumber(snapshots)) out.snapshots = snapshots;
 
       var convertCodec = safeGet(job, "convertCodec");
-      if (typeof convertCodec === "string") out.convertCodec = convertCodec;
+      if (typeof convertCodec === "string") {
+        var ccOk = sanitizePopupOptionalString(convertCodec);
+        if (ccOk !== undefined) out.convertCodec = ccOk;
+      }
 
       var convertPct = safeGet(job, "convertPct");
       if (isFiniteNumber(convertPct)) out.convertPct = convertPct;
 
       var mergeCommand = safeGet(job, "mergeCommand");
-      if (typeof mergeCommand === "string") out.mergeCommand = mergeCommand;
+      if (typeof mergeCommand === "string") {
+        var mcOk = sanitizePopupOptionalString(mergeCommand);
+        if (mcOk !== undefined) out.mergeCommand = mcOk;
+      }
 
       var fixCommand = safeGet(job, "fixCommand");
-      if (typeof fixCommand === "string") out.fixCommand = fixCommand;
+      if (typeof fixCommand === "string") {
+        var fcOk = sanitizePopupOptionalString(fixCommand);
+        if (fcOk !== undefined) out.fixCommand = fcOk;
+      }
 
       var stateVersion = safeGet(job, "stateVersion");
       if (isFiniteNumber(stateVersion)) out.stateVersion = stateVersion;
@@ -397,6 +507,22 @@
       return deepFreeze(out);
     }
 
+    function manualRedactAbsoluteHttp(url) {
+      // Never echo userinfo, query, or fragment when URL parsing is unavailable/fails.
+      var s = String(url);
+      var hashIdx = s.indexOf("#");
+      if (hashIdx !== -1) s = s.slice(0, hashIdx);
+      var qIdx = s.indexOf("?");
+      if (qIdx !== -1) s = s.slice(0, qIdx);
+      // Strip userinfo after scheme://
+      s = s.replace(/^(https?:\/\/)([^/@]+@)/i, "$1");
+      // If anything still looks like credentials/query/fragment, fail closed.
+      if (!s || /[?#]/.test(s) || /^(https?:\/\/)[^/]*@/i.test(s)) {
+        return "[redacted]";
+      }
+      return s;
+    }
+
     function redactUrlForLog(url) {
       if (typeof url !== "string" || url.length === 0) return "[redacted]";
 
@@ -415,10 +541,7 @@
         } catch (e) {
           // fall through to manual strip
         }
-        // Manual fallback: strip credentials, query, fragment.
-        var noFrag = url.split("#")[0];
-        var noQuery = noFrag.split("?")[0];
-        return noQuery.replace(/^(https?:\/\/)([^/@]+@)/i, "$1");
+        return manualRedactAbsoluteHttp(url);
       }
 
       // Relative or other primitive strings: strip query and fragment only.
@@ -473,18 +596,24 @@
         return false;
       }
 
-      var ephemeral;
-      try {
-        ephemeral = job.ephemeral;
-      } catch (e) {
-        return false;
-      }
+      // Descriptor-safe: never invoke job.ephemeral / clear accessors or inherited getters.
+      var ephemeral = safeGet(job, "ephemeral");
       if (ephemeral == null || (typeof ephemeral !== "object" && typeof ephemeral !== "function")) {
         return false;
       }
-      if (typeof ephemeral.clear !== "function") {
+
+      var clearFn;
+      try {
+        var clearDesc = Object.getOwnPropertyDescriptor(ephemeral, "clear");
+        if (!clearDesc || clearDesc.get || clearDesc.set || typeof clearDesc.value !== "function") {
+          return false;
+        }
+        clearFn = clearDesc.value;
+      } catch (e) {
+        // Hostile Proxy reflection: fail closed without trap text.
         return false;
       }
+
       if (wasCleared(ephemeral)) {
         return false;
       }
@@ -492,7 +621,7 @@
       // Mark before invoke so throwing fakes are never called twice.
       markCleared(ephemeral);
       try {
-        ephemeral.clear();
+        clearFn.call(ephemeral);
       } catch (e) {
         throw new Error("ephemeral cleanup failed");
       }
