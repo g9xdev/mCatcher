@@ -500,7 +500,9 @@ def main():
 # shared with handle_ytdl, which registers its yt-dlp proc there) is owned by
 # downloads and not re-exported.
 from mchost.downloads import (_pget_open, _pget_probe, _pget_segment,   # noqa: E402,F401
-                              _pget_cleanup, _pget_cancel, handle_pget)
+                              _pget_cleanup, _pget_cancel, handle_pget,
+                              _pget_send_result, _pget_classify_exc,
+                              _pget_classify_http_status, _PGET)
 
 
 if __name__ == "__main__":

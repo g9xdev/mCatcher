@@ -1105,9 +1105,45 @@ def handle_ytdl(req):
 # Fetch a direct file from one or more mirror URLs using several range requests
 # at once, with per-segment failover to another mirror. Each segment streams to
 # its own part file (no concurrent writes to one handle), then the parts are
-# stitched in order. Any failure emits "pget-fallback" so the extension hands off
-# to the browser's own downloader — so it is never worse than a plain download.
-_PGET = {}  # id -> {"stop": threading.Event}
+# stitched into a sibling .part path and committed with os.replace. Terminal
+# outcomes are structured pget-result messages (never browser handoff).
+_PGET = {}  # id -> operation dict (stop Event, cancel flag, optional yt-dlp proc)
+_PGET_MAX_CONN = 6
+_PGET_CR_PROBE = re.compile(r"^bytes 0-0/(\d+)$")
+_PGET_CR_SEG = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+# Deterministic failure priority (higher wins). User cancel is handled separately.
+_PGET_FAIL_PRIORITY = {
+    "range_unsupported": 90,
+    "http_429": 80,
+    "http_5xx_temporary": 70,
+    "timeout": 60,
+    "connection_reset": 50,
+    "short_read": 40,
+    "local_io": 30,
+    "permanent": 10,
+    "cancelled": 5,  # only if not user-cancel path; user cancel short-circuits
+}
+
+
+class _PgetError(Exception):
+    """Normalized transfer/probe failure with a failureCategory."""
+    def __init__(self, category, local=False):
+        self.category = category
+        self.local = local
+        super().__init__(category)
+
+
+def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState):
+    """Emit exactly one structured terminal pget-result (caller enforces once)."""
+    _h().send({
+        "type": "pget-result",
+        "id": id,
+        "attemptToken": attemptToken,
+        "status": status,
+        "mode": mode,
+        "failureCategory": failureCategory,
+        "partState": partState,
+    })
 
 
 def _pget_open(url, referer, ua, range_header=None, timeout=30):
@@ -1117,168 +1153,496 @@ def _pget_open(url, referer, ua, range_header=None, timeout=30):
         headers["Referer"] = referer
     if range_header:
         headers["Range"] = range_header
-    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers), timeout=timeout
+    )
 
 
-def _pget_probe(urls, referer, ua):
-    """Probe every mirror with a 1-byte range request. Return (size, ok_mirrors),
-    where ok_mirrors is the list of URLs that answered 206 with a Content-Range
-    whose total matches the reference size — i.e. mirrors that both support ranges
-    AND serve the same file. A mirror that ignores the range (returns 200) or
-    reports a different size is dropped, since assigning it a segment would write
-    the wrong bytes. Empty list => no usable mirror (caller falls back)."""
+def _pget_classify_exc(exc):
+    """Map a transport/OS exception to a normalized failure category."""
+    import errno as _errno
+    import socket as _socket
+    import urllib.error as _ue
+
+    if isinstance(exc, _PgetError):
+        return exc.category
+    if isinstance(exc, (_socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+        return "connection_reset"
+    if isinstance(exc, _ue.HTTPError):
+        return _pget_classify_http_status(exc.code)
+    if isinstance(exc, _ue.URLError):
+        reason = exc.reason
+        if isinstance(reason, (_socket.timeout, TimeoutError)):
+            return "timeout"
+        if isinstance(reason, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return "connection_reset"
+        if isinstance(reason, OSError):
+            return _pget_classify_exc(reason)
+        # Some platforms wrap timeout as URLError(str/timeout message)
+        rtxt = str(reason).lower() if reason is not None else ""
+        if "timed out" in rtxt or "timeout" in rtxt:
+            return "timeout"
+        if "reset" in rtxt or "aborted" in rtxt or "broken pipe" in rtxt:
+            return "connection_reset"
+        return "connection_reset" if reason is not None else "permanent"
+    if isinstance(exc, OSError):
+        en = getattr(exc, "errno", None)
+        if en in (_errno.ETIMEDOUT, getattr(_errno, "WSAETIMEDOUT", -1)):
+            return "timeout"
+        if en in (
+            _errno.ECONNRESET,
+            _errno.ECONNABORTED,
+            _errno.EPIPE,
+            getattr(_errno, "WSAECONNRESET", -1),
+            getattr(_errno, "WSAECONNABORTED", -1),
+        ):
+            return "connection_reset"
+        # Local filesystem-ish errors callers may reclassify as local_io
+        return "permanent"
+    return "permanent"
+
+
+def _pget_classify_http_status(code):
+    if code == 429:
+        return "http_429"
+    if 500 <= int(code) <= 599:
+        return "http_5xx_temporary"
+    return "permanent"
+
+
+def _pget_pick_category(categories):
+    """Choose the deterministic highest-priority category from a list."""
+    best = None
+    best_p = -1
+    for c in categories:
+        if not c:
+            continue
+        p = _PGET_FAIL_PRIORITY.get(c, 0)
+        if p > best_p:
+            best_p = p
+            best = c
+    return best or "permanent"
+
+
+def _pget_close_resp(resp):
+    try:
+        if resp is not None:
+            resp.close()
+    except Exception:
+        pass
+
+
+def _pget_probe_one(url, referer, ua, timeout=30):
+    """Probe a single mirror with Range: bytes=0-0 after redirects.
+
+    Returns one of:
+      ("ok", total, url)
+      ("range_unsupported", None, url)
+      ("fail", category, url)
+    """
+    import urllib.error as _ue
+
+    resp = None
+    try:
+        resp = _pget_open(url, referer, ua, "bytes=0-0", timeout=timeout)
+        status = getattr(resp, "status", None) or getattr(resp, "code", None)
+        if status == 206:
+            cr = (resp.headers.get("Content-Range") or "").strip()
+            m = _PGET_CR_PROBE.match(cr)
+            if not m:
+                return ("fail", "permanent", url)
+            total = int(m.group(1))
+            if total <= 0:
+                return ("fail", "permanent", url)
+            # Require exactly one readable body byte for the probe range.
+            first = resp.read(1)
+            if len(first) != 1:
+                return ("fail", "short_read" if len(first) == 0 else "permanent", url)
+            return ("ok", total, url)
+        if status == 200:
+            # Final successful 200 that ignored the Range request.
+            return ("range_unsupported", None, url)
+        # Any other successful open with non-206/200 is permanent.
+        return ("fail", _pget_classify_http_status(status or 0), url)
+    except _ue.HTTPError as e:
+        # HTTPError is a response; classify by status and close.
+        try:
+            cat = _pget_classify_http_status(e.code)
+        finally:
+            _pget_close_resp(e)
+        return ("fail", cat, url)
+    except Exception as e:
+        return ("fail", _pget_classify_exc(e), url)
+    finally:
+        _pget_close_resp(resp)
+
+
+def _pget_probe(urls, referer, ua, timeout=30):
+    """Probe every mirror. Return (size, ok_mirrors, failure_category_or_None).
+
+    If at least one mirror proves valid ranges, ok_mirrors holds only valid
+    same-size mirrors and failure_category is None. If none are valid, size is
+    None, ok_mirrors is empty, and failure_category is the deterministic
+    normalized outcome (range_unsupported only when a conclusive 200 was seen;
+    a single transient-only probe retains its transient category).
+    """
     size = None
     ok = []
+    fails = []
+    saw_no_range = False
     for u in urls:
-        try:
-            with _pget_open(u, referer, ua, "bytes=0-0") as r:
-                if getattr(r, "status", None) != 206:
-                    continue                       # 200 => server ignored the range
-                cr = r.headers.get("Content-Range") or ""
-                if "/" not in cr:
-                    continue
-                total = int(cr.rsplit("/", 1)[1])
-                if size is None:
-                    size = total
-                if total == size:                  # only mirrors serving the same-size file
-                    ok.append(u)
-        except Exception:
-            continue
-    return size, ok
+        kind, total, _u = _pget_probe_one(u, referer, ua, timeout=timeout)
+        if kind == "ok":
+            if size is None:
+                size = total
+            if total == size:
+                ok.append(u)
+            else:
+                fails.append("permanent")  # size mismatch across mirrors
+        elif kind == "range_unsupported":
+            saw_no_range = True
+            fails.append("range_unsupported")
+        else:
+            fails.append(total)  # total carries category on fail
+    if ok:
+        return size, ok, None
+    if saw_no_range:
+        return None, [], "range_unsupported"
+    if fails:
+        return None, [], _pget_pick_category(fails)
+    return None, [], "permanent"
 
 
-def _pget_segment(part_path, urls, idx, start, end, referer, ua, seg_done, stop):
-    """Download bytes [start, end] into part_path, trying the assigned mirror
-    first, then the others. Raises if every mirror fails."""
+def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
+                  seg_done, stop, timeout=30):
+    """Download bytes [start, end] into part_path with mirror failover.
+
+    Validates 206 + exact Content-Range, reads exactly the expected length, and
+    closes handles before returning. Raises _PgetError on failure.
+    """
+    import urllib.error as _ue
+
     length = end - start + 1
     order = urls[idx % len(urls):] + urls[:idx % len(urls)]
-    last = "no mirror"
+    errors = []
     for u in order:
+        if stop.is_set():
+            raise _PgetError("cancelled")
         got = 0
         try:
-            with _pget_open(u, referer, ua, "bytes=%d-%d" % (start, end)) as r, open(part_path, "wb") as f:
-                if getattr(r, "status", None) != 206:
-                    raise RuntimeError("not partial content (status %s)" % getattr(r, "status", None))
-                while got < length:
-                    if stop.is_set():
-                        raise RuntimeError("cancelled")
-                    chunk = r.read(65536)
-                    if not chunk:
-                        break
-                    if got + len(chunk) > length:
-                        chunk = chunk[:length - got]
-                    f.write(chunk)
-                    got += len(chunk)
-                    seg_done[idx] = got
-            if got >= length:
+            # Open response first; only create the segment file after headers OK
+            # enough to begin streaming (status checked immediately).
+            with _pget_open(u, referer, ua, "bytes=%d-%d" % (start, end),
+                            timeout=timeout) as r:
+                status = getattr(r, "status", None) or getattr(r, "code", None)
+                if status == 200:
+                    # Conclusive full body for a ranged request.
+                    raise _PgetError("range_unsupported")
+                if status != 206:
+                    raise _PgetError(_pget_classify_http_status(status or 0))
+                cr = (r.headers.get("Content-Range") or "").strip()
+                m = _PGET_CR_SEG.match(cr)
+                if not m:
+                    raise _PgetError("permanent")
+                cr_start, cr_end, cr_total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if cr_start != start or cr_end != end or cr_total != total_size:
+                    raise _PgetError("permanent")
+                with open(part_path, "wb") as f:
+                    while got < length:
+                        if stop.is_set():
+                            raise _PgetError("cancelled")
+                        chunk = r.read(min(65536, length - got))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        seg_done[idx] = got
+            if got == length:
                 return
-            last = "short read %d/%d" % (got, length)
+            if got < length:
+                raise _PgetError("short_read")
+            raise _PgetError("permanent")
+        except _PgetError as e:
+            errors.append(e.category)
+            if e.category == "range_unsupported":
+                # No point trying other mirrors for conclusive no-range on this
+                # resource shape; still record and continue only if others remain.
+                # Prefer reporting range_unsupported after all mirrors tried.
+                pass
+            elif e.category == "cancelled":
+                raise
+        except _ue.HTTPError as e:
+            try:
+                errors.append(_pget_classify_http_status(e.code))
+            finally:
+                _pget_close_resp(e)
+        except OSError as e:
+            # File open/write errors are local_io; transport OSErrors classify.
+            if getattr(e, "filename", None) or (
+                getattr(e, "errno", None) in (
+                    getattr(__import__("errno"), "EACCES", -1),
+                    getattr(__import__("errno"), "EPERM", -1),
+                    getattr(__import__("errno"), "ENOSPC", -1),
+                    getattr(__import__("errno"), "EROFS", -1),
+                )
+            ):
+                raise _PgetError("local_io", local=True)
+            errors.append(_pget_classify_exc(e))
         except Exception as e:
-            last = str(e)
+            errors.append(_pget_classify_exc(e))
         seg_done[idx] = 0
-    raise RuntimeError("segment %d failed on all mirrors: %s" % (idx, last))
+        # Remove partial segment before trying next mirror
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except Exception:
+            pass
+    if stop.is_set():
+        raise _PgetError("cancelled")
+    raise _PgetError(_pget_pick_category(errors))
+
+
+def _pget_work_paths(final_path, n):
+    """Assembly .part path plus per-segment paths. Never includes final_path."""
+    part = final_path + ".part"
+    segs = ["%s.part%d" % (final_path, i) for i in range(n)]
+    return part, segs
+
+
+def _pget_cleanup_work(final_path, n):
+    """Remove assembly .part and segment files only — never the final path."""
+    part, segs = _pget_work_paths(final_path, n)
+    for p in [part] + segs:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def _pget_part_state(final_path, n):
+    """empty only when no work artifacts remain; else partial.
+
+    The final committed file is not a work artifact for failure partState.
+    """
+    part, segs = _pget_work_paths(final_path, n)
+    for p in [part] + segs:
+        try:
+            if os.path.exists(p):
+                return "partial"
+        except Exception:
+            return "partial"
+    return "empty"
 
 
 def _pget_cleanup(path, n):
-    for p in [path] + ["%s.part%d" % (path, i) for i in range(n)]:
-        try: os.remove(p)
-        except Exception: pass
+    """Back-compat name: clean work files only (does not delete final path)."""
+    _pget_cleanup_work(path, n)
 
 
 def _pget_cancel(req):
     j = _PGET.get(req.get("id"))
     if not j:
         return
+    j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
     if j.get("proc"):
         _safe_kill(j["proc"])    # yt-dlp job: kill the process
 
 
+def _pget_unregister(jid, op):
+    """Pop registry only if it still points at this exact operation."""
+    if _PGET.get(jid) is op:
+        _PGET.pop(jid, None)
+
+
+def _pget_lease(req, size):
+    """Initial finite connection lease from maxConnections, clamped safely."""
+    try:
+        raw = int(req.get("maxConnections") or 1)
+    except (TypeError, ValueError):
+        raw = 1
+    lease = max(1, min(_PGET_MAX_CONN, raw))
+    # Segment count never exceeds lease, file size (bytes), or safe cap.
+    by_mib = max(1, size // (1024 * 1024)) if size >= 1024 * 1024 else 1
+    n = max(1, min(lease, _PGET_MAX_CONN, size, by_mib))
+    return lease, n
+
+
 def handle_pget(req):
+    """Multi-range native transfer with structured pget-result terminal contract.
+
+    Probe is conclusive before any worker/file write. Assembly uses a sibling
+    .part path; os.replace is the commit point. Live pget-set-limit is Task 13.
+    """
     def worker():
         jid = req.get("id")
+        attempt = req.get("attemptToken")
         urls = [u for u in (req.get("urls") or []) if u]
         referer = req.get("referer") or ""
         ua = req.get("userAgent") or ""
         name = _h().sanitize(req.get("name") or "download")
         out_dir = req.get("dir") or _h().downloads_dir()
+        mode = "multi-range"
+        terminal = {"sent": False}
+        op = None
+        final_path = None
+        n = 0
+
+        def finish(status, failure_category, part_state):
+            if terminal["sent"]:
+                return
+            terminal["sent"] = True
+            _pget_send_result(jid, attempt, status, mode, failure_category, part_state)
+
         if not urls:
-            _h().send({"type": "pget-fallback", "id": jid, "reason": "no-urls"}); return
+            finish("failed", "permanent", "empty")
+            return
+
         try:
-            size, ok_urls = _pget_probe(urls, referer, ua)
-        except Exception:
-            size, ok_urls = None, []
+            size, ok_urls, probe_fail = _pget_probe(urls, referer, ua)
+        except Exception as e:
+            size, ok_urls, probe_fail = None, [], _pget_classify_exc(e)
+
         if not size or not ok_urls:
-            _h().send({"type": "pget-fallback", "id": jid, "reason": "no-range"}); return
+            finish("failed", probe_fail or "permanent", "empty")
+            return
+
         try:
             os.makedirs(out_dir, exist_ok=True)
-            path = _dedup(os.path.join(out_dir, name))
+            final_path = _dedup(os.path.join(out_dir, name))
         except Exception:
-            _h().send({"type": "pget-fallback", "id": jid, "reason": "path"}); return
+            finish("failed", "local_io", "empty")
+            return
 
-        n = max(1, min(6, size // (1024 * 1024)))
+        _lease, n = _pget_lease(req, size)
         seg = size // n
-        ranges = [(i * seg, (size - 1 if i == n - 1 else (i + 1) * seg - 1)) for i in range(n)]
+        ranges = [
+            (i * seg, (size - 1 if i == n - 1 else (i + 1) * seg - 1))
+            for i in range(n)
+        ]
         seg_done = [0] * n
         stop = threading.Event()
-        _PGET[jid] = {"stop": stop}
+        op = {
+            "stop": stop,
+            "cancel_requested": False,
+            "lease": _lease,
+            "n": n,
+            "final_path": final_path,
+        }
+        _PGET[jid] = op
 
         def monitor():
-            while not stop.is_set():
-                _h().send({"type": "pget-progress", "id": jid, "bytes": sum(seg_done), "total": size})
+            while not stop.is_set() and not terminal["sent"]:
+                _h().send({
+                    "type": "pget-progress",
+                    "id": jid,
+                    "bytes": sum(seg_done),
+                    "total": size,
+                })
                 if sum(seg_done) >= size:
                     break
                 time.sleep(0.5)
+
         threading.Thread(target=monitor, daemon=True).start()
 
         errors = []
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
-                futs = [ex.submit(_pget_segment, "%s.part%d" % (path, i), ok_urls, i, s, e, referer, ua, seg_done, stop)
-                        for i, (s, e) in enumerate(ranges)]
-                for fu in concurrent.futures.as_completed(futs):
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+                    futs = [
+                        ex.submit(
+                            _pget_segment,
+                            "%s.part%d" % (final_path, i),
+                            ok_urls, i, s, e, size, referer, ua, seg_done, stop,
+                        )
+                        for i, (s, e) in enumerate(ranges)
+                    ]
+                    for fu in concurrent.futures.as_completed(futs):
+                        try:
+                            fu.result()
+                        except Exception as exc:
+                            cat = _pget_classify_exc(exc)
+                            errors.append(cat)
+                            stop.set()
+                    # Ensure all workers joined before any terminal classification
+                    # (as_completed already waited; context manager shuts down).
+            except Exception as exc:
+                errors.append(_pget_classify_exc(exc))
+                stop.set()
+
+            if op.get("cancel_requested"):
+                _pget_cleanup_work(final_path, n)
+                finish("cancelled", "cancelled", _pget_part_state(final_path, n))
+                return
+
+            if errors:
+                # range_unsupported only after workers joined (above) and cleanup
+                _pget_cleanup_work(final_path, n)
+                cat = _pget_pick_category(errors)
+                # After cleanup for range_unsupported, partState must be empty
+                # when nothing remains; compute honestly either way.
+                finish("failed", cat, _pget_part_state(final_path, n))
+                return
+
+            part_path, _segs = _pget_work_paths(final_path, n)
+            try:
+                with open(part_path, "wb") as out:
+                    for i in range(n):
+                        seg_p = "%s.part%d" % (final_path, i)
+                        with open(seg_p, "rb") as pf:
+                            shutil.copyfileobj(pf, out, 1024 * 1024)
+                for i in range(n):
                     try:
-                        fu.result()
-                    except Exception as e:
-                        errors.append(str(e)); stop.set()
+                        os.remove("%s.part%d" % (final_path, i))
+                    except Exception:
+                        pass
+                if os.path.getsize(part_path) != size:
+                    _pget_cleanup_work(final_path, n)
+                    finish("failed", "local_io", _pget_part_state(final_path, n))
+                    return
+                # Commit point: atomic replace into the final deduplicated name.
+                os.replace(part_path, final_path)
+            except Exception:
+                stop.set()
+                _pget_cleanup_work(final_path, n)
+                if op.get("cancel_requested"):
+                    finish("cancelled", "cancelled", _pget_part_state(final_path, n))
+                else:
+                    finish("failed", "local_io", _pget_part_state(final_path, n))
+                return
+
+            if op.get("cancel_requested"):
+                # Cancel landed after commit — file is already final; report
+                # cancelled only if we have not committed result yet. Spec:
+                # committed result is sent only after replace succeeds; a late
+                # cancel after terminal is no-op. We still send completed.
+                pass
+
+            _h().send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
+            # Optional re-encode (H.265 / AV1) — same as recordings, kept only if smaller.
+            conv = req.get("convert")
+            if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
+                codec = conv["codec"]
+                _h().send({"type": "converting", "id": jid, "file": final_path, "codec": codec})
+                tres = transcode(
+                    final_path, codec,
+                    conv.get("quality", "visually-lossless"),
+                    conv.get("encoder", "auto"),
+                    on_progress=lambda pct, j=jid, c=codec: _h().send(
+                        {"type": "convert-progress", "id": j, "pct": pct, "codec": c}
+                    ),
+                )
+                final_path = tres["path"]
+
+            finish("completed", None, "committed")
         finally:
             stop.set()
-            _PGET.pop(jid, None)
+            _pget_unregister(jid, op)
 
-        if errors:
-            _pget_cleanup(path, n)
-            _h().send({"type": "pget-fallback", "id": jid, "reason": errors[0]}); return
-
-        try:  # stitch the parts in order into the final file
-            with open(path, "wb") as out:
-                for i in range(n):
-                    with open("%s.part%d" % (path, i), "rb") as pf:
-                        shutil.copyfileobj(pf, out, 1024 * 1024)
-            for i in range(n):
-                try: os.remove("%s.part%d" % (path, i))
-                except Exception: pass
-        except Exception as e:
-            _pget_cleanup(path, n)
-            _h().send({"type": "pget-fallback", "id": jid, "reason": "stitch: %s" % e}); return
-
-        if os.path.getsize(path) != size:
-            _pget_cleanup(path, n)
-            _h().send({"type": "pget-fallback", "id": jid, "reason": "size-mismatch"}); return
-        _h().send({"type": "pget-progress", "id": jid, "bytes": size, "total": size})
-        # Optional re-encode (H.265 / AV1) — same as recordings, kept only if smaller.
-        conv_info = None
-        conv = req.get("convert")
-        if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
-            codec = conv["codec"]
-            _h().send({"type": "converting", "id": jid, "file": path, "codec": codec})
-            res = transcode(path, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"),
-                            on_progress=lambda pct, j=jid, c=codec: _h().send({"type": "convert-progress", "id": j, "pct": pct, "codec": c}))
-            path = res["path"]
-            conv_info = {"converted": res["converted"], "note": res["note"], "codec": codec,
-                         "srcBytes": res["srcBytes"], "hevcBytes": res["hevcBytes"],
-                         "kept": codec if res["converted"] else "orig"}
-        _h().send({"type": "pget-done", "id": jid, "file": path, "bytes": os.path.getsize(path), "convert": conv_info})
     threading.Thread(target=worker, daemon=True).start()
 
 # yt-dlp tool discovery state (owned here; ensure_ytdlp/ensure_deno and the
