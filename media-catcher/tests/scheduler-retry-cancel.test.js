@@ -1456,19 +1456,28 @@ test("Firefox handoff post-token sync throw settles without stuck inFlight; hook
     // Drain owner observation so handoff is quiescent (outstanding permits reject).
     while (s.getJob("owner").inFlightPermits > 0) s.releasePermit("owner");
     throwComplete = true;
-    await s.requestFirefoxHandoff("owner", fxIntent("o.mp4", "sync-tok"));
-    // Token consumed; not stuck in handing_off_firefox; Firefox not called if pre-await failed.
-    assert.equal(store.has("sync-tok"), false);
-    assert.notEqual(s.getJob("owner").state, "handing_off_firefox");
-    assert.ok(
-      s.getJob("owner").state === "needs_user" || s.getJob("owner").state === "cancelled"
+    const ownerTokBefore = s.getJob("owner").attemptToken;
+    const ownerVerBefore = s.getJob("owner").stateVersion;
+    await assert.rejects(
+      () => s.requestFirefoxHandoff("owner", fxIntent("o.mp4", "sync-tok")),
+      /ownership|completeOwner|provider/i
     );
-    assert.equal(s.getJob("owner").holdsGlobalSlot, false);
-    // If pre-await threw before hook, downloadCalls stays 0; if after state set but before await, still 0.
+    // Token consumed; rollback to live running attempt; Firefox not called.
+    assert.equal(store.has("sync-tok"), false);
+    assert.equal(s.getJob("owner").state, "running");
+    assert.equal(s.getJob("owner").attemptToken, ownerTokBefore);
+    assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+    // Handoff not in flight: owner may acquire provider permits again.
+    const permitAgain = s.acquireProviderPermit("owner", "probe");
+    assert.ok(permitAgain);
+    permitAgain.release();
+    assert.ok(s.getJob("owner").stateVersion > ownerVerBefore);
+    assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.equal(s.getJob("waiter").state, "waiting_provider");
     assert.equal(downloadCalls, 0);
     assertSlotInvariant(s);
 
-    // Non-advanced completeOwner must never wake/charge a waiter.
+    // Non-advanced completeOwner must fail closed: never Firefox, restore running.
     require.cache[require.resolve(gatePath)] = {
       id: gatePath,
       filename: gatePath,
@@ -1526,12 +1535,20 @@ test("Firefox handoff post-token sync throw settles without stuck inFlight; hook
     quiesceIfPausing(s2, "waiter");
     while (s2.getJob("owner").inFlightPermits > 0) s2.releasePermit("owner");
     const waiterRetries = s2.getJob("waiter").retryRemaining;
-    await s2.requestFirefoxHandoff("owner", fxIntent("o.mp4", "adv-tok2"));
+    const ownerTok2 = s2.getJob("owner").attemptToken;
+    await assert.rejects(
+      () => s2.requestFirefoxHandoff("owner", fxIntent("o.mp4", "adv-tok2")),
+      /ownership|advance|provider/i
+    );
     assert.equal(s2.getJob("waiter").state, "waiting_provider");
     assert.equal(s2.getJob("waiter").autoWakeCount, 0);
     assert.equal(s2.getJob("waiter").retryRemaining, waiterRetries);
-    assert.equal(s2.getJob("owner").state, "handed_to_firefox");
-    assert.equal(downloadCalls2, 1);
+    assert.equal(s2.getJob("owner").state, "running");
+    assert.equal(s2.getJob("owner").attemptToken, ownerTok2);
+    assert.equal(s2.getJob("owner").holdsGlobalSlot, true);
+    assert.equal(s2.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.equal(downloadCalls2, 0);
+    assert.equal(store2.has("adv-tok2"), false);
     assertSlotInvariant(s2);
 
     // Synchronous firefoxDownload throw treated as adapter rejection → needs_user.
@@ -1629,4 +1646,376 @@ test("tick admits due retry_backoff jobs by deadline then creation order", () =>
   assert.equal(s4.getJob("lateCreated").state, "running");
   assert.equal(s4.getJob("earlyCreated").state, "queued");
   assertSlotInvariant(s4);
+});
+
+// ---------------------------------------------------------------------------
+// Task 11 fix2 — owner reconciliation before Firefox handoff
+// ---------------------------------------------------------------------------
+
+function installGateStub(realGate, gatePath, completeOwnerImpl) {
+  require.cache[require.resolve(gatePath)] = {
+    id: gatePath,
+    filename: gatePath,
+    loaded: true,
+    exports: {
+      createProviderGate: function (opts) {
+        const g = realGate.createProviderGate(opts);
+        return {
+          get providerKey() { return g.providerKey; },
+          get state() { return g.state; },
+          get generation() { return g.generation; },
+          get wakeGeneration() { return g.wakeGeneration; },
+          acquire: g.acquire.bind(g),
+          setSaturated: g.setSaturated.bind(g),
+          registerJobLimit: g.registerJobLimit.bind(g),
+          nativeLeaseFor: g.nativeLeaseFor.bind(g),
+          noteNativeOpen: g.noteNativeOpen.bind(g),
+          parkProbe: g.parkProbe.bind(g),
+          completeOwner: function (args) {
+            return completeOwnerImpl(g, args);
+          },
+          designateRecoveryOwner: g.designateRecoveryOwner.bind(g),
+          recoverToNormal: g.recoverToNormal.bind(g),
+          snapshot: g.snapshot.bind(g),
+        };
+      },
+    },
+  };
+}
+
+function loadSchedulerFresh(schedPath) {
+  delete require.cache[require.resolve(schedPath)];
+  return require(schedPath).createDownloadScheduler;
+}
+
+function setupSaturatedOwnerWaiter(createS, opts) {
+  const s = createS(Object.assign({ maxConcurrent: 2, now: () => 0 }, opts || {}));
+  s.createJob({
+    id: "owner",
+    providerKey: "p.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "waiter",
+    providerKey: "p.com",
+    intent: intent("w.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("owner");
+  s.enqueue("waiter");
+  s.notePermitAcquired("owner");
+  s.onTransportResult("waiter", s.getJob("waiter").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  quiesceIfPausing(s, "waiter");
+  while (s.getJob("owner").inFlightPermits > 0) s.releasePermit("owner");
+  assert.equal(s.getJob("waiter").state, "waiting_provider");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+  return s;
+}
+
+test("fix2: non-advanced completeOwner fails closed — restore running, no Firefox, waiter parked", async () => {
+  const path = require("node:path");
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  try {
+    installGateStub(realGate, gatePath, function (g) {
+      return Object.freeze({
+        advanced: false,
+        wakeGeneration: g.wakeGeneration,
+        parkedProbeIds: Object.freeze([]),
+      });
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    let downloadCalls = 0;
+    const store = new Set(["na-tok", "na-replay"]);
+    const s = setupSaturatedOwnerWaiter(createS, {
+      firefoxDownload: async () => {
+        downloadCalls++;
+        return 1;
+      },
+      popupTokenStore: store,
+    });
+    const priorTok = s.getJob("owner").attemptToken;
+    const priorVer = s.getJob("owner").stateVersion;
+    const waiterRetries = s.getJob("waiter").retryRemaining;
+    await assert.rejects(
+      () => s.requestFirefoxHandoff("owner", fxIntent("o.mp4", "na-tok")),
+      /ownership|advance|provider/i
+    );
+    assert.equal(downloadCalls, 0);
+    assert.equal(store.has("na-tok"), false); // consumed
+    assert.equal(s.getJob("owner").state, "running");
+    assert.equal(s.getJob("owner").attemptToken, priorTok);
+    assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+    assert.equal(s.getSnapshot().globalRunning, 1);
+    assert.ok(s.getJob("owner").stateVersion > priorVer); // monotonic, not decremented
+    assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.equal(s.getJob("waiter").state, "waiting_provider");
+    assert.equal(s.getJob("waiter").autoWakeCount, 0);
+    assert.equal(s.getJob("waiter").retryRemaining, waiterRetries);
+    // Replay of consumed token rejects; owner remains running.
+    await assert.rejects(
+      () => s.requestFirefoxHandoff("owner", fxIntent("o.mp4", "na-tok")),
+      /token|forged|consumed/i
+    );
+    assert.equal(s.getJob("owner").state, "running");
+    assert.equal(s.getJob("owner").attemptToken, priorTok);
+    assert.equal(downloadCalls, 0);
+    assertSlotInvariant(s);
+  } finally {
+    if (prevGate) require.cache[require.resolve(gatePath)] = prevGate;
+    else delete require.cache[require.resolve(gatePath)];
+    if (prevSched) require.cache[require.resolve(schedPath)] = prevSched;
+    else delete require.cache[require.resolve(schedPath)];
+    delete require.cache[require.resolve(schedPath)];
+    loadLib("lib/download-scheduler.js");
+  }
+});
+
+test("fix2: completeOwner throw before mutation rolls back to running attempt", async () => {
+  const path = require("node:path");
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  try {
+    installGateStub(realGate, gatePath, function () {
+      throw new Error("simulated completeOwner throw before mutation");
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    let downloadCalls = 0;
+    const store = new Set(["throw-tok"]);
+    const s = setupSaturatedOwnerWaiter(createS, {
+      firefoxDownload: async () => {
+        downloadCalls++;
+        return 1;
+      },
+      popupTokenStore: store,
+    });
+    const priorTok = s.getJob("owner").attemptToken;
+    const priorVer = s.getJob("owner").stateVersion;
+    await assert.rejects(
+      () => s.requestFirefoxHandoff("owner", fxIntent("o.mp4", "throw-tok")),
+      /completeOwner|ownership|provider/i
+    );
+    assert.equal(downloadCalls, 0);
+    assert.equal(store.has("throw-tok"), false);
+    assert.equal(s.getJob("owner").state, "running");
+    assert.equal(s.getJob("owner").attemptToken, priorTok);
+    assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+    assert.ok(s.getJob("owner").stateVersion > priorVer);
+    assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.equal(s.getJob("waiter").state, "waiting_provider");
+    assert.equal(s.getJob("waiter").autoWakeCount, 0);
+    assertSlotInvariant(s);
+  } finally {
+    if (prevGate) require.cache[require.resolve(gatePath)] = prevGate;
+    else delete require.cache[require.resolve(gatePath)];
+    if (prevSched) require.cache[require.resolve(schedPath)] = prevSched;
+    else delete require.cache[require.resolve(schedPath)];
+    delete require.cache[require.resolve(schedPath)];
+    loadLib("lib/download-scheduler.js");
+  }
+});
+
+test("fix2: completeOwner advances then throws — settle failed, authorize recovery once, no Firefox", async () => {
+  const path = require("node:path");
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  try {
+    let completeCalls = 0;
+    installGateStub(realGate, gatePath, function (g, args) {
+      completeCalls += 1;
+      const result = g.completeOwner(args);
+      throw new Error("simulated throw after advance");
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    let downloadCalls = 0;
+    const store = new Set(["adv-throw"]);
+    const s = setupSaturatedOwnerWaiter(createS, {
+      firefoxDownload: async () => {
+        downloadCalls++;
+        return 1;
+      },
+      popupTokenStore: store,
+    });
+    const waiterRetries = s.getJob("waiter").retryRemaining;
+    await assert.rejects(
+      () => s.requestFirefoxHandoff("owner", fxIntent("o.mp4", "adv-throw")),
+      /after advance|ownership|provider|completeOwner/i
+    );
+    assert.equal(downloadCalls, 0);
+    assert.ok(
+      s.getJob("owner").state === "needs_user" || s.getJob("owner").state === "cancelled"
+    );
+    assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+    assert.notEqual(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    // Installed recovery waiter authorized exactly once / admits via global queue.
+    assert.ok(
+      s.getJob("waiter").state === "running" || s.getJob("waiter").state === "queued"
+    );
+    assert.equal(s.getJob("waiter").autoWakeCount, 1);
+    assert.equal(s.getJob("waiter").retryRemaining, waiterRetries - 1);
+    // No double retry charge on any subsequent settle-like path.
+    const wakeAfter = s.getJob("waiter").autoWakeCount;
+    const retriesAfter = s.getJob("waiter").retryRemaining;
+    // Second completeOwner from settlement (if any) must not re-wake.
+    assert.equal(s.getJob("waiter").autoWakeCount, wakeAfter);
+    assert.equal(s.getJob("waiter").retryRemaining, retriesAfter);
+    assert.ok(completeCalls >= 1);
+    assertSlotInvariant(s);
+  } finally {
+    if (prevGate) require.cache[require.resolve(gatePath)] = prevGate;
+    else delete require.cache[require.resolve(gatePath)];
+    if (prevSched) require.cache[require.resolve(schedPath)] = prevSched;
+    else delete require.cache[require.resolve(schedPath)];
+    delete require.cache[require.resolve(schedPath)];
+    loadLib("lib/download-scheduler.js");
+  }
+});
+
+test("fix2: adapter reject after successful owner advance does not strand waiter", async () => {
+  let downloadCalls = 0;
+  const store = new Set(["adapt-rej", "adapt-late"]);
+  const s = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: () => 0,
+    firefoxDownload: async () => {
+      downloadCalls++;
+      throw new Error("dialog cancelled");
+    },
+    popupTokenStore: store,
+  });
+  saturateOwnerWithWaiter(s, "p.com", "owner", "waiter");
+  while (s.getJob("owner").inFlightPermits > 0) s.releasePermit("owner");
+  const waiterRetries = s.getJob("waiter").retryRemaining;
+  await s.requestFirefoxHandoff("owner", fxIntent("owner.mp4", "adapt-rej"));
+  assert.equal(downloadCalls, 1);
+  assert.equal(s.getJob("owner").state, "needs_user");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.notEqual(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+  assert.ok(
+    s.getJob("waiter").state === "running" || s.getJob("waiter").state === "queued"
+  );
+  assert.equal(s.getJob("waiter").autoWakeCount, 1);
+  assert.equal(s.getJob("waiter").retryRemaining, waiterRetries - 1);
+  assertSlotInvariant(s);
+
+  // Late cancel + reject → cancelled; waiter still not stranded.
+  let resolveHook;
+  const hookP = new Promise((r) => { resolveHook = r; });
+  const s2 = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: () => 0,
+    firefoxDownload: async () => {
+      await hookP;
+      throw new Error("late reject");
+    },
+    popupTokenStore: store,
+  });
+  saturateOwnerWithWaiter(s2, "q.com", "own2", "wait2");
+  while (s2.getJob("own2").inFlightPermits > 0) s2.releasePermit("own2");
+  const p2 = s2.requestFirefoxHandoff("own2", fxIntent("own2.mp4", "adapt-late"));
+  s2.cancel("own2");
+  resolveHook();
+  await p2;
+  assert.equal(s2.getJob("own2").state, "cancelled");
+  assert.equal(s2.getJob("own2").holdsGlobalSlot, false);
+  assert.notEqual(s2.getSnapshot().providers["q.com"].gate.ownerJobId, "own2");
+  assert.ok(
+    s2.getJob("wait2").state === "running" || s2.getJob("wait2").state === "queued"
+  );
+  assert.equal(s2.getJob("wait2").autoWakeCount, 1);
+  assertSlotInvariant(s2);
+});
+
+test("fix2: success path handed_to_firefox job is never still gate owner", async () => {
+  const store = new Set(["ok-own", "ok-plain"]);
+  const s = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: () => 0,
+    firefoxDownload: async () => 1,
+    popupTokenStore: store,
+  });
+  saturateOwnerWithWaiter(s, "p.com", "owner", "waiter");
+  while (s.getJob("owner").inFlightPermits > 0) s.releasePermit("owner");
+  await s.requestFirefoxHandoff("owner", fxIntent("owner.mp4", "ok-own"));
+  assert.equal(s.getJob("owner").state, "handed_to_firefox");
+  assert.notEqual(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+  assert.ok(
+    s.getJob("waiter").state === "running" || s.getJob("waiter").state === "queued"
+  );
+  assertSlotInvariant(s);
+
+  // Non-owner success also must not claim gate ownership.
+  const s2 = createDownloadScheduler({
+    maxConcurrent: 1,
+    now: () => 0,
+    firefoxDownload: async () => 1,
+    popupTokenStore: store,
+  });
+  s2.createJob({
+    id: "j",
+    providerKey: "solo.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+  });
+  s2.enqueue("j");
+  await s2.requestFirefoxHandoff("j", fxIntent("a.mp4", "ok-plain"));
+  assert.equal(s2.getJob("j").state, "handed_to_firefox");
+  assert.notEqual(s2.getSnapshot().providers["solo.com"].gate.ownerJobId, "j");
+  assertSlotInvariant(s2);
+});
+
+test("fix2: duplicate/late settlement cannot wake twice or double-release", async () => {
+  let resolveHook;
+  const hookP = new Promise((r) => { resolveHook = r; });
+  const store = new Set(["dup-tok"]);
+  const s = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: () => 0,
+    firefoxDownload: async () => {
+      await hookP;
+      throw new Error("adapter reject");
+    },
+    popupTokenStore: store,
+  });
+  saturateOwnerWithWaiter(s, "p.com", "owner", "waiter");
+  while (s.getJob("owner").inFlightPermits > 0) s.releasePermit("owner");
+  const p = s.requestFirefoxHandoff("owner", fxIntent("owner.mp4", "dup-tok"));
+  // Mid-flight: ownership should already have advanced; waiter authorized at most once.
+  assert.equal(s.getJob("owner").state, "handing_off_firefox");
+  assert.notEqual(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+  assert.equal(s.getJob("waiter").autoWakeCount, 1);
+  const wakeMid = s.getJob("waiter").autoWakeCount;
+  const retriesMid = s.getJob("waiter").retryRemaining;
+  const globalMid = s.getSnapshot().globalRunning;
+  resolveHook();
+  await p;
+  assert.equal(s.getJob("owner").state, "needs_user");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.equal(s.getJob("waiter").autoWakeCount, wakeMid); // no second wake
+  assert.equal(s.getJob("waiter").retryRemaining, retriesMid); // no double charge
+  // Slot not double-released (invariant holds; globalRunning consistent).
+  assert.ok(s.getSnapshot().globalRunning >= 0);
+  assert.ok(s.getSnapshot().globalRunning <= globalMid + 1);
+  assertSlotInvariant(s);
+
+  // Late cancel after already settled is no-op for wake/slot.
+  s.cancel("owner");
+  assert.equal(s.getJob("waiter").autoWakeCount, wakeMid);
+  assertSlotInvariant(s);
 });

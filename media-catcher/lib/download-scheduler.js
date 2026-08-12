@@ -1696,17 +1696,160 @@
     }
 
     /**
+     * Authorize the gate-named recovery owner at most once when they are still
+     * waiting_provider. Never charges/wakes a different waiter than the gate owner.
+     */
+    function authorizeGateNamedRecoveryOwner(providerKey) {
+      var gate = getGate(providerKey);
+      var snap = gate.snapshot();
+      if (snap.state !== "saturated" && snap.state !== "recovering") return false;
+      var recoveryId = snap.ownerJobId;
+      if (!recoveryId) return false;
+      var next = jobs.get(recoveryId);
+      if (!next || next.state !== "waiting_provider") return false;
+      if (snap.reducedConcurrency != null) {
+        applyReducedConcurrency(next, snap.reducedConcurrency);
+      }
+      return authorizeWake(next);
+    }
+
+    /**
+     * Shared owner-reconciliation for Firefox handoff setup and failed settlement.
+     * Authenticated completeOwner with oldest eligible recovery (or null). Authorizes
+     * the installed recovery owner only when advancement is confirmed (or when the
+     * gate already names an eligible waiting recovery owner).
+     *
+     * Returns:
+     *   {
+     *     wasAuthenticatedOwner: boolean,
+     *     advanced: boolean,
+     *     stillOwner: boolean,
+     *     recoveryId: string|null,
+     *     authorized: boolean,
+     *     error: Error|null
+     *   }
+     */
+    function reconcileProviderOwnerRelease(job, options) {
+      options = options || {};
+      var gate = getGate(job.providerKey);
+      var snap = gate.snapshot();
+      var wasAuthenticatedOwner =
+        (snap.state === "saturated" || snap.state === "recovering") &&
+        snap.ownerJobId === job.id;
+
+      if (!wasAuthenticatedOwner) {
+        // Gate already advanced (or job was never owner): authorize exact named
+        // recovery owner at most once; do not charge a different waiter.
+        var authorizedExisting = authorizeGateNamedRecoveryOwner(job.providerKey);
+        return {
+          wasAuthenticatedOwner: false,
+          advanced: true,
+          stillOwner: false,
+          recoveryId: snap.ownerJobId,
+          authorized: authorizedExisting,
+          error: null,
+        };
+      }
+
+      var recoveryId = null;
+      if (Object.prototype.hasOwnProperty.call(options, "recoveryOwnerJobId")) {
+        recoveryId = options.recoveryOwnerJobId;
+      } else {
+        var waiter = oldestEligibleWaiter(job.providerKey);
+        recoveryId = waiter ? waiter.id : null;
+      }
+
+      var result = null;
+      var err = null;
+      try {
+        result = gate.completeOwner({
+          jobId: job.id,
+          recoveryOwnerJobId: recoveryId,
+        });
+      } catch (e) {
+        err = e;
+      }
+
+      var after = gate.snapshot();
+      var stillOwner =
+        (after.state === "saturated" || after.state === "recovering") &&
+        after.ownerJobId === job.id;
+      // Prefer explicit advanced flag; also treat post-throw snapshot that no longer
+      // names this job as owner as advancement (gate mutated before throw).
+      var advanced = !!(result && result.advanced === true) || (!stillOwner && err);
+
+      var authorized = false;
+      if (advanced && !stillOwner) {
+        // Authorize exact gate-named recovery owner (or the recovery we requested if
+        // still waiting under that id). authorizeWake is per-epoch idempotent.
+        if (after.ownerJobId) {
+          authorized = authorizeGateNamedRecoveryOwner(job.providerKey);
+        } else if (recoveryId) {
+          var nextFallback = jobs.get(recoveryId);
+          if (nextFallback && nextFallback.state === "waiting_provider") {
+            if (after.reducedConcurrency != null) {
+              applyReducedConcurrency(nextFallback, after.reducedConcurrency);
+            }
+            authorized = authorizeWake(nextFallback);
+          }
+        }
+      }
+
+      return {
+        wasAuthenticatedOwner: true,
+        advanced: advanced,
+        stillOwner: stillOwner,
+        recoveryId: recoveryId,
+        authorized: authorized,
+        error: err,
+      };
+    }
+
+    /**
+     * Restore the exact live mCatcher attempt after a failed pre-adapter owner
+     * transition. StateVersion stays monotonic (never decremented). Caller must
+     * not have drained between slot release and this restore.
+     */
+    function restoreRunningOwnerAttempt(job, priorAttemptToken) {
+      job.firefoxHandoffInFlight = false;
+      job.attemptToken = priorAttemptToken;
+      if (job.holdsGlobalSlot !== true) {
+        job.holdsGlobalSlot = true;
+        globalRunning += 1;
+      }
+      if (job.state !== "running") {
+        job.state = "running";
+        job.stateVersion += 1;
+      }
+    }
+
+    /**
      * Settle a failed/aborted explicit Firefox handoff after the one-time token
      * was consumed. Never leaves handing_off_firefox / firefoxHandoffInFlight stuck.
      * Late cancel → cancelled (ephemeral cleared); otherwise needs_user (ephemeral retained).
-     * Best-effort owner generation release if still authenticated owner.
+     * Reconciles provider ownership so waiters are not stranded and a nonrunning job
+     * never remains gate owner when release can be confirmed.
+     *
+     * Returns { ownerStillHeld: boolean, error: Error|null } for callers that must
+     * surface unconfirmed owner release after rollback is no longer possible.
      */
     function settleFailedFirefoxHandoff(job) {
-      if (!job) return;
-      if (job.state === "handed_to_firefox") return;
+      if (!job) {
+        return { ownerStillHeld: false, error: null };
+      }
+      if (job.state === "handed_to_firefox") {
+        return { ownerStillHeld: false, error: null };
+      }
+      // Duplicate/late settlement: already left handoff; do not re-wake or re-release.
+      if (job.state !== "handing_off_firefox" && job.firefoxHandoffInFlight !== true) {
+        if (isTrulyTerminal(job.state) || job.state === "needs_user" || job.state === "running") {
+          job.firefoxHandoffInFlight = false;
+          return { ownerStillHeld: false, error: null };
+        }
+      }
       if (isTrulyTerminal(job.state) && job.state !== "handing_off_firefox") {
         job.firefoxHandoffInFlight = false;
-        return;
+        return { ownerStillHeld: false, error: null };
       }
 
       removeFromQueue(job);
@@ -1716,19 +1859,32 @@
       job.attemptToken = null;
       job.firefoxHandoffInFlight = false;
 
-      // Best-effort: if we still look like the gate owner, advance generation without
-      // waking waiters from a non-advanced path (completeOwner is idempotent).
+      var release = {
+        stillOwner: false,
+        error: null,
+        advanced: false,
+      };
       try {
-        var gateS = getGate(job.providerKey);
-        var snapS = gateS.snapshot();
-        if (
-          (snapS.state === "saturated" || snapS.state === "recovering") &&
-          snapS.ownerJobId === job.id
-        ) {
-          gateS.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
-        }
+        release = reconcileProviderOwnerRelease(job);
       } catch (errS) {
-        // Gate recovery must not prevent local settlement.
+        // If completeOwner path threw outside the helper, still try to authorize
+        // any gate-named recovery owner so waiters are not stranded.
+        release = {
+          stillOwner: false,
+          error: errS,
+          advanced: false,
+        };
+        try {
+          var gateSnap = getGate(job.providerKey).snapshot();
+          release.stillOwner =
+            (gateSnap.state === "saturated" || gateSnap.state === "recovering") &&
+            gateSnap.ownerJobId === job.id;
+          if (!release.stillOwner) {
+            authorizeGateNamedRecoveryOwner(job.providerKey);
+          }
+        } catch (errAuth) {
+          // Authorization best-effort after unexpected gate failure.
+        }
       }
 
       if (job.cancelRequested === true) {
@@ -1741,6 +1897,10 @@
         // Ephemeral retained for manualRetry / later explicit handoff.
       }
       drain();
+      return {
+        ownerStillHeld: release.stillOwner === true,
+        error: release.error || null,
+      };
     }
 
     /**
@@ -1820,7 +1980,12 @@
       // Recovery boundary: every post-token pre-await mutation + adapter call.
       // A sync throw must not leave handing_off_firefox / inFlight stuck.
       // Do not auto-set cancelRequested — firefoxHandoffInFlight denies new permits.
+      // Owner release must advance before Firefox; non-advanced / still-owner rolls back
+      // the live mCatcher attempt (no drain between slot release and restore).
       var adapterReady = false;
+      var rolledBackOwner = false;
+      var priorAttemptToken = job.attemptToken;
+      var ownershipTransitionError = null;
       try {
         job.firefoxHandoffInFlight = true;
 
@@ -1837,34 +2002,47 @@
           snapH.ownerJobId === job.id;
 
         if (wasOwner) {
-          var waiterH = oldestEligibleWaiter(job.providerKey);
-          var recoveryIdH = waiterH ? waiterH.id : null;
+          // Local transition first; do NOT drain until commit or rollback completes.
           job.state = "handing_off_firefox";
           job.stateVersion += 1;
           job.attemptToken = null;
           releaseSlotIfHeld(job);
-          var resultH = gateH.completeOwner({
-            jobId: job.id,
-            recoveryOwnerJobId: recoveryIdH,
-          });
-          // Non-advanced completeOwner must never wake/charge a waiter.
-          if (resultH && resultH.advanced === true && recoveryIdH) {
-            var nextH = jobs.get(recoveryIdH);
-            if (nextH && nextH.state === "waiting_provider") {
-              var afterH = gateH.snapshot();
-              if (afterH.reducedConcurrency != null) {
-                applyReducedConcurrency(nextH, afterH.reducedConcurrency);
-              }
-              authorizeWake(nextH);
-            }
+
+          var releaseH = reconcileProviderOwnerRelease(job);
+
+          if (!releaseH.advanced && releaseH.stillOwner) {
+            // Fail closed: restore exact live attempt; never invoke Firefox.
+            restoreRunningOwnerAttempt(job, priorAttemptToken);
+            rolledBackOwner = true;
+            drain(); // rollback complete — safe to drain with slot restored
+            var failClosedErr =
+              releaseH.error ||
+              new Error(
+                "Firefox handoff rejected: provider ownership did not advance"
+              );
+            throw failClosedErr;
           }
+
+          if (releaseH.advanced && releaseH.error) {
+            // Gate advanced then threw: reconcile recovery already applied; settle
+            // failed without Firefox. Do not restore a job that is no longer owner.
+            ownershipTransitionError =
+              releaseH.error instanceof Error
+                ? releaseH.error
+                : new Error(String(releaseH.error || "provider ownership transition failed"));
+            settleFailedFirefoxHandoff(job);
+            throw ownershipTransitionError;
+          }
+
+          // Ownership advanced cleanly — commit drain so recovery can admit.
+          drain();
         } else {
           job.state = "handing_off_firefox";
           job.stateVersion += 1;
           job.attemptToken = null;
           releaseSlotIfHeld(job);
+          drain();
         }
-        drain();
 
         // Build guarded adapter input: only immutable intent + in-memory source handle.
         // Never project/serialize media URLs, cookies, headers, or ephemeral objects.
@@ -1892,12 +2070,48 @@
           job.firefoxHandoffInFlight = false;
           clearEphemeralOnce(job);
         }
+        // A handed_to_firefox job must never remain the gate owner.
+        try {
+          var snapDone = getGate(job.providerKey).snapshot();
+          if (
+            (snapDone.state === "saturated" || snapDone.state === "recovering") &&
+            snapDone.ownerJobId === job.id
+          ) {
+            reconcileProviderOwnerRelease(job);
+          }
+        } catch (errDone) {
+          // Success path already terminal for the job; gate reconcile is best-effort.
+        }
         drain();
       } catch (err) {
+        // Rolled-back owner path already restored running — rethrow without settle.
+        if (rolledBackOwner) {
+          throw err;
+        }
+        // Ownership transition after advance already settled — rethrow to surface error.
+        if (ownershipTransitionError) {
+          throw ownershipTransitionError;
+        }
         // Pre-await failure or adapter rejection: settle without stuck inFlight.
-        // Token remains consumed. void adapterReady keeps the branch explicit for readers.
+        // Token remains consumed. Adapter rejection resolves (settled); internal
+        // unconfirmed owner-release after settlement is surfaced as rejection.
+        var settleResult = settleFailedFirefoxHandoff(job);
+        if (!adapterReady) {
+          // Pre-adapter failure that was not a clean rollback: surface the error.
+          throw err;
+        }
+        if (settleResult && settleResult.ownerStillHeld) {
+          throw (
+            settleResult.error ||
+            err ||
+            new Error(
+              "Firefox handoff failed: provider ownership could not be released"
+            )
+          );
+        }
+        // Adapter rejection with confirmed ownership release: resolve (needs_user /
+        // cancelled already applied). Existing callers await without expect-reject.
         void adapterReady;
-        settleFailedFirefoxHandoff(job);
       }
     }
 
