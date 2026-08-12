@@ -331,6 +331,9 @@ def test_range_capable_completes_with_pget_result(tmp_path, monkeypatch):
         assert res["attemptToken"] == "atk-1"
         assert not any(m.get("type") == "pget-fallback" for m in sent)
         assert not any(m.get("type") == "pget-done" for m in sent)
+        progress = [m for m in sent if m.get("type") == "pget-progress"]
+        assert progress, "expected at least one multi-range progress frame"
+        assert all(m.get("attemptToken") == "atk-1" for m in progress)
         final = tmp_path / "clip.mp4"
         assert final.is_file()
         assert final.read_bytes() == DEFAULT_PAYLOAD
@@ -1210,6 +1213,9 @@ def test_pget_single_writes_exact_filename_no_range(tmp_path, monkeypatch):
         assert res["failureCategory"] is None
         assert res["partState"] == "committed"
         assert res["attemptToken"] == "atk-s"
+        progress = [m for m in sent if m.get("type") == "pget-progress"]
+        assert progress, "expected at least one single-connection progress frame"
+        assert all(m.get("attemptToken") == "atk-s" for m in progress)
         final = tmp_path / "11238-makemebi.net.mp4"
         assert final.is_file()
         assert final.read_bytes() == payload
@@ -2801,3 +2807,608 @@ def test_ytdl_registry_cas_and_identity_unregister(monkeypatch):
     mc._pget_cancel({"id": jid})
     assert mid["proc"].killed is True or mid["proc"] in killed
     d._pget_unregister(jid, mid)
+
+
+# ---------------------------------------------------------------------------
+# Task 20 host-pget: terminal file/bytes, attempt fencing, reentrant range→single
+# ---------------------------------------------------------------------------
+
+
+def test_completed_multi_range_result_includes_deduped_file_and_bytes(tmp_path, monkeypatch):
+    """Pre-existing clip.mp4 forces dedup; completed pget-result reports actual path+bytes."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    preexisting = tmp_path / "clip.mp4"
+    preexisting.write_bytes(b"ALREADY-HERE")
+    httpd, _state = run_server("range")
+    try:
+        url = server_url(httpd)
+        mc.handle_pget({
+            "id": "jobDedupMeta",
+            "attemptToken": "atk-dedup-meta",
+            "urls": [url],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "completed"
+        assert res["partState"] == "committed"
+        assert res["mode"] == "multi-range"
+        assert res["failureCategory"] is None
+        expected = tmp_path / "clip (1).mp4"
+        assert expected.is_file()
+        assert expected.read_bytes() == DEFAULT_PAYLOAD
+        assert preexisting.read_bytes() == b"ALREADY-HERE"
+        assert res.get("file") == str(expected)
+        assert res.get("bytes") == len(DEFAULT_PAYLOAD)
+        # Failure shape must stay free of secrets.
+        blob = str(res)
+        assert "http://" not in blob
+        assert "Cookie" not in blob
+        assert partish(leftovers(tmp_path)) == []
+    finally:
+        shutdown_server(httpd)
+
+
+def test_completed_single_conversion_result_describes_post_transcode_file(tmp_path, monkeypatch):
+    """Successful convert updates terminal file/bytes to the post-transcode path/length."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    import mchost.downloads as d
+
+    converted_name = "clip.converted.mp4"
+    converted_payload = b"POST-TRANSCODE-BYTES-42"
+
+    def fake_transcode(src, codec="h265", quality="visually-lossless", prefer="auto", on_progress=None):
+        out = os.path.join(os.path.dirname(src), converted_name)
+        with open(out, "wb") as f:
+            f.write(converted_payload)
+        try:
+            os.remove(src)
+        except Exception:
+            pass
+        return {
+            "path": out,
+            "converted": True,
+            "note": None,
+            "srcBytes": len(DEFAULT_PAYLOAD),
+            "hevcBytes": len(converted_payload),
+        }
+
+    monkeypatch.setattr(mc, "FFMPEG", "C:\\fake\\ffmpeg.exe")
+    monkeypatch.setattr(d, "transcode", fake_transcode)
+
+    payload = DEFAULT_PAYLOAD
+    ranges_seen = []
+
+    class NoRange(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            ranges_seen.append(self.headers.get("Range"))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), NoRange)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        mc.handle_pget_single({
+            "id": "jobConvMeta",
+            "attemptToken": "atk-conv-meta",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "userAgent": "t",
+            "convert": {"codec": "h265", "quality": "visually-lossless", "encoder": "auto"},
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "completed"
+        assert res["partState"] == "committed"
+        assert res["mode"] == "single-connection"
+        final = tmp_path / converted_name
+        assert final.is_file()
+        assert final.read_bytes() == converted_payload
+        assert res.get("file") == str(final)
+        assert res.get("bytes") == len(converted_payload)
+        # Not the pre-convert requested path as the terminal metadata.
+        assert res.get("file") != str(tmp_path / "clip.mp4")
+        assert not any(m.get("type") == "pget-fallback" for m in sent)
+        assert all(r is None for r in ranges_seen)
+    finally:
+        shutdown_server(httpd)
+
+
+def test_failed_and_cancelled_results_omit_file_and_bytes(tmp_path, monkeypatch):
+    """Failed/cancelled terminals keep exact base shape and omit file/bytes pair."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    httpd, _state = run_server("429")
+    try:
+        mc.handle_pget({
+            "id": "jobFailShape",
+            "attemptToken": "atk-fail-shape",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent)
+        assert res["status"] == "failed"
+        assert "file" not in res
+        assert "bytes" not in res
+        assert set(res.keys()) == {
+            "type", "id", "attemptToken", "status", "mode", "failureCategory", "partState",
+        }
+    finally:
+        shutdown_server(httpd)
+
+    sent.clear()
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"C" * (256 * 1024)
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:2048])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=10.0)
+            try:
+                self.wfile.write(payload[2048:])
+            except Exception:
+                pass
+
+    httpd2 = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    threading.Thread(target=httpd2.serve_forever, daemon=True).start()
+    try:
+        mc.handle_pget_single({
+            "id": "jobCanShape",
+            "attemptToken": "atk-can-shape",
+            "urls": [server_url(httpd2)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        mc._pget_cancel({"id": "jobCanShape"})
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert "file" not in res
+        assert "bytes" not in res
+        assert set(res.keys()) == {
+            "type", "id", "attemptToken", "status", "mode", "failureCategory", "partState",
+        }
+        assert d._PGET.get("jobCanShape") is None
+    finally:
+        hold.set()
+        shutdown_server(httpd2)
+
+
+def test_stat_failure_after_commit_still_completed_without_revoking(tmp_path, monkeypatch):
+    """Metadata/stat failure after commit must not revoke completed/committed success."""
+    sent = []
+    import mchost.downloads as d
+
+    orig_getsize = d.os.path.getsize
+    orig_isfile = d.os.path.isfile
+
+    def flaky_getsize(path):
+        # Only break post-commit terminal metadata; allow segment assembly checks.
+        if str(path).endswith("clip.mp4") and os.path.isfile(path):
+            # After real file exists (committed), raise once for metadata path.
+            try:
+                # Prefer real size during assembly of .part siblings.
+                if path.endswith(".part") or ".part" in os.path.basename(path):
+                    return orig_getsize(path)
+            except Exception:
+                pass
+            # Raise only when asked about the final committed path from metadata helper.
+            raise OSError("stat failed for metadata")
+        return orig_getsize(path)
+
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    # Patch helper path via os.path.getsize used by terminal metadata.
+    monkeypatch.setattr(d.os.path, "getsize", flaky_getsize)
+
+    httpd, _state = run_server("range")
+    try:
+        mc.handle_pget({
+            "id": "jobStatFail",
+            "attemptToken": "atk-stat-fail",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "completed"
+        assert res["partState"] == "committed"
+        assert (tmp_path / "clip.mp4").is_file()
+        # file/bytes may be omitted on metadata failure, but success is retained.
+        assert res["failureCategory"] is None
+        assert "OSError" not in str(res)
+        assert "stat failed" not in str(res)
+    finally:
+        shutdown_server(httpd)
+        monkeypatch.setattr(d.os.path, "getsize", orig_getsize)
+        monkeypatch.setattr(d.os.path, "isfile", orig_isfile)
+
+
+def test_range_unsupported_to_single_same_id_reentrant_identity(tmp_path, monkeypatch):
+    """range_unsupported terminal unregisters first so same-id single fallback can register."""
+    import mchost.downloads as d
+
+    sent = []
+    payload = DEFAULT_PAYLOAD
+    replacement_seen = {"op": None, "during_run": False}
+
+    class Always200(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            # Probe and ordinary GET both 200 (range unsupported for multi; ok for single).
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Always200)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def reentrant_send(msg):
+        m = dict(msg)
+        sent.append(m)
+        if (
+            m.get("type") == "pget-result"
+            and m.get("attemptToken") == "atk-range-first"
+            and m.get("failureCategory") == "range_unsupported"
+        ):
+            # Synchronous same-id fallback with a fresh attempt token.
+            mc.handle_pget_single({
+                "id": "jobRangeSingle",
+                "attemptToken": "atk-single-second",
+                "urls": [server_url(httpd)],
+                "name": "clip.mp4",
+                "dir": str(tmp_path),
+                "maxConnections": 1,
+                "userAgent": "t",
+            })
+            # Replacement must be registered through its run after re-entry.
+            rep = d._PGET.get("jobRangeSingle")
+            replacement_seen["op"] = rep
+            if rep is not None and rep.get("attemptToken") == "atk-single-second":
+                replacement_seen["during_run"] = True
+
+    monkeypatch.setattr(mc, "send", reentrant_send)
+
+    try:
+        mc.handle_pget({
+            "id": "jobRangeSingle",
+            "attemptToken": "atk-range-first",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-result" and m.get("attemptToken") == "atk-single-second"
+                for m in sent
+            ),
+            timeout=10,
+        )
+        multi = [
+            m for m in sent
+            if m.get("type") == "pget-result" and m.get("attemptToken") == "atk-range-first"
+        ]
+        single = [
+            m for m in sent
+            if m.get("type") == "pget-result" and m.get("attemptToken") == "atk-single-second"
+        ]
+        assert len(multi) == 1
+        assert multi[0]["status"] == "failed"
+        assert multi[0]["mode"] == "multi-range"
+        assert multi[0]["failureCategory"] == "range_unsupported"
+        assert "file" not in multi[0]
+        assert "bytes" not in multi[0]
+        assert len(single) == 1
+        assert single[0]["status"] == "completed"
+        assert single[0]["mode"] == "single-connection"
+        assert single[0]["failureCategory"] is None
+        assert single[0]["partState"] == "committed"
+        assert single[0]["status"] != "failed"
+        assert replacement_seen["during_run"] is True
+        assert wait_for(lambda: d._PGET.get("jobRangeSingle") is None, timeout=5)
+        assert (tmp_path / "clip.mp4").read_bytes() == payload
+        assert not any(m.get("type") == "pget-fallback" for m in sent)
+    finally:
+        shutdown_server(httpd)
+
+
+def test_attempt_token_fences_set_limit_and_cancel(tmp_path, monkeypatch):
+    """Stale/null/mismatch tokens no-op; matching and omitted tokens act; ack echoes stored."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"F" * (512 * 1024)
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:4096])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=15.0)
+            try:
+                self.wfile.write(payload[4096:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    jid = "jobFenceTok"
+    stored_token = "atk-live-token"
+    try:
+        mc.handle_pget_single({
+            "id": jid,
+            "attemptToken": stored_token,
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        op = d._PGET.get(jid)
+        assert op is not None
+        assert op.get("attemptToken") == stored_token
+        assert op.get("cancel_requested") is False
+
+        # Stale token set-limit: no mutation, no ack.
+        acks_before = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": "stale-token",
+            "maxConnections": 0,
+            "providerGeneration": 1,
+        })
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+        assert op["maxConnections"] == 1
+
+        # Null token property present: no-op.
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": None,
+            "maxConnections": 0,
+            "providerGeneration": 2,
+        })
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+
+        # Matching token acts; ack echoes STORED token (not request-controlled input).
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": stored_token,
+            "maxConnections": 0,
+            "providerGeneration": 3,
+        })
+        ack = _wait_ack(sent, jid, timeout=5)
+        assert ack["providerGeneration"] == 3
+        assert ack["maxConnections"] == 0
+        assert ack.get("attemptToken") == stored_token
+        assert op["providerGeneration"] == 3
+        assert op["maxConnections"] == 0
+
+        # Omitted attemptToken preserves legacy id-only behavior; still echoes stored.
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "maxConnections": 1,
+            "providerGeneration": 4,
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-limit-ack"
+                and m.get("providerGeneration") == 4
+                for m in sent
+            ),
+            timeout=5,
+        )
+        ack_legacy = [
+            m for m in sent
+            if m.get("type") == "pget-limit-ack" and m.get("providerGeneration") == 4
+        ][-1]
+        assert ack_legacy["maxConnections"] == 1
+        assert ack_legacy.get("attemptToken") == stored_token
+        assert op["maxConnections"] == 1
+
+        # Stale cancel is a no-op.
+        mc._pget_cancel({"id": jid, "attemptToken": "other-token"})
+        time.sleep(0.05)
+        assert op.get("cancel_requested") is False
+        assert not (op.get("stop") and op["stop"].is_set())
+
+        # Null token cancel is a no-op.
+        mc._pget_cancel({"id": jid, "attemptToken": None})
+        time.sleep(0.05)
+        assert op.get("cancel_requested") is False
+
+        # Matching cancel acts.
+        mc._pget_cancel({"id": jid, "attemptToken": stored_token})
+        assert op.get("cancel_requested") is True
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert res["attemptToken"] == stored_token
+        assert "file" not in res and "bytes" not in res
+        assert d._PGET.get(jid) is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_attempt_token_omitted_cancel_still_works(tmp_path, monkeypatch):
+    """Legacy cancel without attemptToken still cancels the live op."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"G" * (256 * 1024)
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:2048])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=10.0)
+            try:
+                self.wfile.write(payload[2048:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        mc.handle_pget_single({
+            "id": "jobLegacyCan",
+            "attemptToken": "atk-legacy-can",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        mc._pget_cancel({"id": "jobLegacyCan"})  # omitted token
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert res["attemptToken"] == "atk-legacy-can"
+        assert d._PGET.get("jobLegacyCan") is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_safe_ascii_filename_exactly_150_preserved_multi_and_single(tmp_path, monkeypatch):
+    """Safe ASCII basename of exactly 150 chars is preserved for multi and single."""
+    safe_name = ("n" * 146) + ".mp4"
+    assert len(safe_name) == 150
+
+    # Multi-range
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    httpd, _state = run_server("range")
+    try:
+        mc.handle_pget({
+            "id": "jobName150m",
+            "attemptToken": "atk-name-150m",
+            "urls": [server_url(httpd)],
+            "name": safe_name,
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "completed"
+        final = tmp_path / safe_name
+        assert final.is_file()
+        assert final.name == safe_name
+        assert len(final.name) == 150
+        assert res.get("file") == str(final)
+        assert res.get("bytes") == len(DEFAULT_PAYLOAD)
+        assert final.read_bytes() == DEFAULT_PAYLOAD
+    finally:
+        shutdown_server(httpd)
+
+    # Single-connection
+    sent2 = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent2.append(dict(msg)))
+    payload = DEFAULT_PAYLOAD
+
+    class NoRange(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd2 = ThreadingHTTPServer(("127.0.0.1", 0), NoRange)
+    threading.Thread(target=httpd2.serve_forever, daemon=True).start()
+    try:
+        single_name = ("s" * 146) + ".mp4"
+        assert len(single_name) == 150
+        mc.handle_pget_single({
+            "id": "jobName150s",
+            "attemptToken": "atk-name-150s",
+            "urls": [server_url(httpd2)],
+            "name": single_name,
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "userAgent": "t",
+        })
+        res2 = wait_result(sent2, timeout=10)
+        assert res2["status"] == "completed"
+        final2 = tmp_path / single_name
+        assert final2.is_file()
+        assert final2.name == single_name
+        assert len(final2.name) == 150
+        assert res2.get("file") == str(final2)
+        assert res2.get("bytes") == len(payload)
+    finally:
+        shutdown_server(httpd2)
