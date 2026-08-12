@@ -1156,32 +1156,33 @@ class _PgetError(Exception):
 def _pget_nonneg_int_bytes(val):
     """Integral nonnegative byte count, or None.
 
-    Rejects bool (bool is a subclass of int), floats, strings, and negatives.
-    No lossy coercion — only real int values >= 0 are accepted.
+    Rejects bool, int subclasses (hostile __lt__), floats, strings, and negatives.
+    No lossy coercion — only exact built-in int values >= 0 are accepted.
+    Returns a plain int.
     """
-    if isinstance(val, bool) or not isinstance(val, int):
+    if type(val) is not int:
         return None
     if val < 0:
         return None
-    return val
+    return int(val)
 
 
 def _pget_attempt_token_allows(req, op):
     """True when cancel / set-limit may act on the live op.
 
     ONLY ABSENCE of the attemptToken key enables legacy id-only compatibility.
-    When the key is present, its value must be a nonblank primitive string that
-    exactly equals the stored active token (also a nonblank string). Present
-    null/None, empty/whitespace, bool, number, object, or different string is
-    a no-op — even when the stored token is None.
+    When the key is present, its value must be a nonblank exact built-in str
+    that exactly equals the stored active token (also an exact built-in str).
+    Present null/None, empty/whitespace, bool, number, object, str subclass,
+    or different string is a no-op — even when the stored token is None.
     """
     if not isinstance(req, dict) or "attemptToken" not in req:
         return True
     provided = req.get("attemptToken")
-    if not isinstance(provided, str) or not provided.strip():
+    if type(provided) is not str or not provided.strip():
         return False
     stored = op.get("attemptToken") if isinstance(op, dict) else None
-    if not isinstance(stored, str) or not stored.strip():
+    if type(stored) is not str or not stored.strip():
         return False
     return provided == stored
 
