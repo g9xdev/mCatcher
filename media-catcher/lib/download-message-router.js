@@ -352,8 +352,8 @@
     }
 
     function routePgetProgress(message) {
+      // Exact own-data nonblank `id` only — never fall back to jobId.
       var id = readNonblankOwnString(message, "id");
-      if (!id) id = readNonblankOwnString(message, "jobId");
       var attemptToken = readNonblankOwnString(message, "attemptToken");
       if (!id || !attemptToken) return ignoreDecision();
 
@@ -376,8 +376,8 @@
     }
 
     function routePgetLimitAck(message) {
+      // Exact own-data nonblank `id` only — never fall back to jobId.
       var id = readNonblankOwnString(message, "id");
-      if (!id) id = readNonblankOwnString(message, "jobId");
       var attemptToken = readNonblankOwnString(message, "attemptToken");
       if (!id || !attemptToken) return ignoreDecision();
 
@@ -766,19 +766,55 @@
       return { present: true, value: state.value };
     }
 
-    function readOptionalMirrors(input) {
-      var m = readOptionalOwnValue(input, "mirrors");
-      if (!m.present) return undefined;
-      return m.value;
+    /** Reject C0, DEL, and C1 controls in HTTP-context strings. */
+    function isSafeHttpContextString(v) {
+      return typeof v === "string" && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
     }
 
+    /**
+     * Descriptor-safe mirrors snapshot for start payloads.
+     * Absent → undefined. null → undefined (omit). Non-array present → generic TypeError.
+     * Dense own-data entries only; sparse/accessor/hostile length → generic TypeError.
+     * Own-data blank/non-string entries are omitted (closed skip contract).
+     * Returns a fresh dense array of unique nonblank strings (no primary).
+     */
+    function snapshotOptionalMirrors(input) {
+      var m = readOptionalOwnValue(input, "mirrors");
+      if (!m.present) return undefined;
+      var mirrors = m.value;
+      if (mirrors == null) return undefined;
+      if (!Array.isArray(mirrors)) throw genericTypeError();
+
+      var lenState = ownKeyState(mirrors, "length");
+      if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
+        throw genericTypeError();
+      }
+      var len = lenState.value;
+      var out = [];
+      var seen = Object.create(null);
+      for (var i = 0; i < len; i++) {
+        var entry = ownData(mirrors, String(i));
+        if (!entry.ok) throw genericTypeError();
+        var v = entry.value;
+        if (typeof v !== "string" || !isNonblankPrimitiveString(v)) continue;
+        if (seen[v]) continue;
+        seen[v] = true;
+        out.push(v);
+      }
+      return out;
+    }
+
+    /**
+     * Only ABSENT referer/userAgent may normalize later to "".
+     * Present values must be primitive strings without C0/C1/DEL controls.
+     * Present null/undefined/object/accessor → generic TypeError.
+     * Returns { present:false } or { present:true, value:string }.
+     */
     function readOptionalHttpContext(input, key) {
       var r = readOptionalOwnValue(input, key);
-      if (!r.present) return undefined;
-      // Builders normalize absence to ""; reject non-strings here too.
-      if (r.value === null || r.value === undefined) return "";
-      if (!isPrimitiveString(r.value)) throw genericTypeError();
-      return r.value;
+      if (!r.present) return { present: false };
+      if (!isSafeHttpContextString(r.value)) throw genericTypeError();
+      return { present: true, value: r.value };
     }
 
     function readOptionalEffectiveDir(input) {
@@ -793,8 +829,15 @@
       return gen;
     }
 
+    function assignOptionalHttpFields(target, referer, userAgent) {
+      if (referer.present) target.referer = referer.value;
+      if (userAgent.present) target.userAgent = userAgent.value;
+    }
+
     function buildNativeStartPayload(input) {
       // Input/reflection validation — always generic TypeError.
+      // Fully snapshot/sanitize selected kind fields BEFORE resolving dependencies
+      // so malformed caller input never leaks dependency load/runtime errors.
       if (!input || typeof input !== "object") throw genericTypeError();
 
       var kind = requireOwnData(input, "kind");
@@ -814,15 +857,13 @@
       var attemptToken = requireOwnData(input, "attemptToken");
       if (!isNonblankPrimitiveString(attemptToken)) throw genericTypeError();
 
-      // Sanitized inputs only — dependency load/runtime exceptions propagate by identity.
-      var Protocol = resolveFileSinkProtocol();
-
       // Control commands: no intent/URL required; always fence with attemptToken.
       if (kind === "pget-set-limit") {
         var setGen = requireProviderGeneration(input);
         var setLim = requireOwnData(input, "maxConnections");
         if (!isNonnegInt(setLim)) throw genericTypeError();
-        return Protocol.buildPgetSetLimitCmd({
+        // Sanitized only — dependency exceptions propagate by identity.
+        return resolveFileSinkProtocol().buildPgetSetLimitCmd({
           jobId: jobId,
           attemptToken: attemptToken,
           providerGeneration: setGen,
@@ -831,7 +872,7 @@
       }
 
       if (kind === "pget-cancel") {
-        return Protocol.buildPgetCancelCmd({
+        return resolveFileSinkProtocol().buildPgetCancelCmd({
           jobId: jobId,
           attemptToken: attemptToken,
         });
@@ -847,45 +888,58 @@
         var maxConnections = requireOwnData(input, "maxConnections");
         if (!isPositiveInt(maxConnections)) throw genericTypeError();
         var pgetGen = requireProviderGeneration(input);
-        return Protocol.buildPgetCmd({
+        var pgetMirrors = snapshotOptionalMirrors(input);
+        var pgetReferer = readOptionalHttpContext(input, "referer");
+        var pgetUa = readOptionalHttpContext(input, "userAgent");
+        var pgetInput = {
           jobId: jobId,
           attemptToken: attemptToken,
           intent: intent,
           url: url,
-          mirrors: readOptionalMirrors(input),
           maxConnections: maxConnections,
           providerGeneration: pgetGen,
-          referer: readOptionalHttpContext(input, "referer"),
-          userAgent: readOptionalHttpContext(input, "userAgent"),
-          effectiveDestinationDirectory: effectiveDir,
-        });
+        };
+        if (pgetMirrors !== undefined) pgetInput.mirrors = pgetMirrors;
+        if (effectiveDir !== undefined) {
+          pgetInput.effectiveDestinationDirectory = effectiveDir;
+        }
+        assignOptionalHttpFields(pgetInput, pgetReferer, pgetUa);
+        return resolveFileSinkProtocol().buildPgetCmd(pgetInput);
       }
 
       if (kind === "pget-single") {
         var singleUrl = requireOwnData(input, "url");
         if (!isNonblankPrimitiveString(singleUrl)) throw genericTypeError();
         var singleGen = requireProviderGeneration(input);
-        return Protocol.buildPgetSingleCmd({
+        var singleMirrors = snapshotOptionalMirrors(input);
+        var singleReferer = readOptionalHttpContext(input, "referer");
+        var singleUa = readOptionalHttpContext(input, "userAgent");
+        var singleInput = {
           jobId: jobId,
           attemptToken: attemptToken,
           intent: intent,
           url: singleUrl,
-          mirrors: readOptionalMirrors(input),
           providerGeneration: singleGen,
-          referer: readOptionalHttpContext(input, "referer"),
-          userAgent: readOptionalHttpContext(input, "userAgent"),
-          effectiveDestinationDirectory: effectiveDir,
-        });
+        };
+        if (singleMirrors !== undefined) singleInput.mirrors = singleMirrors;
+        if (effectiveDir !== undefined) {
+          singleInput.effectiveDestinationDirectory = effectiveDir;
+        }
+        assignOptionalHttpFields(singleInput, singleReferer, singleUa);
+        return resolveFileSinkProtocol().buildPgetSingleCmd(singleInput);
       }
 
       // file-open — never include media URL or userActionToken in host command.
-      var session = Protocol.createFileSinkSession({
+      var openInput = {
         jobId: jobId,
         attemptToken: attemptToken,
         requestedFilename: intent.requestedFilename,
         destinationDirectory: intent.destinationDirectory,
-        effectiveDestinationDirectory: effectiveDir,
-      });
+      };
+      if (effectiveDir !== undefined) {
+        openInput.effectiveDestinationDirectory = effectiveDir;
+      }
+      var session = resolveFileSinkProtocol().createFileSinkSession(openInput);
       var openCmd = session.openCmd();
       if (!openCmd) throw genericTypeError();
       return openCmd;

@@ -1369,6 +1369,238 @@ test("builders reject malformed identities/intent/url/concurrency", () => {
   assert.equal(defaultDir.userAgent, "");
 });
 
+test("builders require own-data nonnegative providerGeneration (no default 0)", () => {
+  const { buildPgetCmd, buildPgetSingleCmd } = loadProtocol();
+  const base = {
+    jobId: "j1",
+    attemptToken: "a1",
+    intent: { requestedFilename: FLOREN, destinationDirectory: null },
+    url: "https://cdn/x.mp4",
+    maxConnections: 2,
+  };
+
+  // Missing key — no silent default to 0.
+  assert.throws(() => buildPgetCmd(base), TypeError);
+  assert.throws(() => buildPgetSingleCmd(base), TypeError);
+
+  // Explicit undefined own-data value.
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { providerGeneration: undefined })),
+    TypeError
+  );
+
+  // null / bool / fractional / negative / object / string.
+  for (const bad of [null, true, false, 1.5, -1, -0.1, "0", {}, [], NaN, Infinity]) {
+    assert.throws(
+      () => buildPgetCmd(Object.assign({}, base, { providerGeneration: bad })),
+      TypeError,
+      `providerGeneration=${String(bad)}`
+    );
+  }
+
+  // Accessor must not be invoked; still TypeError.
+  let hits = 0;
+  const acc = Object.assign({}, base);
+  Object.defineProperty(acc, "providerGeneration", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      hits += 1;
+      return 0;
+    },
+  });
+  assert.throws(() => buildPgetCmd(acc), TypeError);
+  assert.equal(hits, 0);
+
+  // Valid nonnegative integers including 0.
+  const zero = buildPgetCmd(Object.assign({}, base, { providerGeneration: 0 }));
+  assert.equal(zero.providerGeneration, 0);
+  const pos = buildPgetSingleCmd(
+    Object.assign({}, base, { providerGeneration: 9 })
+  );
+  assert.equal(pos.providerGeneration, 9);
+});
+
+test("HTTP context: only absent referer/userAgent normalize to empty; present controls/null/undefined reject", () => {
+  const { buildPgetCmd } = loadProtocol();
+  const base = {
+    jobId: "j1",
+    attemptToken: "a1",
+    intent: { requestedFilename: FLOREN, destinationDirectory: null },
+    url: "https://cdn/x.mp4",
+    maxConnections: 1,
+    providerGeneration: 0,
+  };
+
+  const absent = buildPgetCmd(base);
+  assert.equal(absent.referer, "");
+  assert.equal(absent.userAgent, "");
+
+  const ordinary = buildPgetCmd(
+    Object.assign({}, base, {
+      referer: "https://page.example/watch",
+      userAgent: "TestUA/1.0",
+    })
+  );
+  assert.equal(ordinary.referer, "https://page.example/watch");
+  assert.equal(ordinary.userAgent, "TestUA/1.0");
+
+  // Present null / explicit undefined are invalid (not normalized to "").
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { referer: null })),
+    TypeError
+  );
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { userAgent: null })),
+    TypeError
+  );
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { referer: undefined })),
+    TypeError
+  );
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { userAgent: undefined })),
+    TypeError
+  );
+
+  // C0 / DEL / C1 controls (incl. U+0085 NEL, CR, LF, NUL).
+  for (const bad of [
+    "x\ny",
+    "x\ry",
+    "x\u0000y",
+    "x\u007fy",
+    "x\u0085y",
+    "x\u009fy",
+    "\u0080",
+  ]) {
+    assert.throws(
+      () => buildPgetCmd(Object.assign({}, base, { referer: bad })),
+      TypeError,
+      `referer=${JSON.stringify(bad)}`
+    );
+    assert.throws(
+      () => buildPgetCmd(Object.assign({}, base, { userAgent: bad })),
+      TypeError,
+      `userAgent=${JSON.stringify(bad)}`
+    );
+  }
+
+  // Present non-string / accessor.
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { referer: 12 })),
+    TypeError
+  );
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { userAgent: { v: "x" } })),
+    TypeError
+  );
+  let hits = 0;
+  const acc = Object.assign({}, base);
+  Object.defineProperty(acc, "referer", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return "https://page";
+    },
+  });
+  assert.throws(() => buildPgetCmd(acc), TypeError);
+  assert.equal(hits, 0);
+});
+
+test("mirrors snapshot is descriptor-safe; hostile index/length/proxy fail generically", () => {
+  const { buildPgetCmd } = loadProtocol();
+  const base = {
+    jobId: "j1",
+    attemptToken: "a1",
+    intent: { requestedFilename: FLOREN, destinationDirectory: null },
+    url: "https://cdn/primary.mp4",
+    maxConnections: 2,
+    providerGeneration: 1,
+  };
+  const primary = base.url;
+  const mirrorB = "https://mirror/b.mp4";
+
+  // Happy path remains primary-first, exact-string dedupe, frozen.
+  const ok = buildPgetCmd(
+    Object.assign({}, base, {
+      mirrors: [primary, mirrorB, mirrorB, "", null, 12],
+    })
+  );
+  assert.deepEqual(ok.urls, [primary, mirrorB]);
+  assert.equal(Object.isFrozen(ok.urls), true);
+
+  // Hostile index getter: must not leak secret-bearing errors.
+  const hostileIndex = ["https://mirror/ok.mp4"];
+  Object.defineProperty(hostileIndex, "0", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      throw new Error("DEPENDENCY_SECRET_INDEX");
+    },
+  });
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { mirrors: hostileIndex })),
+    (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(String(err.message).includes("SECRET"), false);
+      assert.equal(String(err.stack || "").includes("DEPENDENCY_SECRET_INDEX"), false);
+      return true;
+    }
+  );
+
+  // Hostile length via proxy trap (Array.length cannot be redefined as accessor).
+  const hostileLength = new Proxy(["https://mirror/ok.mp4"], {
+    getOwnPropertyDescriptor(target, prop) {
+      if (prop === "length") {
+        return {
+          configurable: true,
+          enumerable: false,
+          get() {
+            throw new Error("DEPENDENCY_SECRET_LENGTH");
+          },
+        };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { mirrors: hostileLength })),
+    (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(String(err.message).includes("SECRET"), false);
+      return true;
+    }
+  );
+
+  // Sparse hole (missing own index) fails closed.
+  const sparse = [];
+  sparse.length = 2;
+  sparse[1] = mirrorB;
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { mirrors: sparse })),
+    TypeError
+  );
+
+  // Hostile proxy trap must fail closed as generic TypeError without secret leak.
+  const proxy = new Proxy(["https://mirror/ok.mp4"], {
+    get() {
+      throw new Error("DEPENDENCY_SECRET_PROXY_GET");
+    },
+    getOwnPropertyDescriptor() {
+      throw new Error("DEPENDENCY_SECRET_PROXY_DESC");
+    },
+  });
+  assert.throws(
+    () => buildPgetCmd(Object.assign({}, base, { mirrors: proxy })),
+    (err) => {
+      assert.equal(err instanceof TypeError, true);
+      assert.equal(String(err.message).includes("SECRET"), false);
+      assert.equal(String(err.stack || "").includes("DEPENDENCY_SECRET"), false);
+      return true;
+    }
+  );
+});
+
 test("builders preserve primary+mirrors byte-for-byte with exact-string dedupe and freeze", () => {
   const { buildPgetCmd, buildPgetSingleCmd } = loadProtocol();
   const intent = {
