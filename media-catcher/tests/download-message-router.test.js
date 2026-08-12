@@ -186,6 +186,7 @@ test("native start payloads for pget pget-single file-open carry name and dir", 
     intent,
     url: "https://cdn/x.mp4",
     maxConnections: 2,
+    providerGeneration: 1,
   });
   assert.equal(pget.cmd, "pget");
   assert.equal(pget.name, FLOREN);
@@ -193,6 +194,7 @@ test("native start payloads for pget pget-single file-open carry name and dir", 
   assert.equal(pget.id, "j");
   assert.equal(pget.attemptToken, "a");
   assert.equal(pget.maxConnections, 2);
+  assert.equal(pget.providerGeneration, 1);
   assertDeeplyFrozen(pget);
 
   const single = buildNativeStartPayload({
@@ -201,6 +203,7 @@ test("native start payloads for pget pget-single file-open carry name and dir", 
     attemptToken: "a2",
     intent,
     url: "https://cdn/x.mp4",
+    providerGeneration: 0,
   });
   assert.equal(single.cmd, "pget-single");
   assert.equal(single.name, FLOREN);
@@ -208,6 +211,7 @@ test("native start payloads for pget pget-single file-open carry name and dir", 
   assert.equal(single.id, "j");
   assert.equal(single.attemptToken, "a2");
   assert.equal(single.maxConnections, 1);
+  assert.equal(single.providerGeneration, 0);
 
   const open = buildNativeStartPayload({
     kind: "file-open",
@@ -233,6 +237,7 @@ test("native start payloads for pget pget-single file-open carry name and dir", 
     }),
     url: "https://cdn/y.mp4",
     maxConnections: 1,
+    providerGeneration: 0,
   });
   assert.equal(def.dir, null);
   assert.equal(def.name, FLOREN);
@@ -366,6 +371,7 @@ test("browser classic-script resolves globals when CommonJS is inactive", () => 
     intent: req.intent,
     url: "https://cdn/x.mp4",
     maxConnections: 3,
+    providerGeneration: 0,
   });
   assert.equal(pget.cmd, "pget");
   assert.equal(pget.name, FLOREN);
@@ -441,6 +447,7 @@ test("CommonJS dependency load failures propagate and do not fall back to global
         intent: saveAsIntent(),
         url: "https://cdn/x.mp4",
         maxConnections: 1,
+        providerGeneration: 0,
       }),
     /simulated FileSinkProtocol load failure/
   );
@@ -1212,6 +1219,7 @@ test("buildNativeStartPayload preserves Florenfile name and null default destina
     intent: req.intent,
     url: "https://cdn/x.mp4?token=SECRET",
     maxConnections: 4,
+    providerGeneration: 0,
   });
   assert.equal(pget.name, FLOREN);
   assert.equal(pget.dir, null);
@@ -1225,6 +1233,7 @@ test("buildNativeStartPayload preserves Florenfile name and null default destina
     attemptToken: "a2",
     intent: req.intent,
     url: "https://cdn/x.mp4",
+    providerGeneration: 0,
   });
   assert.equal(single.name, FLOREN);
   assert.equal(single.dir, null);
@@ -1254,6 +1263,7 @@ test("buildNativeStartPayload rejects unknown kinds and malformed inputs", () =>
         intent,
         url: "https://x",
         maxConnections: 1,
+        providerGeneration: 0,
       }),
     TypeError
   );
@@ -1267,6 +1277,19 @@ test("buildNativeStartPayload rejects unknown kinds and malformed inputs", () =>
         intent,
         url: "https://x",
         maxConnections: 0,
+        providerGeneration: 0,
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget",
+        jobId: "j",
+        attemptToken: "a",
+        intent,
+        url: "https://x",
+        maxConnections: 1,
       }),
     TypeError
   );
@@ -1375,6 +1398,7 @@ test("caller mutation cannot alter frozen decisions payloads or requests", () =>
     intent: req.intent,
     url: "https://cdn/x.mp4",
     maxConnections: 2,
+    providerGeneration: 0,
   });
   assert.throws(() => {
     payload.name = "nope";
@@ -1952,9 +1976,579 @@ test("dependency exceptions propagate by identity after sanitized inputs", () =>
       intent: saveAsIntent(),
       url: "https://cdn/x.mp4",
       maxConnections: 1,
+      providerGeneration: 0,
     });
   } catch (e) {
     thrown2 = e;
   }
   assert.equal(thrown2, protocolErr);
+});
+
+// ---------------------------------------------------------------------------
+// Task 20c — provider-aware start contract, saved path, progress, limit-ack
+// ---------------------------------------------------------------------------
+
+test("buildNativeStartPayload forwards mirrors generation context and exact destination", () => {
+  const { buildNativeStartPayload } = loadRouter();
+  const intentSave = saveAsIntent({
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\Vids",
+  });
+  const intentDefault = saveAsIntent({
+    requestedFilename: FLOREN,
+    destinationDirectory: null,
+    saveMode: "default",
+  });
+  const primary = "https://cdn/x.mp4?sig=PRIMARY";
+  const mirror = "https://mirror/x.mp4?sig=MIRROR";
+
+  const pget = buildNativeStartPayload({
+    kind: "pget",
+    jobId: "j1",
+    attemptToken: "atk-1",
+    intent: intentSave,
+    url: primary,
+    mirrors: [primary, mirror, mirror, "", null],
+    maxConnections: 4,
+    providerGeneration: 5,
+    referer: "https://florenfile.com/watch",
+    userAgent: "mCatcher-Test/1",
+  });
+  assert.equal(pget.cmd, "pget");
+  assert.deepEqual(pget.urls, [primary, mirror]);
+  assert.equal(pget.name, FLOREN);
+  assert.equal(pget.dir, "D:\\\\Vids");
+  assert.equal(pget.providerGeneration, 5);
+  assert.equal(pget.referer, "https://florenfile.com/watch");
+  assert.equal(pget.userAgent, "mCatcher-Test/1");
+  assert.equal(pget.maxConnections, 4);
+  assertDeeplyFrozen(pget);
+
+  const single = buildNativeStartPayload({
+    kind: "pget-single",
+    jobId: "j1",
+    attemptToken: "atk-2",
+    intent: intentDefault,
+    url: primary,
+    mirrors: [mirror],
+    providerGeneration: 0,
+    referer: "",
+    userAgent: "",
+    effectiveDestinationDirectory: "E:\\\\DefaultFolder",
+  });
+  assert.equal(single.cmd, "pget-single");
+  assert.equal(single.maxConnections, 1);
+  assert.equal(single.dir, "E:\\\\DefaultFolder");
+  assert.equal(single.providerGeneration, 0);
+  assert.deepEqual(single.urls, [primary, mirror]);
+
+  const open = buildNativeStartPayload({
+    kind: "file-open",
+    jobId: "j1",
+    attemptToken: "atk-3",
+    intent: intentDefault,
+    effectiveDestinationDirectory: "E:\\\\DefaultFolder",
+  });
+  assert.equal(open.cmd, "file-open");
+  assert.equal(open.requestedFilename, FLOREN);
+  assert.equal(open.dir, "E:\\\\DefaultFolder");
+  assert.equal(Object.prototype.hasOwnProperty.call(open, "url"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(open, "userActionToken"), false);
+
+  // Exact filename and resolved dir identical across native save paths.
+  assert.equal(pget.name, single.name);
+  assert.equal(single.name, open.requestedFilename);
+  assert.equal(single.dir, open.dir);
+
+  // Missing generation fails the new start contract (no silent default).
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: intentSave,
+        url: primary,
+        maxConnections: 2,
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget-single",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: intentSave,
+        url: primary,
+      }),
+    TypeError
+  );
+
+  // Empty destination rejection.
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: intentDefault,
+        url: primary,
+        maxConnections: 1,
+        providerGeneration: 0,
+        effectiveDestinationDirectory: "",
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "file-open",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: intentDefault,
+        effectiveDestinationDirectory: "  ",
+      }),
+    TypeError
+  );
+  // Conflicting non-null destination override.
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget",
+        jobId: "j1",
+        attemptToken: "atk",
+        intent: intentSave,
+        url: primary,
+        maxConnections: 1,
+        providerGeneration: 0,
+        effectiveDestinationDirectory: "E:\\\\Other",
+      }),
+    TypeError
+  );
+
+  // Control builders via start payload (no intent/url required).
+  const limit = buildNativeStartPayload({
+    kind: "pget-set-limit",
+    jobId: "j1",
+    attemptToken: "atk-limit",
+    providerGeneration: 9,
+    maxConnections: 0,
+  });
+  assert.deepEqual(limit, {
+    cmd: "pget-set-limit",
+    id: "j1",
+    attemptToken: "atk-limit",
+    providerGeneration: 9,
+    maxConnections: 0,
+  });
+  assertDeeplyFrozen(limit);
+
+  const cancel = buildNativeStartPayload({
+    kind: "pget-cancel",
+    jobId: "j1",
+    attemptToken: "atk-cancel",
+  });
+  assert.deepEqual(cancel, {
+    cmd: "pget-cancel",
+    id: "j1",
+    attemptToken: "atk-cancel",
+  });
+  assertDeeplyFrozen(cancel);
+
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget-set-limit",
+        jobId: "j1",
+        attemptToken: "atk",
+        maxConnections: 0,
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      buildNativeStartPayload({
+        kind: "pget-cancel",
+        jobId: "j1",
+      }),
+    TypeError
+  );
+});
+
+test("buildNativeStartPayload never touches cookie Authorization headers origin or token getters", () => {
+  const { buildNativeStartPayload } = loadRouter();
+  let hits = 0;
+  const input = {
+    kind: "pget",
+    jobId: "j1",
+    attemptToken: "atk",
+    intent: saveAsIntent(),
+    url: "https://cdn/x.mp4?sig=1",
+    maxConnections: 2,
+    providerGeneration: 1,
+    referer: "https://page",
+    userAgent: "UA",
+  };
+  for (const key of [
+    "cookie",
+    "Cookie",
+    "headers",
+    "Authorization",
+    "origin",
+    "userActionToken",
+  ]) {
+    Object.defineProperty(input, key, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        hits += 1;
+        return "SECRET";
+      },
+    });
+  }
+  const out = buildNativeStartPayload(input);
+  assert.equal(out.cmd, "pget");
+  assert.equal(hits, 0);
+  assertNoSecrets(out);
+  assert.equal(Object.prototype.hasOwnProperty.call(out, "cookie"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(out, "headers"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(out, "userActionToken"), false);
+});
+
+test("completed pget-result projects paired file+bytes; one-sided unsafe and non-completed fail closed", () => {
+  const { routeNativeMessage } = loadRouter();
+  const baseCompleted = {
+    type: "pget-result",
+    id: "j1",
+    attemptToken: "atk-1",
+    status: "completed",
+    mode: "multi-range",
+    failureCategory: null,
+    partState: "committed",
+  };
+
+  // Backward compatible: omit both.
+  const omitted = routeNativeMessage(Object.assign({}, baseCompleted));
+  assert.equal(omitted.action, "transport-result");
+  assert.equal(Object.prototype.hasOwnProperty.call(omitted, "file"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(omitted, "bytes"), false);
+  assertDeeplyFrozen(omitted);
+
+  const withBoth = routeNativeMessage(
+    Object.assign({}, baseCompleted, {
+      file: "D:\\\\Vids\\\\out.mp4",
+      bytes: 4096,
+    })
+  );
+  assert.equal(withBoth.action, "transport-result");
+  assert.equal(withBoth.file, "D:\\\\Vids\\\\out.mp4");
+  assert.equal(withBoth.bytes, 4096);
+  assert.equal(withBoth.jobId, "j1");
+  assert.equal(withBoth.attemptToken, "atk-1");
+  assert.equal(withBoth.invokeFirefox, false);
+  assertDeeplyFrozen(withBoth);
+
+  // One-sided → ignore.
+  for (const patch of [{ file: "D:\\\\Vids\\\\out.mp4" }, { bytes: 10 }]) {
+    const out = routeNativeMessage(Object.assign({}, baseCompleted, patch));
+    assert.deepEqual(out, { action: "ignore", invokeFirefox: false });
+  }
+
+  // Unsafe / URL-shaped / control chars → ignore.
+  for (const file of [
+    "https://cdn/f?token=SECRET",
+    "//cdn/f",
+    "file://host/x",
+    "bad\u0000null",
+    "line\r\nCookie: x",
+    "path Authorization: Bearer SECRET",
+  ]) {
+    const out = routeNativeMessage(
+      Object.assign({}, baseCompleted, { file, bytes: 1 })
+    );
+    assert.deepEqual(out, { action: "ignore", invokeFirefox: false });
+    assertNoSecrets(out);
+  }
+
+  // Negative / fractional bytes → ignore.
+  for (const bytes of [-1, 1.5, true, "10", null]) {
+    const out = routeNativeMessage(
+      Object.assign({}, baseCompleted, {
+        file: "D:\\\\Vids\\\\out.mp4",
+        bytes,
+      })
+    );
+    assert.deepEqual(out, { action: "ignore", invokeFirefox: false });
+  }
+
+  // Accessor forms → ignore without invoking.
+  let fileHits = 0;
+  let bytesHits = 0;
+  const accessorMsg = Object.assign({}, baseCompleted);
+  Object.defineProperty(accessorMsg, "file", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      fileHits += 1;
+      return "D:\\\\Vids\\\\out.mp4";
+    },
+  });
+  Object.defineProperty(accessorMsg, "bytes", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      bytesHits += 1;
+      return 9;
+    },
+  });
+  assert.deepEqual(routeNativeMessage(accessorMsg), {
+    action: "ignore",
+    invokeFirefox: false,
+  });
+  assert.equal(fileHits, 0);
+  assert.equal(bytesHits, 0);
+
+  // Failed/cancelled metadata ignored (still transport-result, no file/bytes).
+  const failed = routeNativeMessage({
+    type: "pget-result",
+    id: "j1",
+    attemptToken: "atk",
+    status: "failed",
+    mode: "multi-range",
+    failureCategory: "timeout",
+    partState: "partial",
+    file: "D:\\\\Vids\\\\out.mp4",
+    bytes: 10,
+  });
+  assert.equal(failed.action, "transport-result");
+  assert.equal(Object.prototype.hasOwnProperty.call(failed, "file"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(failed, "bytes"), false);
+
+  const cancelled = routeNativeMessage({
+    type: "pget-result",
+    id: "j1",
+    attemptToken: "atk",
+    status: "cancelled",
+    mode: "single-connection",
+    failureCategory: "cancelled",
+    partState: "partial",
+    file: "D:\\\\Vids\\\\out.mp4",
+    bytes: 10,
+  });
+  assert.equal(cancelled.action, "transport-result");
+  assert.equal(Object.prototype.hasOwnProperty.call(cancelled, "file"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(cancelled, "bytes"), false);
+});
+
+test("pget-progress routes to frozen transport-progress with identity and bounds", () => {
+  const { routeNativeMessage } = loadRouter();
+  const ok = routeNativeMessage({
+    type: "pget-progress",
+    id: "j1",
+    attemptToken: "atk-1",
+    bytes: 50,
+    total: 100,
+  });
+  assert.deepEqual(ok, {
+    action: "transport-progress",
+    invokeFirefox: false,
+    jobId: "j1",
+    attemptToken: "atk-1",
+    bytes: 50,
+    total: 100,
+  });
+  assertDeeplyFrozen(ok);
+
+  const equal = routeNativeMessage({
+    type: "pget-progress",
+    id: "j1",
+    attemptToken: "atk-1",
+    bytes: 0,
+    total: 0,
+  });
+  assert.equal(equal.action, "transport-progress");
+  assert.equal(equal.bytes, 0);
+  assert.equal(equal.total, 0);
+
+  const rejects = [
+    { type: "pget-progress", id: "j1", attemptToken: "atk", bytes: 2, total: 1 },
+    { type: "pget-progress", id: "", attemptToken: "atk", bytes: 1, total: 2 },
+    { type: "pget-progress", id: "j1", attemptToken: "  ", bytes: 1, total: 2 },
+    { type: "pget-progress", id: "j1", attemptToken: "atk", bytes: -1, total: 2 },
+    { type: "pget-progress", id: "j1", attemptToken: "atk", bytes: 1, total: 1.5 },
+    { type: "pget-progress", id: "j1", attemptToken: "atk", bytes: 1 },
+    { type: "pget-progress", attemptToken: "atk", bytes: 1, total: 2 },
+    { type: "pget-progress", id: "j1", bytes: 1, total: 2 },
+  ];
+  for (const msg of rejects) {
+    assert.deepEqual(routeNativeMessage(msg), {
+      action: "ignore",
+      invokeFirefox: false,
+    });
+  }
+
+  let hits = 0;
+  const acc = {
+    type: "pget-progress",
+    id: "j1",
+    attemptToken: "atk",
+  };
+  Object.defineProperty(acc, "bytes", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return 1;
+    },
+  });
+  Object.defineProperty(acc, "total", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return 2;
+    },
+  });
+  assert.deepEqual(routeNativeMessage(acc), {
+    action: "ignore",
+    invokeFirefox: false,
+  });
+  assert.equal(hits, 0);
+});
+
+test("pget-limit-ack routes to frozen native-limit-ack with generation and zero limit", () => {
+  const { routeNativeMessage } = loadRouter();
+  const ok = routeNativeMessage({
+    type: "pget-limit-ack",
+    id: "j1",
+    attemptToken: "atk-1",
+    providerGeneration: 3,
+    maxConnections: 0,
+  });
+  assert.deepEqual(ok, {
+    action: "native-limit-ack",
+    invokeFirefox: false,
+    jobId: "j1",
+    attemptToken: "atk-1",
+    providerGeneration: 3,
+    maxConnections: 0,
+  });
+  assertDeeplyFrozen(ok);
+
+  const pos = routeNativeMessage({
+    type: "pget-limit-ack",
+    id: "j1",
+    attemptToken: "atk-1",
+    providerGeneration: 0,
+    maxConnections: 4,
+  });
+  assert.equal(pos.action, "native-limit-ack");
+  assert.equal(pos.providerGeneration, 0);
+  assert.equal(pos.maxConnections, 4);
+
+  const rejects = [
+    {
+      type: "pget-limit-ack",
+      id: "j1",
+      attemptToken: "atk",
+      providerGeneration: -1,
+      maxConnections: 0,
+    },
+    {
+      type: "pget-limit-ack",
+      id: "j1",
+      attemptToken: "atk",
+      providerGeneration: 1,
+      maxConnections: -1,
+    },
+    {
+      type: "pget-limit-ack",
+      id: "j1",
+      attemptToken: "atk",
+      providerGeneration: 1.5,
+      maxConnections: 0,
+    },
+    {
+      type: "pget-limit-ack",
+      id: "",
+      attemptToken: "atk",
+      providerGeneration: 1,
+      maxConnections: 0,
+    },
+    {
+      type: "pget-limit-ack",
+      id: "j1",
+      providerGeneration: 1,
+      maxConnections: 0,
+    },
+    {
+      type: "pget-limit-ack",
+      id: "j1",
+      attemptToken: "atk",
+      maxConnections: 0,
+    },
+    {
+      type: "pget-limit-ack",
+      id: "j1",
+      attemptToken: "atk",
+      providerGeneration: 1,
+    },
+  ];
+  for (const msg of rejects) {
+    assert.deepEqual(routeNativeMessage(msg), {
+      action: "ignore",
+      invokeFirefox: false,
+    });
+  }
+
+  let hits = 0;
+  const acc = {
+    type: "pget-limit-ack",
+    id: "j1",
+    attemptToken: "atk",
+  };
+  Object.defineProperty(acc, "providerGeneration", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return 1;
+    },
+  });
+  Object.defineProperty(acc, "maxConnections", {
+    enumerable: true,
+    get() {
+      hits += 1;
+      return 0;
+    },
+  });
+  assert.deepEqual(routeNativeMessage(acc), {
+    action: "ignore",
+    invokeFirefox: false,
+  });
+  assert.equal(hits, 0);
+});
+
+test("range_unsupported single-switch and legacy pget-fallback remain unchanged", () => {
+  const { routeNativeMessage } = loadRouter();
+  const switchOut = routeNativeMessage({
+    type: "pget-result",
+    id: "j",
+    attemptToken: "a",
+    status: "failed",
+    mode: "multi-range",
+    failureCategory: "range_unsupported",
+    partState: "empty",
+    file: "D:\\\\Vids\\\\out.mp4",
+    bytes: 0,
+  });
+  assert.equal(switchOut.action, "start-single-connection");
+  assert.equal(switchOut.invokeFirefox, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(switchOut, "file"), false);
+
+  const legacy = routeNativeMessage({
+    type: "pget-fallback",
+    id: "j",
+    reason: "no-range",
+  });
+  assert.equal(legacy.action, "ignore-legacy");
+  assert.equal(legacy.invokeFirefox, false);
 });

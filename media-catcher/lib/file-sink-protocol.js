@@ -46,6 +46,39 @@
       return v;
     }
 
+    /**
+     * Transport-only destination resolution.
+     * Non-null intent directory is authoritative. When intent is null, use
+     * effectiveDestinationDirectory or null. Reject empty/whitespace/objects
+     * and conflicting non-null overrides.
+     */
+    function resolveTransportDestination(intentDir, effective) {
+      var intentNorm = normalizeDestination(intentDir);
+      var hasEffective = effective !== undefined && effective !== null;
+      if (intentNorm !== null) {
+        if (hasEffective) {
+          if (typeof effective !== "string" || !isNonblankString(effective)) {
+            throw new TypeError(
+              "effectiveDestinationDirectory must be a nonblank primitive string when provided"
+            );
+          }
+          if (effective !== intentNorm) {
+            throw new TypeError(
+              "effectiveDestinationDirectory conflicts with intent.destinationDirectory"
+            );
+          }
+        }
+        return intentNorm;
+      }
+      if (!hasEffective) return null;
+      if (typeof effective !== "string" || !isNonblankString(effective)) {
+        throw new TypeError(
+          "effectiveDestinationDirectory must be a nonblank primitive string when provided"
+        );
+      }
+      return effective;
+    }
+
     function isNonnegInt(v) {
       return (
         typeof v === "number" &&
@@ -66,6 +99,55 @@
 
     function hasOwn(obj, key) {
       return Object.prototype.hasOwnProperty.call(obj, key);
+    }
+
+    /** Reject CR/LF/NUL and other control characters in HTTP-context strings. */
+    function isSafeHttpContextString(v) {
+      return typeof v === "string" && !/[\u0000-\u001f\u007f]/.test(v);
+    }
+
+    function normalizeHttpContextField(v, label) {
+      if (v === undefined || v === null) return "";
+      if (!isSafeHttpContextString(v)) {
+        throw new TypeError(label + " must be a primitive string without control characters");
+      }
+      return v;
+    }
+
+    function requireProviderGeneration(v) {
+      if (!isNonnegInt(v)) {
+        throw new TypeError("providerGeneration must be a nonnegative integer");
+      }
+      return v;
+    }
+
+    function readProviderGeneration(input) {
+      // Pre-generation callers omit the field; default 0. Explicit null/invalid throws.
+      if (!hasOwn(input, "providerGeneration") || input.providerGeneration === undefined) {
+        return 0;
+      }
+      return requireProviderGeneration(input.providerGeneration);
+    }
+
+    /**
+     * Primary URL first, then exact-string-deduped valid mirrors.
+     * Invalid mirror entries are skipped; never mutate caller arrays.
+     */
+    function buildUrlsList(url, mirrors) {
+      requireNonblankString(url, "url");
+      var out = [url];
+      var seen = Object.create(null);
+      seen[url] = true;
+      if (mirrors == null) return Object.freeze(out);
+      if (!Array.isArray(mirrors)) return Object.freeze(out);
+      for (var i = 0; i < mirrors.length; i++) {
+        var m = mirrors[i];
+        if (typeof m !== "string" || !isNonblankString(m)) continue;
+        if (seen[m]) continue;
+        seen[m] = true;
+        out.push(m);
+      }
+      return Object.freeze(out);
     }
 
     /**
@@ -103,7 +185,7 @@
       return deepFreeze(obj);
     }
 
-    function readIntentNameDir(intent) {
+    function readIntentNameDir(intent, effectiveDestinationDirectory) {
       if (!intent || typeof intent !== "object") {
         throw new TypeError("intent must be an object");
       }
@@ -111,7 +193,7 @@
       var name = intent.requestedFilename;
       var dirRaw = intent.destinationDirectory;
       requireNonblankString(name, "intent.requestedFilename");
-      var dir = normalizeDestination(dirRaw);
+      var dir = resolveTransportDestination(dirRaw, effectiveDestinationDirectory);
       return { name: name, dir: dir };
     }
 
@@ -123,15 +205,22 @@
       if (!isPositiveInt(input.maxConnections)) {
         throw new TypeError("maxConnections must be a positive integer");
       }
-      var bound = readIntentNameDir(input.intent);
+      var providerGeneration = readProviderGeneration(input);
+      var referer = normalizeHttpContextField(input.referer, "referer");
+      var userAgent = normalizeHttpContextField(input.userAgent, "userAgent");
+      var bound = readIntentNameDir(input.intent, input.effectiveDestinationDirectory);
+      var urls = buildUrlsList(url, input.mirrors);
       return freezeCmd({
         cmd: "pget",
         id: jobId,
         attemptToken: attemptToken,
-        urls: Object.freeze([url]),
+        urls: urls,
         name: bound.name,
         dir: bound.dir,
         maxConnections: input.maxConnections,
+        providerGeneration: providerGeneration,
+        referer: referer,
+        userAgent: userAgent,
       });
     }
 
@@ -140,15 +229,50 @@
       var jobId = requireNonblankString(input.jobId, "jobId");
       var attemptToken = requireNonblankString(input.attemptToken, "attemptToken");
       var url = requireNonblankString(input.url, "url");
-      var bound = readIntentNameDir(input.intent);
+      var providerGeneration = readProviderGeneration(input);
+      var referer = normalizeHttpContextField(input.referer, "referer");
+      var userAgent = normalizeHttpContextField(input.userAgent, "userAgent");
+      var bound = readIntentNameDir(input.intent, input.effectiveDestinationDirectory);
+      var urls = buildUrlsList(url, input.mirrors);
       return freezeCmd({
         cmd: "pget-single",
         id: jobId,
         attemptToken: attemptToken,
-        urls: Object.freeze([url]),
+        urls: urls,
         name: bound.name,
         dir: bound.dir,
         maxConnections: 1,
+        providerGeneration: providerGeneration,
+        referer: referer,
+        userAgent: userAgent,
+      });
+    }
+
+    function buildPgetSetLimitCmd(input) {
+      input = input || {};
+      var jobId = requireNonblankString(input.jobId, "jobId");
+      var attemptToken = requireNonblankString(input.attemptToken, "attemptToken");
+      var providerGeneration = requireProviderGeneration(input.providerGeneration);
+      if (!isNonnegInt(input.maxConnections)) {
+        throw new TypeError("maxConnections must be a nonnegative integer");
+      }
+      return freezeCmd({
+        cmd: "pget-set-limit",
+        id: jobId,
+        attemptToken: attemptToken,
+        providerGeneration: providerGeneration,
+        maxConnections: input.maxConnections,
+      });
+    }
+
+    function buildPgetCancelCmd(input) {
+      input = input || {};
+      var jobId = requireNonblankString(input.jobId, "jobId");
+      var attemptToken = requireNonblankString(input.attemptToken, "attemptToken");
+      return freezeCmd({
+        cmd: "pget-cancel",
+        id: jobId,
+        attemptToken: attemptToken,
       });
     }
 
@@ -161,7 +285,10 @@
         input.requestedFilename,
         "requestedFilename"
       );
-      var destinationDirectory = normalizeDestination(input.destinationDirectory);
+      var destinationDirectory = resolveTransportDestination(
+        input.destinationDirectory,
+        input.effectiveDestinationDirectory
+      );
 
       var state = "open"; // open | streaming | committed | aborted | failed
       var sinkId = null;
@@ -384,12 +511,14 @@
       return Object.freeze(session);
     }
 
-    return {
+    return Object.freeze({
       MAX_UNACKED: MAX_UNACKED,
       MAX_CHUNK_BYTES: MAX_CHUNK_BYTES,
       createFileSinkSession: createFileSinkSession,
       buildPgetCmd: buildPgetCmd,
       buildPgetSingleCmd: buildPgetSingleCmd,
-    };
+      buildPgetSetLimitCmd: buildPgetSetLimitCmd,
+      buildPgetCancelCmd: buildPgetCancelCmd,
+    });
   }
 );

@@ -290,6 +290,32 @@
 
       var failureCategory = normalizePgetFailureCategory(status, rawCategory);
 
+      // Optional saved-path metadata: completed may omit both (compat).
+      // If either is present both are required and validated; failed/cancelled
+      // metadata is ignored. Accessors and one-sided forms fail closed.
+      var fileState = ownKeyState(message, "file");
+      var bytesState = ownKeyState(message, "bytes");
+      var savedFile = null;
+      var savedBytes = null;
+      var hasFile = false;
+      var hasBytes = false;
+      if (fileState.present) {
+        if (!fileState.data) return ignoreDecision();
+        hasFile = true;
+      }
+      if (bytesState.present) {
+        if (!bytesState.data) return ignoreDecision();
+        hasBytes = true;
+      }
+      if (status === "completed" && (hasFile || hasBytes)) {
+        if (!hasFile || !hasBytes) return ignoreDecision();
+        if (!isSafeLocalFilePath(fileState.value)) return ignoreDecision();
+        if (!isNonnegInt(bytesState.value)) return ignoreDecision();
+        savedFile = fileState.value;
+        savedBytes = bytesState.value;
+      }
+      // failed/cancelled: ignore file/bytes metadata (do not project).
+
       if (
         status === "failed" &&
         mode === "multi-range" &&
@@ -308,7 +334,7 @@
         });
       }
 
-      return deepFreeze({
+      var result = {
         action: "transport-result",
         invokeFirefox: false,
         jobId: id,
@@ -317,6 +343,58 @@
         mode: mode,
         failureCategory: failureCategory,
         partState: partState,
+      };
+      if (savedFile !== null) {
+        result.file = savedFile;
+        result.bytes = savedBytes;
+      }
+      return deepFreeze(result);
+    }
+
+    function routePgetProgress(message) {
+      var id = readNonblankOwnString(message, "id");
+      if (!id) id = readNonblankOwnString(message, "jobId");
+      var attemptToken = readNonblankOwnString(message, "attemptToken");
+      if (!id || !attemptToken) return ignoreDecision();
+
+      var bytesR = ownData(message, "bytes");
+      var totalR = ownData(message, "total");
+      if (!bytesR.ok || !totalR.ok) return ignoreDecision();
+      if (!isNonnegInt(bytesR.value) || !isNonnegInt(totalR.value)) {
+        return ignoreDecision();
+      }
+      if (bytesR.value > totalR.value) return ignoreDecision();
+
+      return deepFreeze({
+        action: "transport-progress",
+        invokeFirefox: false,
+        jobId: id,
+        attemptToken: attemptToken,
+        bytes: bytesR.value,
+        total: totalR.value,
+      });
+    }
+
+    function routePgetLimitAck(message) {
+      var id = readNonblankOwnString(message, "id");
+      if (!id) id = readNonblankOwnString(message, "jobId");
+      var attemptToken = readNonblankOwnString(message, "attemptToken");
+      if (!id || !attemptToken) return ignoreDecision();
+
+      var genR = ownData(message, "providerGeneration");
+      var limR = ownData(message, "maxConnections");
+      if (!genR.ok || !limR.ok) return ignoreDecision();
+      if (!isNonnegInt(genR.value) || !isNonnegInt(limR.value)) {
+        return ignoreDecision();
+      }
+
+      return deepFreeze({
+        action: "native-limit-ack",
+        invokeFirefox: false,
+        jobId: id,
+        attemptToken: attemptToken,
+        providerGeneration: genR.value,
+        maxConnections: limR.value,
       });
     }
 
@@ -427,6 +505,8 @@
         var type = typeR.value;
 
         if (type === "pget-result") return routePgetResult(message);
+        if (type === "pget-progress") return routePgetProgress(message);
+        if (type === "pget-limit-ack") return routePgetLimitAck(message);
         if (type === "pget-fallback") return ignoreLegacyDecision();
         if (type === "use-firefox") return routeUseFirefox(message);
         if (
@@ -679,12 +759,52 @@
       });
     }
 
+    function readOptionalOwnValue(input, key) {
+      var state = ownKeyState(input, key);
+      if (!state.present) return { present: false };
+      if (!state.data) throw genericTypeError();
+      return { present: true, value: state.value };
+    }
+
+    function readOptionalMirrors(input) {
+      var m = readOptionalOwnValue(input, "mirrors");
+      if (!m.present) return undefined;
+      return m.value;
+    }
+
+    function readOptionalHttpContext(input, key) {
+      var r = readOptionalOwnValue(input, key);
+      if (!r.present) return undefined;
+      // Builders normalize absence to ""; reject non-strings here too.
+      if (r.value === null || r.value === undefined) return "";
+      if (!isPrimitiveString(r.value)) throw genericTypeError();
+      return r.value;
+    }
+
+    function readOptionalEffectiveDir(input) {
+      var r = readOptionalOwnValue(input, "effectiveDestinationDirectory");
+      if (!r.present) return undefined;
+      return r.value;
+    }
+
+    function requireProviderGeneration(input) {
+      var gen = requireOwnData(input, "providerGeneration");
+      if (!isNonnegInt(gen)) throw genericTypeError();
+      return gen;
+    }
+
     function buildNativeStartPayload(input) {
       // Input/reflection validation — always generic TypeError.
       if (!input || typeof input !== "object") throw genericTypeError();
 
       var kind = requireOwnData(input, "kind");
-      if (kind !== "pget" && kind !== "pget-single" && kind !== "file-open") {
+      if (
+        kind !== "pget" &&
+        kind !== "pget-single" &&
+        kind !== "file-open" &&
+        kind !== "pget-set-limit" &&
+        kind !== "pget-cancel"
+      ) {
         throw genericTypeError();
       }
 
@@ -694,40 +814,67 @@
       var attemptToken = requireOwnData(input, "attemptToken");
       if (!isNonblankPrimitiveString(attemptToken)) throw genericTypeError();
 
-      var intentRaw = requireOwnData(input, "intent");
-      var intent = readExactSixKeyIntent(intentRaw);
-
-      var url = null;
-      var maxConnections = null;
-      if (kind === "pget") {
-        url = requireOwnData(input, "url");
-        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
-        maxConnections = requireOwnData(input, "maxConnections");
-        if (!isPositiveInt(maxConnections)) throw genericTypeError();
-      } else if (kind === "pget-single") {
-        url = requireOwnData(input, "url");
-        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
-      }
-
       // Sanitized inputs only — dependency load/runtime exceptions propagate by identity.
       var Protocol = resolveFileSinkProtocol();
 
+      // Control commands: no intent/URL required; always fence with attemptToken.
+      if (kind === "pget-set-limit") {
+        var setGen = requireProviderGeneration(input);
+        var setLim = requireOwnData(input, "maxConnections");
+        if (!isNonnegInt(setLim)) throw genericTypeError();
+        return Protocol.buildPgetSetLimitCmd({
+          jobId: jobId,
+          attemptToken: attemptToken,
+          providerGeneration: setGen,
+          maxConnections: setLim,
+        });
+      }
+
+      if (kind === "pget-cancel") {
+        return Protocol.buildPgetCancelCmd({
+          jobId: jobId,
+          attemptToken: attemptToken,
+        });
+      }
+
+      var intentRaw = requireOwnData(input, "intent");
+      var intent = readExactSixKeyIntent(intentRaw);
+      var effectiveDir = readOptionalEffectiveDir(input);
+
       if (kind === "pget") {
+        var url = requireOwnData(input, "url");
+        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
+        var maxConnections = requireOwnData(input, "maxConnections");
+        if (!isPositiveInt(maxConnections)) throw genericTypeError();
+        var pgetGen = requireProviderGeneration(input);
         return Protocol.buildPgetCmd({
           jobId: jobId,
           attemptToken: attemptToken,
           intent: intent,
           url: url,
+          mirrors: readOptionalMirrors(input),
           maxConnections: maxConnections,
+          providerGeneration: pgetGen,
+          referer: readOptionalHttpContext(input, "referer"),
+          userAgent: readOptionalHttpContext(input, "userAgent"),
+          effectiveDestinationDirectory: effectiveDir,
         });
       }
 
       if (kind === "pget-single") {
+        var singleUrl = requireOwnData(input, "url");
+        if (!isNonblankPrimitiveString(singleUrl)) throw genericTypeError();
+        var singleGen = requireProviderGeneration(input);
         return Protocol.buildPgetSingleCmd({
           jobId: jobId,
           attemptToken: attemptToken,
           intent: intent,
-          url: url,
+          url: singleUrl,
+          mirrors: readOptionalMirrors(input),
+          providerGeneration: singleGen,
+          referer: readOptionalHttpContext(input, "referer"),
+          userAgent: readOptionalHttpContext(input, "userAgent"),
+          effectiveDestinationDirectory: effectiveDir,
         });
       }
 
@@ -737,6 +884,7 @@
         attemptToken: attemptToken,
         requestedFilename: intent.requestedFilename,
         destinationDirectory: intent.destinationDirectory,
+        effectiveDestinationDirectory: effectiveDir,
       });
       var openCmd = session.openCmd();
       if (!openCmd) throw genericTypeError();
