@@ -86,20 +86,24 @@ test("pget, pget-single, and file-open carry requestedFilename and destination d
     intent: intentDefault,
     url: "https://cdn/x.mp4",
     maxConnections: 4,
+    providerGeneration: 0,
   });
   assert.equal(pget.cmd, "pget");
   assert.equal(pget.name, PROPOSAL);
   assert.equal(pget.dir, null);
+  assert.equal(pget.providerGeneration, 0);
 
   const pgetSingle = buildPgetSingleCmd({
     jobId: "j1",
     attemptToken: "a2",
     intent: intentSaveAs,
     url: "https://cdn/x.mp4",
+    providerGeneration: 0,
   });
   assert.equal(pgetSingle.cmd, "pget-single");
   assert.equal(pgetSingle.name, PROPOSAL);
   assert.equal(pgetSingle.dir, "D:\\\\Vids");
+  assert.equal(pgetSingle.providerGeneration, 0);
 
   const sink = createFileSinkSession({
     jobId: "j1",
@@ -154,19 +158,23 @@ test("filename and destination survive scheduler mode change and both builders",
     intent: job.intent,
     url: "https://cdn/video.mp4?token=SIGNED",
     maxConnections: 4,
+    providerGeneration: 0,
   });
   assert.equal(multi.name, PROPOSAL);
   assert.equal(multi.dir, "D:\\\\Vids");
+  assert.equal(multi.providerGeneration, 0);
 
   const single = buildPgetSingleCmd({
     jobId: job.id,
     attemptToken: "atk-2",
     intent: job.intent,
     url: "https://cdn/video.mp4?token=SIGNED",
+    providerGeneration: 0,
   });
   assert.equal(single.name, PROPOSAL);
   assert.equal(single.dir, "D:\\\\Vids");
   assert.equal(single.maxConnections, 1);
+  assert.equal(single.providerGeneration, 0);
 
   const fx = Intent.createFirefoxIntent({ baseIntent: job.intent });
   assert.equal(fx.requestedFilename, PROPOSAL);
@@ -217,17 +225,21 @@ test("default null destination survives pget and pget-single without URL basenam
     intent,
     url,
     maxConnections: 3,
+    providerGeneration: 0,
   });
   const single = buildPgetSingleCmd({
     jobId: "j",
     attemptToken: "a2",
     intent,
     url,
+    providerGeneration: 0,
   });
   assert.equal(pget.name, PROPOSAL);
   assert.equal(pget.dir, null);
+  assert.equal(pget.providerGeneration, 0);
   assert.equal(single.name, PROPOSAL);
   assert.equal(single.dir, null);
+  assert.equal(single.providerGeneration, 0);
   assert.equal(pget.name.includes("totally-different"), false);
   assert.equal(single.name.includes("totally-different"), false);
 });
