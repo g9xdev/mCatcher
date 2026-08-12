@@ -30,7 +30,7 @@ function baseJob(overrides) {
 
 function fakeScheduler(job, opts) {
   const options = opts || {};
-  const calls = { transport: [], capability: [], firefox: 0, starts: [] };
+  const calls = { transport: [], capability: [], draining: [], firefox: 0, starts: [] };
   const sched = {
     calls,
     getJob(id) {
@@ -39,6 +39,13 @@ function fakeScheduler(job, opts) {
     },
     onTransportResult(id, token, result) {
       calls.transport.push({ id, token, result });
+    },
+    onDrainingTransportResult(id, token, result) {
+      calls.draining.push({ id, token, result });
+      if (typeof options.onDrainingTransportResult === "function") {
+        return options.onDrainingTransportResult(id, token, result);
+      }
+      return true;
     },
     onCapabilitySwitch(id, info) {
       calls.capability.push({ id, info });
@@ -67,6 +74,7 @@ function optionsBag(started, firefoxHits) {
 function assertNoEffects(sched, firefoxHits, started) {
   assert.equal(sched.calls.transport.length, 0);
   assert.equal(sched.calls.capability.length, 0);
+  assert.equal(sched.calls.draining.length, 0);
   assert.equal(firefoxHits.count, 0);
   assert.equal(started.length, 0);
 }
@@ -1066,4 +1074,332 @@ test("switch path with throwing startSingleConnection getter: no capability muta
   assert.equal(firefoxAccesses, 0, "no firefox access");
   assert.equal(job.mode, "multi-range", "job stays multi-range");
   assert.equal(job.state, "running");
+});
+
+// ---------------------------------------------------------------------------
+// 11. Task 20D: pausing_provider terminals delegate to onDrainingTransportResult
+// ---------------------------------------------------------------------------
+
+test("pausing_provider completed delegates only allowlisted fields to onDrainingTransportResult", () => {
+  const { handlePgetResult } = loadAdapter();
+  const job = baseJob({
+    state: "pausing_provider",
+    attemptToken: null, // public identity is null while draining
+  });
+  const sched = fakeScheduler(job);
+  const started = [];
+  const firefoxHits = { count: 0 };
+
+  handlePgetResult(
+    sched,
+    {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-drain-1",
+      status: "completed",
+      mode: "multi-range",
+      failureCategory: null,
+      partState: "committed",
+      secret: "SHOULD-NOT-LEAK",
+      rawUrl: "https://evil.example/x",
+      cookie: "session=1",
+    },
+    optionsBag(started, firefoxHits)
+  );
+
+  assert.equal(firefoxHits.count, 0);
+  assert.equal(started.length, 0);
+  assert.equal(sched.calls.capability.length, 0);
+  assert.equal(sched.calls.transport.length, 0);
+  assert.equal(sched.calls.draining.length, 1);
+  assert.equal(sched.calls.draining[0].id, "j1");
+  assert.equal(sched.calls.draining[0].token, "atk-drain-1");
+  assert.deepEqual(sched.calls.draining[0].result, {
+    status: "completed",
+    mode: "multi-range",
+    failureCategory: null,
+    partState: "committed",
+  });
+  assertAllowlistedResult(sched.calls.draining[0].result);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(sched.calls.draining[0].result, "secret"),
+    false
+  );
+});
+
+test("pausing_provider failed/cancelled allowlist to draining API; never startSingleConnection", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  for (const [status, category, partState, outCategory] of [
+    ["failed", "timeout", "partial", "timeout"],
+    ["failed", "local_io", "empty", "local_io"],
+    ["failed", "range_unsupported", "empty", "range_unsupported"],
+    ["cancelled", null, "partial", "cancelled"],
+  ]) {
+    const job = baseJob({
+      id: "jp",
+      state: "pausing_provider",
+      attemptToken: null,
+    });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "jp",
+        attemptToken: "old-atk",
+        status,
+        mode: "multi-range",
+        failureCategory: category,
+        partState,
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(started.length, 0, status);
+    assert.equal(firefoxHits.count, 0, status);
+    assert.equal(sched.calls.capability.length, 0, status);
+    assert.equal(sched.calls.transport.length, 0, status);
+    assert.equal(sched.calls.draining.length, 1, status);
+    assert.deepEqual(sched.calls.draining[0].result, {
+      status,
+      mode: "multi-range",
+      failureCategory: outCategory,
+      partState,
+    });
+    assertAllowlistedResult(sched.calls.draining[0].result);
+  }
+});
+
+test("pausing_provider never accepts public null as identity; never Firefox; malformed inert", () => {
+  const { handlePgetResult } = loadAdapter();
+  const job = baseJob({
+    state: "pausing_provider",
+    attemptToken: null,
+  });
+
+  // Missing attemptToken in msg — inert (cannot authenticate).
+  {
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: null,
+        status: "completed",
+        mode: "multi-range",
+        failureCategory: null,
+        partState: "committed",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // Blank token
+  {
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "  ",
+        status: "completed",
+        mode: "multi-range",
+        failureCategory: null,
+        partState: "committed",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // completed without committed
+  {
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-1",
+        status: "completed",
+        mode: "multi-range",
+        failureCategory: null,
+        partState: "partial",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // failed + committed
+  {
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-1",
+        status: "failed",
+        mode: "multi-range",
+        failureCategory: "timeout",
+        partState: "committed",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // mode mismatch while pausing
+  {
+    const job2 = baseJob({
+      state: "pausing_provider",
+      attemptToken: null,
+      mode: "single-connection",
+    });
+    const sched = fakeScheduler(job2);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-1",
+        status: "failed",
+        mode: "multi-range",
+        failureCategory: "timeout",
+        partState: "partial",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // range_unsupported empty while pausing must NOT capability-switch/start
+  {
+    const job3 = baseJob({
+      state: "pausing_provider",
+      attemptToken: null,
+      mode: "multi-range",
+    });
+    const sched = fakeScheduler(job3);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-old",
+        status: "failed",
+        mode: "multi-range",
+        failureCategory: "range_unsupported",
+        partState: "empty",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(sched.calls.capability.length, 0);
+    assert.equal(started.length, 0);
+    assert.equal(sched.calls.transport.length, 0);
+    assert.equal(sched.calls.draining.length, 1);
+    assert.equal(sched.calls.draining[0].result.failureCategory, "range_unsupported");
+    assert.equal(job3.mode, "multi-range");
+    assert.equal(firefoxHits.count, 0);
+  }
+
+  // Missing onDrainingTransportResult: fail closed
+  {
+    const sched = {
+      calls: { transport: [], capability: [], draining: [] },
+      getJob() {
+        return job;
+      },
+      onTransportResult() {
+        sched.calls.transport.push(1);
+      },
+    };
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-1",
+        status: "completed",
+        mode: "multi-range",
+        failureCategory: null,
+        partState: "committed",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(sched.calls.transport.length, 0);
+    assert.equal(started.length, 0);
+    assert.equal(firefoxHits.count, 0);
+  }
+});
+
+test("running range_unsupported empty still switches and starts; draining path untouched", () => {
+  const { handlePgetResult } = loadAdapter();
+  const job = baseJob({ state: "running", attemptToken: "atk-1", mode: "multi-range" });
+  const sched = fakeScheduler(job);
+  const started = [];
+  const firefoxHits = { count: 0 };
+  handlePgetResult(
+    sched,
+    {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-1",
+      status: "failed",
+      mode: "multi-range",
+      failureCategory: "range_unsupported",
+      partState: "empty",
+    },
+    optionsBag(started, firefoxHits)
+  );
+  assert.equal(sched.calls.capability.length, 1);
+  assert.equal(started.length, 1);
+  assert.equal(sched.calls.draining.length, 0);
+  assert.equal(sched.calls.transport.length, 0);
+  assert.equal(job.mode, "single-connection");
+  assert.equal(firefoxHits.count, 0);
+});
+
+test("replayed/wrong-state draining messages remain inert for non-pausing jobs", () => {
+  const { handlePgetResult } = loadAdapter();
+  for (const state of ["waiting_provider", "queued", "completed", "needs_user"]) {
+    const job = baseJob({ state, attemptToken: null });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-1",
+        status: "completed",
+        mode: "multi-range",
+        failureCategory: null,
+        partState: "committed",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
 });
