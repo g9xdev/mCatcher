@@ -1227,3 +1227,257 @@ def test_empty_chunk_allowed(tmp_path, monkeypatch):
     assert (tmp_path / "e.mp4").read_bytes() == b""
     committed = [m for m in sent if m.get("type") == "file-committed"][0]
     assert committed["bytes"] == 0
+
+
+# ---------------------------------------------------------------------------
+# EOF / host-exit sink cleanup (Task 20)
+# ---------------------------------------------------------------------------
+
+def _two_open_partials(tmp_path, monkeypatch, sent):
+    """Open two partially written sinks; return (part_a, part_b, sink_ids)."""
+    o1 = _open(tmp_path, monkeypatch, sent, job="jA", token="t1", name="a.mp4")
+    o2 = _open(tmp_path, monkeypatch, sent, job="jB", token="t2", name="b.mp4")
+    assert o1 and o2
+    s1, s2 = o1["sinkId"], o2["sinkId"]
+    mc.handle_file_chunk({
+        "sinkId": s1, "jobId": "jA", "attemptToken": "t1", "seq": 0,
+        "dataB64": _b64(b"AAA"), "length": 3,
+    })
+    mc.handle_file_chunk({
+        "sinkId": s2, "jobId": "jB", "attemptToken": "t2", "seq": 0,
+        "dataB64": _b64(b"BBB"), "length": 3,
+    })
+    part_a = tmp_path / "a.mp4.part"
+    part_b = tmp_path / "b.mp4.part"
+    assert part_a.exists() and part_b.exists()
+    return part_a, part_b, (s1, s2)
+
+
+def test_cleanup_closes_two_open_sinks_and_clears_registries(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    part_a, part_b, _ids = _two_open_partials(tmp_path, monkeypatch, sent)
+    assert hasattr(fs, "cleanup_file_sinks")
+    fs.cleanup_file_sinks()
+    assert not part_a.exists()
+    assert not part_b.exists()
+    assert not (tmp_path / "a.mp4").exists()
+    assert not (tmp_path / "b.mp4").exists()
+    with fs._LOCK:
+        assert fs._SINKS == {}
+        assert fs._PART_OWNERS == {}
+        assert fs._BINDINGS == {}
+
+
+def test_cleanup_is_idempotent(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    part_a, part_b, _ids = _two_open_partials(tmp_path, monkeypatch, sent)
+    fs.cleanup_file_sinks()
+    fs.cleanup_file_sinks()
+    fs.cleanup_file_sinks()
+    assert not part_a.exists()
+    assert not part_b.exists()
+    with fs._LOCK:
+        assert fs._SINKS == {}
+        assert fs._PART_OWNERS == {}
+        assert fs._BINDINGS == {}
+
+
+def test_cleanup_fault_on_one_does_not_block_other(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    part_a, part_b, (s1, s2) = _two_open_partials(tmp_path, monkeypatch, sent)
+    with fs._LOCK:
+        sink_a = fs._SINKS[s1]
+    real_a = sink_a.handle
+    boom_path = os.path.realpath(str(part_a))
+
+    class BoomClose:
+        def write(self, data):
+            return real_a.write(data)
+
+        def flush(self):
+            return real_a.flush()
+
+        def fileno(self):
+            return real_a.fileno()
+
+        def close(self):
+            try:
+                real_a.close()
+            except Exception:
+                pass
+            raise OSError(errno.EIO, "close failed")
+
+    with sink_a.lock:
+        sink_a.handle = BoomClose()
+
+    real_remove = fs.os.remove
+
+    def selective_remove(path):
+        try:
+            if os.path.realpath(path) == boom_path:
+                raise OSError(errno.EPERM, "remove denied")
+        except OSError:
+            raise
+        except Exception:
+            pass
+        return real_remove(path)
+
+    monkeypatch.setattr(fs.os, "remove", selective_remove)
+    # Must not raise even when one sink's close/remove fails.
+    fs.cleanup_file_sinks()
+    # Other sink still cleaned; registries empty (detach is atomic).
+    assert not part_b.exists()
+    with fs._LOCK:
+        assert fs._SINKS == {}
+        assert fs._PART_OWNERS == {}
+        assert fs._BINDINGS == {}
+        assert s1 not in fs._SINKS and s2 not in fs._SINKS
+
+
+def test_cleanup_emits_no_frames(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    _two_open_partials(tmp_path, monkeypatch, sent)
+    n = len(sent)
+    fs.cleanup_file_sinks()
+    assert sent[n:] == []
+    assert not any(m.get("type") in ("file-aborted", "file-error") for m in sent[n:])
+
+
+def test_main_invokes_cleanup_on_clean_eof(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    part_a, part_b, _ids = _two_open_partials(tmp_path, monkeypatch, sent)
+    monkeypatch.setattr(mc, "init_io", lambda: None)
+    monkeypatch.setattr(mc, "read_message", lambda: None)
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    # Avoid background work / config side effects during main().
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    n = len(sent)
+    mc.main()
+    assert not part_a.exists()
+    assert not part_b.exists()
+    with fs._LOCK:
+        assert fs._SINKS == {}
+        assert fs._PART_OWNERS == {}
+        assert fs._BINDINGS == {}
+    # Clean EOF must not emit sink terminal frames (stdout may be gone).
+    assert not any(
+        m.get("type") in ("file-aborted", "file-error", "file-committed")
+        for m in sent[n:]
+    )
+
+
+def test_main_invokes_cleanup_when_read_message_raises(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    part_a, part_b, _ids = _two_open_partials(tmp_path, monkeypatch, sent)
+    monkeypatch.setattr(mc, "init_io", lambda: None)
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+
+    def boom_read():
+        raise OSError(errno.EIO, "stdin dead")
+
+    monkeypatch.setattr(mc, "read_message", boom_read)
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    mc.main()
+    assert not part_a.exists()
+    assert not part_b.exists()
+    with fs._LOCK:
+        assert fs._SINKS == {}
+        assert fs._PART_OWNERS == {}
+        assert fs._BINDINGS == {}
+
+
+def test_after_eof_cleanup_same_filename_reopens(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    o1 = _open(tmp_path, monkeypatch, sent, job="j1", token="t1", name="retry.mp4")
+    assert o1
+    sink = o1["sinkId"]
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "j1", "attemptToken": "t1", "seq": 0,
+        "dataB64": _b64(b"old"), "length": 3,
+    })
+    part = tmp_path / "retry.mp4.part"
+    assert part.exists()
+    fs.cleanup_file_sinks()
+    assert not part.exists()
+    # Fresh job/attempt can open the same requested filename.
+    n = len(sent)
+    mc.handle_file_open({
+        "jobId": "j2", "attemptToken": "t2",
+        "requestedFilename": "retry.mp4", "dir": str(tmp_path),
+    })
+    opened = [m for m in sent[n:] if m.get("type") == "file-opened"]
+    assert opened, sent[n:]
+    o2 = opened[0]
+    assert o2["sinkId"] != sink
+    assert part.exists()
+    mc.handle_file_chunk({
+        "sinkId": o2["sinkId"], "jobId": "j2", "attemptToken": "t2", "seq": 0,
+        "dataB64": _b64(b"new"), "length": 3,
+    })
+    mc.handle_file_commit({
+        "sinkId": o2["sinkId"], "jobId": "j2", "attemptToken": "t2",
+    })
+    assert (tmp_path / "retry.mp4").read_bytes() == b"new"
+
+
+def test_cleanup_never_deletes_committed_final(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    sent = []
+    o1 = _open(tmp_path, monkeypatch, sent, job="jc", token="t1", name="final.mp4")
+    sink = o1["sinkId"]
+    data = b"committed-body"
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "jc", "attemptToken": "t1", "seq": 0,
+        "dataB64": _b64(data), "length": len(data),
+    })
+    mc.handle_file_commit({
+        "sinkId": sink, "jobId": "jc", "attemptToken": "t1",
+    })
+    final = tmp_path / "final.mp4"
+    assert final.read_bytes() == data
+    # A second live partial still open when cleanup runs.
+    o2 = _open(tmp_path, monkeypatch, sent, job="jo", token="t2", name="other.mp4")
+    mc.handle_file_chunk({
+        "sinkId": o2["sinkId"], "jobId": "jo", "attemptToken": "t2", "seq": 0,
+        "dataB64": _b64(b"xx"), "length": 2,
+    })
+    part_other = tmp_path / "other.mp4.part"
+    assert part_other.exists()
+    # Unrelated pre-existing .part must not be swept by registry cleanup.
+    stray = tmp_path / "stray.mp4.part"
+    stray.write_bytes(b"not-ours")
+    fs.cleanup_file_sinks()
+    assert final.read_bytes() == data
+    assert final.exists()
+    assert not part_other.exists()
+    assert stray.exists() and stray.read_bytes() == b"not-ours"
+
+
+def test_cleanup_reexported_and_reset_delegates(tmp_path, monkeypatch):
+    import mchost.filesink as fs
+
+    assert hasattr(mc, "cleanup_file_sinks")
+    assert mc.cleanup_file_sinks is fs.cleanup_file_sinks
+    # _reset_for_tests must use the production primitive (not a parallel path).
+    src = inspect.getsource(fs._reset_for_tests)
+    assert "cleanup_file_sinks" in src
+    main_src = inspect.getsource(mc.main)
+    assert "cleanup_file_sinks" in main_src
+    assert "finally" in main_src
