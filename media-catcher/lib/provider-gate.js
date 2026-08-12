@@ -50,8 +50,26 @@
    * Session memory only — never persisted.
    *
    * States: normal | saturated | recovering
-   * Task 10 consumes acquire / setSaturated / completeOwner / recoverToNormal
-   * and nativeLeaseFor + registerJobLimit for native connection caps.
+   *
+   * Task 10 surface:
+   *   acquire / setSaturated / completeOwner / designateRecoveryOwner /
+   *   recoverToNormal / registerJobLimit / nativeLeaseFor / noteNativeOpen /
+   *   parkProbe / snapshot
+   *
+   * Ownership: completeOwner authenticates the completing current job id and
+   * advances wakeGeneration once per ownership epoch. A distinct recovery
+   * successor installs a fresh epoch so B→C handoff works in the same provider
+   * generation; late duplicates of prior owners are frozen no-ops.
+   *
+   * Probes stay parked through saturated/recovering; only authenticated
+   * recoverToNormal drains them once (sorted) for reschedule.
+   *
+   * Permits: physical outstanding is tracked separately from current-generation
+   * issuance. acquire caps against physical outstanding (including stale-gen
+   * permits). setSaturated clears current issuance only. Stale release never
+   * touches current-generation counters.
+   *
+   * Owner flag: isProviderOwner === true (isDrainOwner is a compatibility alias).
    */
   function createProviderGate(opts) {
     opts = opts || {};
@@ -63,30 +81,64 @@
     var ownerJobId = null;
     var reducedConcurrency = null;
 
-    // Current-generation active browser permit counts: jobId -> count
-    var activeByJob = new Map();
+    // Current-generation issuance counts: jobId -> count (cleared on gen bump).
+    var currentIssuanceByJob = new Map();
+    // Physical outstanding permits (any generation) still held: jobId -> count.
+    var physicalOutstandingByJob = new Map();
     // Normal-state native maxConnections registration: jobId -> positive int
     var jobLimits = new Map();
     // Observed native open counts (not permits): jobId -> nonnegative int
+    // Cleared on provider generation transitions so snapshots cannot claim
+    // stale opens are current.
     var nativeOpen = new Map();
-    // Parked detection/enrichment probe ids
+    // Parked detection/enrichment probe ids (stay until recoverToNormal).
     var parkedProbes = new Set();
-    // Provider generation for which completeOwner already advanced wake (once).
-    var wakeAppliedForGeneration = null;
+    // Ownership epochs: each install gets a new epoch; terminalizing is once.
+    var ownershipEpoch = 0;
+    var ownerEpochTerminalized = true; // no owner initially
 
-    function clearActivePermits() {
-      activeByJob.clear();
+    function currentIssuance(jobId) {
+      return currentIssuanceByJob.get(jobId) || 0;
     }
 
-    function activeCount(jobId) {
-      return activeByJob.get(jobId) || 0;
+    function physicalOutstanding(jobId) {
+      return physicalOutstandingByJob.get(jobId) || 0;
+    }
+
+    function bumpPhysical(jobId, delta) {
+      var n = physicalOutstanding(jobId) + delta;
+      if (n <= 0) physicalOutstandingByJob.delete(jobId);
+      else physicalOutstandingByJob.set(jobId, n);
+    }
+
+    function bumpCurrentIssuance(jobId, delta) {
+      var n = currentIssuance(jobId) + delta;
+      if (n <= 0) currentIssuanceByJob.delete(jobId);
+      else currentIssuanceByJob.set(jobId, n);
+    }
+
+    function clearCurrentIssuance() {
+      currentIssuanceByJob.clear();
     }
 
     function bumpGeneration() {
       generation += 1;
-      clearActivePermits();
-      // New saturation generation may accept one owner-completion wake.
-      wakeAppliedForGeneration = null;
+      // Invalidate current-generation issuance only. Physical outstanding
+      // remains until each still-live permit releases.
+      clearCurrentIssuance();
+      // Drop diagnostic native-open observations for the prior generation.
+      nativeOpen.clear();
+    }
+
+    function installOwner(jobId) {
+      ownerJobId = jobId;
+      ownershipEpoch += 1;
+      ownerEpochTerminalized = false;
+    }
+
+    function clearOwner() {
+      ownerJobId = null;
+      ownerEpochTerminalized = true;
     }
 
     function effectiveCap(jobId, maxForJob) {
@@ -97,12 +149,17 @@
       return 0;
     }
 
+    function isOwnerFlag(options) {
+      // Neutral Task-10 flag; isDrainOwner kept as compatibility alias.
+      return options.isProviderOwner === true || options.isDrainOwner === true;
+    }
+
     function canAcquire(jobId, options) {
       if (options.isRunningJob !== true) return false;
       if (state === "normal") return true;
-      // saturated | recovering: only designated owner with drain flag
+      // saturated | recovering: only designated owner with owner flag
       if (!ownerJobId || jobId !== ownerJobId) return false;
-      if (options.isDrainOwner !== true) return false;
+      if (!isOwnerFlag(options)) return false;
       return true;
     }
 
@@ -116,26 +173,30 @@
 
       var cap = effectiveCap(jobId, maxForJob);
       if (cap < 1) return null;
-      if (activeCount(jobId) >= cap) return null;
+      // Cap against physical outstanding so still-live stale-generation
+      // browser connections block replacement issuance.
+      if (physicalOutstanding(jobId) >= cap) return null;
 
-      activeByJob.set(jobId, activeCount(jobId) + 1);
+      bumpPhysical(jobId, 1);
+      bumpCurrentIssuance(jobId, 1);
       var issuedGeneration = generation;
       var released = false;
 
-      var permit = {
+      var permit = Object.freeze({
         jobId: jobId,
         purpose: purpose,
         generation: issuedGeneration,
         release: function release() {
           if (released) return;
           released = true;
-          // Stale permits must never touch current-generation counters.
-          if (issuedGeneration !== generation) return;
-          var n = activeCount(jobId);
-          if (n <= 1) activeByJob.delete(jobId);
-          else activeByJob.set(jobId, n - 1);
+          // Always decrement physical outstanding for this live permit.
+          bumpPhysical(jobId, -1);
+          // Current-generation issuance only when this permit is current.
+          if (issuedGeneration === generation) {
+            bumpCurrentIssuance(jobId, -1);
+          }
         },
-      };
+      });
       return permit;
     }
 
@@ -145,8 +206,8 @@
       var reduced = requirePositiveInt(args.reducedConcurrency, "reducedConcurrency");
       bumpGeneration();
       state = "saturated";
-      ownerJobId = drainOwnerJobId;
       reducedConcurrency = reduced;
+      installOwner(drainOwnerJobId);
     }
 
     /**
@@ -160,9 +221,7 @@
     }
 
     function nativeLeaseFor(jobId) {
-      // jobId may be any string key; empty is still echoed for shape stability
-      // when callers pass a known id. Validation only on mutators.
-      var jid = jobId == null ? "" : String(jobId);
+      var jid = requireNonblankId(jobId, "jobId");
       var maxConnections = 0;
       if (state === "normal") {
         maxConnections = jobLimits.has(jid) ? jobLimits.get(jid) : 0;
@@ -195,53 +254,108 @@
       return ids;
     }
 
-    /**
-     * Idempotent owner completion / wake.
-     * Advances wakeGeneration at most once per provider generation so
-     * completion + late cancellation cannot double-wake. Designates a
-     * recovery owner (or blocks with no owner). Further completeOwner
-     * calls for the same generation are no-ops until setSaturated or
-     * recoverToNormal bumps generation.
-     */
-    function completeOwner(args) {
-      args = args || {};
-      if (state === "normal" || wakeAppliedForGeneration === generation) {
-        return deepFreeze({
-          advanced: false,
-          wakeGeneration: wakeGeneration,
-          parkedProbeIds: [],
-        });
-      }
-
-      wakeAppliedForGeneration = generation;
-      wakeGeneration += 1;
-      var drained = drainParkedProbes();
-
-      var next = args.recoveryOwnerJobId;
-      state = "recovering";
-      if (isNonblankString(next)) {
-        ownerJobId = next;
-      } else {
-        ownerJobId = null;
-      }
-
+    function frozenCompleteNoop() {
       return deepFreeze({
-        advanced: true,
+        advanced: false,
         wakeGeneration: wakeGeneration,
-        parkedProbeIds: drained.slice(),
+        parkedProbeIds: [],
       });
     }
 
     /**
-     * Successful recovery path: back to normal.
-     * Bumps generation so saturated/recovering permits cannot corrupt counters.
+     * Ownership-event terminal of the current owner epoch.
+     * Advances wakeGeneration only when:
+     *   - state is saturated|recovering
+     *   - jobId exactly equals the current owner
+     *   - that ownership epoch has not already terminalized
+     * Does not drain parked probes. Distinct nonblank recoveryOwnerJobId
+     * (≠ completing jobId) installs a fresh owner epoch; otherwise remains
+     * recovering with no owner (blocked).
      */
-    function recoverToNormal() {
+    function completeOwner(args) {
+      args = args || {};
+      var jobId = requireNonblankId(args.jobId, "jobId");
+
+      if (state === "normal") return frozenCompleteNoop();
+      if (!ownerJobId || jobId !== ownerJobId) return frozenCompleteNoop();
+      if (ownerEpochTerminalized) return frozenCompleteNoop();
+
+      ownerEpochTerminalized = true;
+      wakeGeneration += 1;
+      state = "recovering";
+
+      var next = args.recoveryOwnerJobId;
+      if (isNonblankString(next) && next !== jobId) {
+        installOwner(next);
+      } else {
+        clearOwner();
+      }
+
+      // Probes remain parked; return empty list so callers never treat a wake
+      // as a probe drain.
+      return deepFreeze({
+        advanced: true,
+        wakeGeneration: wakeGeneration,
+        parkedProbeIds: [],
+      });
+    }
+
+    /**
+     * When recovering with no owner (blocked after terminal without a valid
+     * successor), designate a recovery owner for Task 10. Creates a fresh
+     * ownership epoch. No-op when not blocked-recovering.
+     */
+    function designateRecoveryOwner(args) {
+      args = args || {};
+      var next = requireNonblankId(args.recoveryOwnerJobId, "recoveryOwnerJobId");
+      if (state !== "recovering" || ownerJobId != null) {
+        return deepFreeze({
+          applied: false,
+          ownerJobId: ownerJobId,
+        });
+      }
+      installOwner(next);
+      return deepFreeze({
+        applied: true,
+        ownerJobId: ownerJobId,
+      });
+    }
+
+    /**
+     * Successful recovery path: authenticate current recovery owner, bump
+     * provider generation, return to normal, drain parked probes once.
+     * Stale/wrong completions are frozen no-ops that leave probes parked.
+     */
+    function recoverToNormal(args) {
+      args = args || {};
+      var jobId = requireNonblankId(args.jobId, "jobId");
+
+      if (state !== "recovering") {
+        return deepFreeze({
+          advanced: false,
+          generation: generation,
+          parkedProbeIds: [],
+        });
+      }
+      if (!ownerJobId || jobId !== ownerJobId) {
+        return deepFreeze({
+          advanced: false,
+          generation: generation,
+          parkedProbeIds: [],
+        });
+      }
+
       bumpGeneration();
       state = "normal";
-      ownerJobId = null;
+      clearOwner();
       reducedConcurrency = null;
-      parkedProbes.clear();
+      var drained = drainParkedProbes();
+
+      return deepFreeze({
+        advanced: true,
+        generation: generation,
+        parkedProbeIds: drained.slice(),
+      });
     }
 
     function snapshot() {
@@ -278,6 +392,7 @@
       noteNativeOpen: noteNativeOpen,
       parkProbe: parkProbe,
       completeOwner: completeOwner,
+      designateRecoveryOwner: designateRecoveryOwner,
       recoverToNormal: recoverToNormal,
       snapshot: snapshot,
     };

@@ -17,29 +17,49 @@ const { createProviderGate } = loadLib("lib/provider-gate.js");
  *   gate.generation, gate.wakeGeneration
  *
  * Methods:
- *   acquire(jobId, { maxForJob, isDrainOwner, isRunningJob, purpose })
+ *   acquire(jobId, { maxForJob, isProviderOwner|isDrainOwner, isRunningJob, purpose })
  *     -> permit | null
- *     permit: { jobId, purpose, generation, release() }  // release is idempotent
+ *     permit: frozen { jobId, purpose, generation, release() }  // release is idempotent
+ *     isProviderOwner === true is the neutral owner flag; isDrainOwner is a compatibility alias.
+ *     Owner id match + isRunningJob remain mandatory in saturated/recovering.
  *   setSaturated({ drainOwnerJobId, reducedConcurrency })
- *     -> bumps generation once, state=saturated, invalidates old permits
+ *     -> bumps generation once, state=saturated, invalidates current-generation issuance counters
+ *        but keeps physical outstanding permits until each release()
  *   registerJobLimit(jobId, maxConnections)
  *     -> normal-state native lease registration (positive finite integer; never Infinity/NaN)
  *   nativeLeaseFor(jobId)
- *     -> { jobId, providerGeneration, maxConnections }
+ *     -> { jobId, providerGeneration, maxConnections }; jobId must be nonblank string
  *   noteNativeOpen(jobId, n)
  *     -> tracks nonnegative finite open count; does NOT invent a permit
+ *     cleared on provider generation transitions
  *   parkProbe(probeId)
- *     -> idempotent parking while saturated/recovering
- *   completeOwner({ recoveryOwnerJobId })
- *     -> idempotent owner completion/wake; returns
- *        { advanced, wakeGeneration, parkedProbeIds }
- *   recoverToNormal()
- *     -> successful recovery path: state=normal, generation++, stale permits inert
+ *     -> idempotent parking while saturated/recovering; probes stay parked until
+ *        authenticated recoverToNormal
+ *   completeOwner({ jobId, recoveryOwnerJobId })
+ *     -> ownership-event idempotent terminal of the *current* owner epoch.
+ *        Advances wakeGeneration only when state is saturated|recovering, jobId exactly
+ *        equals the current owner, and that ownership epoch has not already terminalized.
+ *        Does NOT drain parked probes. Distinct nonblank recoveryOwnerJobId (≠ jobId)
+ *        installs a fresh owner epoch; same id or blank leaves recovering blocked.
+ *        Returns frozen { advanced, wakeGeneration, parkedProbeIds: [] }
+ *   designateRecoveryOwner({ recoveryOwnerJobId })
+ *     -> when recovering with no owner (blocked), install a fresh recovery owner epoch.
+ *        Returns frozen { applied, ownerJobId }
+ *   recoverToNormal({ jobId })
+ *     -> successful recovery: authenticates current recovery owner, bumps generation,
+ *        state=normal, drains parked probes once in sorted order.
+ *        Stale/wrong completions are frozen no-ops that do not drain probes.
+ *        Returns frozen { advanced, generation, parkedProbeIds }
  *   snapshot()
  *     -> deep-frozen deterministic projection
  *
  * Denied acquire (not running, at cap, non-owner, etc.) returns null — does not throw.
  * Invalid ids / concurrency values throw.
+ *
+ * Physical outstanding permits are tracked separately from current-generation issuance.
+ * acquire enforces its effective cap against physical outstanding (including stale-generation
+ * permits still held). Stale release decrements only physical outstanding; current release
+ * decrements both. No persistence; session memory only.
  */
 
 function gate(key) {
@@ -51,6 +71,10 @@ function running(opts) {
     { maxForJob: 2, isDrainOwner: false, isRunningJob: true, purpose: "segment" },
     opts || {}
   );
+}
+
+function ownerOpts(opts) {
+  return running(Object.assign({ isProviderOwner: true, isDrainOwner: true }, opts || {}));
 }
 
 // ---------------------------------------------------------------------------
@@ -76,9 +100,7 @@ test("saturated: only drain owner gets permits; others zero native lease", () =>
   // Mutation: still issuing permits to non-owners.
   const g = gate();
   g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
-  assert.ok(
-    g.acquire("owner", running({ maxForJob: 1, isDrainOwner: true }))
-  );
+  assert.ok(g.acquire("owner", ownerOpts({ maxForJob: 1 })));
   assert.equal(
     g.acquire("other", running({ maxForJob: 4, isDrainOwner: false })),
     null
@@ -142,7 +164,7 @@ test("double release is idempotent and does not free extra slots", () => {
 });
 
 // ---------------------------------------------------------------------------
-// setSaturated / generation / stale permits
+// setSaturated / generation / stale permits / physical outstanding
 // ---------------------------------------------------------------------------
 
 test("setSaturated increments generation once, switches state, validates inputs", () => {
@@ -167,6 +189,7 @@ test("setSaturated increments generation once, switches state, validates inputs"
 
 test("stale permit release after generation bump does not corrupt current counters", () => {
   // Mutation: old permit.release() decrements the new generation's counter.
+  // Owner starts with no physical outstanding; reduced cap applies cleanly.
   const g = gate();
   const old = g.acquire("j1", running({ maxForJob: 2 }));
   assert.ok(old);
@@ -177,36 +200,103 @@ test("stale permit release after generation bump does not corrupt current counte
   old.release();
 
   // Owner can still acquire up to reduced cap in the new generation.
-  const p1 = g.acquire("owner", running({ maxForJob: 2, isDrainOwner: true }));
+  const p1 = g.acquire("owner", ownerOpts({ maxForJob: 2 }));
   assert.ok(p1);
   assert.equal(p1.generation, g.generation);
-  const p2 = g.acquire("owner", running({ maxForJob: 2, isDrainOwner: true }));
+  const p2 = g.acquire("owner", ownerOpts({ maxForJob: 2 }));
   // reducedConcurrency=1 so second permit denied
   assert.equal(p2, null);
   p1.release();
-  const p3 = g.acquire("owner", running({ maxForJob: 2, isDrainOwner: true }));
+  const p3 = g.acquire("owner", ownerOpts({ maxForJob: 2 }));
   assert.ok(p3);
   p3.release();
+});
+
+test("owner physical outstanding from old generation blocks new issuance after setSaturated", () => {
+  // Mutation: clearing current-generation counters hides still-live old browser connections.
+  const g = gate();
+  const old1 = g.acquire("owner", running({ maxForJob: 2 }));
+  const old2 = g.acquire("owner", running({ maxForJob: 2 }));
+  assert.ok(old1);
+  assert.ok(old2);
+
+  g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+
+  // Two physical permits still live; reduced cap is 1 → no replacement until enough releases.
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 2 })), null);
+
+  // Non-owner remains denied even if owner is blocked by physical outstanding.
+  assert.equal(
+    g.acquire("other", running({ maxForJob: 4, isDrainOwner: true, isProviderOwner: true })),
+    null
+  );
+
+  // One stale release: physical drops to 1, still at reduced cap → still blocked.
+  old1.release();
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 2 })), null);
+
+  // Second stale release: physical 0 → owner may take one current-generation permit.
+  old2.release();
+  const fresh = g.acquire("owner", ownerOpts({ maxForJob: 2 }));
+  assert.ok(fresh);
+  assert.equal(fresh.generation, g.generation);
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 2 })), null);
+  fresh.release();
+});
+
+test("stale release decrements only physical outstanding; never corrupts current issuance", () => {
+  // Mutation: stale release also decrements current-generation counter → extra free slots.
+  const g = gate();
+  const old1 = g.acquire("owner", running({ maxForJob: 3 }));
+  const old2 = g.acquire("owner", running({ maxForJob: 3 }));
+  assert.ok(old1 && old2);
+
+  g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 2 });
+  // physical=2, cap=2 → at cap
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 3 })), null);
+
+  // Free one physical slot via stale release, then take one current-gen permit.
+  old1.release();
+  const current = g.acquire("owner", ownerOpts({ maxForJob: 3 }));
+  assert.ok(current);
+  assert.equal(current.generation, g.generation);
+  // physical=2 (1 stale + 1 current), at cap
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 3 })), null);
+
+  // Remaining stale release must NOT free an extra current-generation slot.
+  old2.release();
+  // physical should now be 1 (current only); cap=2 → exactly one more allowed
+  const extra = g.acquire("owner", ownerOpts({ maxForJob: 3 }));
+  assert.ok(extra);
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 3 })), null);
+
+  // Double-release of already-released stale is still idempotent.
+  old1.release();
+  old2.release();
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 3 })), null);
+
+  current.release();
+  extra.release();
 });
 
 test("saturated/recovering cap owner at min(maxForJob, reducedConcurrency); non-owner and non-running denied", () => {
   const g = gate();
   g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 2 });
 
-  // Owner must be drain owner AND running.
+  // Owner must be provider/drain owner AND running.
   assert.equal(
-    g.acquire("owner", running({ maxForJob: 4, isDrainOwner: false })),
+    g.acquire("owner", running({ maxForJob: 4, isDrainOwner: false, isProviderOwner: false })),
     null
   );
   assert.equal(
-    g.acquire("owner", running({ maxForJob: 4, isDrainOwner: true, isRunningJob: false })),
+    g.acquire("owner", ownerOpts({ maxForJob: 4, isRunningJob: false })),
     null
   );
 
   // Cap = min(4, 2) = 2
-  const a = g.acquire("owner", running({ maxForJob: 4, isDrainOwner: true }));
-  const b = g.acquire("owner", running({ maxForJob: 4, isDrainOwner: true }));
-  const c = g.acquire("owner", running({ maxForJob: 4, isDrainOwner: true }));
+  const a = g.acquire("owner", ownerOpts({ maxForJob: 4 }));
+  const b = g.acquire("owner", ownerOpts({ maxForJob: 4 }));
+  const c = g.acquire("owner", ownerOpts({ maxForJob: 4 }));
   assert.ok(a);
   assert.ok(b);
   assert.equal(c, null);
@@ -214,13 +304,40 @@ test("saturated/recovering cap owner at min(maxForJob, reducedConcurrency); non-
   // Cap = min(1, 2) = 1 when maxForJob is tighter
   a.release();
   b.release();
-  const d = g.acquire("owner", running({ maxForJob: 1, isDrainOwner: true }));
+  const d = g.acquire("owner", ownerOpts({ maxForJob: 1 }));
   assert.ok(d);
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 1 })), null);
+  d.release();
+});
+
+test("isProviderOwner is accepted; isDrainOwner remains compatibility alias", () => {
+  const g = gate();
+  g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+
+  // Neutral flag alone is enough.
+  const p1 = g.acquire(
+    "owner",
+    running({ maxForJob: 1, isProviderOwner: true, isDrainOwner: false })
+  );
+  assert.ok(p1);
+  p1.release();
+
+  // Compatibility alias alone is enough.
+  const p2 = g.acquire(
+    "owner",
+    running({ maxForJob: 1, isProviderOwner: false, isDrainOwner: true })
+  );
+  assert.ok(p2);
+  p2.release();
+
+  // Neither flag → denied even with matching owner id and running.
   assert.equal(
-    g.acquire("owner", running({ maxForJob: 1, isDrainOwner: true })),
+    g.acquire(
+      "owner",
+      running({ maxForJob: 1, isProviderOwner: false, isDrainOwner: false })
+    ),
     null
   );
-  d.release();
 });
 
 // ---------------------------------------------------------------------------
@@ -273,7 +390,7 @@ test("nativeLeaseFor shape is exact; owner/non-owner leases in saturated and rec
     maxConnections: 0,
   });
 
-  const wake = g.completeOwner({ recoveryOwnerJobId: "recover" });
+  const wake = g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "recover" });
   assert.equal(wake.advanced, true);
   assert.equal(g.state, "recovering");
   assert.deepEqual(g.nativeLeaseFor("recover"), {
@@ -293,6 +410,15 @@ test("nativeLeaseFor shape is exact; owner/non-owner leases in saturated and rec
   });
 });
 
+test("nativeLeaseFor rejects malformed job ids instead of stringifying them", () => {
+  const g = gate();
+  assert.throws(() => g.nativeLeaseFor(""));
+  assert.throws(() => g.nativeLeaseFor("  "));
+  assert.throws(() => g.nativeLeaseFor(null));
+  assert.throws(() => g.nativeLeaseFor(undefined));
+  assert.throws(() => g.nativeLeaseFor(42));
+});
+
 test("noteNativeOpen tracks nonnegative finite count without inventing a permit", () => {
   const g = gate();
   g.noteNativeOpen("j1", 0);
@@ -307,11 +433,32 @@ test("noteNativeOpen tracks nonnegative finite count without inventing a permit"
   assert.throws(() => g.noteNativeOpen("", 1));
 });
 
+test("nativeOpen diagnostic observations clear on provider generation transitions", () => {
+  // Mutation: snapshot still reports pre-saturation opens as current after generation bump.
+  const g = gate();
+  g.noteNativeOpen("j1", 3);
+  assert.equal(g.snapshot().nativeOpen.j1, 3);
+
+  g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+  assert.equal(g.snapshot().nativeOpen.j1, undefined);
+  assert.deepEqual(g.snapshot().nativeOpen, {});
+
+  g.noteNativeOpen("owner", 1);
+  assert.equal(g.snapshot().nativeOpen.owner, 1);
+
+  g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "recover" });
+  // completeOwner does not bump provider generation → observation may remain for same gen.
+  assert.equal(g.snapshot().nativeOpen.owner, 1);
+
+  g.recoverToNormal({ jobId: "recover" });
+  assert.deepEqual(g.snapshot().nativeOpen, {});
+});
+
 // ---------------------------------------------------------------------------
-// parkProbe / completeOwner / duplicate wake / recovery
+// parkProbe / completeOwner ownership epochs / recovery chain
 // ---------------------------------------------------------------------------
 
-test("parkProbe is idempotent; completeOwner drains probes and advances wake once", () => {
+test("parkProbe is idempotent; probes stay parked across completeOwner until recoverToNormal", () => {
   const g = gate();
   g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
   g.parkProbe("probe-a");
@@ -320,59 +467,190 @@ test("parkProbe is idempotent; completeOwner drains probes and advances wake onc
   assert.deepEqual(g.snapshot().parkedProbeIds, ["probe-a", "probe-b"]);
 
   // Parked probes cannot acquire permits.
-  assert.equal(
-    g.acquire("probe-a", running({ purpose: "probe" })),
-    null
-  );
+  assert.equal(g.acquire("probe-a", running({ purpose: "probe" })), null);
 
   const wake0 = g.wakeGeneration;
-  const first = g.completeOwner({ recoveryOwnerJobId: "next" });
+  const first = g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "next" });
   assert.equal(first.advanced, true);
   assert.equal(first.wakeGeneration, wake0 + 1);
-  assert.deepEqual(first.parkedProbeIds, ["probe-a", "probe-b"]);
+  // completeOwner must not drain/expose parked probes.
+  assert.deepEqual(first.parkedProbeIds, []);
   assert.equal(g.wakeGeneration, wake0 + 1);
   assert.equal(g.state, "recovering");
-  assert.deepEqual(g.snapshot().parkedProbeIds, []);
+  assert.deepEqual(g.snapshot().parkedProbeIds, ["probe-a", "probe-b"]);
+
+  // Probes parked during recovering are not silently lost.
+  g.parkProbe("probe-c");
+  assert.deepEqual(g.snapshot().parkedProbeIds, ["probe-a", "probe-b", "probe-c"]);
 
   // Recovery owner can acquire; others cannot.
-  assert.ok(
-    g.acquire("next", running({ maxForJob: 1, isDrainOwner: true }))
-  );
-  assert.equal(
-    g.acquire("owner", running({ maxForJob: 1, isDrainOwner: true })),
-    null
-  );
+  assert.ok(g.acquire("next", ownerOpts({ maxForJob: 1 })));
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 1 })), null);
+
+  // Authenticated recovery drains probes once in deterministic order.
+  const reset = g.recoverToNormal({ jobId: "next" });
+  assert.equal(reset.advanced, true);
+  assert.deepEqual(reset.parkedProbeIds, ["probe-a", "probe-b", "probe-c"]);
+  assert.deepEqual(g.snapshot().parkedProbeIds, []);
+  assert.equal(g.state, "normal");
 });
 
-test("duplicate/stale owner completion does not double-wake", () => {
-  // Mutation: each completeOwner call increments wakeGeneration.
+test("completeOwner authenticates current owner; wrong/stale/duplicate are frozen no-ops", () => {
+  // Mutation: any completeOwner advances wake, or wrong jobId can steal the handoff.
   const g = gate();
   g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
   g.parkProbe("p1");
-  const first = g.completeOwner({ recoveryOwnerJobId: "next" });
+
+  const wrong = g.completeOwner({ jobId: "not-owner", recoveryOwnerJobId: "hijack" });
+  assert.equal(wrong.advanced, false);
+  assert.deepEqual(wrong.parkedProbeIds, []);
+  assert.equal(g.state, "saturated");
+  assert.equal(g.snapshot().ownerJobId, "owner");
+  assert.deepEqual(g.snapshot().parkedProbeIds, ["p1"]);
+
+  const first = g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "next" });
   assert.equal(first.advanced, true);
   const wakeAfter = g.wakeGeneration;
+  assert.equal(g.state, "recovering");
+  assert.equal(g.snapshot().ownerJobId, "next");
+  assert.deepEqual(g.snapshot().parkedProbeIds, ["p1"]);
 
-  const dup = g.completeOwner({ recoveryOwnerJobId: "other" });
-  assert.equal(dup.advanced, false);
+  // Late owner-A completion must not wake or change successor.
+  const lateA = g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "other" });
+  assert.equal(lateA.advanced, false);
   assert.equal(g.wakeGeneration, wakeAfter);
-  assert.deepEqual(dup.parkedProbeIds, []);
-  // Owner remains the recovery owner from the first successful wake.
+  assert.deepEqual(lateA.parkedProbeIds, []);
+  assert.equal(g.snapshot().ownerJobId, "next");
+
+  // Duplicate completion of the same already-terminalized epoch (via current owner once more
+  // is tested in chain; here duplicate of previous owner already covered).
+  const dupNextWrong = g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "zzz" });
+  assert.equal(dupNextWrong.advanced, false);
   assert.equal(g.snapshot().ownerJobId, "next");
 });
 
-test("completeOwner with no recovery owner remains blocked; no permits issued", () => {
+test("recovery chain A→B→C in same provider generation; late A never wakes", () => {
+  // Mutation: once-per-provider-generation wake blocks B→C handoff.
+  const g = gate();
+  g.setSaturated({ drainOwnerJobId: "A", reducedConcurrency: 1 });
+  const gen = g.generation;
+
+  const ab = g.completeOwner({ jobId: "A", recoveryOwnerJobId: "B" });
+  assert.equal(ab.advanced, true);
+  assert.equal(g.state, "recovering");
+  assert.equal(g.snapshot().ownerJobId, "B");
+  assert.equal(g.generation, gen);
+
+  const lateA = g.completeOwner({ jobId: "A", recoveryOwnerJobId: "X" });
+  assert.equal(lateA.advanced, false);
+
+  // B cancels/fails/retry-exhausts and hands off to C — new ownership epoch, same provider gen.
+  const bc = g.completeOwner({ jobId: "B", recoveryOwnerJobId: "C" });
+  assert.equal(bc.advanced, true);
+  assert.equal(bc.wakeGeneration, ab.wakeGeneration + 1);
+  assert.equal(g.wakeGeneration, ab.wakeGeneration + 1);
+  assert.equal(g.generation, gen);
+  assert.equal(g.snapshot().ownerJobId, "C");
+
+  // Duplicate B completion after handoff is a no-op.
+  const dupB = g.completeOwner({ jobId: "B", recoveryOwnerJobId: "D" });
+  assert.equal(dupB.advanced, false);
+  assert.equal(g.snapshot().ownerJobId, "C");
+  assert.equal(g.wakeGeneration, ab.wakeGeneration + 1);
+
+  // C can still complete further if needed.
+  const blocked = g.completeOwner({ jobId: "C", recoveryOwnerJobId: null });
+  assert.equal(blocked.advanced, true);
+  assert.equal(g.snapshot().ownerJobId, null);
+  assert.equal(g.state, "recovering");
+});
+
+test("completeOwner rejects same completed id as successor; no successor remains blocked", () => {
   const g = gate();
   g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
-  const r = g.completeOwner({ recoveryOwnerJobId: null });
-  assert.equal(r.advanced, true);
+
+  const same = g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "owner" });
+  assert.equal(same.advanced, true);
   assert.equal(g.state, "recovering");
   assert.equal(g.snapshot().ownerJobId, null);
+  assert.equal(g.acquire("owner", ownerOpts({ maxForJob: 1 })), null);
+  assert.equal(g.nativeLeaseFor("owner").maxConnections, 0);
+
+  // Fresh gate for blank successor path.
+  const g2 = gate();
+  g2.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+  const none = g2.completeOwner({ jobId: "owner", recoveryOwnerJobId: null });
+  assert.equal(none.advanced, true);
+  assert.equal(g2.state, "recovering");
+  assert.equal(g2.snapshot().ownerJobId, null);
   assert.equal(
-    g.acquire("anyone", running({ maxForJob: 2, isDrainOwner: true })),
+    g2.acquire("anyone", ownerOpts({ maxForJob: 2 })),
     null
   );
-  assert.equal(g.nativeLeaseFor("anyone").maxConnections, 0);
+  assert.equal(g2.nativeLeaseFor("anyone").maxConnections, 0);
+});
+
+test("designateRecoveryOwner installs a later owner when recovering blocked", () => {
+  const g = gate();
+  g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+  g.completeOwner({ jobId: "owner", recoveryOwnerJobId: null });
+  assert.equal(g.snapshot().ownerJobId, null);
+
+  // Not blocked (has owner) → no-op.
+  const gBusy = gate();
+  gBusy.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+  const busy = gBusy.designateRecoveryOwner({ recoveryOwnerJobId: "later" });
+  assert.equal(busy.applied, false);
+  assert.equal(gBusy.snapshot().ownerJobId, "owner");
+
+  // Blocked recovering → install fresh owner epoch.
+  const applied = g.designateRecoveryOwner({ recoveryOwnerJobId: "later" });
+  assert.equal(applied.applied, true);
+  assert.equal(applied.ownerJobId, "later");
+  assert.equal(g.snapshot().ownerJobId, "later");
+  assert.ok(g.acquire("later", ownerOpts({ maxForJob: 1 })));
+
+  // That designated owner can terminalize and hand off again.
+  const handoff = g.completeOwner({ jobId: "later", recoveryOwnerJobId: "final" });
+  assert.equal(handoff.advanced, true);
+  assert.equal(g.snapshot().ownerJobId, "final");
+
+  assert.throws(() => g.designateRecoveryOwner({ recoveryOwnerJobId: "" }));
+  assert.throws(() => g.designateRecoveryOwner({ recoveryOwnerJobId: "  " }));
+});
+
+test("recoverToNormal authenticates recovery owner; wrong/stale do not drain probes or reset", () => {
+  const g = gate();
+  g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
+  g.parkProbe("z");
+  g.parkProbe("a");
+  g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "recover" });
+  g.parkProbe("m");
+  const genBefore = g.generation;
+  const wakeBefore = g.wakeGeneration;
+
+  const wrong = g.recoverToNormal({ jobId: "not-recover" });
+  assert.equal(wrong.advanced, false);
+  assert.deepEqual(wrong.parkedProbeIds, []);
+  assert.equal(g.state, "recovering");
+  assert.equal(g.generation, genBefore);
+  assert.equal(g.wakeGeneration, wakeBefore);
+  assert.deepEqual(g.snapshot().parkedProbeIds, ["a", "m", "z"]);
+
+  const ok = g.recoverToNormal({ jobId: "recover" });
+  assert.equal(ok.advanced, true);
+  assert.equal(g.state, "normal");
+  assert.equal(g.generation, genBefore + 1);
+  assert.deepEqual(ok.parkedProbeIds, ["a", "m", "z"]);
+  assert.deepEqual(g.snapshot().parkedProbeIds, []);
+  assert.equal(g.snapshot().ownerJobId, null);
+  assert.equal(g.snapshot().reducedConcurrency, null);
+
+  // Duplicate / after-normal is a frozen no-op and does not invent probes.
+  const dup = g.recoverToNormal({ jobId: "recover" });
+  assert.equal(dup.advanced, false);
+  assert.deepEqual(dup.parkedProbeIds, []);
+  assert.equal(g.state, "normal");
 });
 
 test("recoverToNormal returns to normal without reusing stale generation permits", () => {
@@ -380,23 +658,21 @@ test("recoverToNormal returns to normal without reusing stale generation permits
   g.registerJobLimit("job-a", 3);
   g.setSaturated({ drainOwnerJobId: "owner", reducedConcurrency: 1 });
   const satGen = g.generation;
-  const ownerPermit = g.acquire("owner", running({ maxForJob: 1, isDrainOwner: true }));
+  const ownerPermit = g.acquire("owner", ownerOpts({ maxForJob: 1 }));
   assert.ok(ownerPermit);
-  g.completeOwner({ recoveryOwnerJobId: "recover" });
+  g.completeOwner({ jobId: "owner", recoveryOwnerJobId: "recover" });
   assert.equal(g.state, "recovering");
-  const recoveringPermit = g.acquire(
-    "recover",
-    running({ maxForJob: 1, isDrainOwner: true })
-  );
+  const recoveringPermit = g.acquire("recover", ownerOpts({ maxForJob: 1 }));
   assert.ok(recoveringPermit);
 
   const genBefore = g.generation;
-  g.recoverToNormal();
+  const reset = g.recoverToNormal({ jobId: "recover" });
+  assert.equal(reset.advanced, true);
   assert.equal(g.state, "normal");
   assert.equal(g.generation, genBefore + 1);
   assert.notEqual(g.generation, satGen);
 
-  // Stale permits are inert.
+  // Stale permits are inert for current-generation counters (physical still tracked).
   ownerPermit.release();
   recoveringPermit.release();
 
@@ -415,8 +691,30 @@ test("recoverToNormal returns to normal without reusing stale generation permits
 });
 
 // ---------------------------------------------------------------------------
-// Invalid inputs / snapshot / dual export
+// Permit freeze / invalid inputs / snapshot / dual export
 // ---------------------------------------------------------------------------
+
+test("returned permit objects are frozen; release remains closure-safe and idempotent", () => {
+  const g = gate();
+  const p = g.acquire("j1", running({ maxForJob: 1 }));
+  assert.ok(p);
+  assert.ok(Object.isFrozen(p));
+  assert.throws(() => {
+    p.jobId = "mutated";
+  });
+  assert.throws(() => {
+    p.purpose = "mutated";
+  });
+  assert.throws(() => {
+    p.generation = -1;
+  });
+  assert.equal(p.jobId, "j1");
+  p.release();
+  p.release();
+  const p2 = g.acquire("j1", running({ maxForJob: 1 }));
+  assert.ok(p2);
+  p2.release();
+});
 
 test("rejects invalid providerKey/jobId/purpose/maxForJob without throwing on ordinary deny", () => {
   assert.throws(() => createProviderGate({ providerKey: "" }));
@@ -445,6 +743,8 @@ test("rejects invalid providerKey/jobId/purpose/maxForJob without throwing on or
   assert.throws(() => g.acquire("j1", running({ purpose: "  " })));
   assert.throws(() => g.parkProbe(""));
   assert.throws(() => g.parkProbe("  "));
+  assert.throws(() => g.completeOwner({ jobId: "", recoveryOwnerJobId: "x" }));
+  assert.throws(() => g.completeOwner({ jobId: "  ", recoveryOwnerJobId: "x" }));
 });
 
 test("snapshot is deep-frozen deterministic and reflects state transitions", () => {
