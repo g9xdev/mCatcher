@@ -568,6 +568,77 @@ input:focus-visible {
   line-height: 1.5;
 }
 
+/* Inline Save As form (per-item .slot) */
+.saveas-form {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+}
+
+.saveas-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.saveas-input {
+  min-width: 0;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.22);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.saveas-input:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-color: rgba(96, 205, 255, 0.45);
+}
+
+.saveas-input:disabled {
+  opacity: 0.55;
+}
+
+.saveas-folder {
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.saveas-feedback {
+  min-height: 1.2em;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-tertiary);
+}
+
+.saveas-feedback.error {
+  color: var(--danger);
+}
+
+.saveas-feedback.warn {
+  color: var(--warning);
+}
+
+.saveas-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
 .note.snap {
   color: var(--success);
 }
