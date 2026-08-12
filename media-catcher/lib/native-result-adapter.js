@@ -100,6 +100,14 @@
           failureCategory === "range_unsupported" &&
           partState === "empty"
         ) {
+          // Capture and type-check start callback before any capability mutation.
+          // Invalid/missing/throwing start must leave the job in multi-range.
+          var startFn = null;
+          if (options && typeof options === "object") {
+            startFn = options.startSingleConnection;
+          }
+          if (typeof startFn !== "function") return;
+
           if (typeof scheduler.onCapabilitySwitch !== "function") return;
           try {
             scheduler.onCapabilitySwitch(id, {
@@ -121,11 +129,6 @@
           if (post.attemptToken !== attemptToken) return;
           if (post.mode !== "single-connection") return;
 
-          var startFn = null;
-          if (options && typeof options === "object") {
-            startFn = options.startSingleConnection;
-          }
-          if (typeof startFn !== "function") return;
           // Defer call so outer fail-closed catch does not swallow start errors.
           startAfterSwitch = { fn: startFn, job: post };
         } else {

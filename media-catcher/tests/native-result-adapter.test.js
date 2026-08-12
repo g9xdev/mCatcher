@@ -969,3 +969,101 @@ test("matching-mode single-connection ordinary results forward", () => {
   assert.equal(started.length, 0);
   assert.equal(firefoxHits.count, 0);
 });
+
+// ---------------------------------------------------------------------------
+// 11. invalid startSingleConnection on exact empty multi-range switch path
+//     must not call onCapabilitySwitch (job must stay multi-range)
+// ---------------------------------------------------------------------------
+
+function rangeUnsupportedEmptyMsg(overrides) {
+  return Object.assign(
+    {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-1",
+      status: "failed",
+      mode: "multi-range",
+      failureCategory: "range_unsupported",
+      partState: "empty",
+    },
+    overrides || {}
+  );
+}
+
+function assertSwitchPathNoEffects(sched, job, firefoxHits, started) {
+  assert.equal(sched.calls.capability.length, 0, "no capability switch");
+  assert.equal(sched.calls.transport.length, 0, "no transport");
+  assert.equal(started.length, 0, "no start");
+  assert.equal(firefoxHits.count, 0, "no firefox calls/accesses");
+  assert.equal(job.mode, "multi-range", "job stays multi-range");
+  assert.equal(job.state, "running");
+}
+
+test("switch path with missing options/callback: no capability mutation", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  for (const opts of [undefined, null, {}, { firefoxDownload() {} }]) {
+    const job = baseJob();
+    const sched = fakeScheduler(job); // onCapabilitySwitch would mutate mode
+    const started = [];
+    const firefoxHits = { count: 0 };
+    assert.doesNotThrow(() => {
+      handlePgetResult(sched, rangeUnsupportedEmptyMsg(), opts);
+    });
+    assertSwitchPathNoEffects(sched, job, firefoxHits, started);
+  }
+});
+
+test("switch path with non-function startSingleConnection: no capability mutation", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  for (const bad of ["not-a-fn", 0, 1, true, false, { call() {} }, []]) {
+    const job = baseJob();
+    const sched = fakeScheduler(job); // onCapabilitySwitch would mutate mode
+    const started = [];
+    const firefoxHits = { count: 0 };
+    assert.doesNotThrow(() => {
+      handlePgetResult(sched, rangeUnsupportedEmptyMsg(), {
+        startSingleConnection: bad,
+        firefoxDownload() {
+          firefoxHits.count++;
+        },
+      });
+    });
+    assertSwitchPathNoEffects(sched, job, firefoxHits, started);
+  }
+});
+
+test("switch path with throwing startSingleConnection getter: no capability mutation", () => {
+  const { handlePgetResult } = loadAdapter();
+  const job = baseJob();
+  const sched = fakeScheduler(job); // onCapabilitySwitch would mutate mode
+  const started = [];
+  let firefoxAccesses = 0;
+  const opts = {};
+  Object.defineProperty(opts, "startSingleConnection", {
+    enumerable: true,
+    get() {
+      throw new Error("start-getter-boom");
+    },
+  });
+  Object.defineProperty(opts, "firefoxDownload", {
+    enumerable: true,
+    get() {
+      firefoxAccesses++;
+      return () => {
+        firefoxAccesses++;
+      };
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    handlePgetResult(sched, rangeUnsupportedEmptyMsg(), opts);
+  });
+  assert.equal(sched.calls.capability.length, 0, "no capability switch");
+  assert.equal(sched.calls.transport.length, 0, "no transport");
+  assert.equal(started.length, 0, "no start");
+  assert.equal(firefoxAccesses, 0, "no firefox access");
+  assert.equal(job.mode, "multi-range", "job stays multi-range");
+  assert.equal(job.state, "running");
+});
