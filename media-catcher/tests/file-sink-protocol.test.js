@@ -1,0 +1,985 @@
+"use strict";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const path = require("node:path");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const { loadLib, mediaCatcherRoot } = require("./harness/load-lib.js");
+
+const FLOREN = "11238-makemebi.net.mp4";
+const MAX_CHUNK = 512 * 1024;
+
+function loadProtocol() {
+  return loadLib("lib/file-sink-protocol.js");
+}
+
+function openStreaming(overrides) {
+  const P = loadProtocol();
+  const input = Object.assign(
+    {
+      jobId: "j1",
+      attemptToken: "a1",
+      requestedFilename: FLOREN,
+      destinationDirectory: "D:\\\\v",
+    },
+    overrides || {}
+  );
+  const s = P.createFileSinkSession(input);
+  const opened = s.onOpened({
+    type: "file-opened",
+    sinkId: "s1",
+    jobId: input.jobId,
+    attemptToken: input.attemptToken,
+  });
+  assert.equal(opened, true);
+  return { P, s, input };
+}
+
+function snapshotSession(s) {
+  return {
+    state: s.state,
+    sinkId: s.sinkId,
+    outstandingCount: s.outstandingCount,
+    jobId: s.jobId,
+    attemptToken: s.attemptToken,
+    requestedFilename: s.requestedFilename,
+    destinationDirectory: s.destinationDirectory,
+  };
+}
+
+function assertFrozenAllowlist(obj, keys) {
+  assert.equal(Object.isFrozen(obj), true);
+  assert.deepEqual(Object.keys(obj).sort(), keys.slice().sort());
+  for (const k of keys) {
+    const v = obj[k];
+    if (v && typeof v === "object") {
+      assert.equal(Object.isFrozen(v), true);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Plan samples
+// ---------------------------------------------------------------------------
+
+test("open binds filename; chunks respect unacked window", () => {
+  const { createFileSinkSession, MAX_UNACKED } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\v",
+  });
+  assert.deepEqual(s.openCmd(), {
+    cmd: "file-open",
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: FLOREN,
+    dir: "D:\\\\v",
+  });
+  s.onOpened({ type: "file-opened", sinkId: "s1", jobId: "j1", attemptToken: "a1" });
+  const cmds = [];
+  for (let i = 0; i < MAX_UNACKED; i++) {
+    cmds.push(s.nextChunkCmd(new Uint8Array([i])));
+  }
+  assert.equal(cmds.length, MAX_UNACKED);
+  assert.equal(s.nextChunkCmd(new Uint8Array([9])), null); // backpressure
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 });
+  assert.ok(s.nextChunkCmd(new Uint8Array([9])));
+});
+
+test("commit and abort commands carry bound sink identity", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  s.onOpened({ type: "file-opened", sinkId: "s9", jobId: "j1", attemptToken: "a1" });
+  assert.deepEqual(s.commitCmd(), {
+    cmd: "file-commit",
+    sinkId: "s9",
+    jobId: "j1",
+    attemptToken: "a1",
+  });
+  assert.deepEqual(s.abortCmd(), {
+    cmd: "file-abort",
+    sinkId: "s9",
+    jobId: "j1",
+    attemptToken: "a1",
+  });
+});
+
+test("host error maps to local_io and never flags saturation or firefox", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  s.onOpened({ type: "file-opened", sinkId: "s1", jobId: "j1", attemptToken: "a1" });
+  const out = s.onHostError({
+    type: "file-error",
+    failureCategory: "local_io",
+    reason: "disk full",
+  });
+  assert.equal(out.failureCategory, "local_io");
+  assert.equal(out.invokeFirefox, false);
+  assert.equal(out.isSaturation, false);
+  assert.equal(s.state, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// Constants + dual export
+// ---------------------------------------------------------------------------
+
+test("exports MAX_UNACKED 4 and MAX_CHUNK_BYTES 512KiB", () => {
+  const P = loadProtocol();
+  assert.equal(P.MAX_UNACKED, 4);
+  assert.equal(P.MAX_CHUNK_BYTES, 512 * 1024);
+});
+
+test("dual-export assigns exact McFileSinkProtocol global identity", () => {
+  const abs = path.join(mediaCatcherRoot, "lib", "file-sink-protocol.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const root = {};
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require,
+    console,
+    self: root,
+  };
+  sandbox.module.exports = sandbox.exports;
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  assert.equal(root.McFileSinkProtocol, sandbox.module.exports);
+  assert.equal(typeof root.McFileSinkProtocol.createFileSinkSession, "function");
+  assert.equal(typeof root.McFileSinkProtocol.buildPgetCmd, "function");
+  assert.equal(typeof root.McFileSinkProtocol.buildPgetSingleCmd, "function");
+  assert.equal(root.McFileSinkProtocol.MAX_UNACKED, 4);
+  assert.equal(root.McFileSinkProtocol.MAX_CHUNK_BYTES, MAX_CHUNK);
+});
+
+// ---------------------------------------------------------------------------
+// Constructor validation + frozen bindings
+// ---------------------------------------------------------------------------
+
+test("constructor requires nonblank primitive strings; destination null/undefined or nonblank string", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const base = {
+    jobId: "j",
+    attemptToken: "a",
+    requestedFilename: "x.mp4",
+    destinationDirectory: null,
+  };
+
+  for (const bad of ["", "  ", null, undefined, 1, true, {}, [], () => "x"]) {
+    assert.throws(() => createFileSinkSession({ ...base, jobId: bad }));
+    assert.throws(() => createFileSinkSession({ ...base, attemptToken: bad }));
+    assert.throws(() => createFileSinkSession({ ...base, requestedFilename: bad }));
+  }
+
+  assert.throws(() =>
+    createFileSinkSession({ ...base, destinationDirectory: "" })
+  );
+  assert.throws(() =>
+    createFileSinkSession({ ...base, destinationDirectory: "  " })
+  );
+  assert.throws(() =>
+    createFileSinkSession({ ...base, destinationDirectory: 12 })
+  );
+  assert.throws(() =>
+    createFileSinkSession({ ...base, destinationDirectory: {} })
+  );
+  assert.throws(() =>
+    createFileSinkSession({ ...base, destinationDirectory: [] })
+  );
+  assert.throws(() =>
+    createFileSinkSession({ ...base, destinationDirectory: () => "D:\\\\x" })
+  );
+
+  const s1 = createFileSinkSession({ ...base, destinationDirectory: undefined });
+  assert.equal(s1.destinationDirectory, null);
+  const s2 = createFileSinkSession({ ...base, destinationDirectory: null });
+  assert.equal(s2.destinationDirectory, null);
+  const s3 = createFileSinkSession({
+    ...base,
+    destinationDirectory: "D:\\\\Vids",
+  });
+  assert.equal(s3.destinationDirectory, "D:\\\\Vids");
+});
+
+test("session is frozen with read-only bindings; caller input mutation cannot rebind", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const input = {
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\v",
+  };
+  const s = createFileSinkSession(input);
+  assert.equal(Object.isFrozen(s), true);
+  assert.equal(s.state, "open");
+  assert.equal(s.sinkId, null);
+  assert.equal(s.outstandingCount, 0);
+
+  input.jobId = "mutated";
+  input.attemptToken = "mutated";
+  input.requestedFilename = "evil.mp4";
+  input.destinationDirectory = "C:\\\\evil";
+
+  assert.equal(s.jobId, "j1");
+  assert.equal(s.attemptToken, "a1");
+  assert.equal(s.requestedFilename, FLOREN);
+  assert.equal(s.destinationDirectory, "D:\\\\v");
+
+  const open = s.openCmd();
+  assert.equal(open.jobId, "j1");
+  assert.equal(open.requestedFilename, FLOREN);
+  assert.equal(open.dir, "D:\\\\v");
+
+  assert.throws(() => {
+    s.requestedFilename = "nope.mp4";
+  });
+  assert.throws(() => {
+    s.state = "failed";
+  });
+  assert.equal(s.requestedFilename, FLOREN);
+  assert.equal(s.state, "open");
+});
+
+test("hostile extra getters on constructor input are never touched", () => {
+  const { createFileSinkSession } = loadProtocol();
+  let touched = 0;
+  const input = {
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "ok.mp4",
+    destinationDirectory: null,
+  };
+  Object.defineProperty(input, "cookie", {
+    enumerable: true,
+    get() {
+      touched++;
+      return "session=secret";
+    },
+  });
+  Object.defineProperty(input, "headers", {
+    enumerable: true,
+    get() {
+      touched++;
+      return { Authorization: "Bearer x" };
+    },
+  });
+  Object.defineProperty(input, "pageTitle", {
+    enumerable: true,
+    get() {
+      touched++;
+      return "Rank Me";
+    },
+  });
+  const s = createFileSinkSession(input);
+  assert.equal(s.requestedFilename, "ok.mp4");
+  assert.equal(touched, 0);
+});
+
+// ---------------------------------------------------------------------------
+// open / onOpened
+// ---------------------------------------------------------------------------
+
+test("openCmd only in open state; returns frozen allowlisted shape", () => {
+  const { s } = openStreaming({ destinationDirectory: null });
+  assert.equal(s.openCmd(), null);
+  assert.equal(s.state, "streaming");
+
+  const { createFileSinkSession } = loadProtocol();
+  const open = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  const cmd = open.openCmd();
+  assertFrozenAllowlist(cmd, [
+    "cmd",
+    "jobId",
+    "attemptToken",
+    "requestedFilename",
+    "dir",
+  ]);
+  assert.equal(cmd.cmd, "file-open");
+  assert.equal(cmd.dir, null);
+  const again = open.openCmd();
+  assert.notEqual(again, cmd);
+  assert.deepEqual(again, cmd);
+});
+
+test("onOpened rejects stale/malformed/duplicate frames with zero mutation", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  const before = snapshotSession(s);
+
+  const rejects = [
+    null,
+    undefined,
+    "file-opened",
+    { type: "file-opened" },
+    { type: "wrong", sinkId: "s1", jobId: "j1", attemptToken: "a1" },
+    { type: "file-opened", sinkId: "", jobId: "j1", attemptToken: "a1" },
+    { type: "file-opened", sinkId: "  ", jobId: "j1", attemptToken: "a1" },
+    { type: "file-opened", sinkId: 12, jobId: "j1", attemptToken: "a1" },
+    { type: "file-opened", sinkId: "s1", jobId: "other", attemptToken: "a1" },
+    { type: "file-opened", sinkId: "s1", jobId: "j1", attemptToken: "stale" },
+    { type: "file-opened", sinkId: "s1", jobId: "j1" },
+    { type: "file-opened", sinkId: "s1", attemptToken: "a1" },
+  ];
+  for (const msg of rejects) {
+    assert.equal(s.onOpened(msg), false);
+    assert.deepEqual(snapshotSession(s), before);
+  }
+
+  assert.equal(
+    s.onOpened({
+      type: "file-opened",
+      sinkId: "s1",
+      jobId: "j1",
+      attemptToken: "a1",
+    }),
+    true
+  );
+  assert.equal(s.state, "streaming");
+  assert.equal(s.sinkId, "s1");
+  const afterOpen = snapshotSession(s);
+  assert.equal(
+    s.onOpened({
+      type: "file-opened",
+      sinkId: "s2",
+      jobId: "j1",
+      attemptToken: "a1",
+    }),
+    false
+  );
+  assert.deepEqual(snapshotSession(s), afterOpen);
+  assert.equal(s.sinkId, "s1");
+});
+
+// ---------------------------------------------------------------------------
+// Chunks / base64 / backpressure
+// ---------------------------------------------------------------------------
+
+test("nextChunkCmd copies bytes, encodes base64, sequences from 0, and freezes", () => {
+  const { s } = openStreaming();
+  const bytes = new Uint8Array([72, 101, 108, 108, 111]); // Hello
+  const cmd = s.nextChunkCmd(bytes);
+  assertFrozenAllowlist(cmd, [
+    "cmd",
+    "sinkId",
+    "jobId",
+    "attemptToken",
+    "seq",
+    "dataB64",
+    "length",
+  ]);
+  assert.equal(cmd.cmd, "file-chunk");
+  assert.equal(cmd.sinkId, "s1");
+  assert.equal(cmd.jobId, "j1");
+  assert.equal(cmd.attemptToken, "a1");
+  assert.equal(cmd.seq, 0);
+  assert.equal(cmd.length, 5);
+  assert.equal(cmd.dataB64, "SGVsbG8=");
+  assert.equal(Object.prototype.hasOwnProperty.call(cmd, "requestedFilename"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(cmd, "url"), false);
+
+  bytes[0] = 0;
+  assert.equal(cmd.dataB64, "SGVsbG8=");
+
+  const empty = s.nextChunkCmd(new Uint8Array(0));
+  assert.equal(empty.seq, 1);
+  assert.equal(empty.length, 0);
+  assert.equal(empty.dataB64, "");
+});
+
+test("base64 known vectors and 512KiB boundary; oversized rejects", () => {
+  const { s, P } = openStreaming();
+  assert.equal(s.nextChunkCmd(new Uint8Array([0])).dataB64, "AA==");
+  assert.equal(s.nextChunkCmd(new Uint8Array([255])).dataB64, "/w==");
+  assert.equal(s.nextChunkCmd(new Uint8Array([0, 0])).dataB64, "AAA=");
+  // Drain window so boundary tests can run independently of outstanding.
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 });
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 1 });
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 2 });
+
+  const max = new Uint8Array(P.MAX_CHUNK_BYTES);
+  max[0] = 1;
+  max[P.MAX_CHUNK_BYTES - 1] = 2;
+  const maxCmd = s.nextChunkCmd(max);
+  assert.equal(maxCmd.length, P.MAX_CHUNK_BYTES);
+  assert.equal(typeof maxCmd.dataB64, "string");
+  assert.equal(maxCmd.dataB64.length, Math.ceil(P.MAX_CHUNK_BYTES / 3) * 4);
+
+  assert.throws(
+    () => s.nextChunkCmd(new Uint8Array(P.MAX_CHUNK_BYTES + 1)),
+    (err) => err instanceof RangeError
+  );
+  assert.throws(() => s.nextChunkCmd(null), TypeError);
+  assert.throws(() => s.nextChunkCmd(new ArrayBuffer(4)), TypeError);
+  assert.throws(() => s.nextChunkCmd([1, 2, 3]), TypeError);
+  assert.throws(() => s.nextChunkCmd("AA=="), TypeError);
+});
+
+test("window of four unacked; duplicate/unknown/wrong-sink acks do not free capacity", () => {
+  const { s, P } = openStreaming();
+  assert.equal(P.MAX_UNACKED, 4);
+  const issued = [];
+  for (let i = 0; i < 4; i++) {
+    const cmd = s.nextChunkCmd(new Uint8Array([i]));
+    assert.ok(cmd);
+    assert.equal(cmd.seq, i);
+    issued.push(cmd);
+  }
+  assert.equal(s.outstandingCount, 4);
+  assert.equal(s.nextChunkCmd(new Uint8Array([9])), null);
+  assert.equal(s.outstandingCount, 4);
+
+  const before = snapshotSession(s);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 }), true);
+  assert.equal(s.outstandingCount, 3);
+  // Duplicate ack
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 }), false);
+  assert.equal(s.outstandingCount, 3);
+  // Never issued
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 99 }), false);
+  assert.equal(s.outstandingCount, 3);
+  // Wrong sink
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "other", seq: 1 }), false);
+  assert.equal(s.outstandingCount, 3);
+  // Malformed
+  assert.equal(s.onAck({ type: "file-chunk", sinkId: "s1", seq: 1 }), false);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: -1 }), false);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 1.5 }), false);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: true }), false);
+  assert.equal(s.onAck(null), false);
+  assert.equal(s.outstandingCount, 3);
+  assert.equal(s.state, before.state);
+  assert.equal(s.sinkId, before.sinkId);
+
+  // Free remaining; no underflow past zero
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 1 }), true);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 2 }), true);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 3 }), true);
+  assert.equal(s.outstandingCount, 0);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 3 }), false);
+  assert.equal(s.outstandingCount, 0);
+
+  const next = s.nextChunkCmd(new Uint8Array([7]));
+  assert.equal(next.seq, 4);
+  assert.equal(s.outstandingCount, 1);
+  assert.ok(issued[0]);
+});
+
+test("nextChunkCmd only while streaming; seq advances only for issued commands", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  assert.equal(s.nextChunkCmd(new Uint8Array([1])), null);
+  s.onOpened({ type: "file-opened", sinkId: "s1", jobId: "j1", attemptToken: "a1" });
+  const c0 = s.nextChunkCmd(new Uint8Array([1]));
+  const c1 = s.nextChunkCmd(new Uint8Array([2]));
+  const c2 = s.nextChunkCmd(new Uint8Array([3]));
+  const c3 = s.nextChunkCmd(new Uint8Array([4]));
+  assert.equal(s.nextChunkCmd(new Uint8Array([5])), null);
+  assert.equal(c0.seq, 0);
+  assert.equal(c1.seq, 1);
+  assert.equal(c2.seq, 2);
+  assert.equal(c3.seq, 3);
+  // Backpressured call must not advance seq.
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 });
+  const c4 = s.nextChunkCmd(new Uint8Array([5]));
+  assert.equal(c4.seq, 4);
+});
+
+// ---------------------------------------------------------------------------
+// Commit / abort / terminal first-wins
+// ---------------------------------------------------------------------------
+
+test("commit waits for outstanding acks; abort allowed with outstanding", () => {
+  const { s } = openStreaming({ requestedFilename: "out.mp4", destinationDirectory: null });
+  s.nextChunkCmd(new Uint8Array([1]));
+  s.nextChunkCmd(new Uint8Array([2]));
+  assert.equal(s.outstandingCount, 2);
+  assert.equal(s.commitCmd(), null);
+
+  const abortWhileOut = s.abortCmd();
+  assertFrozenAllowlist(abortWhileOut, ["cmd", "sinkId", "jobId", "attemptToken"]);
+  assert.equal(abortWhileOut.cmd, "file-abort");
+  assert.equal(s.state, "streaming"); // building abort does not terminalize
+
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 });
+  s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 1 });
+  assert.equal(s.outstandingCount, 0);
+  const commit = s.commitCmd();
+  assert.deepEqual(commit, {
+    cmd: "file-commit",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
+  });
+  assert.equal(s.state, "streaming");
+  assert.equal(Object.prototype.hasOwnProperty.call(commit, "requestedFilename"), false);
+});
+
+test("onCommitted and onAborted require host ack; first valid terminal wins", () => {
+  const { s } = openStreaming({ requestedFilename: "out.mp4", destinationDirectory: null });
+  // Building commit/abort alone does not terminalize.
+  s.commitCmd();
+  s.abortCmd();
+  assert.equal(s.state, "streaming");
+
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "wrong",
+      file: "out.mp4",
+      bytes: 10,
+    }),
+    null
+  );
+  assert.equal(s.state, "streaming");
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "",
+      bytes: 10,
+    }),
+    null
+  );
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "out.mp4",
+      bytes: -1,
+    }),
+    null
+  );
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "out.mp4",
+      bytes: 1.5,
+    }),
+    null
+  );
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "out.mp4",
+      bytes: 3,
+      jobId: "stale",
+    }),
+    null
+  );
+
+  const committed = s.onCommitted({
+    type: "file-committed",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
+    file: "out.mp4",
+    bytes: 3,
+    secret: "SHOULD-NOT-LEAK",
+    path: "C:\\\\secret\\out.mp4",
+  });
+  assertFrozenAllowlist(committed, ["status", "bytes", "file"]);
+  assert.equal(committed.status, "committed");
+  assert.equal(committed.bytes, 3);
+  assert.equal(committed.file, "out.mp4");
+  assert.equal(s.state, "committed");
+
+  // Later terminals ignored.
+  assert.equal(
+    s.onAborted({ type: "file-aborted", sinkId: "s1" }),
+    null
+  );
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "other.mp4",
+      bytes: 9,
+    }),
+    null
+  );
+  assert.equal(s.state, "committed");
+  assert.equal(s.openCmd(), null);
+  assert.equal(s.nextChunkCmd(new Uint8Array([1])), null);
+  assert.equal(s.commitCmd(), null);
+  assert.equal(s.abortCmd(), null);
+  assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 }), false);
+  assert.equal(
+    s.onHostError({ type: "file-error", failureCategory: "local_io" }),
+    null
+  );
+});
+
+test("abort acknowledgement can win when commit was only requested", () => {
+  const { s } = openStreaming({ requestedFilename: "out.mp4", destinationDirectory: null });
+  s.commitCmd();
+  const aborted = s.onAborted({ type: "file-aborted", sinkId: "s1" });
+  assert.ok(aborted);
+  assert.equal(s.state, "aborted");
+  assert.equal(
+    s.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "out.mp4",
+      bytes: 0,
+    }),
+    null
+  );
+  assert.equal(s.state, "aborted");
+  assert.equal(s.abortCmd(), null);
+  assert.equal(s.commitCmd(), null);
+});
+
+test("stale aborted frames cause zero mutation", () => {
+  const { s } = openStreaming();
+  const before = snapshotSession(s);
+  assert.equal(s.onAborted(null), null);
+  assert.equal(s.onAborted({ type: "file-aborted", sinkId: "other" }), null);
+  assert.equal(s.onAborted({ type: "file-abort", sinkId: "s1" }), null);
+  assert.deepEqual(snapshotSession(s), before);
+});
+
+// ---------------------------------------------------------------------------
+// Host error privacy / stale identity
+// ---------------------------------------------------------------------------
+
+test("host error strips secrets, normalizes category, rejects stale identity", () => {
+  const { s } = openStreaming();
+  const before = snapshotSession(s);
+
+  assert.equal(
+    s.onHostError({
+      type: "file-error",
+      sinkId: "old-sink",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "timeout",
+      reason: "SECRET-PATH",
+    }),
+    null
+  );
+  assert.deepEqual(snapshotSession(s), before);
+
+  assert.equal(
+    s.onHostError({
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "other-job",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    }),
+    null
+  );
+  assert.deepEqual(snapshotSession(s), before);
+
+  assert.equal(
+    s.onHostError({
+      type: "pget-fallback",
+      sinkId: "s1",
+      failureCategory: "local_io",
+    }),
+    null
+  );
+
+  const out = s.onHostError({
+    type: "file-error",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
+    failureCategory: "timeout",
+    reason: "disk full at C:\\\\Users\\secret\\file.mp4",
+    rawError: "EIO boom",
+    path: "C:\\\\Users\\secret\\file.mp4",
+    isSaturation: true,
+    invokeFirefox: true,
+    secret: "token",
+  });
+  assertFrozenAllowlist(out, [
+    "failureCategory",
+    "invokeFirefox",
+    "isSaturation",
+  ]);
+  assert.deepEqual(out, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(s.state, "failed");
+  // Exactly once
+  assert.equal(
+    s.onHostError({
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    }),
+    null
+  );
+  assert.equal(s.state, "failed");
+  assert.equal(JSON.stringify(out).includes("SECRET"), false);
+  assert.equal(JSON.stringify(out).includes("secret"), false);
+  assert.equal(JSON.stringify(out).includes("disk full"), false);
+});
+
+test("open-state host error matches attempt identity without sink", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  assert.equal(
+    s.onHostError({
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "stale",
+      failureCategory: "local_io",
+      reason: "bad-dir",
+    }),
+    null
+  );
+  assert.equal(s.state, "open");
+  const out = s.onHostError({
+    type: "file-error",
+    jobId: "j1",
+    attemptToken: "a1",
+    failureCategory: "local_io",
+    reason: "bad-dir",
+  });
+  assert.deepEqual(out, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(s.state, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// Pure pget builders
+// ---------------------------------------------------------------------------
+
+test("buildPgetCmd and buildPgetSingleCmd exact shapes; ignore secrets without touching getters", () => {
+  const { buildPgetCmd, buildPgetSingleCmd } = loadProtocol();
+  let cookieTouches = 0;
+  let headerTouches = 0;
+  let referrerTouches = 0;
+  let pageTitleTouches = 0;
+  const intent = {
+    requestedFilename: FLOREN,
+    destinationDirectory: "D:\\\\Vids",
+    saveMode: "save-as",
+    userSelectedFirefox: false,
+    userActionToken: "t",
+    createdAt: "t0",
+  };
+  Object.defineProperty(intent, "cookie", {
+    enumerable: true,
+    get() {
+      cookieTouches++;
+      return "a=b";
+    },
+  });
+  Object.defineProperty(intent, "headers", {
+    enumerable: true,
+    get() {
+      headerTouches++;
+      return { Authorization: "Bearer x", Cookie: "a=b" };
+    },
+  });
+  Object.defineProperty(intent, "referrer", {
+    enumerable: true,
+    get() {
+      referrerTouches++;
+      return "https://evil";
+    },
+  });
+  Object.defineProperty(intent, "pageTitle", {
+    enumerable: true,
+    get() {
+      pageTitleTouches++;
+      return "Should Not Rank";
+    },
+  });
+  Object.defineProperty(intent, "sourceContext", {
+    enumerable: true,
+    get() {
+      headerTouches++;
+      return { url: "https://cdn/other.mp4" };
+    },
+  });
+
+  const pget = buildPgetCmd({
+    jobId: "j1",
+    attemptToken: "a1",
+    intent,
+    url: "https://cdn/x.mp4?sig=SECRET",
+    maxConnections: 4,
+  });
+  assertFrozenAllowlist(pget, [
+    "cmd",
+    "id",
+    "attemptToken",
+    "urls",
+    "name",
+    "dir",
+    "maxConnections",
+  ]);
+  assert.deepEqual(pget, {
+    cmd: "pget",
+    id: "j1",
+    attemptToken: "a1",
+    urls: ["https://cdn/x.mp4?sig=SECRET"],
+    name: FLOREN,
+    dir: "D:\\\\Vids",
+    maxConnections: 4,
+  });
+  assert.equal(Object.isFrozen(pget.urls), true);
+
+  const single = buildPgetSingleCmd({
+    jobId: "j1",
+    attemptToken: "a2",
+    intent,
+    url: "https://cdn/x.mp4?sig=SECRET",
+  });
+  assertFrozenAllowlist(single, [
+    "cmd",
+    "id",
+    "attemptToken",
+    "urls",
+    "name",
+    "dir",
+    "maxConnections",
+  ]);
+  assert.deepEqual(single, {
+    cmd: "pget-single",
+    id: "j1",
+    attemptToken: "a2",
+    urls: ["https://cdn/x.mp4?sig=SECRET"],
+    name: FLOREN,
+    dir: "D:\\\\Vids",
+    maxConnections: 1,
+  });
+
+  assert.equal(cookieTouches, 0);
+  assert.equal(headerTouches, 0);
+  assert.equal(referrerTouches, 0);
+  assert.equal(pageTitleTouches, 0);
+
+  // Fresh objects each call
+  const again = buildPgetCmd({
+    jobId: "j1",
+    attemptToken: "a1",
+    intent,
+    url: "https://cdn/x.mp4?sig=SECRET",
+    maxConnections: 4,
+  });
+  assert.notEqual(again, pget);
+  assert.notEqual(again.urls, pget.urls);
+});
+
+test("builders reject malformed identities/intent/url/concurrency", () => {
+  const { buildPgetCmd, buildPgetSingleCmd } = loadProtocol();
+  const goodIntent = {
+    requestedFilename: FLOREN,
+    destinationDirectory: null,
+  };
+  const good = {
+    jobId: "j1",
+    attemptToken: "a1",
+    intent: goodIntent,
+    url: "https://cdn/x.mp4",
+    maxConnections: 2,
+  };
+
+  assert.throws(() => buildPgetCmd({ ...good, jobId: "" }));
+  assert.throws(() => buildPgetCmd({ ...good, attemptToken: "  " }));
+  assert.throws(() => buildPgetCmd({ ...good, url: "" }));
+  assert.throws(() => buildPgetCmd({ ...good, url: 12 }));
+  assert.throws(() => buildPgetCmd({ ...good, maxConnections: 0 }));
+  assert.throws(() => buildPgetCmd({ ...good, maxConnections: -1 }));
+  assert.throws(() => buildPgetCmd({ ...good, maxConnections: 1.5 }));
+  assert.throws(() => buildPgetCmd({ ...good, maxConnections: true }));
+  assert.throws(() =>
+    buildPgetCmd({
+      ...good,
+      intent: { requestedFilename: "", destinationDirectory: null },
+    })
+  );
+  assert.throws(() =>
+    buildPgetCmd({
+      ...good,
+      intent: { requestedFilename: FLOREN, destinationDirectory: "" },
+    })
+  );
+  assert.throws(() => buildPgetCmd({ ...good, intent: null }));
+  assert.throws(() => buildPgetSingleCmd({ ...good, url: null }));
+
+  const defaultDir = buildPgetCmd({
+    ...good,
+    intent: { requestedFilename: FLOREN },
+  });
+  assert.equal(defaultDir.dir, null);
+});
+
+// ---------------------------------------------------------------------------
+// Source hygiene greps (module must stay pure)
+// ---------------------------------------------------------------------------
+
+test("file-sink-protocol source contains no downloads/firefox/storage/privacy leaks", () => {
+  const abs = path.join(mediaCatcherRoot, "lib", "file-sink-protocol.js");
+  const src = fs.readFileSync(abs, "utf8");
+  const forbidden = [
+    /browser\.downloads/,
+    /downloads\.download/,
+    /firefoxDownload/,
+    /chrome\.storage/,
+    /browser\.storage/,
+    /localStorage/,
+    /sessionStorage/,
+    /indexedDB/,
+    /document\./,
+    /window\./,
+    /setTimeout/,
+    /setInterval/,
+    /XMLHttpRequest/,
+    /fetch\s*\(/,
+    /pageTitle/,
+    /rankFilename|filename-ranker|McFilenameRanker/,
+    /cookie/i,
+    /Authorization/,
+    /referr?er/i,
+    /userAgent/,
+    /nativeMessaging|runtime\.connectNative|port\.postMessage/,
+  ];
+  for (const re of forbidden) {
+    assert.equal(re.test(src), false, `forbidden pattern ${re} found in source`);
+  }
+});
