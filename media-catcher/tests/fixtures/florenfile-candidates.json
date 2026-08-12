@@ -1,0 +1,13 @@
+{
+  "pageUrl": "https://florenfile.com/qnzjnabo3jec/11238-makemebi.net.mp4.html",
+  "providerSite": "florenfile.com",
+  "knownExtension": ".mp4",
+  "candidates": [
+    { "kind": "document-title", "value": "Florenfile.com - Secure Cloud Storage" },
+    { "kind": "og-title", "value": "Florenfile.com - Secure Cloud Storage" },
+    { "kind": "page-url", "value": "/qnzjnabo3jec/11238-makemebi.net.mp4.html" },
+    { "kind": "media-url", "value": "video.mp4" },
+    { "kind": "visible-filename", "value": "11238-makemebi.net.mp4" }
+  ],
+  "expectedProposedFilename": "11238-makemebi.net.mp4"
+}
