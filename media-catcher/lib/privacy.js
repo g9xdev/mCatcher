@@ -14,12 +14,18 @@
   function () {
     "use strict";
 
-    var TERMINAL_STATES = {
-      completed: true,
-      failed: true,
-      cancelled: true,
-      handed_to_firefox: true,
-    };
+    // Null-prototype set: only exact own keys are terminal. Object.prototype
+    // names (constructor, toString, …) must never count as terminal.
+    var TERMINAL_STATES = Object.create(null);
+    TERMINAL_STATES.completed = true;
+    TERMINAL_STATES.failed = true;
+    TERMINAL_STATES.cancelled = true;
+    TERMINAL_STATES.handed_to_firefox = true;
+
+    function isTerminalState(state) {
+      return typeof state === "string" &&
+        Object.prototype.hasOwnProperty.call(TERMINAL_STATES, state);
+    }
 
     /** Module-private: ephemeral objects already cleared on a terminal transition. */
     var clearedEphemerals = typeof WeakSet === "function" ? new WeakSet() : null;
@@ -114,6 +120,12 @@
       }
     }
 
+    // Secret-bearing query/fragment parameter names (case-insensitive).
+    // Matched only after ?, &, or # so ordinary text like "HTTP 429? retry later"
+    // and filenames with a harmless "#" stay friendly.
+    var SECRET_PARAM_RE =
+      /[?#&](?:token|access_token|auth|authorization|key|api_key|session|cookie|sig|signature|policy|expires|expiry|x-amz-[^=&#\s]*)=/i;
+
     /**
      * True when a popup-facing string carries URL query/fragment, userinfo, or
      * secret-bearing header syntax. Allowlisted field names do not authorize
@@ -126,11 +138,15 @@
           /^(?:Cookie|Set-Cookie|Authorization|Proxy-Authorization)\s*:/i.test(s)) {
         return true;
       }
-      // Absolute http(s) with userinfo, query, or fragment material.
-      if (/https?:\/\//i.test(s)) {
-        if (/https?:\/\/[^/\s"'<>]*@/i.test(s)) return true;
-        if (/https?:\/\/[^\s"'<>?#]*[?#]/i.test(s)) return true;
-      }
+      // Secret-bearing params in absolute, scheme-relative, relative, or bare strings.
+      if (SECRET_PARAM_RE.test(s)) return true;
+      // Scheme-relative network refs (//host/…, //user:pass@host/…) with
+      // userinfo, query, or fragment — same risk class as absolute URLs.
+      if (/\/\/[^/\s"'<>]*@/i.test(s)) return true;
+      if (/\/\/[^\s"'<>?#]*[?#]/i.test(s)) return true;
+      // Any absolute scheme:// with userinfo, query, or fragment material.
+      if (/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s"'<>]*@/i.test(s)) return true;
+      if (/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'<>?#]*[?#]/i.test(s)) return true;
       return false;
     }
 
@@ -523,7 +539,22 @@
       return s;
     }
 
+    function manualRedactSchemeRelative(url) {
+      var s = String(url);
+      var hashIdx = s.indexOf("#");
+      if (hashIdx !== -1) s = s.slice(0, hashIdx);
+      var qIdx = s.indexOf("?");
+      if (qIdx !== -1) s = s.slice(0, qIdx);
+      // Strip userinfo: //user:pass@host → //host
+      s = s.replace(/^\/\/([^/@]+@)/, "//");
+      if (!s || /[?#]/.test(s) || /^\/\/[^/]*@/.test(s)) {
+        return "[redacted]";
+      }
+      return s;
+    }
+
     function redactUrlForLog(url) {
+      // Primitive strings only — never coerce objects/arrays via String().
       if (typeof url !== "string" || url.length === 0) return "[redacted]";
 
       // Absolute http(s): strip userinfo, query, fragment via URL when available.
@@ -542,6 +573,11 @@
           // fall through to manual strip
         }
         return manualRedactAbsoluteHttp(url);
+      }
+
+      // Scheme-relative: //host/path?... — strip userinfo, query, fragment.
+      if (/^\/\//.test(url)) {
+        return manualRedactSchemeRelative(url);
       }
 
       // Relative or other primitive strings: strip query and fragment only.
@@ -589,7 +625,7 @@
     }
 
     function clearEphemeralOnTerminal(job, state) {
-      if (typeof state !== "string" || !TERMINAL_STATES[state]) {
+      if (!isTerminalState(state)) {
         return false;
       }
       if (job == null || (typeof job !== "object" && typeof job !== "function")) {

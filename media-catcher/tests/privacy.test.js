@@ -721,3 +721,224 @@ test("redactUrlForLog manual fallback never echoes secrets when URL is absent", 
   assert.equal(String(badAbs).includes("SECRET"), false);
   assert.equal(String(badAbs).includes("token="), false);
 });
+
+// --- Task-19 fix2: exact terminal states + signed-string redaction ---
+
+function assertPopupNoLeak(view, sentinels) {
+  const raw = JSON.stringify(view);
+  for (const s of sentinels) {
+    assert.equal(raw.includes(s), false, "leak in serialized popup: " + s);
+  }
+  // Walk all top-level and nested string fields.
+  function walk(obj, pathLabel) {
+    if (obj == null || typeof obj !== "object") return;
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      const p = pathLabel + "." + k;
+      if (typeof v === "string") {
+        for (const s of sentinels) {
+          assert.equal(v.includes(s), false, "leak in " + p + ": " + s);
+        }
+      } else if (v && typeof v === "object") {
+        walk(v, p);
+      }
+    }
+  }
+  walk(view, "view");
+}
+
+test("clearEphemeralOnTerminal recognizes only the four exact terminal states", () => {
+  const TERMINALS = ["completed", "failed", "cancelled", "handed_to_firefox"];
+  for (const state of TERMINALS) {
+    const e = P.createEphemeral("https://cdn/f?token=x", { Cookie: COOKIE });
+    const cleared = P.clearEphemeralOnTerminal({ ephemeral: e }, state);
+    assert.equal(cleared, true, "terminal " + state + " must clear");
+    assert.equal(e.mediaUrl, null, state);
+    assert.equal(e.requestHeaders, null, state);
+  }
+});
+
+test("clearEphemeralOnTerminal rejects inherited Object names and near-miss states", () => {
+  const NON_TERMINALS = [
+    // Inherited truthy Object.prototype names (the confirmed defect).
+    "constructor",
+    "toString",
+    "valueOf",
+    "__proto__",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+    // Near-miss / case / whitespace.
+    "Completed",
+    "FAILED",
+    "Cancelled",
+    "HANDED_TO_FIREFOX",
+    " completed",
+    "completed ",
+    " completed ",
+    "complete",
+    "fail",
+    "cancel",
+    "handed-to-firefox",
+    "handed_to_firefox ",
+    "running",
+    "queued",
+    "paused",
+    "",
+    "true",
+    "prototype",
+  ];
+  for (const state of NON_TERMINALS) {
+    const e = P.createEphemeral("https://cdn/f?token=x", { Cookie: COOKIE });
+    const cleared = P.clearEphemeralOnTerminal({ ephemeral: e }, state);
+    assert.equal(cleared, false, "non-terminal must return false: " + JSON.stringify(state));
+    assert.equal(e.mediaUrl, "https://cdn/f?token=x", "must preserve URL for " + JSON.stringify(state));
+    assert.equal(e.requestHeaders.Cookie, COOKIE, "must preserve headers for " + JSON.stringify(state));
+  }
+
+  // Non-string states also non-terminal.
+  for (const state of [null, undefined, 1, true, false, {}, ["completed"]]) {
+    const e = P.createEphemeral("https://cdn/f?token=x", null);
+    assert.equal(P.clearEphemeralOnTerminal({ ephemeral: e }, state), false);
+    assert.equal(e.mediaUrl, "https://cdn/f?token=x");
+  }
+
+  // Controller probe: constructor must not clear.
+  const e = P.createEphemeral("https://cdn/f?token=x", null);
+  assert.equal(P.clearEphemeralOnTerminal({ ephemeral: e }, "constructor"), false);
+  assert.equal(e.mediaUrl, "https://cdn/f?token=x");
+});
+
+test("projectPopupJob redacts scheme-relative and relative signed material", () => {
+  // Controller probe.
+  const view = P.projectPopupJob({
+    id: "j",
+    state: "failed",
+    error: "GET //cdn.example/f.mp4?token=SECRET_SCHEME_REL",
+    progress: { note: "/f?X-Amz-Signature=SECRET_REL" },
+  });
+  assertPopupNoLeak(view, ["SECRET_SCHEME_REL", "SECRET_REL", "token=", "X-Amz-Signature"]);
+  assert.equal(view.error, "Download error");
+  assert.equal(Object.prototype.hasOwnProperty.call(view, "progress") &&
+    Object.prototype.hasOwnProperty.call(view.progress, "note"), false);
+
+  // Scheme-relative with userinfo.
+  const uinfo = P.projectPopupJob({
+    id: "u",
+    state: "failed",
+    error: "GET //user:SECRET_PASS@cdn.example/f.mp4",
+  });
+  assertPopupNoLeak(uinfo, ["SECRET_PASS", "user:"]);
+  assert.equal(uinfo.error, "Download error");
+
+  // Relative / bare secret-bearing query params (case-insensitive), after ?, &, or #.
+  const secretParams = [
+    "token", "access_token", "auth", "authorization", "key", "api_key",
+    "session", "cookie", "sig", "signature", "policy", "expires", "expiry",
+    "X-Amz-Signature", "X-Amz-Credential", "x-amz-security-token",
+  ];
+  for (const param of secretParams) {
+    const sentinel = "SECRET_PARAM_" + param.replace(/[^A-Za-z0-9]/g, "_");
+    const forms = [
+      "/path?" + param + "=" + sentinel,
+      "/path?other=1&" + param + "=" + sentinel,
+      "/path#" + param + "=" + sentinel,
+      "f.mp4?" + param.toUpperCase() + "=" + sentinel,
+      "note: rel?" + param.toLowerCase() + "=" + sentinel,
+    ];
+    for (const bad of forms) {
+      const errView = P.projectPopupJob({ id: "e", state: "failed", error: bad });
+      assertPopupNoLeak(errView, [sentinel]);
+      assert.equal(errView.error, "Download error", bad);
+
+      const optView = P.projectPopupJob({
+        id: "o",
+        state: "running",
+        name: bad,
+        progress: { note: bad, stage: "dl" },
+        convert: { note: bad, codec: "h264" },
+      });
+      assertPopupNoLeak(optView, [sentinel]);
+      if (Object.prototype.hasOwnProperty.call(optView, "name")) {
+        assert.equal(String(optView.name).includes(sentinel), false);
+      }
+      if (optView.progress && Object.prototype.hasOwnProperty.call(optView.progress, "note")) {
+        assert.equal(String(optView.progress.note).includes(sentinel), false);
+      }
+    }
+  }
+
+  // Absolute non-http schemes with query/userinfo/fragment are suspicious.
+  for (const bad of [
+    "ftp://cdn.example/f?token=SECRET_FTP",
+    "blob:https://x?sig=SECRET_BLOB",
+    "custom://host/path#SECRET_FRAG_SCHEME",
+    "s3://bucket/key?X-Amz-Signature=SECRET_S3",
+  ]) {
+    const v = P.projectPopupJob({ id: "s", state: "failed", error: bad });
+    assertPopupNoLeak(v, ["SECRET_"]);
+    assert.equal(v.error, "Download error", bad);
+  }
+});
+
+test("projectPopupJob preserves ordinary friendly text without signed material", () => {
+  const cases = [
+    { error: "HTTP 429? retry later" },
+    { error: "Helper unavailable" },
+    { name: "clip#1 final.mp4" },
+    { savedPath: "C:\\Users\\me\\Videos\\file.mp4" },
+    { savedPath: "D:\\Downloads\\out#draft.mp4" },
+    { providerKey: "florenfile.com" },
+    { mergeCommand: "ffmpeg -i in.mp4 -c copy out.mp4" },
+    { fixCommand: "ffmpeg -err_detect ignore_err -i broken.mp4 fixed.mp4" },
+    { progress: { note: "retry later", stage: "wait" } },
+    { convert: { note: "kept original", codec: "h264" } },
+  ];
+  for (const partial of cases) {
+    const job = Object.assign({ id: "ok", state: "running" }, partial);
+    const view = P.projectPopupJob(job);
+    const raw = JSON.stringify(view);
+    assert.equal(raw.includes("Download error"), false, JSON.stringify(partial));
+    if (partial.error) assert.equal(view.error, partial.error);
+    if (partial.name) assert.equal(view.name, partial.name);
+    if (partial.savedPath) assert.equal(view.savedPath, partial.savedPath);
+    if (partial.providerKey) assert.equal(view.providerKey, partial.providerKey);
+    if (partial.mergeCommand) assert.equal(view.mergeCommand, partial.mergeCommand);
+    if (partial.fixCommand) assert.equal(view.fixCommand, partial.fixCommand);
+    if (partial.progress) {
+      assert.equal(view.progress.note, partial.progress.note);
+      assert.equal(view.progress.stage, partial.progress.stage);
+    }
+    if (partial.convert) {
+      assert.equal(view.convert.note, partial.convert.note);
+      assert.equal(view.convert.codec, partial.convert.codec);
+    }
+  }
+});
+
+test("redactUrlForLog hardens scheme-relative URLs without leaking or coercing", () => {
+  const schemeRel = P.redactUrlForLog("//cdn.example/f.mp4?token=SECRET_SCHEME_REL#frag");
+  assert.equal(String(schemeRel).includes("SECRET"), false);
+  assert.equal(String(schemeRel).includes("token="), false);
+  assert.equal(String(schemeRel).includes("#frag"), false);
+  if (schemeRel !== "[redacted]") {
+    assert.equal(schemeRel.includes("?"), false);
+    assert.equal(schemeRel.includes("#"), false);
+    // Acceptable safe form: //cdn.example/f.mp4 or similar path-only.
+    assert.match(schemeRel, /^\/\/cdn\.example\/f\.mp4$/);
+  }
+
+  const withUser = P.redactUrlForLog("//user:SECRET_PASS@cdn.example/a?token=SECRET_Q");
+  assert.equal(String(withUser).includes("SECRET"), false);
+  assert.equal(String(withUser).includes("user:"), false);
+  assert.equal(String(withUser).includes("token="), false);
+  if (withUser !== "[redacted]") {
+    assert.equal(withUser.includes("@"), false);
+    assert.equal(withUser.includes("?"), false);
+  }
+
+  // No object coercion.
+  assert.equal(P.redactUrlForLog({ href: "//cdn.example/f?token=SECRET_OBJ" }), "[redacted]");
+  assert.equal(P.redactUrlForLog(["//x?token=SECRET_ARR"]), "[redacted]");
+});
