@@ -3717,3 +3717,110 @@ def test_hostile_negative_getsize_completed_omits_metadata_pair(tmp_path, monkey
         assert res.get("bytes") != -1
     finally:
         shutdown_server(httpd)
+
+
+def test_hostile_str_subclass_token_noops_set_limit_and_cancel(monkeypatch):
+    """Hostile str subclass (__eq__ always True) must not fence-match for set-limit/cancel.
+
+    Only exact built-in str tokens act. Present subclass tokens no-op: no mutation,
+    no ack, no cancel/stop. Omitted attemptToken remains the legacy path.
+    """
+    import mchost.downloads as d
+
+    class AlwaysEq(str):
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return str.__hash__(self)
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    jid = "jobHostileTok"
+    op = _make_lease_op(gen=0, limit=1, cap=2)
+    op["attemptToken"] = "live-token"
+    d._PGET[jid] = op
+    try:
+        acks_before = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+        for tok in (AlwaysEq("live-token"), AlwaysEq("wrong"), AlwaysEq("")):
+            d.handle_pget_set_limit({
+                "id": jid,
+                "attemptToken": tok,
+                "maxConnections": 0,
+                "providerGeneration": 1,
+            })
+        time.sleep(0.02)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+        assert op["maxConnections"] == 1
+        assert op.get("cancel_requested") is False
+        assert not op["stop"].is_set()
+
+        for tok in (AlwaysEq("live-token"), AlwaysEq("x")):
+            d._pget_cancel({"id": jid, "attemptToken": tok})
+        time.sleep(0.02)
+        assert op.get("cancel_requested") is False
+        assert not op["stop"].is_set()
+
+        # Stored hostile token also fails exact primitive match.
+        op["attemptToken"] = AlwaysEq("live-token")
+        d.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": "live-token",
+            "maxConnections": 0,
+            "providerGeneration": 2,
+        })
+        time.sleep(0.02)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+        d._pget_cancel({"id": jid, "attemptToken": "live-token"})
+        assert op.get("cancel_requested") is False
+        assert not op["stop"].is_set()
+    finally:
+        d._PGET.pop(jid, None)
+
+
+def test_hostile_int_subclass_bytes_omits_metadata_pair(tmp_path, monkeypatch):
+    """Hostile int subclass (-1 with __lt__ always False) must not emit as bytes.
+
+    type(value) is int and value >= 0 required; invalid subclass omits file+bytes
+    without revoking completed/committed success. Valid plain int still returned.
+    """
+    import mchost.downloads as d
+
+    class AlwaysNonNeg(int):
+        def __lt__(self, other):
+            return False
+
+        def __ge__(self, other):
+            return True
+
+    path = str(tmp_path / "h.bin")
+    with open(path, "wb") as f:
+        f.write(b"ab")
+
+    bad = AlwaysNonNeg(-1)
+    assert isinstance(bad, int) and (bad < 0) is False  # demonstrates the escape
+    assert d._pget_nonneg_int_bytes(bad) is None
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: bad)
+    monkeypatch.setattr(d.os.path, "isfile", lambda p: True)
+    assert d._pget_terminal_file_bytes({"final_path": path}) == (None, None)
+
+    sent = []
+    monkeypatch.setattr(
+        d, "_h",
+        lambda: type("H", (), {"send": staticmethod(lambda m: sent.append(dict(m)))})(),
+    )
+    d._pget_send_result(
+        "idH", "tok", "completed", "multi-range", None, "committed",
+        file=path, bytes=bad,
+    )
+    msg = sent[-1]
+    assert msg["status"] == "completed"
+    assert msg["partState"] == "committed"
+    assert "file" not in msg and "bytes" not in msg
+
+    good = d._pget_nonneg_int_bytes(7)
+    assert good == 7 and type(good) is int
