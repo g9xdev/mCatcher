@@ -781,6 +781,67 @@ test("snapshot is deep-frozen deterministic and reflects state transitions", () 
   assert.deepEqual(snap1.parkedProbeIds, ["a-probe", "z-probe"]);
 });
 
+test("snapshot represents hostile jobIds as own enumerable data keys without prototype mutation", () => {
+  // Mutation: ordinary open[id]=n / limits[id]=n loses __proto__ and can pollute Object.prototype.
+  const hostileIds = ["__proto__", "constructor", "prototype", "toString", "hasOwnProperty", "valueOf"];
+  const g = gate("hostile.com");
+  const protoBefore = Object.getPrototypeOf({});
+  const polluteKey = "__hostile_gate_pollute__";
+  assert.equal(Object.prototype[polluteKey], undefined);
+
+  hostileIds.forEach(function (id, idx) {
+    g.registerJobLimit(id, idx + 1);
+    g.noteNativeOpen(id, idx + 10);
+  });
+
+  const snap = g.snapshot();
+  assert.ok(Object.isFrozen(snap.nativeOpen));
+  assert.ok(Object.isFrozen(snap.jobLimits));
+  // Must not have rewritten Object.prototype via __proto__ assignment.
+  assert.equal(Object.getPrototypeOf({}), protoBefore);
+  assert.equal(Object.prototype[polluteKey], undefined);
+  assert.notEqual(Object.getPrototypeOf(snap.nativeOpen), null);
+  // Null-prototype is also acceptable, but ordinary frozen records must stay clean.
+  assert.equal(Object.prototype.isPrototypeOf(snap.nativeOpen) || Object.getPrototypeOf(snap.nativeOpen) === null, true);
+
+  hostileIds.forEach(function (id, idx) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(snap.nativeOpen, id),
+      true,
+      "nativeOpen must own " + id
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(snap.jobLimits, id),
+      true,
+      "jobLimits must own " + id
+    );
+    assert.equal(snap.nativeOpen[id], idx + 10);
+    assert.equal(snap.jobLimits[id], idx + 1);
+    assert.equal(
+      Object.getOwnPropertyDescriptor(snap.nativeOpen, id).enumerable,
+      true
+    );
+    assert.equal(
+      Object.getOwnPropertyDescriptor(snap.jobLimits, id).enumerable,
+      true
+    );
+  });
+
+  // Freeze: cannot rewrite hostile own keys after snapshot.
+  assert.throws(function () {
+    snap.nativeOpen["__proto__"] = 999;
+  });
+  assert.throws(function () {
+    snap.jobLimits["constructor"] = 999;
+  });
+  assert.equal(snap.nativeOpen["__proto__"], 10);
+  assert.equal(snap.jobLimits["constructor"], 2);
+  // Object.prototype must remain unpolluted after attempted writes.
+  assert.equal(Object.prototype[polluteKey], undefined);
+  assert.equal(Object.getOwnPropertyNames(Object.prototype).indexOf("__proto__") === -1 ||
+    typeof Object.getOwnPropertyDescriptor(Object.prototype, "__proto__") === "object", true);
+});
+
 test("provider-gate dual-export assigns locked McProviderGate global with identity", () => {
   // Mutation: else-branch only assigns one side, or creates two distinct objects.
   const abs = path.join(mediaCatcherRoot, "lib", "provider-gate.js");
