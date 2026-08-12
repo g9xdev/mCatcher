@@ -1404,6 +1404,13 @@
           (snapF.state === "saturated" || snapF.state === "recovering") &&
           snapF.ownerJobId === job.id
         ) {
+          // local_io: never saturation/Firefox. Advance authenticated owner generation,
+          // wake at most one eligible waiter, put owner in needs_user (ephemeral retained).
+          // Reuses completeProviderOwner — same ordering as other owner terminal paths.
+          if (category === "local_io") {
+            completeProviderOwner(job, attemptToken, "needs_user");
+            return;
+          }
           var waiter = oldestEligibleWaiter(job.providerKey);
           if (waiter) {
             // Owner ends; wake chain selects next. Permanent/transient both release owner.
@@ -1411,18 +1418,6 @@
             return;
           }
           // No waiter: ordinary bounded retry / needs_user. Never leave exhausted owner retrying.
-          if (category === "local_io") {
-            assertRunningOwnsSlot(job);
-            job.state = "needs_user";
-            job.stateVersion += 1;
-            job.attemptToken = null;
-            clearRetryDeadline(job);
-            releaseSlotIfHeld(job);
-            removeFromQueue(job);
-            gateF.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
-            drain();
-            return;
-          }
           if (FailureClassify.isSaturationCandidate(category)) {
             assertRunningOwnsSlot(job);
             if (job.retryRemaining > 0) {
@@ -1493,16 +1488,31 @@
 
     /**
      * Move due retry_backoff jobs to queued, then central drain.
+     * Collect all due jobs first and sort by (retryDeadlineMs asc, creation order)
+     * so staggered same-provider deadlines are deterministic after a large clock jump.
+     * Central drain still enforces provider FIFO / global round-robin.
      * Invalid / non-finite nowMs is a no-op. Duplicate ticks after admission
      * cannot double-admit (state is no longer retry_backoff). No real timers.
      */
     function tick(nowMs) {
       if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) return;
       lastTickMs = nowMs;
+      var due = [];
       jobs.forEach(function (job) {
         if (job.state !== "retry_backoff") return;
         if (job.retryDeadlineMs == null) return;
         if (nowMs < job.retryDeadlineMs) return;
+        due.push(job);
+      });
+      due.sort(function (a, b) {
+        if (a.retryDeadlineMs !== b.retryDeadlineMs) {
+          return a.retryDeadlineMs - b.retryDeadlineMs;
+        }
+        return jobOrder.indexOf(a.id) - jobOrder.indexOf(b.id);
+      });
+      for (var di = 0; di < due.length; di++) {
+        var job = due[di];
+        if (job.state !== "retry_backoff") continue;
         // Due: re-enter provider FIFO for central admission (fresh token on admit).
         clearRetryDeadline(job);
         job.state = "queued";
@@ -1511,7 +1521,7 @@
         ensureProvider(job.providerKey);
         var q = providerQueues.get(job.providerKey);
         if (q.indexOf(job.id) === -1) q.push(job.id);
-      });
+      }
       drain();
     }
 
@@ -1520,12 +1530,18 @@
      * Active running/pausing work records cancelRequested, denies new permits,
      * preserves the attempt token until matching cancel/terminal acknowledgement,
      * and releases the slot exactly once when acknowledged.
+     * During explicit Firefox handoff, records a late cancel request (not a silent
+     * no-op) so adapter rejection can settle as cancelled.
      */
     function cancel(jobId) {
       var job = jobs.get(jobId);
       if (!job) return;
       if (isTrulyTerminal(job.state)) return;
-      if (job.state === "handing_off_firefox") return;
+      if (job.state === "handing_off_firefox" || job.firefoxHandoffInFlight === true) {
+        // Late cancel during explicit handoff: record only; settlement decides terminal.
+        job.cancelRequested = true;
+        return;
+      }
 
       if (job.state === "running" || job.state === "pausing_provider") {
         if (job.cancelRequested === true) return;
@@ -1680,12 +1696,69 @@
     }
 
     /**
+     * Settle a failed/aborted explicit Firefox handoff after the one-time token
+     * was consumed. Never leaves handing_off_firefox / firefoxHandoffInFlight stuck.
+     * Late cancel → cancelled (ephemeral cleared); otherwise needs_user (ephemeral retained).
+     * Best-effort owner generation release if still authenticated owner.
+     */
+    function settleFailedFirefoxHandoff(job) {
+      if (!job) return;
+      if (job.state === "handed_to_firefox") return;
+      if (isTrulyTerminal(job.state) && job.state !== "handing_off_firefox") {
+        job.firefoxHandoffInFlight = false;
+        return;
+      }
+
+      removeFromQueue(job);
+      removeFromWaitQueue(job);
+      clearRetryDeadline(job);
+      releaseSlotIfHeld(job);
+      job.attemptToken = null;
+      job.firefoxHandoffInFlight = false;
+
+      // Best-effort: if we still look like the gate owner, advance generation without
+      // waking waiters from a non-advanced path (completeOwner is idempotent).
+      try {
+        var gateS = getGate(job.providerKey);
+        var snapS = gateS.snapshot();
+        if (
+          (snapS.state === "saturated" || snapS.state === "recovering") &&
+          snapS.ownerJobId === job.id
+        ) {
+          gateS.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
+        }
+      } catch (errS) {
+        // Gate recovery must not prevent local settlement.
+      }
+
+      if (job.cancelRequested === true) {
+        job.state = "cancelled";
+        job.stateVersion += 1;
+        clearEphemeralOnce(job);
+      } else {
+        job.state = "needs_user";
+        job.stateVersion += 1;
+        // Ephemeral retained for manualRetry / later explicit handoff.
+      }
+      drain();
+    }
+
+    /**
      * Explicit Firefox handoff — the scheduler's ONLY Firefox hook.
      * Requires immutable intent with userSelectedFirefox === true, a nonblank
      * popup token present in the one-time store, exact filename/destination/saveMode
      * binding, and an eligible nonterminal job. Consumes the token synchronously
-     * once before the first await. Success → handed_to_firefox (ephemeral cleared).
-     * Adapter rejection → needs_user (token stays consumed, ephemeral retained).
+     * once before the first await.
+     *
+     * Pre-existing cancelRequested rejects before token consumption (no resurrection).
+     * During handoff, firefoxHandoffInFlight (not auto-set cancelRequested) denies new
+     * mCatcher permits; cancel() may record a late cancel request.
+     *
+     * Settlement:
+     *   - hook success → handed_to_firefox (ownership transferred; ephemeral cleared)
+     *   - reject + late cancel → cancelled (ephemeral cleared)
+     *   - reject otherwise → needs_user (token consumed, ephemeral retained)
+     * Post-token pre-await mutations share the same recovery boundary as the adapter call.
      */
     async function requestFirefoxHandoff(jobId, handoffIntent) {
       var job = jobs.get(jobId);
@@ -1712,6 +1785,10 @@
       }
       if (job.state === "handing_off_firefox" || job.firefoxHandoffInFlight === true) {
         throw new Error("Firefox handoff already in progress or completed for token");
+      }
+      // Pre-existing user cancel: reject before token consumption / state mutation.
+      if (job.cancelRequested === true) {
+        throw new Error("Firefox handoff rejected: cancel already requested");
       }
       // Eligible: needs_user, or safe live/quiescent path (running/queued/backoff/waiting/created without outstanding physical permits).
       var eligible =
@@ -1740,64 +1817,74 @@
         throw new Error("Firefox handoff token missing, forged, or already consumed");
       }
 
-      job.firefoxHandoffInFlight = true;
-      job.cancelRequested = true;
-
-      // Stop/mark mCatcher work: deny permits, clear retry deadline/queues, release slot.
-      removeFromQueue(job);
-      removeFromWaitQueue(job);
-      clearRetryDeadline(job);
-      // If this job is a saturated/recovering owner, wake next via completeOwner path.
-      var gateH = getGate(job.providerKey);
-      var snapH = gateH.snapshot();
-      var wasOwner =
-        job.state === "running" &&
-        (snapH.state === "saturated" || snapH.state === "recovering") &&
-        snapH.ownerJobId === job.id;
-
-      if (wasOwner) {
-        var waiterH = oldestEligibleWaiter(job.providerKey);
-        var recoveryIdH = waiterH ? waiterH.id : null;
-        job.state = "handing_off_firefox";
-        job.stateVersion += 1;
-        job.attemptToken = null;
-        releaseSlotIfHeld(job);
-        gateH.completeOwner({ jobId: job.id, recoveryOwnerJobId: recoveryIdH });
-        if (recoveryIdH) {
-          var nextH = jobs.get(recoveryIdH);
-          if (nextH && nextH.state === "waiting_provider") {
-            var afterH = gateH.snapshot();
-            if (afterH.reducedConcurrency != null) {
-              applyReducedConcurrency(nextH, afterH.reducedConcurrency);
-            }
-            authorizeWake(nextH);
-          }
-        }
-      } else {
-        job.state = "handing_off_firefox";
-        job.stateVersion += 1;
-        job.attemptToken = null;
-        releaseSlotIfHeld(job);
-      }
-      drain();
-
-      // Build guarded adapter input: only immutable intent + in-memory source handle.
-      // Never project/serialize media URLs, cookies, headers, or ephemeral objects.
-      var sourceHandle = null;
-      if (job.ephemeral && typeof job.ephemeral === "object") {
-        // Pass a closure/handle object without exposing raw URL fields via projection.
-        sourceHandle = job.ephemeral;
-      }
-      var adapterInput = Object.freeze({
-        filename: job.intent.requestedFilename,
-        saveAs: true,
-        intent: job.intent,
-        sourceHandle: sourceHandle,
-      });
-
+      // Recovery boundary: every post-token pre-await mutation + adapter call.
+      // A sync throw must not leave handing_off_firefox / inFlight stuck.
+      // Do not auto-set cancelRequested — firefoxHandoffInFlight denies new permits.
+      var adapterReady = false;
       try {
+        job.firefoxHandoffInFlight = true;
+
+        // Stop/mark mCatcher work: deny permits, clear retry deadline/queues, release slot.
+        removeFromQueue(job);
+        removeFromWaitQueue(job);
+        clearRetryDeadline(job);
+        // If this job is a saturated/recovering owner, wake next only when completeOwner advances.
+        var gateH = getGate(job.providerKey);
+        var snapH = gateH.snapshot();
+        var wasOwner =
+          job.state === "running" &&
+          (snapH.state === "saturated" || snapH.state === "recovering") &&
+          snapH.ownerJobId === job.id;
+
+        if (wasOwner) {
+          var waiterH = oldestEligibleWaiter(job.providerKey);
+          var recoveryIdH = waiterH ? waiterH.id : null;
+          job.state = "handing_off_firefox";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          releaseSlotIfHeld(job);
+          var resultH = gateH.completeOwner({
+            jobId: job.id,
+            recoveryOwnerJobId: recoveryIdH,
+          });
+          // Non-advanced completeOwner must never wake/charge a waiter.
+          if (resultH && resultH.advanced === true && recoveryIdH) {
+            var nextH = jobs.get(recoveryIdH);
+            if (nextH && nextH.state === "waiting_provider") {
+              var afterH = gateH.snapshot();
+              if (afterH.reducedConcurrency != null) {
+                applyReducedConcurrency(nextH, afterH.reducedConcurrency);
+              }
+              authorizeWake(nextH);
+            }
+          }
+        } else {
+          job.state = "handing_off_firefox";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          releaseSlotIfHeld(job);
+        }
+        drain();
+
+        // Build guarded adapter input: only immutable intent + in-memory source handle.
+        // Never project/serialize media URLs, cookies, headers, or ephemeral objects.
+        var sourceHandle = null;
+        if (job.ephemeral && typeof job.ephemeral === "object") {
+          // Pass a closure/handle object without exposing raw URL fields via projection.
+          sourceHandle = job.ephemeral;
+        }
+        var adapterInput = Object.freeze({
+          filename: job.intent.requestedFilename,
+          saveAs: true,
+          intent: job.intent,
+          sourceHandle: sourceHandle,
+        });
+
+        adapterReady = true;
+        // Sync throw from firefoxDownload itself is treated as adapter rejection.
         await firefoxDownload(adapterInput);
-        // Success → handed_to_firefox, clear ephemeral exactly once, terminal.
+
+        // Success → ownership transferred to Firefox (even if a late cancel was recorded).
         if (job.state === "handing_off_firefox") {
           job.state = "handed_to_firefox";
           job.stateVersion += 1;
@@ -1807,16 +1894,10 @@
         }
         drain();
       } catch (err) {
-        // Adapter rejection → needs_user, no slot, token remains consumed, ephemeral retained.
-        if (job.state === "handing_off_firefox") {
-          job.state = "needs_user";
-          job.stateVersion += 1;
-          job.attemptToken = null;
-          job.firefoxHandoffInFlight = false;
-          job.cancelRequested = false;
-          releaseSlotIfHeld(job);
-        }
-        drain();
+        // Pre-await failure or adapter rejection: settle without stuck inFlight.
+        // Token remains consumed. void adapterReady keeps the branch explicit for readers.
+        void adapterReady;
+        settleFailedFirefoxHandoff(job);
       }
     }
 
