@@ -66,25 +66,31 @@
     return i;
   }
 
+  /**
+   * CommonJS is the active path when module.exports is live and require exists.
+   * In that mode, require deps directly and propagate load/init failures.
+   * Browser dual-export uses globals only when CommonJS is not the active path.
+   */
+  function isCommonJsActive() {
+    return (
+      typeof module === "object" &&
+      module != null &&
+      typeof module.exports !== "undefined" &&
+      typeof require === "function"
+    );
+  }
+
   function resolveProviderGateApi() {
-    if (typeof require === "function") {
-      try {
-        return require("./provider-gate.js");
-      } catch (e) {
-        // Browser dual-export load path uses the global.
-      }
+    if (isCommonJsActive()) {
+      return require("./provider-gate.js");
     }
     if (root && root.McProviderGate) return root.McProviderGate;
     throw new Error("McProviderGate is required for DownloadScheduler");
   }
 
   function resolveFailureClassifyApi() {
-    if (typeof require === "function") {
-      try {
-        return require("./failure-classify.js");
-      } catch (e) {
-        // Browser dual-export load path uses the global.
-      }
+    if (isCommonJsActive()) {
+      return require("./failure-classify.js");
     }
     if (root && root.McFailureClassify) return root.McFailureClassify;
     throw new Error("McFailureClassify is required for DownloadScheduler");
@@ -239,8 +245,15 @@
       return providerGates.get(providerKey);
     }
 
+    function totalInFlightPermits(job) {
+      var w = job.wrapperPermits || 0;
+      var o = job.observedPermits || 0;
+      return w + o;
+    }
+
     function projectJob(job) {
       // Safe allowlist — never ephemeral, cookies, headers, signed URLs, mediaOrigin.
+      // inFlightPermits is the exact sum of wrapper-owned + observation-adapter counts.
       return deepFreeze({
         id: job.id,
         providerKey: job.providerKey,
@@ -255,7 +268,7 @@
         mode: job.mode,
         mediaKind: job.mediaKind,
         autoWakeCount: job.autoWakeCount,
-        inFlightPermits: job.inFlightPermits,
+        inFlightPermits: totalInFlightPermits(job),
         nativeOpenConnections: job.nativeOpenConnections,
       });
     }
@@ -372,9 +385,25 @@
 
     function isQuiescent(job) {
       return (
-        (!job.inFlightPermits || job.inFlightPermits <= 0) &&
+        totalInFlightPermits(job) <= 0 &&
         (!job.nativeOpenConnections || job.nativeOpenConnections <= 0)
       );
+    }
+
+    /**
+     * Shared quiesce edge: pausing_provider → waiting_provider exactly once when
+     * total permits and native opens are both zero. State guard only (single-threaded).
+     */
+    function maybeQuiesce(job) {
+      if (!job) return;
+      if (job.state !== "pausing_provider") return;
+      if (!isQuiescent(job)) return;
+      job.state = "waiting_provider";
+      job.stateVersion += 1;
+      job.attemptToken = null;
+      releaseSlotIfHeld(job);
+      appendWaitFifo(job);
+      drain();
     }
 
     function releaseSlotIfHeld(job) {
@@ -423,7 +452,7 @@
           id: j.id,
           providerKey: j.providerKey,
           state: j.state,
-          inFlightPermits: j.inFlightPermits,
+          inFlightPermits: totalInFlightPermits(j),
           nativeOpenConnections: j.nativeOpenConnections,
           cancelRequested: j.cancelRequested === true,
         });
@@ -443,40 +472,61 @@
       // hasActiveSibling walks facts in creation order → first match is oldest.
       var owner = jobs.get(check.siblingJobId);
       if (!owner) return null;
+      // Explicit distinct-sibling guard: failed job can never be owner.
       if (owner.id === excludeJobId) return null;
       return owner;
     }
 
-    function providerAllowsAdmission(job) {
+    /**
+     * Pure peek: can this job be admitted for provider reasons?
+     * Never designates recovery owner or lowers concurrency.
+     */
+    function providerCanAdmit(job) {
       var gate = getGate(job.providerKey);
       var st = gate.state;
       if (st === "normal") return true;
-      // saturated | recovering: only the authenticated owner may be admitted / run new work.
       var snap = gate.snapshot();
       if (snap.ownerJobId && job.id === snap.ownerJobId) return true;
-      // recovering blocked (no owner): designate this eligible job as recovery owner.
+      // recovering blocked (no owner): eligible for commit-time designation.
+      if (st === "recovering" && snap.ownerJobId == null) return true;
+      return false;
+    }
+
+    /**
+     * Commit-time provider admission mutations. Call only after global capacity
+     * is known and immediately before slot commit. Designates recovery owner
+     * at most once for recovering-blocked providers.
+     */
+    function commitProviderAdmission(job) {
+      var gate = getGate(job.providerKey);
+      var st = gate.state;
+      if (st === "normal") return true;
+      var snap = gate.snapshot();
+      if (snap.ownerJobId && job.id === snap.ownerJobId) return true;
       if (st === "recovering" && snap.ownerJobId == null) {
         var des = gate.designateRecoveryOwner({ recoveryOwnerJobId: job.id });
         if (des && des.applied) {
-          // Recovery owner inherits provider reduced cap when present.
           if (snap.reducedConcurrency != null) {
             applyReducedConcurrency(job, snap.reducedConcurrency);
           }
           return true;
         }
+        return false;
       }
       return false;
     }
 
     /**
-     * Atomically admit a queued job into running: one slot token, fresh
-     * attemptToken, single stateVersion bump. Caller already removed it
-     * from the provider FIFO.
+     * Atomically admit a queued job into running: commit provider designation
+     * (if needed), one slot token, fresh attemptToken, single stateVersion bump.
+     * Caller already removed it from the provider FIFO.
      */
     function admitJob(job) {
       if (job.state !== "queued") return false;
       if (globalRunning >= maxConcurrent) return false;
-      if (!providerAllowsAdmission(job)) return false;
+      if (!providerCanAdmit(job)) return false;
+      // Capacity known: designate/recover-owner commit immediately before slot.
+      if (!commitProviderAdmission(job)) return false;
       var token = mintAttemptToken();
       job.state = "running";
       job.stateVersion += 1;
@@ -522,15 +572,10 @@
             }
             if (q.length === 0) continue;
 
-            // Peek: if head cannot be admitted for provider reasons, skip provider
-            // (do not starve others by shifting permanently).
+            // Pure peek: never designate or mutate concurrency.
             var peekJob = jobs.get(q[0]);
             if (!peekJob || peekJob.state !== "queued") continue;
-            if (!providerAllowsAdmission(peekJob)) {
-              // If blocked recovering can designate, providerAllowsAdmission may
-              // have side-effected designation. Re-check after.
-              if (!providerAllowsAdmission(peekJob)) continue;
-            }
+            if (!providerCanAdmit(peekJob)) continue;
 
             var jobId = q.shift();
             var job = jobs.get(jobId);
@@ -541,9 +586,9 @@
               admitted = true;
               break;
             }
-            // Cap race / provider deny after shift: restore FIFO head.
+            // Local admit failure after shift: restore FIFO and keep scanning
+            // independent providers rather than aborting the full drain.
             q.unshift(jobId);
-            break;
           }
           if (!admitted) break;
         }
@@ -552,15 +597,26 @@
       }
     }
 
+    /** Start a new wait epoch: reset per-epoch wake authorization / retry flags. */
+    function beginWaitEpoch(job) {
+      job.waitEpoch = (job.waitEpoch || 0) + 1;
+      job.wakeAuthorized = false;
+      job.wakeRetryConsumed = false;
+    }
+
     function enterWaitingProvider(job, opts) {
       opts = opts || {};
       if (job.state === "waiting_provider") {
-        // Still ensure FIFO membership + optional mark.
+        // Same epoch: ensure FIFO membership + optional mark.
         if (opts.consumeRetryOnWake === true && !job.wakeRetryConsumed) {
           job.consumeRetryOnWake = true;
         }
         appendWaitFifo(job);
         return;
+      }
+      // pausing → waiting keeps the same wait epoch; only non-pause starts a new one.
+      if (job.state !== "pausing_provider") {
+        beginWaitEpoch(job);
       }
       job.state = "waiting_provider";
       job.stateVersion += 1;
@@ -580,6 +636,7 @@
         }
         return;
       }
+      beginWaitEpoch(job);
       job.state = "pausing_provider";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -657,16 +714,19 @@
     }
 
     /**
-     * Single authorized wake of a waiting_provider job back to queued.
-     * Consumes retry budget at most once when marked consumeRetryOnWake.
-     * Never bypasses global admission — re-enters provider FIFO then drain.
+     * Single authorized wake of a waiting_provider job back to queued for the
+     * current wait epoch. Late duplicates in the same epoch no-op.
+     * Failed waiters consume at most one retry per epoch; paused-only consume none.
+     * Never bypasses global admission — appends wait-FIFO order into provider FIFO,
+     * then central drain applies global cap / round-robin.
      */
     function authorizeWake(job) {
       if (!job || job.state !== "waiting_provider") return false;
+      // Per wait-epoch idempotence (not job lifetime).
       if (job.wakeAuthorized) return false;
       job.wakeAuthorized = true;
       job.autoWakeCount += 1;
-      // Failed saturation waiter: consume retry budget exactly once at authorized wake.
+      // Failed saturation waiter: consume retry budget exactly once per epoch at wake.
       // Paused-only competitors do not consume. Task 11 finishes backoff timers.
       if (job.consumeRetryOnWake === true && job.wakeRetryConsumed !== true) {
         job.wakeRetryConsumed = true;
@@ -682,8 +742,7 @@
       job.attemptToken = null;
       ensureProvider(job.providerKey);
       var q = providerQueues.get(job.providerKey);
-      // Wake joins the FIFO head-side for same-provider fairness after owner.
-      // Append preserves order among multiple wakes; single wake is fine at end.
+      // Deterministic wait-FIFO: append preserves authorization order among wakes.
       if (q.indexOf(job.id) === -1) q.push(job.id);
       return true;
     }
@@ -745,7 +804,9 @@
     }
 
     /**
-     * Successful recovery-owner completion: terminalize + authenticated recoverToNormal.
+     * Successful recovery-owner completion: terminalize + authenticated recoverToNormal,
+     * then re-authorize every remaining eligible same-provider waiter in wait-FIFO order.
+     * Never admits directly — central drain applies global cap / round-robin.
      */
     function completeRecoverySuccess(job, attemptToken) {
       if (!job) return false;
@@ -768,13 +829,47 @@
       removeFromQueue(job);
 
       gate.recoverToNormal({ jobId: job.id });
-      // Remaining provider FIFO becomes eligible under normal admission.
+
+      // Re-authorize remaining waiters in deterministic wait-FIFO order.
+      var waitQ = providerWaitQueues.get(job.providerKey) || [];
+      var remaining = waitQ.slice();
+      for (var i = 0; i < remaining.length; i++) {
+        var waiter = jobs.get(remaining[i]);
+        if (!waiter) continue;
+        if (waiter.state !== "waiting_provider") continue;
+        if (waiter.cancelRequested === true) continue;
+        authorizeWake(waiter);
+      }
+
       drain();
       return true;
     }
 
+    /**
+     * Join an already-saturated/recovering gate's wait under the existing reduced
+     * cap without generation bump / re-halving / re-arming owner bookkeeping.
+     */
+    function joinExistingSaturationWait(failedJob, snap) {
+      if (snap.reducedConcurrency != null) {
+        applyReducedConcurrency(failedJob, snap.reducedConcurrency);
+      }
+      pauseOrWaitNonOwner(failedJob, { consumeRetryOnWake: true });
+      drain();
+    }
+
     function enterSaturation(failedJob, ownerJob) {
       var gate = getGate(failedJob.providerKey);
+      var snap = gate.snapshot();
+
+      // Fresh saturation only from normal. Late failures join existing wait.
+      if (snap.state !== "normal") {
+        joinExistingSaturationWait(failedJob, snap);
+        return;
+      }
+
+      // Explicit distinct oldest-active-sibling guard; failed job can never be owner.
+      if (!ownerJob || ownerJob.id === failedJob.id) return;
+
       var reduced = reducedCapFrom(ownerJob.effectiveConcurrency);
 
       gate.setSaturated({
@@ -843,9 +938,13 @@
         ephemeral: ephemeral,
         autoWakeCount: 0,
         cancelRequested: false,
-        inFlightPermits: 0,
+        // Separate wrapper-owned vs observation-adapter permit counts.
+        // Projected inFlightPermits is their exact sum.
+        wrapperPermits: 0,
+        observedPermits: 0,
         nativeOpenConnections: 0,
         // Saturation wake bookkeeping (not projected).
+        waitEpoch: 0,
         consumeRetryOnWake: false,
         wakeRetryConsumed: false,
         wakeAuthorized: false,
@@ -880,16 +979,18 @@
     function notePermitAcquired(jobId) {
       var job = jobs.get(jobId);
       if (!job) return;
-      // Deterministic test/native-observation adapter — never drives counts negative.
-      job.inFlightPermits += 1;
+      // Observation adapter only — never touches wrapper-owned or raw permits.
+      job.observedPermits += 1;
     }
 
     function releasePermit(jobId) {
       var job = jobs.get(jobId);
       if (!job) return;
-      if (job.inFlightPermits > 0) {
-        job.inFlightPermits -= 1;
+      // Observation adapter only — never under-counts wrapper-owned permits.
+      if (job.observedPermits > 0) {
+        job.observedPermits -= 1;
       }
+      maybeQuiesce(job);
     }
 
     function noteNativeOpen(jobId, n) {
@@ -899,6 +1000,9 @@
       job.nativeOpenConnections = count;
       var gate = getGate(job.providerKey);
       gate.noteNativeOpen(jobId, count);
+      if (count === 0) {
+        maybeQuiesce(job);
+      }
     }
 
     function nativeLeaseFor(jobId) {
@@ -919,9 +1023,9 @@
     /**
      * Sole public ProviderGate wrapper. Only a running job may acquire; during
      * saturated/recovering only the authenticated owner acquires at reduced cap.
-     * Returns a wrapped frozen permit: release is idempotent, calls underlying
-     * gate release exactly once, and decrements scheduler inFlightPermits exactly
-     * once (including stale-generation physical closes).
+     * Returns a wrapped frozen permit. Wrapper release calls raw.release first;
+     * only on success marks released and decrements wrapper count. Failed raw
+     * release leaves counts unchanged and can be retried.
      */
     function acquireProviderPermit(jobId, purpose) {
       var job = jobs.get(jobId);
@@ -946,8 +1050,8 @@
       });
       if (!raw) return null;
 
-      // Scheduler-side in-flight count (active-sibling predicate + quiesce).
-      job.inFlightPermits += 1;
+      // Wrapper-owned count only (observation adapter is separate).
+      job.wrapperPermits += 1;
       var released = false;
 
       return Object.freeze({
@@ -956,41 +1060,25 @@
         generation: raw.generation,
         release: function release() {
           if (released) return;
+          // raw first — throws leave released=false and counts unchanged for retry.
+          raw.release();
           released = true;
-          // Underlying physical close exactly once (stale-gen safe inside gate).
-          try {
-            raw.release();
-          } catch (err) {
-            // Release must not throw out of caller finally.
+          if (job.wrapperPermits > 0) {
+            job.wrapperPermits -= 1;
           }
-          // Scheduler counter exactly once; never negative.
-          if (job.inFlightPermits > 0) {
-            job.inFlightPermits -= 1;
-          }
+          maybeQuiesce(job);
         },
       });
     }
 
     /**
-     * When a pausing_provider job has drained all permits/native opens, move to
-     * waiting_provider and release its global slot exactly once (stateVersion CAS).
+     * Public quiesce hook: idempotent. Counter edges (wrapper release, observed
+     * releasePermit, noteNativeOpen(...,0)) also call maybeQuiesce automatically.
      */
     function onQuiesced(jobId) {
       var job = jobs.get(jobId);
       if (!job) return;
-      if (job.state !== "pausing_provider") return;
-      if (!isQuiescent(job)) return;
-
-      var expectedVersion = job.stateVersion;
-      // CAS-style: only transition if still pausing at this version.
-      if (job.state !== "pausing_provider" || job.stateVersion !== expectedVersion) return;
-
-      job.state = "waiting_provider";
-      job.stateVersion += 1;
-      job.attemptToken = null;
-      releaseSlotIfHeld(job);
-      appendWaitFifo(job);
-      drain();
+      maybeQuiesce(job);
     }
 
     function userStatus(jobOrId) {
@@ -1087,7 +1175,7 @@
         var snapF = gateF.snapshot();
 
         // Owner failure while saturated/recovering: hand off via completeOwner
-        // (or retry_backoff if no waiter / transient solo recovery failure).
+        // (or bounded retry / terminal failed if no waiter).
         if (
           (snapF.state === "saturated" || snapF.state === "recovering") &&
           snapF.ownerJobId === job.id
@@ -1097,16 +1185,25 @@
             completeProviderOwner(job, attemptToken, "failed");
             return;
           }
-          // No waiter: transient owner failure with no sibling → bounded retry placeholder.
-          // Provider stays recovering/blocked (do not recoverToNormal).
+          // No waiter: inspect retryRemaining. Positive → retry_backoff + completeOwner(null).
+          // Zero → terminal failed + completeOwner(null). Never leave exhausted owner retrying.
           if (FailureClassify.isSaturationCandidate(category)) {
-            // Leave gate as-is; terminalize owner out of running into retry_backoff.
-            // completeOwner with null recovery to advance ownership epoch if saturated.
             assertRunningOwnsSlot(job);
-            job.state = "retry_backoff";
+            if (job.retryRemaining > 0) {
+              job.state = "retry_backoff";
+              job.stateVersion += 1;
+              job.attemptToken = null;
+              releaseSlotIfHeld(job);
+              removeFromQueue(job);
+              gateF.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
+              drain();
+              return;
+            }
+            job.state = "failed";
             job.stateVersion += 1;
             job.attemptToken = null;
             releaseSlotIfHeld(job);
+            clearEphemeralOnce(job);
             removeFromQueue(job);
             gateF.completeOwner({ jobId: job.id, recoveryOwnerJobId: null });
             drain();
@@ -1117,13 +1214,26 @@
         }
 
         if (FailureClassify.isSaturationCandidate(category)) {
+          // Running non-owner under existing saturated/recovering joins that wait
+          // without generation bump (enterSaturation guards on normal).
+          if (snapF.state === "saturated" || snapF.state === "recovering") {
+            if (snapF.ownerJobId !== job.id) {
+              joinExistingSaturationWait(job, snapF);
+              return;
+            }
+          }
           var owner = pickOldestActiveSibling(job.providerKey, job.id);
           if (owner && owner.id !== job.id) {
             enterSaturation(job, owner);
             return;
           }
-          // No viable sibling → ordinary bounded-policy placeholder; never provider wait; never Firefox.
-          enterRetryBackoff(job, attemptToken);
+          // No viable sibling: positive budget → retry_backoff; zero → terminal failed.
+          // Never provider wait; never Firefox.
+          if (job.retryRemaining > 0) {
+            enterRetryBackoff(job, attemptToken);
+          } else {
+            terminalizeRunning(job, attemptToken, "failed");
+          }
           return;
         }
 

@@ -516,14 +516,18 @@ test("permit cap, idempotent release, and stale release never go negative", () =
   p1.release();
   p1.release(); // idempotent — no double decrement
   assert.equal(s.getJob("j").inFlightPermits, 1);
-  // Adapter release never goes negative
+  // Adapter release must not consume wrapper-owned permits (no under-count).
   s.releasePermit("j");
   s.releasePermit("j");
-  s.releasePermit("j");
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  p2.release();
   assert.equal(s.getJob("j").inFlightPermits, 0);
-  // notePermitAcquired then release
+  // notePermitAcquired then release (observation adapter only)
   s.notePermitAcquired("j");
   assert.equal(s.getJob("j").inFlightPermits, 1);
+  s.releasePermit("j");
+  assert.equal(s.getJob("j").inFlightPermits, 0);
+  // Adapter never goes negative
   s.releasePermit("j");
   assert.equal(s.getJob("j").inFlightPermits, 0);
   assertSlotInvariant(s);
@@ -1012,4 +1016,717 @@ test("download-scheduler dual-export still same-object McDownloadScheduler", () 
   assert.equal(typeof schedSandbox.module.exports.createDownloadScheduler, "function");
   assert.equal(typeof root.McDownloadScheduler.createDownloadScheduler, "function");
   assert.equal(root.McDownloadScheduler, schedSandbox.module.exports);
+});
+
+
+// ---------------------------------------------------------------------------
+// Fix-round 2 regressions (admission / recovery epochs / permits / quiesce)
+// ---------------------------------------------------------------------------
+
+function loadSchedulerFresh() {
+  return loadLib("lib/download-scheduler.js");
+}
+
+function quiesceIfPausing(s, jobId) {
+  if (s.getJob(jobId).state === "pausing_provider") {
+    while (s.getJob(jobId).inFlightPermits > 0) s.releasePermit(jobId);
+    s.onQuiesced(jobId);
+  }
+}
+
+/** Drive provider to recovering-blocked (ownerJobId null). Requires maxConcurrent >= 2. */
+function forceRecoveringBlocked(s, providerKey, ownerId, failId) {
+  s.createJob({
+    id: ownerId,
+    providerKey: providerKey,
+    intent: intent("o.mp4"),
+    segmentConcurrency: 2,
+    retries: 2,
+  });
+  s.createJob({
+    id: failId,
+    providerKey: providerKey,
+    intent: intent("f.mp4"),
+    segmentConcurrency: 2,
+    retries: 2,
+  });
+  s.enqueue(ownerId);
+  s.enqueue(failId);
+  assert.equal(s.getJob(failId).state, "running");
+  s.notePermitAcquired(ownerId);
+  s.onTransportResult(failId, s.getJob(failId).attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  quiesceIfPausing(s, failId);
+  assert.equal(s.getJob(failId).state, "waiting_provider");
+  s.onTransportResult(ownerId, s.getJob(ownerId).attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob(failId).state, "running");
+  s.onTransportResult(failId, s.getJob(failId).attemptToken, {
+    status: "cancelled",
+    failureCategory: null,
+  });
+  assert.equal(s.getSnapshot().providers[providerKey].gate.state, "recovering");
+  assert.equal(s.getSnapshot().providers[providerKey].gate.ownerJobId, null);
+}
+
+test("pure peek does not designate recovery owner when no global capacity", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  forceRecoveringBlocked(s, "p.com", "owner", "fail");
+  s.setMaxConcurrent(1);
+  s.createJob({
+    id: "hold",
+    providerKey: "other.com",
+    intent: intent("h.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+  });
+  s.enqueue("hold");
+  assert.equal(s.getJob("hold").state, "running");
+  s.createJob({
+    id: "late",
+    providerKey: "p.com",
+    intent: intent("late.mp4"),
+    segmentConcurrency: 2,
+    retries: 2,
+  });
+  s.enqueue("late");
+  assert.equal(s.getJob("late").state, "queued");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.state, "recovering");
+  assert.equal(s.getJob("late").effectiveConcurrency, 2);
+  assertSlotInvariant(s);
+});
+
+test("commit-time designation happens exactly once on successful admit", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  forceRecoveringBlocked(s, "p.com", "owner", "fail");
+  s.createJob({
+    id: "late",
+    providerKey: "p.com",
+    intent: intent("late.mp4"),
+    segmentConcurrency: 4,
+    retries: 2,
+  });
+  s.enqueue("late");
+  assert.equal(s.getJob("late").state, "running");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "late");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.state, "recovering");
+  assert.equal(s.getJob("late").effectiveConcurrency, 1);
+  s.setMaxConcurrent(2);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "late");
+  assert.ok(s.acquireProviderPermit("late", "segment"));
+  assertSlotInvariant(s);
+});
+
+test("blocked provider admit failure cannot starve independent provider", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  s.createJob({
+    id: "own",
+    providerKey: "sat.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "sib",
+    providerKey: "sat.com",
+    intent: intent("s.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "queuedSat",
+    providerKey: "sat.com",
+    intent: intent("q.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "freeJob",
+    providerKey: "free.com",
+    intent: intent("f.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+  });
+  s.enqueue("own");
+  s.enqueue("sib");
+  s.notePermitAcquired("own");
+  s.onTransportResult("sib", s.getJob("sib").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  s.enqueue("queuedSat");
+  assert.equal(s.getJob("queuedSat").state, "queued");
+  assert.equal(s.getSnapshot().providers["sat.com"].gate.state, "saturated");
+  s.enqueue("freeJob");
+  assert.equal(s.getJob("freeJob").state, "running");
+  assert.equal(s.getJob("queuedSat").state, "queued");
+  assert.equal(s.getJob("own").state, "running");
+  assertSlotInvariant(s);
+});
+
+test("successful recovery requeues every remaining same-provider waiter in wait-FIFO", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 4, now: () => 0 });
+  ["A", "B", "C", "D"].forEach(function (id) {
+    s.createJob({
+      id: id,
+      providerKey: "p.com",
+      intent: intent(id.toLowerCase() + ".mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.enqueue("D");
+  s.notePermitAcquired("A");
+  s.notePermitAcquired("B");
+  s.notePermitAcquired("C");
+  s.notePermitAcquired("D");
+  s.onTransportResult("B", s.getJob("B").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  ["B", "C", "D"].forEach(function (id) {
+    quiesceIfPausing(s, id);
+  });
+  assert.equal(s.getJob("B").state, "waiting_provider");
+  assert.equal(s.getJob("C").state, "waiting_provider");
+  assert.equal(s.getJob("D").state, "waiting_provider");
+
+  s.onTransportResult("A", s.getJob("A").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("B").state, "running");
+  assert.equal(s.getJob("C").state, "waiting_provider");
+  assert.equal(s.getJob("D").state, "waiting_provider");
+
+  s.onTransportResult("B", s.getJob("B").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getSnapshot().providers["p.com"].gate.state, "normal");
+  assert.ok(s.getJob("C").state === "queued" || s.getJob("C").state === "running");
+  assert.ok(s.getJob("D").state === "queued" || s.getJob("D").state === "running");
+  assert.equal(s.getJob("C").autoWakeCount, 1);
+  assert.equal(s.getJob("D").autoWakeCount, 1);
+  if (s.getJob("C").state === "queued" && s.getJob("D").state === "queued") {
+    const q = s.getSnapshot().providers["p.com"].queued;
+    assert.ok(q.indexOf("C") < q.indexOf("D"));
+  }
+  assertSlotInvariant(s);
+});
+
+test("same job wakes across two saturation cycles; failed retry decrements once per epoch", () => {
+  // O owns; W failed waiter + P paused-only. O wakes W; W recovers → requeues P.
+  // Cycle 2: O2 + P; P fails (new epoch) → O2 wakes P once with one retry charge.
+  const s = createDownloadScheduler({ maxConcurrent: 3, now: () => 0 });
+  s.createJob({
+    id: "O",
+    providerKey: "p.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 5,
+  });
+  s.createJob({
+    id: "W",
+    providerKey: "p.com",
+    intent: intent("w.mp4"),
+    segmentConcurrency: 4,
+    retries: 5,
+  });
+  s.createJob({
+    id: "P",
+    providerKey: "p.com",
+    intent: intent("p.mp4"),
+    segmentConcurrency: 4,
+    retries: 5,
+  });
+  s.enqueue("O");
+  s.enqueue("W");
+  s.enqueue("P");
+  s.notePermitAcquired("O");
+  s.notePermitAcquired("P");
+  const wRetry0 = s.getJob("W").retryRemaining;
+  const pRetry0 = s.getJob("P").retryRemaining;
+  s.onTransportResult("W", s.getJob("W").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  quiesceIfPausing(s, "W");
+  quiesceIfPausing(s, "P");
+  assert.equal(s.getJob("W").state, "waiting_provider");
+  assert.equal(s.getJob("P").state, "waiting_provider");
+
+  s.onTransportResult("O", s.getJob("O").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("W").autoWakeCount, 1);
+  assert.equal(s.getJob("W").retryRemaining, wRetry0 - 1);
+  assert.equal(s.getJob("P").autoWakeCount, 0);
+  assert.equal(s.getJob("P").retryRemaining, pRetry0);
+  assert.equal(s.getJob("W").state, "running");
+
+  s.onTransportResult("W", s.getJob("W").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getSnapshot().providers["p.com"].gate.state, "normal");
+  assert.ok(s.getJob("P").state === "queued" || s.getJob("P").state === "running");
+  assert.equal(s.getJob("P").autoWakeCount, 1);
+  assert.equal(s.getJob("P").retryRemaining, pRetry0);
+  assert.equal(s.getJob("P").state, "running");
+
+  s.createJob({
+    id: "O2",
+    providerKey: "p.com",
+    intent: intent("o2.mp4"),
+    segmentConcurrency: 4,
+    retries: 5,
+  });
+  s.enqueue("O2");
+  assert.equal(s.getJob("O2").state, "running");
+  s.notePermitAcquired("O2");
+  const pRetry1 = s.getJob("P").retryRemaining;
+  s.onTransportResult("P", s.getJob("P").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  quiesceIfPausing(s, "P");
+  assert.equal(s.getJob("P").state, "waiting_provider");
+  s.onTransportResult("O2", s.getJob("O2").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("P").autoWakeCount, 2);
+  assert.equal(s.getJob("P").retryRemaining, pRetry1 - 1);
+  assert.ok(s.getJob("P").state === "queued" || s.getJob("P").state === "running");
+  s.onTransportResult("O2", s.getJob("O2").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("P").autoWakeCount, 2);
+  assert.equal(s.getJob("P").retryRemaining, pRetry1 - 1);
+  assertSlotInvariant(s);
+});
+
+test("paused-only waiter consumes no retry on authorize or recovery requeue", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 3, now: () => 0 });
+  s.createJob({
+    id: "owner",
+    providerKey: "p.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 4,
+  });
+  s.createJob({
+    id: "fail",
+    providerKey: "p.com",
+    intent: intent("f.mp4"),
+    segmentConcurrency: 4,
+    retries: 4,
+  });
+  s.createJob({
+    id: "pausedOnly",
+    providerKey: "p.com",
+    intent: intent("p.mp4"),
+    segmentConcurrency: 4,
+    retries: 4,
+  });
+  s.enqueue("owner");
+  s.enqueue("fail");
+  s.enqueue("pausedOnly");
+  s.notePermitAcquired("owner");
+  s.notePermitAcquired("pausedOnly");
+  const pausedBefore = s.getJob("pausedOnly").retryRemaining;
+  s.onTransportResult("fail", s.getJob("fail").attemptToken, {
+    status: "failed",
+    failureCategory: "short_read",
+  });
+  quiesceIfPausing(s, "fail");
+  quiesceIfPausing(s, "pausedOnly");
+  s.onTransportResult("owner", s.getJob("owner").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("pausedOnly").retryRemaining, pausedBefore);
+  s.onTransportResult("fail", s.getJob("fail").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getJob("pausedOnly").retryRemaining, pausedBefore);
+  assert.equal(s.getJob("pausedOnly").autoWakeCount, 1);
+  assertSlotInvariant(s);
+});
+
+test("zero-budget solo and owner saturation candidates fail terminally", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
+  s.createJob({
+    id: "solo",
+    providerKey: "p.com",
+    intent: intent("s.mp4"),
+    segmentConcurrency: 2,
+    retries: 0,
+  });
+  s.enqueue("solo");
+  s.onTransportResult("solo", s.getJob("solo").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  assert.equal(s.getJob("solo").state, "failed");
+  assert.equal(s.getJob("solo").holdsGlobalSlot, false);
+  assertSlotInvariant(s);
+
+  const s2 = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  s2.createJob({
+    id: "A",
+    providerKey: "r.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 0,
+  });
+  s2.createJob({
+    id: "B",
+    providerKey: "r.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 0,
+  });
+  s2.enqueue("A");
+  s2.enqueue("B");
+  s2.notePermitAcquired("A");
+  s2.onTransportResult("B", s2.getJob("B").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  quiesceIfPausing(s2, "B");
+  s2.onTransportResult("A", s2.getJob("A").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s2.getJob("B").state, "running");
+  assert.equal(s2.getSnapshot().providers["r.com"].gate.state, "recovering");
+  s2.onTransportResult("B", s2.getJob("B").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  assert.equal(s2.getJob("B").state, "failed");
+  assert.equal(s2.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s2.getSnapshot().providers["r.com"].gate.state, "recovering");
+  assert.equal(s2.getSnapshot().providers["r.com"].gate.ownerJobId, null);
+  assertSlotInvariant(s2);
+});
+
+test("raw release throw keeps wrapper counts and can be retried", () => {
+  const gatePath = path.join(mediaCatcherRoot, "lib", "provider-gate.js");
+  const schedPath = path.join(mediaCatcherRoot, "lib", "download-scheduler.js");
+  const realGate = loadLib("lib/provider-gate.js");
+  let throwNext = true;
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  try {
+    require.cache[require.resolve(gatePath)] = {
+      id: require.resolve(gatePath),
+      filename: require.resolve(gatePath),
+      loaded: true,
+      exports: {
+        createProviderGate: function (opts) {
+          const g = realGate.createProviderGate(opts);
+          const origAcquire = g.acquire.bind(g);
+          return {
+            get providerKey() {
+              return g.providerKey;
+            },
+            get state() {
+              return g.state;
+            },
+            get generation() {
+              return g.generation;
+            },
+            get wakeGeneration() {
+              return g.wakeGeneration;
+            },
+            acquire: function (jobId, options) {
+              const raw = origAcquire(jobId, options);
+              if (!raw) return null;
+              return Object.freeze({
+                jobId: raw.jobId,
+                purpose: raw.purpose,
+                generation: raw.generation,
+                release: function () {
+                  if (throwNext) {
+                    throwNext = false;
+                    throw new Error("simulated raw release failure");
+                  }
+                  return raw.release();
+                },
+              });
+            },
+            setSaturated: g.setSaturated.bind(g),
+            registerJobLimit: g.registerJobLimit.bind(g),
+            nativeLeaseFor: g.nativeLeaseFor.bind(g),
+            noteNativeOpen: g.noteNativeOpen.bind(g),
+            parkProbe: g.parkProbe.bind(g),
+            completeOwner: g.completeOwner.bind(g),
+            designateRecoveryOwner: g.designateRecoveryOwner.bind(g),
+            recoverToNormal: g.recoverToNormal.bind(g),
+            snapshot: g.snapshot.bind(g),
+          };
+        },
+      },
+    };
+    delete require.cache[require.resolve(schedPath)];
+    const { createDownloadScheduler: createS } = require(schedPath);
+    const s = createS({ maxConcurrent: 1, now: () => 0 });
+    s.createJob({
+      id: "j",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 2,
+      retries: 1,
+    });
+    s.enqueue("j");
+    const p = s.acquireProviderPermit("j", "segment");
+    assert.ok(p);
+    assert.equal(s.getJob("j").inFlightPermits, 1);
+    assert.throws(() => p.release(), /simulated raw release failure/);
+    assert.equal(s.getJob("j").inFlightPermits, 1);
+    p.release();
+    assert.equal(s.getJob("j").inFlightPermits, 0);
+    p.release();
+    assert.equal(s.getJob("j").inFlightPermits, 0);
+    assertSlotInvariant(s);
+  } finally {
+    if (prevGate) require.cache[require.resolve(gatePath)] = prevGate;
+    else delete require.cache[require.resolve(gatePath)];
+    if (prevSched) require.cache[require.resolve(schedPath)] = prevSched;
+    else delete require.cache[require.resolve(schedPath)];
+    loadSchedulerFresh();
+  }
+});
+
+test("mixed observed adapter and wrapper permit counts sum without crosstalk", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
+  s.createJob({
+    id: "j",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 3,
+    retries: 1,
+  });
+  s.enqueue("j");
+  const p = s.acquireProviderPermit("j", "segment");
+  assert.ok(p);
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  s.notePermitAcquired("j");
+  assert.equal(s.getJob("j").inFlightPermits, 2);
+  s.releasePermit("j");
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  s.releasePermit("j");
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  p.release();
+  assert.equal(s.getJob("j").inFlightPermits, 0);
+  s.notePermitAcquired("j");
+  s.notePermitAcquired("j");
+  assert.equal(s.getJob("j").inFlightPermits, 2);
+  s.releasePermit("j");
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  assertSlotInvariant(s);
+});
+
+test("automatic quiesce from permit and native edges without explicit onQuiesced", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  s.createJob({
+    id: "owner",
+    providerKey: "p.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "sib",
+    providerKey: "p.com",
+    intent: intent("s.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("owner");
+  s.enqueue("sib");
+  s.notePermitAcquired("owner");
+  const p = s.acquireProviderPermit("sib", "segment");
+  assert.ok(p);
+  s.onTransportResult("sib", s.getJob("sib").attemptToken, {
+    status: "failed",
+    failureCategory: "short_read",
+  });
+  assert.equal(s.getJob("sib").state, "pausing_provider");
+  assert.equal(s.getJob("sib").holdsGlobalSlot, true);
+  p.release();
+  assert.equal(s.getJob("sib").state, "waiting_provider");
+  assert.equal(s.getJob("sib").holdsGlobalSlot, false);
+  s.onQuiesced("sib");
+  assert.equal(s.getJob("sib").state, "waiting_provider");
+  assert.equal(s.getSnapshot().globalRunning, 1);
+  assertSlotInvariant(s);
+
+  const s2 = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  s2.createJob({
+    id: "owner",
+    providerKey: "q.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s2.createJob({
+    id: "sib",
+    providerKey: "q.com",
+    intent: intent("s.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s2.enqueue("owner");
+  s2.enqueue("sib");
+  s2.notePermitAcquired("owner");
+  s2.noteNativeOpen("sib", 2);
+  s2.onTransportResult("sib", s2.getJob("sib").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  assert.equal(s2.getJob("sib").state, "pausing_provider");
+  s2.noteNativeOpen("sib", 0);
+  assert.equal(s2.getJob("sib").state, "waiting_provider");
+  assert.equal(s2.getJob("sib").holdsGlobalSlot, false);
+  s2.onQuiesced("sib");
+  assert.equal(s2.getSnapshot().globalRunning, 1);
+  assertSlotInvariant(s2);
+
+  const s3 = createDownloadScheduler({ maxConcurrent: 2, now: () => 0 });
+  s3.createJob({
+    id: "owner",
+    providerKey: "r.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s3.createJob({
+    id: "sib",
+    providerKey: "r.com",
+    intent: intent("s.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s3.enqueue("owner");
+  s3.enqueue("sib");
+  s3.notePermitAcquired("owner");
+  s3.notePermitAcquired("sib");
+  s3.onTransportResult("sib", s3.getJob("sib").attemptToken, {
+    status: "failed",
+    failureCategory: "connection_reset",
+  });
+  assert.equal(s3.getJob("sib").state, "pausing_provider");
+  s3.releasePermit("sib");
+  assert.equal(s3.getJob("sib").state, "waiting_provider");
+  assert.equal(s3.getJob("sib").holdsGlobalSlot, false);
+  assertSlotInvariant(s3);
+});
+
+test("repeated saturation while already saturated keeps generation and reduced cap stable", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 3, now: () => 0 });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 8,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 8,
+    retries: 3,
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 8,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.notePermitAcquired("B");
+  s.notePermitAcquired("C");
+  s.onTransportResult("B", s.getJob("B").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  const gate1 = s.getSnapshot().providers["p.com"].gate;
+  assert.equal(gate1.state, "saturated");
+  assert.equal(gate1.ownerJobId, "A");
+  const gen1 = gate1.generation;
+  const reduced1 = gate1.reducedConcurrency;
+  assert.equal(s.getJob("A").effectiveConcurrency, 4);
+  assert.equal(reduced1, 4);
+  const gate2 = s.getSnapshot().providers["p.com"].gate;
+  assert.equal(gate2.state, "saturated");
+  assert.equal(gate2.ownerJobId, "A");
+  assert.equal(gate2.generation, gen1);
+  assert.equal(gate2.reducedConcurrency, reduced1);
+  assert.equal(s.getJob("A").effectiveConcurrency, 4);
+  assert.notEqual(gate2.ownerJobId, "B");
+  assert.notEqual(gate2.ownerJobId, "C");
+  assertSlotInvariant(s);
+});
+
+test("CommonJS dependency load failures propagate and do not fall back to globals", () => {
+  const schedPath = path.join(mediaCatcherRoot, "lib", "download-scheduler.js");
+  const code = fs.readFileSync(schedPath, "utf8");
+  const root = {
+    McProviderGate: {
+      createProviderGate: function () {
+        return {};
+      },
+    },
+    McFailureClassify: {
+      isSaturationCandidate: function () {
+        return false;
+      },
+      hasActiveSibling: function () {
+        return { ok: false, siblingJobId: null };
+      },
+    },
+  };
+  function throwingRequire(id) {
+    if (String(id).indexOf("provider-gate") !== -1) {
+      throw new Error("simulated ProviderGate load failure");
+    }
+    if (String(id).indexOf("failure-classify") !== -1) {
+      return root.McFailureClassify;
+    }
+    return require(id);
+  }
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require: throwingRequire,
+    console,
+    self: root,
+  };
+  sandbox.module.exports = sandbox.exports;
+  assert.throws(() => {
+    vm.runInNewContext(code, sandbox, { filename: schedPath });
+    if (sandbox.module.exports && sandbox.module.exports.createDownloadScheduler) {
+      sandbox.module.exports.createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
+    }
+  }, /simulated ProviderGate load failure/);
 });
