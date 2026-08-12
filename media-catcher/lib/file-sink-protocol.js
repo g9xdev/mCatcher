@@ -177,11 +177,34 @@
         );
       }
 
+      function clearOutstanding() {
+        outstanding = Object.create(null);
+        outstandingCount = 0;
+      }
+
       function identityExtrasOk(msg) {
         if (hasOwn(msg, "jobId") && msg.jobId !== jobId) return false;
         if (hasOwn(msg, "attemptToken") && msg.attemptToken !== attemptToken) {
           return false;
         }
+        return true;
+      }
+
+      // Host errors require full identity (Task-15 always emits it). Missing
+      // fields are uncorrelated and must not fail the live session.
+      function openHostErrorIdentityOk(msg) {
+        if (msg.jobId !== jobId) return false;
+        if (msg.attemptToken !== attemptToken) return false;
+        if (hasOwn(msg, "sinkId") && msg.sinkId != null && msg.sinkId !== "") {
+          return false;
+        }
+        return true;
+      }
+
+      function streamingHostErrorIdentityOk(msg) {
+        if (msg.sinkId !== sinkId) return false;
+        if (msg.jobId !== jobId) return false;
+        if (msg.attemptToken !== attemptToken) return false;
         return true;
       }
 
@@ -275,12 +298,14 @@
 
       function onCommitted(msg) {
         if (state !== "streaming" || sinkId === null) return null;
+        if (outstandingCount !== 0) return null;
         if (!msg || typeof msg !== "object") return null;
         if (msg.type !== "file-committed") return null;
         if (msg.sinkId !== sinkId) return null;
         if (!identityExtrasOk(msg)) return null;
         if (!isNonblankString(msg.file)) return null;
         if (!isNonnegInt(msg.bytes)) return null;
+        clearOutstanding();
         state = "committed";
         return freezeCmd({
           status: "committed",
@@ -295,6 +320,7 @@
         if (msg.type !== "file-aborted") return null;
         if (msg.sinkId !== sinkId) return null;
         if (!identityExtrasOk(msg)) return null;
+        clearOutstanding();
         state = "aborted";
         return freezeCmd({ status: "aborted" });
       }
@@ -303,19 +329,16 @@
         if (isTerminal()) return null;
         if (!msg || typeof msg !== "object") return null;
         if (msg.type !== "file-error") return null;
-        if (!identityExtrasOk(msg)) return null;
 
         if (state === "streaming") {
-          if (hasOwn(msg, "sinkId") && msg.sinkId !== sinkId) return null;
+          if (!streamingHostErrorIdentityOk(msg)) return null;
         } else if (state === "open") {
-          // Open-attempt errors may carry job/attempt; reject foreign sink ids.
-          if (hasOwn(msg, "sinkId") && msg.sinkId != null && msg.sinkId !== "") {
-            return null;
-          }
+          if (!openHostErrorIdentityOk(msg)) return null;
         } else {
           return null;
         }
 
+        clearOutstanding();
         state = "failed";
         // Always normalize: never copy reason/path/raw/host category extras.
         return freezeCmd({

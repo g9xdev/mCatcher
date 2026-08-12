@@ -120,8 +120,12 @@ test("host error maps to local_io and never flags saturation or firefox", () => 
     destinationDirectory: null,
   });
   s.onOpened({ type: "file-opened", sinkId: "s1", jobId: "j1", attemptToken: "a1" });
+  // Task-15 live-sink errors always carry exact sink+job+attempt identity.
   const out = s.onHostError({
     type: "file-error",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
     failureCategory: "local_io",
     reason: "disk full",
   });
@@ -631,7 +635,13 @@ test("onCommitted and onAborted require host ack; first valid terminal wins", ()
   assert.equal(s.abortCmd(), null);
   assert.equal(s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 }), false);
   assert.equal(
-    s.onHostError({ type: "file-error", failureCategory: "local_io" }),
+    s.onHostError({
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    }),
     null
   );
 });
@@ -780,6 +790,341 @@ test("open-state host error matches attempt identity without sink", () => {
     isSaturation: false,
   });
   assert.equal(s.state, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// Task-16 fix1: required host-error identity + commit waits for outstanding
+// ---------------------------------------------------------------------------
+
+test("open-state file-error requires exact job+attempt; missing/mismatched/nonempty-sink ignored", () => {
+  const { createFileSinkSession } = loadProtocol();
+  const s = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  const before = snapshotSession(s);
+
+  const rejects = [
+    { type: "file-error", failureCategory: "local_io" },
+    { type: "file-error", jobId: "j1", failureCategory: "local_io" },
+    { type: "file-error", attemptToken: "a1", failureCategory: "local_io" },
+    {
+      type: "file-error",
+      jobId: "other",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "stale",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "a1",
+      sinkId: "s1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "a1",
+      sinkId: "foreign",
+      failureCategory: "local_io",
+    },
+  ];
+  for (const msg of rejects) {
+    assert.equal(s.onHostError(msg), null);
+    assert.deepEqual(snapshotSession(s), before);
+  }
+
+  // Exact job+attempt with absent/null/empty sinkId is accepted once.
+  const acceptedShapes = [
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "a1",
+      sinkId: null,
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "a1",
+      sinkId: "",
+      failureCategory: "local_io",
+    },
+  ];
+  // First shape fails the session; remaining exact frames are ignored.
+  const out = s.onHostError(acceptedShapes[0]);
+  assert.deepEqual(out, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(s.state, "failed");
+  assert.equal(s.outstandingCount, 0);
+  assert.equal(s.onHostError(acceptedShapes[1]), null);
+  assert.equal(s.onHostError(acceptedShapes[2]), null);
+  assert.equal(s.state, "failed");
+});
+
+test("open-state accepts exact file-error with null or empty sinkId only while open", () => {
+  // Independent session for null sinkId acceptance path.
+  const { createFileSinkSession } = loadProtocol();
+  const sNull = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  const outNull = sNull.onHostError({
+    type: "file-error",
+    jobId: "j1",
+    attemptToken: "a1",
+    sinkId: null,
+    failureCategory: "timeout",
+  });
+  assert.deepEqual(outNull, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(sNull.state, "failed");
+
+  const sEmpty = createFileSinkSession({
+    jobId: "j1",
+    attemptToken: "a1",
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  const outEmpty = sEmpty.onHostError({
+    type: "file-error",
+    jobId: "j1",
+    attemptToken: "a1",
+    sinkId: "",
+    failureCategory: "local_io",
+  });
+  assert.deepEqual(outEmpty, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(sEmpty.state, "failed");
+});
+
+test("streaming file-error requires exact sinkId+jobId+attemptToken; missing forms ignored", () => {
+  const { s } = openStreaming({
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  s.nextChunkCmd(new Uint8Array([1]));
+  const before = snapshotSession(s);
+  assert.equal(before.state, "streaming");
+  assert.equal(before.outstandingCount, 1);
+
+  const rejects = [
+    { type: "file-error", failureCategory: "local_io" },
+    {
+      type: "file-error",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "j1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      sinkId: "s1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      sinkId: "other",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "other",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "j1",
+      attemptToken: "stale",
+      failureCategory: "local_io",
+    },
+    {
+      type: "file-error",
+      sinkId: "",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    },
+  ];
+
+  for (const msg of rejects) {
+    assert.equal(s.onHostError(msg), null);
+    assert.deepEqual(snapshotSession(s), before);
+  }
+
+  const out = s.onHostError({
+    type: "file-error",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
+    failureCategory: "timeout",
+    reason: "disk full",
+  });
+  assert.deepEqual(out, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(s.state, "failed");
+  assert.equal(s.outstandingCount, 0);
+  // Exactly once
+  assert.equal(
+    s.onHostError({
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    }),
+    null
+  );
+  assert.equal(s.state, "failed");
+  assert.equal(s.outstandingCount, 0);
+});
+
+test("onCommitted ignores matching frame while outstanding; accepts after exact ack drains", () => {
+  const { s } = openStreaming({
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  const chunk = s.nextChunkCmd(new Uint8Array([9]));
+  assert.ok(chunk);
+  assert.equal(s.outstandingCount, 1);
+  assert.equal(s.commitCmd(), null);
+
+  const commitFrame = {
+    type: "file-committed",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
+    file: "out.mp4",
+    bytes: 1,
+  };
+  assert.equal(s.onCommitted(commitFrame), null);
+  assert.equal(s.state, "streaming");
+  assert.equal(s.outstandingCount, 1);
+  assert.equal(s.commitCmd(), null);
+
+  assert.equal(
+    s.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: chunk.seq }),
+    true
+  );
+  assert.equal(s.outstandingCount, 0);
+  assert.ok(s.commitCmd());
+
+  const committed = s.onCommitted(commitFrame);
+  assert.deepEqual(committed, {
+    status: "committed",
+    bytes: 1,
+    file: "out.mp4",
+  });
+  assert.equal(s.state, "committed");
+  assert.equal(s.outstandingCount, 0);
+});
+
+test("accepted abort/error terminals clear outstanding; late acks and terminals ignored", () => {
+  // Abort path with outstanding.
+  const { s: sAbort } = openStreaming({
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  sAbort.nextChunkCmd(new Uint8Array([1]));
+  sAbort.nextChunkCmd(new Uint8Array([2]));
+  assert.equal(sAbort.outstandingCount, 2);
+  const aborted = sAbort.onAborted({ type: "file-aborted", sinkId: "s1" });
+  assert.deepEqual(aborted, { status: "aborted" });
+  assert.equal(sAbort.state, "aborted");
+  assert.equal(sAbort.outstandingCount, 0);
+  assert.equal(
+    sAbort.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 }),
+    false
+  );
+  assert.equal(
+    sAbort.onCommitted({
+      type: "file-committed",
+      sinkId: "s1",
+      file: "out.mp4",
+      bytes: 2,
+    }),
+    null
+  );
+  assert.equal(sAbort.onAborted({ type: "file-aborted", sinkId: "s1" }), null);
+  assert.equal(sAbort.outstandingCount, 0);
+  assert.equal(sAbort.state, "aborted");
+
+  // Error path with outstanding.
+  const { s: sFail } = openStreaming({
+    requestedFilename: "out.mp4",
+    destinationDirectory: null,
+  });
+  sFail.nextChunkCmd(new Uint8Array([3]));
+  assert.equal(sFail.outstandingCount, 1);
+  const failed = sFail.onHostError({
+    type: "file-error",
+    sinkId: "s1",
+    jobId: "j1",
+    attemptToken: "a1",
+    failureCategory: "local_io",
+  });
+  assert.deepEqual(failed, {
+    failureCategory: "local_io",
+    invokeFirefox: false,
+    isSaturation: false,
+  });
+  assert.equal(sFail.state, "failed");
+  assert.equal(sFail.outstandingCount, 0);
+  assert.equal(
+    sFail.onAck({ type: "file-chunk-ack", sinkId: "s1", seq: 0 }),
+    false
+  );
+  assert.equal(
+    sFail.onHostError({
+      type: "file-error",
+      sinkId: "s1",
+      jobId: "j1",
+      attemptToken: "a1",
+      failureCategory: "local_io",
+    }),
+    null
+  );
+  assert.equal(sFail.outstandingCount, 0);
+  assert.equal(sFail.state, "failed");
 });
 
 // ---------------------------------------------------------------------------
