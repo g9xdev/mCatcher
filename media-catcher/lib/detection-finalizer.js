@@ -11,6 +11,42 @@
 
   var CONTEXT_WAIT_MS = 750;
 
+  /**
+   * Finite numeric timestamp passthrough.
+   * Never use bitwise | 0 — Firefox epoch ms exceeds signed int32 (2^31).
+   */
+  function asTimestamp(value) {
+    var n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function deepClone(value) {
+    if (value == null || typeof value !== "object") return value;
+    if (Array.isArray(value)) {
+      return value.map(deepClone);
+    }
+    var out = {};
+    Object.keys(value).forEach(function (k) {
+      out[k] = deepClone(value[k]);
+    });
+    return out;
+  }
+
+  function deepFreeze(o) {
+    if (!o || typeof o !== "object" || Object.isFrozen(o)) return o;
+    Object.getOwnPropertyNames(o).forEach(function (k) {
+      var v = o[k];
+      if (v && typeof v === "object") deepFreeze(v);
+    });
+    return Object.freeze(o);
+  }
+
+  /** Clone then deep-freeze so callers cannot mutate stored or original graphs. */
+  function freezeClone(value) {
+    if (value == null || typeof value !== "object") return value;
+    return deepFreeze(deepClone(value));
+  }
+
   function stripQuery(s) {
     var str = String(s == null ? "" : s);
     var i = str.indexOf("?");
@@ -131,7 +167,7 @@
       contentDisposition: event.contentDisposition == null ? null : String(event.contentDisposition),
       referrerUrl: String(event.referrerUrl || ""),
       frameOrigin: String(event.frameOrigin || ""),
-      ts: event.ts | 0,
+      ts: asTimestamp(event.ts),
     };
   }
 
@@ -199,7 +235,7 @@
       contentDisposition: cdHeader,
       referrerUrl: String(details.originUrl || ""),
       frameOrigin: String(hints.frameOrigin || ""),
-      ts: details.timeStamp | 0,
+      ts: asTimestamp(details.timeStamp),
     };
   }
 
@@ -280,9 +316,12 @@
       var item = Object.freeze({
         detectionId: detectionId,
         mediaUrl: event.mediaUrl,
+        // sourceContext is already recursively frozen by its builder.
         sourceContext: sourceContext,
         proposedFilename: ranked.proposedFilename,
-        rankDiagnostics: ranked.diagnostics,
+        // Clone + deep-freeze so nested arrays/objects cannot be mutated and
+        // the original rank return cannot affect the stored record.
+        rankDiagnostics: freezeClone(ranked.diagnostics),
       });
 
       finalized.set(detectionId, item);
@@ -358,7 +397,7 @@
         contentDisposition: input.contentDisposition == null ? null : String(input.contentDisposition),
         referrerUrl: String(input.referrerUrl || ""),
         frameOrigin: String(input.frameOrigin || ""),
-        ts: input.ts | 0,
+        ts: asTimestamp(input.ts),
       };
 
       var detectionId = allocateId(null);

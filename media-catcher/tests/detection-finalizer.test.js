@@ -255,3 +255,85 @@ test("mapWebRequestDetails with missing documentId sets null (exact-URL reuse on
   }, { topLevelUrlHint: "https://site/page", frameOrigin: "https://site" });
   assert.equal(event.documentId, null);
 });
+
+// Firefox webRequest.timeStamp is epoch ms; values exceed signed int32 (2^31).
+// Mutation: coercing timestamps with bitwise | 0 truncates them.
+const FIREFOX_EPOCH_MS = 1786536000123;
+
+test("mapWebRequestDetails preserves Firefox epoch ms timestamps above 2^31", () => {
+  const { mapWebRequestDetails } = loadLib("lib/detection-finalizer.js");
+  const event = mapWebRequestDetails({
+    documentId: "fx-ts",
+    tabId: 1,
+    frameId: 0,
+    url: "https://cdn/x.mp4",
+    originUrl: "https://site/page",
+    documentUrl: "https://site/page",
+    type: "media",
+    timeStamp: FIREFOX_EPOCH_MS,
+    responseHeaders: [],
+  }, { topLevelUrlHint: "https://site/page", frameOrigin: "https://site" });
+  assert.equal(event.ts, FIREFOX_EPOCH_MS);
+});
+
+test("no-snapshot timeout finalizes with exact capturedAt from large epoch ts", () => {
+  const clock = { t: FIREFOX_EPOCH_MS };
+  const f = make(clock);
+  const id = f.beginNetworkDetection({
+    documentId: "doc-ts", tabId: 1, frameId: 0,
+    documentUrl: "https://site/page", topLevelUrlHint: "https://site/page",
+    mediaUrl: "https://cdn/x.mp4", mediaOrigin: "https://cdn",
+    contentDisposition: null, referrerUrl: "https://site/page",
+    frameOrigin: "https://site", ts: FIREFOX_EPOCH_MS,
+  });
+  assert.equal(f.getItem(id), null); // waiting for snapshot / timeout
+  clock.t = FIREFOX_EPOCH_MS + 750;
+  f.tick(clock.t);
+  const item = f.getItem(id);
+  assert.ok(item);
+  assert.equal(item.sourceContext.capturedAt, new Date(FIREFOX_EPOCH_MS).toISOString());
+});
+
+test("finalized sourceContext and rankDiagnostics are deeply immutable", () => {
+  // Mutation: shallow Object.freeze leaves nested rankDiagnostics mutable;
+  // storing the rank return by reference lets callers mutate after storage.
+  const clock = { t: 0 };
+  const rankReturn = {
+    proposedFilename: "clip.mp4",
+    diagnostics: {
+      scores: [{ kind: "visible-filename", value: "clip.mp4", score: 10 }],
+      nested: { arr: [1, 2] },
+    },
+  };
+  const f = createDetectionFinalizer({
+    now: () => clock.t,
+    waitMs: 750,
+    rank: () => rankReturn,
+    buildSourceContext: SC.buildSourceContext,
+  });
+  const id = f.beginNetworkDetection({
+    documentId: null, tabId: 1, frameId: 0,
+    documentUrl: "https://site/page", topLevelUrlHint: "https://site/page",
+    mediaUrl: "https://cdn/clip.mp4", mediaOrigin: "https://cdn",
+    contentDisposition: "clip.mp4", referrerUrl: "https://site/page",
+    frameOrigin: "https://site", ts: 0,
+  });
+  const item = f.getItem(id);
+  assert.ok(item);
+
+  assert.throws(() => { item.proposedFilename = "hacked.mp4"; }, TypeError);
+  assert.throws(() => { item.sourceContext.filenameCandidates.push({ kind: "x", value: "y" }); }, TypeError);
+  assert.throws(() => { item.sourceContext.filenameCandidates[0].value = "mutated"; }, TypeError);
+  assert.throws(() => { item.rankDiagnostics.scores.push({ kind: "x", value: "y", score: 0 }); }, TypeError);
+  assert.throws(() => { item.rankDiagnostics.scores[0].score = 999; }, TypeError);
+  assert.throws(() => { item.rankDiagnostics.nested.arr.push(3); }, TypeError);
+  assert.throws(() => { item.rankDiagnostics.nested.arr[0] = 99; }, TypeError);
+
+  // Mutating the original rank return must not affect the stored diagnostics.
+  rankReturn.diagnostics.scores[0].score = 999;
+  rankReturn.diagnostics.scores.push({ kind: "injected", value: "bad", score: 0 });
+  rankReturn.diagnostics.nested.arr.push(3);
+  assert.equal(item.rankDiagnostics.scores[0].score, 10);
+  assert.equal(item.rankDiagnostics.scores.length, 1);
+  assert.deepEqual(item.rankDiagnostics.nested.arr, [1, 2]);
+});
