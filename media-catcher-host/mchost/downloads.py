@@ -1153,12 +1153,46 @@ class _PgetError(Exception):
         super().__init__(category)
 
 
+def _pget_nonneg_int_bytes(val):
+    """Integral nonnegative byte count, or None.
+
+    Rejects bool (bool is a subclass of int), floats, strings, and negatives.
+    No lossy coercion — only real int values >= 0 are accepted.
+    """
+    if isinstance(val, bool) or not isinstance(val, int):
+        return None
+    if val < 0:
+        return None
+    return val
+
+
+def _pget_attempt_token_allows(req, op):
+    """True when cancel / set-limit may act on the live op.
+
+    ONLY ABSENCE of the attemptToken key enables legacy id-only compatibility.
+    When the key is present, its value must be a nonblank primitive string that
+    exactly equals the stored active token (also a nonblank string). Present
+    null/None, empty/whitespace, bool, number, object, or different string is
+    a no-op — even when the stored token is None.
+    """
+    if not isinstance(req, dict) or "attemptToken" not in req:
+        return True
+    provided = req.get("attemptToken")
+    if not isinstance(provided, str) or not provided.strip():
+        return False
+    stored = op.get("attemptToken") if isinstance(op, dict) else None
+    if not isinstance(stored, str) or not stored.strip():
+        return False
+    return provided == stored
+
+
 def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState,
                       file=None, bytes=None):
     """Emit exactly one structured terminal pget-result (caller enforces once).
 
     file/bytes are an optional pair only on completed/committed terminals.
-    Failed/cancelled keep the exact seven-field base shape.
+    Failed/cancelled keep the exact seven-field base shape. Never emit
+    one-sided metadata; invalid sizes omit the pair entirely.
     """
     msg = {
         "type": "pget-result",
@@ -1169,20 +1203,11 @@ def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState
         "failureCategory": failureCategory,
         "partState": partState,
     }
-    if (
-        status == "completed"
-        and partState == "committed"
-        and file is not None
-        and bytes is not None
-        and not isinstance(bytes, bool)
-    ):
-        try:
+    if status == "completed" and partState == "committed" and file is not None:
+        size = _pget_nonneg_int_bytes(bytes)
+        if size is not None:
             msg["file"] = file
-            msg["bytes"] = int(bytes)
-        except (TypeError, ValueError, OverflowError):
-            # Metadata pair is best-effort; never alter the terminal status.
-            msg.pop("file", None)
-            msg.pop("bytes", None)
+            msg["bytes"] = size
     _h().send(msg)
 
 
@@ -1216,9 +1241,10 @@ def _pget_safe_filename(name):
 def _pget_terminal_file_bytes(op):
     """Best-effort (file, bytes) for a committed op final path. Never raises.
 
-    Returns (None, None) when the path is missing, unreadable, or size is not a
-    valid integer (bool is treated as invalid). Metadata failure never revokes
-    an already-committed success — callers still emit completed/committed.
+    Returns (None, None) when the path is missing, unreadable, or size is not an
+    integral nonnegative int (bool/float/negative/hostile values are invalid).
+    Metadata failure never revokes an already-committed success — callers still
+    emit completed/committed without the optional pair.
     """
     if not isinstance(op, dict):
         return None, None
@@ -1228,10 +1254,10 @@ def _pget_terminal_file_bytes(op):
     try:
         if not os.path.isfile(path):
             return None, None
-        sz = os.path.getsize(path)
-        if isinstance(sz, bool):
+        size = _pget_nonneg_int_bytes(os.path.getsize(path))
+        if size is None:
             return None, None
-        return path, int(sz)
+        return path, size
     except Exception:
         return None, None
 
@@ -1691,12 +1717,10 @@ def _pget_cancel(req):
     j = _pget_registry_get(req.get("id"))
     if not j:
         return
-    # When attemptToken is present on the command, require exact equality to the
-    # stored start token. Stale / null / different tokens are no-ops. Omitted
-    # property preserves legacy id-only cancel.
-    if isinstance(req, dict) and "attemptToken" in req:
-        if req.get("attemptToken") != j.get("attemptToken"):
-            return
+    # Present attemptToken must be a nonblank string equal to the stored token.
+    # Omitted property preserves legacy id-only cancel; present null does not.
+    if not _pget_attempt_token_allows(req, j):
+        return
     j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
@@ -1824,12 +1848,11 @@ def handle_pget_set_limit(req):
     if not op or op.get("lease_cv") is None:
         return
 
-    # Attempt-token fence: when the property is present, require exact equality
-    # to the stored start token. Stale / null / different → no mutate, no ack.
+    # Attempt-token fence: present key requires nonblank string exact match to
+    # stored token. Present null/empty/typed/stale → no mutate, no ack.
     # Omitted property preserves legacy id-only set-limit.
-    if isinstance(req, dict) and "attemptToken" in req:
-        if req.get("attemptToken") != op.get("attemptToken"):
-            return
+    if not _pget_attempt_token_allows(req, op):
+        return
 
     ack_lock = op.get("ack_lock")
     if ack_lock is None:
@@ -1848,9 +1871,8 @@ def handle_pget_set_limit(req):
                 if _PGET.get(jid) is not op:
                     return
                 # Re-check token under identity fence in case of same-id replace.
-                if isinstance(req, dict) and "attemptToken" in req:
-                    if req.get("attemptToken") != op.get("attemptToken"):
-                        return
+                if not _pget_attempt_token_allows(req, op):
+                    return
                 _pget_apply_limit_locked(op, gen, lim)
 
         # Re-entered from an in-flight outer send: apply only; outer drains ack.
