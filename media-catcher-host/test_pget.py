@@ -1789,16 +1789,14 @@ def test_set_limit_generation_monotonic_and_idempotent(tmp_path, monkeypatch):
         assert ack_same["providerGeneration"] == 5
         assert ack_same["maxConnections"] == 0
 
+        acks_before_bool = len([m for m in sent if m.get("type") == "pget-limit-ack"])
         mc.handle_pget_set_limit({
             "id": "jobGen", "maxConnections": True, "providerGeneration": True,
         })
-        assert wait_for(
-            lambda: len([m for m in sent if m.get("type") == "pget-limit-ack"]) >= 4,
-            timeout=3,
-        )
-        ack_bool = [m for m in sent if m.get("type") == "pget-limit-ack"][-1]
-        assert ack_bool["providerGeneration"] == 5
-        assert ack_bool["maxConnections"] == 0
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before_bool
+        assert op["providerGeneration"] == 5
+        assert op["maxConnections"] == 0
 
         mc.handle_pget_set_limit({
             "id": "jobGen", "maxConnections": 2, "providerGeneration": 6,
@@ -1968,3 +1966,838 @@ def test_pget_single_missing_content_length_completes(tmp_path, monkeypatch):
         assert (tmp_path / "x.mp4").read_bytes() == payload
     finally:
         shutdown_server(httpd)
+
+
+# ---------------------------------------------------------------------------
+# Task 13 fix1 — registry identity fence, terminal quiescence, ack order
+# ---------------------------------------------------------------------------
+
+def _make_lease_op(gen=0, limit=1, cap=1):
+    return {
+        "stop": threading.Event(),
+        "cancel_requested": False,
+        "lease_cv": threading.Condition(),
+        "ack_lock": threading.RLock(),
+        "ack_sending": False,
+        "ack_pending": False,
+        "last_sent_gen": None,
+        "last_sent_lim": None,
+        "initial_cap": cap,
+        "maxConnections": limit,
+        "providerGeneration": gen,
+        "openConnections": 0,
+        "lease": cap,
+        "n": 0,
+        "final_path": None,
+        "kind": "pget",
+    }
+
+
+def test_set_limit_identity_fence_after_same_id_replace(monkeypatch):
+    """After lookup captures old op, same-id replace must not mutate either op or ack."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    jid = "jobFence"
+    old = _make_lease_op(gen=1, limit=2, cap=4)
+    new = _make_lease_op(gen=0, limit=3, cap=4)
+    old_gen, old_lim = old["providerGeneration"], old["maxConnections"]
+    new_gen, new_lim = new["providerGeneration"], new["maxConnections"]
+
+    entered = threading.Event()
+    resume = threading.Event()
+    first = {"done": False}
+
+    class PausingMap(dict):
+        def get(self, key, default=None):
+            if key == jid and not first["done"] and key in self:
+                val = dict.get(self, key, default)
+                first["done"] = True
+                entered.set()
+                assert resume.wait(timeout=5.0)
+                return val
+            return dict.get(self, key, default)
+
+    reg = PausingMap()
+    reg[jid] = old
+    monkeypatch.setattr(d, "_PGET", reg)
+
+    err = []
+
+    def runner():
+        try:
+            d.handle_pget_set_limit({
+                "id": jid, "maxConnections": 0, "providerGeneration": 9,
+            })
+        except Exception as e:
+            err.append(e)
+
+    t = threading.Thread(target=runner)
+    t.start()
+    assert entered.wait(timeout=5.0)
+
+    # Same-id replacement while set-limit still holds the old op reference.
+    reg[jid] = new
+    resume.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert err == []
+
+    assert old["providerGeneration"] == old_gen
+    assert old["maxConnections"] == old_lim
+    assert new["providerGeneration"] == new_gen
+    assert new["maxConnections"] == new_lim
+    assert reg.get(jid) is new
+    assert not any(m.get("type") == "pget-limit-ack" for m in sent)
+
+    # Old unregister must not remove the new op.
+    d._pget_unregister(jid, old)
+    assert reg.get(jid) is new
+    d._pget_unregister(jid, new)
+    assert reg.get(jid) is None
+
+
+def test_duplicate_same_id_active_start_rejects_without_stranding(tmp_path, monkeypatch):
+    """Second active start with same id is rejected; first worker is not stranded."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"D" * (256 * 1024)
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:2048])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=15.0)
+            try:
+                self.wfile.write(payload[2048:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        url = server_url(httpd)
+        mc.handle_pget_single({
+            "id": "jobDup",
+            "attemptToken": "atk-first",
+            "urls": [url],
+            "name": "first.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        first_op = d._PGET.get("jobDup")
+        assert first_op is not None
+
+        mc.handle_pget_single({
+            "id": "jobDup",
+            "attemptToken": "atk-second",
+            "urls": [url],
+            "name": "second.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-result" and m.get("attemptToken") == "atk-second"
+                for m in sent
+            ),
+            timeout=5,
+        )
+        second_res = [
+            m for m in sent
+            if m.get("type") == "pget-result" and m.get("attemptToken") == "atk-second"
+        ][-1]
+        assert second_res["status"] == "failed"
+        assert second_res["failureCategory"] == "permanent"
+        assert second_res["mode"] == "single-connection"
+        assert d._PGET.get("jobDup") is first_op
+
+        mc.handle_pget_set_limit({
+            "id": "jobDup", "maxConnections": 0, "providerGeneration": 1,
+        })
+        ack = _wait_ack(sent, "jobDup", timeout=5)
+        assert ack["providerGeneration"] == 1
+        assert ack["maxConnections"] == 0
+        assert first_op["providerGeneration"] == 1
+        assert first_op["maxConnections"] == 0
+
+        mc._pget_cancel({"id": "jobDup"})
+        hold.set()
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-result" and m.get("attemptToken") == "atk-first"
+                for m in sent
+            ),
+            timeout=10,
+        )
+        first_res = [
+            m for m in sent
+            if m.get("type") == "pget-result" and m.get("attemptToken") == "atk-first"
+        ][-1]
+        assert first_res["status"] == "cancelled"
+        assert first_res["failureCategory"] == "cancelled"
+        assert d._PGET.get("jobDup") is None
+
+        results = [m for m in sent if m.get("type") == "pget-result"]
+        assert len(results) == 2
+        tokens = {m["attemptToken"] for m in results}
+        assert tokens == {"atk-first", "atk-second"}
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_single_terminal_quiesces_response_and_lease_before_result(tmp_path, monkeypatch):
+    """At pget-result, response is closed and openConnections == 0 (one terminal)."""
+    import mchost.downloads as d
+
+    original_close = d._pget_close_resp
+    original_open = d._pget_open
+
+    def run_case(label, setup_open, expect_category, cancel=False):
+        sent = []
+        closed = {"n": 0}
+        open_at_result = []
+
+        def tracking_close(resp):
+            if resp is not None:
+                closed["n"] += 1
+            return original_close(resp)
+
+        def tracking_send(msg):
+            m = dict(msg)
+            if m.get("type") == "pget-result":
+                op = d._PGET.get(m.get("id"))
+                if op is not None:
+                    cv = op.get("lease_cv")
+                    if cv is not None:
+                        with cv:
+                            open_at_result.append(int(op.get("openConnections") or 0))
+                    else:
+                        open_at_result.append(int(op.get("openConnections") or 0))
+                else:
+                    open_at_result.append(0)
+                open_at_result.append(closed["n"])
+            sent.append(m)
+
+        monkeypatch.setattr(mc, "send", tracking_send)
+        monkeypatch.setattr(d, "_pget_close_resp", tracking_close)
+        monkeypatch.setattr(d, "_pget_open", original_open)
+        if hasattr(mc, "_pget_open"):
+            monkeypatch.setattr(mc, "_pget_open", original_open)
+
+        jid = "jobQ-%s" % label
+        hold = threading.Event()
+        body_started = threading.Event()
+        httpd = None
+
+        if setup_open == "429":
+            httpd, _ = run_server("429")
+        elif setup_open == "short":
+            class ShortBody(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def log_message(self, *a):
+                    pass
+
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000")
+                    self.end_headers()
+                    self.wfile.write(b"abc")
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), ShortBody)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        elif setup_open == "reset":
+            def boom_reset(*_a, **_k):
+                raise ConnectionResetError("reset")
+
+            monkeypatch.setattr(d, "_pget_open", boom_reset)
+            if hasattr(mc, "_pget_open"):
+                monkeypatch.setattr(mc, "_pget_open", boom_reset)
+        elif setup_open == "cancel":
+            class SlowFull(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+                payload = b"Z" * (512 * 1024)
+
+                def log_message(self, *a):
+                    pass
+
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(self.payload)))
+                    self.end_headers()
+                    self.wfile.write(self.payload[:4096])
+                    self.wfile.flush()
+                    body_started.set()
+                    hold.wait(timeout=10.0)
+                    try:
+                        self.wfile.write(self.payload[4096:])
+                    except Exception:
+                        pass
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        else:
+            raise AssertionError(setup_open)
+
+        try:
+            urls = [server_url(httpd)] if httpd is not None else ["http://127.0.0.1:1/x"]
+            mc.handle_pget_single({
+                "id": jid,
+                "attemptToken": "atk-%s" % label,
+                "urls": urls,
+                "name": "%s.mp4" % label,
+                "dir": str(tmp_path),
+                "maxConnections": 1,
+                "userAgent": "t",
+            })
+            if cancel:
+                assert wait_for(lambda: body_started.is_set(), timeout=5)
+                mc._pget_cancel({"id": jid})
+            res = wait_result(sent, timeout=10)
+            hold.set()
+            assert res["mode"] == "single-connection"
+            assert res["failureCategory"] == expect_category
+            results = [m for m in sent if m.get("type") == "pget-result" and m.get("id") == jid]
+            assert len(results) == 1
+            assert open_at_result[0] == 0, "%s openConnections at result: %r" % (label, open_at_result)
+            # reset fails before a response object exists; other paths must close first.
+            if setup_open != "reset":
+                assert open_at_result[1] >= 1, (
+                    "%s expected response closed before terminal: %r" % (label, open_at_result)
+                )
+                assert closed["n"] >= 1
+            assert d._PGET.get(jid) is None
+        finally:
+            hold.set()
+            if httpd is not None:
+                shutdown_server(httpd)
+
+    run_case("429", "429", "http_429")
+    run_case("short", "short", "short_read")
+    run_case("reset", "reset", "connection_reset")
+    run_case("cancel", "cancel", "cancelled", cancel=True)
+
+
+def test_set_limit_ack_generations_never_regress(tmp_path, monkeypatch):
+    """Gen N+1 cannot apply while N's serialized ack send is blocked; order never regresses."""
+    import mchost.downloads as d
+
+    sent = []
+    ack_gens = []
+    lock = threading.Lock()
+    t1_in_send = threading.Event()
+    allow_t1_send = threading.Event()
+    t2_entered = threading.Event()
+    t2_applied = threading.Event()
+
+    def tracking_send(msg):
+        m = dict(msg)
+        if m.get("type") == "pget-limit-ack":
+            gen = m.get("providerGeneration")
+            if gen == 1:
+                t1_in_send.set()
+                assert allow_t1_send.wait(timeout=5.0)
+            with lock:
+                sent.append(m)
+                ack_gens.append(gen)
+        else:
+            with lock:
+                sent.append(m)
+
+    monkeypatch.setattr(mc, "send", tracking_send)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    jid = "jobAckOrder"
+    hold = threading.Event()
+    httpd, _state = run_server("hold-probe", hold=hold)
+    try:
+        mc.handle_pget({
+            "id": jid,
+            "attemptToken": "atk-ack",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: d._PGET.get(jid) is not None, timeout=5)
+        op = d._PGET[jid]
+        err = []
+
+        def call_limit(gen, lim, entered=None, applied=None):
+            try:
+                if entered is not None:
+                    entered.set()
+                d.handle_pget_set_limit({
+                    "id": jid, "maxConnections": lim, "providerGeneration": gen,
+                })
+                if applied is not None and int(op.get("providerGeneration") or 0) >= gen:
+                    applied.set()
+            except Exception as e:
+                err.append(e)
+
+        t1 = threading.Thread(target=call_limit, args=(1, 1))
+        t1.start()
+        assert t1_in_send.wait(timeout=5.0), "gen1 must reach serialized ack send"
+        assert int(op.get("providerGeneration") or 0) == 1
+        assert int(op.get("maxConnections") or 0) == 1
+
+        t2 = threading.Thread(
+            target=call_limit, args=(2, 0), kwargs={"entered": t2_entered, "applied": t2_applied},
+        )
+        t2.start()
+        assert t2_entered.wait(timeout=5.0)
+
+        # While gen1 holds the ack serializer across send, gen2 must not apply.
+        assert not wait_for(
+            lambda: int(op.get("providerGeneration") or 0) >= 2, timeout=0.4,
+        ), "gen2 applied while gen1 ack send still blocked"
+        assert int(op.get("providerGeneration") or 0) == 1
+        assert int(op.get("maxConnections") or 0) == 1
+        with lock:
+            assert 2 not in ack_gens
+
+        allow_t1_send.set()
+        assert wait_for(lambda: int(op.get("providerGeneration") or 0) >= 2, timeout=5)
+        assert t2_applied.wait(timeout=5.0) or wait_for(
+            lambda: any(g == 2 for g in list(ack_gens)), timeout=5,
+        )
+
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert not t1.is_alive() and not t2.is_alive()
+        assert err == []
+
+        with lock:
+            gens = list(ack_gens)
+        assert gens, "expected at least one limit ack"
+        assert max(gens) == 2
+        peak = -1
+        for g in gens:
+            assert g >= peak, "ack generation regressed: %r" % gens
+            peak = max(peak, g)
+        if 2 in gens:
+            idx2 = gens.index(2)
+            assert 1 not in gens[idx2 + 1 :], "obsolete gen1 after gen2: %r" % gens
+        assert gens == sorted(gens)
+
+        mc._pget_cancel({"id": jid})
+        hold.set()
+        res = wait_result(sent, timeout=15)
+        assert res["status"] == "cancelled"
+    finally:
+        allow_t1_send.set()
+        hold.set()
+        try:
+            mc._pget_cancel({"id": jid})
+        except Exception:
+            pass
+        shutdown_server(httpd)
+
+
+def test_set_limit_invalid_inputs_do_not_mutate_or_ack(tmp_path, monkeypatch):
+    """Fractional/string/negative/bool/NaN/inf inputs must not apply or claim success."""
+    import math
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    hold = threading.Event()
+    httpd, _state = run_server("hold-probe", hold=hold)
+    try:
+        mc.handle_pget({
+            "id": "jobInv",
+            "attemptToken": "atk-inv",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 3,
+            "providerGeneration": 2,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: d._PGET.get("jobInv") is not None, timeout=5)
+        op = d._PGET["jobInv"]
+        assert op["providerGeneration"] == 2
+        assert op["maxConnections"] == 3
+
+        invalids = [
+            {"maxConnections": 1, "providerGeneration": 1.5},
+            {"maxConnections": 1.5, "providerGeneration": 3},
+            {"maxConnections": 1, "providerGeneration": "1.5"},
+            {"maxConnections": "2.0", "providerGeneration": 3},
+            {"maxConnections": 1, "providerGeneration": -1},
+            {"maxConnections": -1, "providerGeneration": 3},
+            {"maxConnections": -5, "providerGeneration": 9},
+            {"maxConnections": True, "providerGeneration": 3},
+            {"maxConnections": 1, "providerGeneration": True},
+            {"maxConnections": 1, "providerGeneration": float("nan")},
+            {"maxConnections": 1, "providerGeneration": float("inf")},
+            {"maxConnections": float("nan"), "providerGeneration": 3},
+            {"maxConnections": float("-inf"), "providerGeneration": 3},
+            {"maxConnections": object(), "providerGeneration": 3},
+            {"maxConnections": 1, "providerGeneration": object()},
+            {"maxConnections": None, "providerGeneration": 3},
+            {"maxConnections": 1, "providerGeneration": None},
+        ]
+        for payload in invalids:
+            before_acks = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+            before_gen = op["providerGeneration"]
+            before_lim = op["maxConnections"]
+            mc.handle_pget_set_limit({"id": "jobInv", **payload})
+            # Invalid commands are synchronous: no mutation and no ack.
+            after_acks = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+            assert after_acks == before_acks, "invalid claimed apply: %r" % payload
+            assert op["providerGeneration"] == before_gen, payload
+            assert op["maxConnections"] == before_lim, payload
+
+        # Valid zero limit on a newer generation still applies (distinct from negative).
+        mc.handle_pget_set_limit({
+            "id": "jobInv", "maxConnections": 0, "providerGeneration": 3,
+        })
+        ack0 = _wait_ack(sent, "jobInv", timeout=5)
+        assert ack0["providerGeneration"] == 3
+        assert ack0["maxConnections"] == 0
+        assert op["providerGeneration"] == 3
+        assert op["maxConnections"] == 0
+
+        # Valid newer generation still applies; valid integer-valued float is accepted.
+        mc.handle_pget_set_limit({
+            "id": "jobInv", "maxConnections": 1, "providerGeneration": 4.0,
+        })
+        ack = _wait_ack(sent, "jobInv", timeout=5)
+        assert ack["providerGeneration"] == 4
+        assert ack["maxConnections"] == 1
+        assert op["providerGeneration"] == 4
+        assert op["maxConnections"] == 1
+
+        # Valid stale generation may ack current live state without raising it.
+        mc.handle_pget_set_limit({
+            "id": "jobInv", "maxConnections": 3, "providerGeneration": 1,
+        })
+        assert wait_for(
+            lambda: any(
+                m.get("type") == "pget-limit-ack"
+                and m.get("id") == "jobInv"
+                and m.get("providerGeneration") == 4
+                for m in sent
+            ),
+            timeout=5,
+        )
+        assert op["providerGeneration"] == 4
+        assert op["maxConnections"] == 1
+
+        hold.set()
+        res = wait_result(sent, timeout=15)
+        assert res["status"] == "completed"
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_set_limit_reentrant_send_applies_newer_without_deadlock(tmp_path, monkeypatch):
+    """Re-entrant set-limit from within gen N send applies N+1; acks are N then N+1."""
+    import mchost.downloads as d
+
+    sent = []
+    ack_gens = []
+    lock = threading.Lock()
+    reentered = {"done": False}
+
+    def tracking_send(msg):
+        m = dict(msg)
+        if m.get("type") == "pget-limit-ack":
+            gen = m.get("providerGeneration")
+            with lock:
+                sent.append(m)
+                ack_gens.append(gen)
+            if gen == 1 and not reentered["done"]:
+                reentered["done"] = True
+                # Nested set-limit while outer gen1 send is still on the stack.
+                d.handle_pget_set_limit({
+                    "id": jid, "maxConnections": 0, "providerGeneration": 2,
+                })
+        else:
+            with lock:
+                sent.append(m)
+
+    monkeypatch.setattr(mc, "send", tracking_send)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    jid = "jobReenter"
+    hold = threading.Event()
+    httpd, _state = run_server("hold-probe", hold=hold)
+    try:
+        mc.handle_pget({
+            "id": jid,
+            "attemptToken": "atk-re",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: d._PGET.get(jid) is not None, timeout=5)
+        op = d._PGET[jid]
+
+        d.handle_pget_set_limit({
+            "id": jid, "maxConnections": 1, "providerGeneration": 1,
+        })
+        assert wait_for(lambda: int(op.get("providerGeneration") or 0) >= 2, timeout=5)
+        assert wait_for(lambda: 2 in list(ack_gens), timeout=5)
+
+        with lock:
+            gens = list(ack_gens)
+        assert gens[:2] == [1, 2], "expected ack order N then N+1, got %r" % gens
+        peak = -1
+        for g in gens:
+            assert g >= peak, "ack generation regressed: %r" % gens
+            peak = max(peak, g)
+        assert op["providerGeneration"] == 2
+        assert op["maxConnections"] == 0
+        assert reentered["done"] is True
+
+        mc._pget_cancel({"id": jid})
+        hold.set()
+        res = wait_result(sent, timeout=15)
+        assert res["status"] == "cancelled"
+    finally:
+        hold.set()
+        try:
+            mc._pget_cancel({"id": jid})
+        except Exception:
+            pass
+        shutdown_server(httpd)
+
+
+def test_set_limit_replacement_waits_for_old_ack_serializer(monkeypatch):
+    """Unregister/replacement cannot claim jid while old op holds ack_lock across send."""
+    import mchost.downloads as d
+
+    sent = []
+    lock = threading.Lock()
+    old_in_send = threading.Event()
+    allow_old_send = threading.Event()
+    unreg_done = threading.Event()
+    reg_done = threading.Event()
+    acked_ops = []
+
+    def tracking_send_ops(msg):
+        m = dict(msg)
+        if m.get("type") == "pget-limit-ack":
+            # Snapshot the registry owner at the moment the ack hits the wire.
+            live = d._PGET.get(jid)
+            with lock:
+                sent.append(m)
+                acked_ops.append(live)
+            old_in_send.set()
+            assert allow_old_send.wait(timeout=5.0)
+        else:
+            with lock:
+                sent.append(m)
+
+    monkeypatch.setattr(mc, "send", tracking_send_ops)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    jid = "jobReplaceAck"
+    old = _make_lease_op(gen=0, limit=2, cap=4)
+    new = _make_lease_op(gen=0, limit=3, cap=4)
+    assert d._pget_register(jid, old)
+
+    err = []
+
+    def apply_old():
+        try:
+            d.handle_pget_set_limit({
+                "id": jid, "maxConnections": 1, "providerGeneration": 1,
+            })
+        except Exception as e:
+            err.append(e)
+
+    def replace_while_ack():
+        try:
+            # Must wait for old ack_lock; must not pop under a concurrent owner.
+            d._pget_unregister(jid, old)
+            unreg_done.set()
+            assert d._pget_register(jid, new)
+            reg_done.set()
+        except Exception as e:
+            err.append(e)
+
+    t_ack = threading.Thread(target=apply_old)
+    t_ack.start()
+    assert old_in_send.wait(timeout=5.0)
+
+    t_rep = threading.Thread(target=replace_while_ack)
+    t_rep.start()
+
+    # Replacement must not complete while old ack send holds the serializer.
+    assert not unreg_done.wait(timeout=0.4), "unregister completed during old ack send"
+    assert d._PGET.get(jid) is old
+    assert new["providerGeneration"] == 0
+    assert old["providerGeneration"] == 1
+
+    allow_old_send.set()
+    t_ack.join(timeout=5)
+    t_rep.join(timeout=5)
+    assert not t_ack.is_alive() and not t_rep.is_alive()
+    assert err == []
+    assert unreg_done.is_set() and reg_done.is_set()
+    assert d._PGET.get(jid) is new
+
+    with lock:
+        wire = list(sent)
+        owners = list(acked_ops)
+    assert len(wire) == 1
+    assert wire[0]["providerGeneration"] == 1
+    assert wire[0]["maxConnections"] == 1
+    # The sole ack belongs to the old op era (registry still pointed at old).
+    assert owners == [old]
+
+    # New op has never been acknowledged under the old apply.
+    assert new["providerGeneration"] == 0
+    assert new["maxConnections"] == 3
+    d._pget_unregister(jid, new)
+    assert d._PGET.get(jid) is None
+
+
+def test_ytdl_registry_cas_and_identity_unregister(monkeypatch):
+    """yt-dlp must use registry CAS; duplicate id kills the new proc without overwrite."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_ytdlp", lambda: "yt-dlp-fake")
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+    monkeypatch.setattr(d, "_no_window", lambda: (0, None))
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = iter(())
+            self.returncode = 1
+            self.killed = False
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    spawned = []
+    killed = []
+
+    def fake_popen(*_a, **_k):
+        p = FakeProc()
+        spawned.append(p)
+        return p
+
+    def fake_kill(p):
+        p.killed = True
+        killed.append(p)
+
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(d, "_safe_kill", fake_kill)
+
+    jid = "jobYtdlCas"
+    # Active pget already owns the id.
+    owner = _make_lease_op(gen=0, limit=1, cap=1)
+    assert d._pget_register(jid, owner)
+
+    d.handle_ytdl({"id": jid, "url": "https://example.test/v", "dir": "."})
+    assert wait_for(lambda: any(m.get("type") == "ytdl-error" for m in sent), timeout=5)
+    err = [m for m in sent if m.get("type") == "ytdl-error" and m.get("id") == jid][-1]
+    assert err["reason"]
+    assert d._PGET.get(jid) is owner
+    assert owner.get("proc") is None
+    assert len(spawned) == 1
+    assert spawned[0].killed is True or spawned[0] in killed
+
+    d._pget_unregister(jid, owner)
+    assert d._PGET.get(jid) is None
+
+    # Successful ytdl path registers with CAS and unregisters by identity.
+    class LiveProc:
+        def __init__(self):
+            self._lines = ["[download] 100.0% of 1.00KiB at 1.00KiB/s ETA 00:00",
+                           "@@FILE@@ C:\\tmp\\done.mp4"]
+            self._i = 0
+            self.returncode = None
+            self.killed = False
+
+        @property
+        def stdout(self):
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._i >= len(self._lines):
+                raise StopIteration
+            line = self._lines[self._i]
+            self._i += 1
+            return line
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    live = []
+
+    def popen_live(*_a, **_k):
+        p = LiveProc()
+        live.append(p)
+        return p
+
+    monkeypatch.setattr(d.subprocess, "Popen", popen_live)
+    monkeypatch.setattr(d.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: 42)
+
+    sent.clear()
+    d.handle_ytdl({"id": jid, "url": "https://example.test/v2", "dir": "."})
+    assert wait_for(
+        lambda: any(m.get("type") == "ytdl-done" for m in sent)
+        or any(m.get("type") == "ytdl-error" for m in sent),
+        timeout=5,
+    )
+    # After completion the identity-safe unregister must clear the slot.
+    assert wait_for(lambda: d._PGET.get(jid) is None, timeout=5)
+    assert not any(m.get("type") == "pget-limit-ack" for m in sent)
+    # Cancel against a ytdl entry still kills the captured proc when present mid-flight.
+    mid = {"proc": FakeProc(), "kind": "ytdl"}
+    assert d._pget_register(jid, mid)
+    mc._pget_cancel({"id": jid})
+    assert mid["proc"].killed is True or mid["proc"] in killed
+    d._pget_unregister(jid, mid)

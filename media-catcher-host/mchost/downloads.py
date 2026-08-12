@@ -1015,7 +1015,12 @@ def handle_ytdl(req):
     """Download a YouTube (or other yt-dlp-supported) URL at the highest quality:
     best video + best audio, merged to mp4 by yt-dlp+ffmpeg, using the PO-token
     provider and Firefox cookies for reliability. Streams progress; maps failures
-    to explicit reasons instead of silently downgrading."""
+    to explicit reasons instead of silently downgrading.
+
+    yt-dlp entries share the pget registry under the same CAS helpers. They are
+    tagged without lease_cv so pget-set-limit never acknowledges them. Cancel
+    still kills the exact captured proc; unregister is identity-safe.
+    """
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
@@ -1056,49 +1061,62 @@ def handle_ytdl(req):
         except Exception as e:
             _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return
+        # Tagged yt-dlp op: same CAS registry as pget; no lease_cv so set-limit ignores it.
+        op = {"proc": p, "kind": "ytdl"}
+        if not _pget_register(jid, op):
+            # Duplicate id owns the registry — kill the just-spawned process, do not overwrite.
+            _safe_kill(p)
+            _h().send({
+                "type": "ytdl-error",
+                "id": jid,
+                "reason": "spawn",
+                "error": "Download id already in use.",
+            })
+            return
         errbuf = []
         filepath = None
         last_pct = -1.0
         last_note = ""
         last_note_ts = 0.0
-        _PGET[jid] = {"proc": p}               # so a cancel can kill it
-        for line in p.stdout:
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("@@FILE@@"):
-                filepath = s[len("@@FILE@@"):].strip()
-                continue
-            if s.startswith("[download]"):
-                prog = _parse_yt_progress(s)
-                if prog:
-                    pct = prog.get("pct", 0.0)
-                    # throttle to ~1% steps; resend on a reset (audio stream starts after video)
-                    if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
-                        last_pct = pct
-                        _h().send({"type": "ytdl-progress", "id": jid, **prog})
+        try:
+            for line in p.stdout:
+                s = line.strip()
+                if not s:
                     continue
-            errbuf.append(s)
-            if "Merging formats" in s or s.startswith("[Merger]"):
-                _h().send({"type": "ytdl-progress", "id": jid, "pct": 99, "stage": "merging"})
-                continue
-            # Before the first real byte, echo yt-dlp's resolution steps as a live label.
-            if last_pct < 0:
-                note = _yt_stage_note(s)
-                now = time.time()
-                if note and (note != last_note or now - last_note_ts > 0.5):
-                    last_note = note
-                    last_note_ts = now
-                    _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": note})
-        p.wait()
-        _PGET.pop(jid, None)
-        if p.returncode == 0 and filepath and os.path.isfile(filepath):
-            _h().send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": os.path.getsize(filepath)})
-            _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
-        else:
-            reason, msg = _map_yt_error("\n".join(errbuf))
-            _h()._hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
-            _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+                if s.startswith("@@FILE@@"):
+                    filepath = s[len("@@FILE@@"):].strip()
+                    continue
+                if s.startswith("[download]"):
+                    prog = _parse_yt_progress(s)
+                    if prog:
+                        pct = prog.get("pct", 0.0)
+                        # throttle to ~1% steps; resend on a reset (audio stream starts after video)
+                        if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
+                            last_pct = pct
+                            _h().send({"type": "ytdl-progress", "id": jid, **prog})
+                        continue
+                errbuf.append(s)
+                if "Merging formats" in s or s.startswith("[Merger]"):
+                    _h().send({"type": "ytdl-progress", "id": jid, "pct": 99, "stage": "merging"})
+                    continue
+                # Before the first real byte, echo yt-dlp's resolution steps as a live label.
+                if last_pct < 0:
+                    note = _yt_stage_note(s)
+                    now = time.time()
+                    if note and (note != last_note or now - last_note_ts > 0.5):
+                        last_note = note
+                        last_note_ts = now
+                        _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": note})
+            p.wait()
+            if p.returncode == 0 and filepath and os.path.isfile(filepath):
+                _h().send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": os.path.getsize(filepath)})
+                _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
+            else:
+                reason, msg = _map_yt_error("\n".join(errbuf))
+                _h()._hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
+                _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+        finally:
+            _pget_unregister(jid, op)
     threading.Thread(target=worker, daemon=True).start()
 
 # ---- parallel multi-mirror direct download --------------------------------
@@ -1108,9 +1126,11 @@ def handle_ytdl(req):
 # stitched into a sibling .part path and committed with os.replace. Terminal
 # outcomes are structured pget-result messages (never browser handoff).
 _PGET = {}  # id -> operation dict (stop Event, cancel flag, optional yt-dlp proc)
+_PGET_LOCK = threading.Lock()  # short CAS only: register / lookup / unregister
 _PGET_MAX_CONN = 6
 _PGET_CR_PROBE = re.compile(r"^bytes 0-0/(\d+)$")
 _PGET_CR_SEG = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+_PGET_INT_RE = re.compile(r"^-?\d+$")
 # Deterministic failure priority (higher wins). User cancel is handled separately.
 _PGET_FAIL_PRIORITY = {
     "range_unsupported": 90,
@@ -1248,6 +1268,32 @@ def _pget_safe_int(val, default=0):
         return default
 
 
+def _pget_strict_int(val):
+    """Mathematical integer or None. Rejects bool/NaN/inf/fractional/objects.
+
+    Integer-valued floats (4.0) and digit strings ("2") are accepted; decimal
+    strings ("1.5", "2.0") and truncated floats (1.5) are not.
+    """
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        import math
+        if not math.isfinite(val) or not val.is_integer():
+            return None
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s or not _PGET_INT_RE.match(s):
+            return None
+        try:
+            return int(s)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
 def _pget_initial_cap(req, single=False):
     """Initial connection cap for an operation (single mode always 1)."""
     if single:
@@ -1304,6 +1350,11 @@ def _pget_make_op(req, stop, single=False):
         "stop": stop,
         "cancel_requested": False,
         "lease_cv": threading.Condition(),
+        "ack_lock": threading.RLock(),
+        "ack_sending": False,
+        "ack_pending": False,
+        "last_sent_gen": None,
+        "last_sent_lim": None,
         "initial_cap": initial_cap,
         "maxConnections": initial_cap,
         "providerGeneration": gen,
@@ -1543,8 +1594,29 @@ def _pget_cleanup(path, n):
     _pget_cleanup_work(path, n)
 
 
+def _pget_registry_get(jid):
+    """Snapshot the current registry entry (short lock)."""
+    with _PGET_LOCK:
+        return _PGET.get(jid)
+
+
+def _pget_registry_is(jid, op):
+    """True only while the registry still points at this exact operation."""
+    with _PGET_LOCK:
+        return _PGET.get(jid) is op
+
+
+def _pget_register(jid, op):
+    """CAS-register a pget op. False if another active entry already owns jid."""
+    with _PGET_LOCK:
+        if jid in _PGET:
+            return False
+        _PGET[jid] = op
+        return True
+
+
 def _pget_cancel(req):
-    j = _PGET.get(req.get("id"))
+    j = _pget_registry_get(req.get("id"))
     if not j:
         return
     j["cancel_requested"] = True
@@ -1560,9 +1632,28 @@ def _pget_cancel(req):
 
 
 def _pget_unregister(jid, op):
-    """Pop registry only if it still points at this exact operation."""
-    if _PGET.get(jid) is op:
-        _PGET.pop(jid, None)
+    """Pop registry only if it still points at this exact operation.
+
+    When the op has an ack_lock, acquire it before the registry lock so an
+    in-flight limit-ack send (which holds ack_lock across send) remains the
+    live registry owner until that send finishes. Lock order: ack_lock →
+    _PGET_LOCK. Never holds either across network I/O.
+    """
+    if not isinstance(op, dict):
+        with _PGET_LOCK:
+            if _PGET.get(jid) is op:
+                _PGET.pop(jid, None)
+        return
+    ack_lock = op.get("ack_lock")
+    if ack_lock is not None:
+        with ack_lock:
+            with _PGET_LOCK:
+                if _PGET.get(jid) is op:
+                    _PGET.pop(jid, None)
+        return
+    with _PGET_LOCK:
+        if _PGET.get(jid) is op:
+            _PGET.pop(jid, None)
 
 
 def _pget_lease(req, size):
@@ -1584,80 +1675,136 @@ def _pget_lease(req, size):
     return lease, n
 
 
+def _pget_apply_limit_locked(op, gen, lim):
+    """Apply a validated generation/limit under lease_cv. Caller holds lease_cv."""
+    cur_gen = int(op.get("providerGeneration") or 0)
+    initial_cap = int(op.get("initial_cap") or 1)
+    if gen > cur_gen:
+        new_lim = max(0, min(initial_cap, lim))
+        op["providerGeneration"] = gen
+        op["maxConnections"] = new_lim
+        op["lease_cv"].notify_all()
+    # gen < cur_gen: stale — no overwrite; may still ack current state
+    # gen == cur_gen: idempotent — cannot raise
+    return (
+        int(op.get("providerGeneration") or 0),
+        int(op.get("maxConnections") or 0),
+    )
+
+
+def _pget_snapshot_live_limit(jid, op):
+    """Identity-fenced live gen/limit under canonical nested locks.
+
+    Caller must already hold op['ack_lock']. Nested order is
+    _PGET_LOCK → lease_cv. Returns (gen, lim) or None if op is not live.
+    """
+    cv = op.get("lease_cv")
+    if cv is None:
+        return None
+    with _PGET_LOCK:
+        if _PGET.get(jid) is not op:
+            return None
+        with cv:
+            if _PGET.get(jid) is not op:
+                return None
+            return (
+                int(op.get("providerGeneration") or 0),
+                int(op.get("maxConnections") or 0),
+            )
+
+
 def handle_pget_set_limit(req):
     """Apply a live connection lease generation to a pget operation.
 
-    Linearized under the same condition lock used by openers. After the
-    acknowledgement is emitted, no replacement open may start contrary to the
-    applied generation/limit. Stale generations cannot overwrite newer leases;
-    same-generation updates are idempotent and cannot raise the limit. A newer
-    generation may resume from zero with a reduced positive limit, never above
-    the operation's initial cap. Does not acknowledge yt-dlp or unknown ids.
+    One operation-local acknowledgement serializer covers: live registry
+    identity fence → apply/snapshot under lease_cv → message send. Nested lock
+    order is ack_lock → _PGET_LOCK → lease_cv for the short apply/snapshot;
+    only ack_lock is held across host send. Unregister takes ack_lock before
+    the registry lock, so the exact op remains the live owner through an ack
+    send without holding the global registry lock across I/O.
+
+    Stale generations cannot overwrite newer leases; same-generation updates
+    are idempotent and cannot raise the limit. A newer generation may resume
+    from zero with a reduced positive limit, never above the operation's
+    initial cap. Negative generation or limit is an invalid command (no
+    mutation, no ack). Does not acknowledge yt-dlp or unknown ids.
+
+    Re-entrant send (set-limit invoked from within an in-flight ack send) may
+    apply a newer generation and mark ack_pending; the outer sender drains the
+    live state so observers never see a regression or an obsolete trailing ack.
     """
     jid = req.get("id")
-    op = _PGET.get(jid)
+    gen = _pget_strict_int(req.get("providerGeneration"))
+    lim = _pget_strict_int(req.get("maxConnections"))
+    # Wholly invalid command: no mutate, no ack. Negative limit is invalid
+    # (distinct from a valid zero lease).
+    if gen is None or lim is None or gen < 0 or lim < 0:
+        return
+
+    op = _pget_registry_get(jid)
     # yt-dlp entries only carry proc; lack of lease_cv means non-pget.
     if not op or op.get("lease_cv") is None:
         return
 
-    gen_raw = req.get("providerGeneration")
-    lim_raw = req.get("maxConnections")
-    gen_ok = not isinstance(gen_raw, bool) and gen_raw is not None
-    lim_ok = not isinstance(lim_raw, bool) and lim_raw is not None
-    gen = None
-    lim = None
-    if gen_ok:
-        try:
-            if isinstance(gen_raw, float):
-                import math
-                if not math.isfinite(gen_raw):
-                    gen_ok = False
-                else:
-                    gen = int(gen_raw)
-            else:
-                gen = int(gen_raw)
-        except (TypeError, ValueError, OverflowError):
-            gen_ok = False
-    if lim_ok:
-        try:
-            if isinstance(lim_raw, float):
-                import math
-                if not math.isfinite(lim_raw):
-                    lim_ok = False
-                else:
-                    lim = int(lim_raw)
-            else:
-                lim = int(lim_raw)
-        except (TypeError, ValueError, OverflowError):
-            lim_ok = False
+    ack_lock = op.get("ack_lock")
+    if ack_lock is None:
+        ack_lock = threading.RLock()
+        op["ack_lock"] = ack_lock
 
-    with op["lease_cv"]:
-        cur_gen = int(op.get("providerGeneration") or 0)
-        initial_cap = int(op.get("initial_cap") or 1)
-        if gen_ok and gen is not None and gen > cur_gen:
-            if lim_ok and lim is not None:
-                new_lim = max(0, min(initial_cap, lim))
-            else:
-                # Invalid limit on a newer generation: keep current live limit.
-                new_lim = int(op.get("maxConnections") or 0)
-            op["providerGeneration"] = gen
-            op["maxConnections"] = new_lim
-            op["lease_cv"].notify_all()
-        # gen < cur_gen: stale — no overwrite
-        # gen == cur_gen: idempotent — cannot raise
-        applied_gen = int(op.get("providerGeneration") or 0)
-        applied_lim = int(op.get("maxConnections") or 0)
+    with ack_lock:
+        # Apply under short nested locks; release before any send.
+        cv = op.get("lease_cv")
+        if cv is None:
+            return
+        with _PGET_LOCK:
+            if _PGET.get(jid) is not op:
+                return
+            with cv:
+                if _PGET.get(jid) is not op:
+                    return
+                _pget_apply_limit_locked(op, gen, lim)
 
-    # Send after the atomic lease update; never hold the lock across send().
-    try:
-        _h().send({
-            "type": "pget-limit-ack",
-            "id": jid,
-            "maxConnections": applied_lim,
-            "providerGeneration": applied_gen,
-        })
-    except Exception:
-        pass
+        # Re-entered from an in-flight outer send: apply only; outer drains ack.
+        if op.get("ack_sending"):
+            op["ack_pending"] = True
+            return
+
+        op["ack_sending"] = True
+        try:
+            while True:
+                op["ack_pending"] = False
+                snap = _pget_snapshot_live_limit(jid, op)
+                if snap is None:
+                    return
+                live_gen, live_lim = snap
+                last_gen = op.get("last_sent_gen")
+                if last_gen is not None and live_gen < int(last_gen):
+                    return
+                msg = {
+                    "type": "pget-limit-ack",
+                    "id": jid,
+                    "maxConnections": live_lim,
+                    "providerGeneration": live_gen,
+                }
+                # Claim before send so concurrent waiters cannot emit lower gens.
+                op["last_sent_gen"] = live_gen
+                op["last_sent_lim"] = live_lim
+                try:
+                    _h().send(msg)
+                except Exception:
+                    pass
+                # No stale mutation after send: only re-snapshot / re-send if
+                # re-entrant apply marked pending or live state advanced.
+                if op.get("ack_pending"):
+                    continue
+                snap2 = _pget_snapshot_live_limit(jid, op)
+                if snap2 is None:
+                    return
+                if snap2 != (live_gen, live_lim):
+                    continue
+                break
+        finally:
+            op["ack_sending"] = False
 
 
 def handle_pget(req):
@@ -1697,7 +1844,10 @@ def handle_pget(req):
 
     # Register before the worker starts so pget-cancel / pget-set-limit after
     # handle_pget returns is never a silent no-op during probe/path setup.
-    _PGET[jid] = op
+    # Reject same-id overwrite so an active worker is never stranded.
+    if not _pget_register(jid, op):
+        finish("failed", "permanent", "empty")
+        return
 
     def worker():
         final_path = None
@@ -1954,6 +2104,9 @@ def handle_pget_single(req):
     .part, validates Content-Length when present, and commits with os.replace.
     Uses the same live connection lease as multi-range (cap always 1). Exactly
     one intended pget-result on every registered/thread-start exit.
+
+    Failure terminals are emitted only after the response is closed and the
+    connection lease is released (openConnections == 0 at observation).
     """
     jid = req.get("id")
     attempt = req.get("attemptToken")
@@ -1977,7 +2130,9 @@ def handle_pget_single(req):
             return "empty"
         return _pget_part_state(final_path, n)
 
-    _PGET[jid] = op
+    if not _pget_register(jid, op):
+        finish("failed", "permanent", "empty")
+        return
 
     def worker():
         final_path = None
@@ -2023,6 +2178,8 @@ def handle_pget_single(req):
             expected = None
             acquired = False
             resp = None
+            # Record outcome only; cleanup + terminal run after close/release.
+            outcome = None  # (status, category) or None while in progress
             try:
                 if not _pget_lease_acquire(op):
                     raise _PgetError("cancelled")
@@ -2072,108 +2229,119 @@ def handle_pget_single(req):
                 os.replace(part_path, final_path)
                 committed = True
             except _PgetError as e:
-                if not committed:
-                    _pget_cleanup_work(final_path, n)
                 if e.category == "cancelled" or op.get("cancel_requested"):
-                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                    outcome = ("cancelled", "cancelled")
                 else:
-                    finish("failed", e.category, _honest_part_state(final_path))
-                return
+                    outcome = ("failed", e.category)
             except _ue.HTTPError as e:
                 try:
                     cat = _pget_classify_http_status(e.code)
                 finally:
                     _pget_close_resp(e)
-                if not committed:
-                    _pget_cleanup_work(final_path, n)
                 if op.get("cancel_requested"):
-                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                    outcome = ("cancelled", "cancelled")
                 else:
-                    finish("failed", cat, _honest_part_state(final_path))
-                return
+                    outcome = ("failed", cat)
             except OSError as e:
-                if not committed:
-                    _pget_cleanup_work(final_path, n)
                 if op.get("cancel_requested"):
-                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                    outcome = ("cancelled", "cancelled")
                 else:
-                    # Path/write/replace failures are local_io.
                     cat = "local_io"
-                    # Transport-ish OSError without filename may be reset/timeout.
                     if not getattr(e, "filename", None):
                         c2 = _pget_classify_exc(e)
                         if c2 in ("timeout", "connection_reset"):
                             cat = c2
-                    finish("failed", cat, _honest_part_state(final_path))
-                return
+                    outcome = ("failed", cat)
             except Exception as e:
-                if not committed:
-                    _pget_cleanup_work(final_path, n)
                 if op.get("cancel_requested"):
-                    finish("cancelled", "cancelled", _honest_part_state(final_path))
+                    outcome = ("cancelled", "cancelled")
                 else:
                     cat = _pget_classify_exc(e)
                     if cat not in _PGET_FAIL_PRIORITY:
                         cat = "permanent"
-                    finish("failed", cat, _honest_part_state(final_path))
-                return
+                    outcome = ("failed", cat)
             finally:
+                # Quiesce: close response and release lease before any terminal.
                 _pget_close_resp(resp)
+                resp = None
                 if acquired:
                     _pget_lease_release(op)
+                    acquired = False
 
-            if not committed:
-                # Should have returned above; belt-and-suspenders.
-                _pget_cleanup_work(final_path, n)
-                finish("failed", "permanent", _honest_part_state(final_path))
+            if committed:
+                # Late cancel after successful replace loses: retain completed.
+                try:
+                    total = expected if expected is not None else got
+                    _h().send({
+                        "type": "pget-progress",
+                        "id": jid,
+                        "bytes": got,
+                        "total": total,
+                    })
+                except Exception:
+                    pass
+                try:
+                    conv = req.get("convert")
+                    if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
+                        codec = conv["codec"]
+                        try:
+                            _h().send({
+                                "type": "converting",
+                                "id": jid,
+                                "file": final_path,
+                                "codec": codec,
+                            })
+                        except Exception:
+                            pass
+                        try:
+                            tres = transcode(
+                                final_path, codec,
+                                conv.get("quality", "visually-lossless"),
+                                conv.get("encoder", "auto"),
+                                on_progress=lambda pct, j=jid, c=codec: _h().send(
+                                    {
+                                        "type": "convert-progress",
+                                        "id": j,
+                                        "pct": pct,
+                                        "codec": c,
+                                    }
+                                ),
+                            )
+                            final_path = tres["path"]
+                            op["final_path"] = final_path
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finish("completed", None, "committed")
                 return
 
-            # Late cancel after successful replace loses: retain completed.
-            try:
-                total = expected if expected is not None else got
-                _h().send({"type": "pget-progress", "id": jid, "bytes": got, "total": total})
-            except Exception:
-                pass
-            try:
-                conv = req.get("convert")
-                if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
-                    codec = conv["codec"]
-                    try:
-                        _h().send({
-                            "type": "converting",
-                            "id": jid,
-                            "file": final_path,
-                            "codec": codec,
-                        })
-                    except Exception:
-                        pass
-                    try:
-                        tres = transcode(
-                            final_path, codec,
-                            conv.get("quality", "visually-lossless"),
-                            conv.get("encoder", "auto"),
-                            on_progress=lambda pct, j=jid, c=codec: _h().send(
-                                {"type": "convert-progress", "id": j, "pct": pct, "codec": c}
-                            ),
-                        )
-                        final_path = tres["path"]
-                        op["final_path"] = final_path
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            finish("completed", None, "committed")
+            # Non-commit path: clean work only after close/release above.
+            if final_path:
+                try:
+                    _pget_cleanup_work(final_path, n)
+                except Exception:
+                    pass
+            if outcome is None:
+                outcome = ("failed", "permanent")
+            status, category = outcome
+            finish(status, category, _honest_part_state(final_path))
         except Exception as e:
             if committed:
                 finish("completed", None, "committed")
             elif op.get("cancel_requested"):
                 if final_path:
-                    _pget_cleanup_work(final_path, n)
+                    try:
+                        _pget_cleanup_work(final_path, n)
+                    except Exception:
+                        pass
                 finish("cancelled", "cancelled", _honest_part_state(final_path))
             else:
                 if final_path:
-                    _pget_cleanup_work(final_path, n)
+                    try:
+                        _pget_cleanup_work(final_path, n)
+                    except Exception:
+                        pass
                 cat = _pget_classify_exc(e)
                 if cat not in _PGET_FAIL_PRIORITY:
                     cat = "permanent"
