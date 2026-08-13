@@ -97,6 +97,6 @@ Execute this in three bounded substeps rather than one broad rewrite:
 
 1. Add the locked policy globals and `background-adapters.js` to manifest order; instantiate exactly one live controller with real settings/effects and route native frames to it.
 2. Extract/adapt one-file VOD HLS/DASH assembly behind the documented effect. Mux separate compatible fMP4 audio/video with the existing `Mux.combineFmp4`; an unsupported split-track or sidecar-only combination must fail safely and visibly rather than silently discard audio or write through `browser.downloads`.
-3. Route popup download/save-as/cancel/retry/use-Firefox and finalized media snapshots through the controller while leaving YouTube and live-recording flows legacy until separately migrated.
+3. Route popup download/save-as/cancel/retry/use-Firefox and finalized media snapshots through the controller while leaving YouTube and live-recording flows legacy until separately migrated. Extend the adapter's guarded Firefox callback for HLS/DASH `needs_user` jobs to use the retained assembled bytes + MIME as a `FirefoxGuard` bytes source (short-lived object URL); never hand Firefox the manifest URL.
 
 Task 3 does not redesign HLS/DASH parsers. Any parser defect discovered is reported separately instead of expanding this slice.
