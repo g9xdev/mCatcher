@@ -420,6 +420,11 @@
       var id = safeGet(job, "id");
       if (isSafePopupIdentifier(id)) out.id = id;
 
+      var mediaId = safeGet(job, "mediaId");
+      if (typeof mediaId === "string" && isSafePopupIdentifier(mediaId)) {
+        out.mediaId = mediaId;
+      }
+
       var state = safeGet(job, "state");
       if (typeof state === "string") {
         var stateOk = sanitizePopupOptionalString(state);

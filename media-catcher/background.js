@@ -2279,6 +2279,51 @@ function livePopupJobs() {
   }
 }
 
+function readOwnActionId(record) {
+  try {
+    if (!record || (typeof record !== "object" && typeof record !== "function")) {
+      return { present: false };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, "id");
+    if (!descriptor) return { present: false };
+    if (descriptor.get || descriptor.set || !("value" in descriptor)) {
+      return { present: true, kind: "invalid" };
+    }
+    if (typeof descriptor.value === "string") {
+      return { present: true, kind: "string", value: descriptor.value };
+    }
+    if (typeof descriptor.value === "number" && Number.isFinite(descriptor.value)) {
+      return { present: true, kind: "number", value: descriptor.value };
+    }
+    return { present: true, kind: "invalid" };
+  } catch (e) {
+    return { present: true, kind: "invalid" };
+  }
+}
+
+async function runLiveControllerAction(sender, action) {
+  try {
+    await settingsReady;
+    if (!liveController || !isExtensionPopupSender(sender)) {
+      return { ok: false, error: "Download action rejected." };
+    }
+    const job = await action(liveController);
+    if (!job || typeof job !== "object") {
+      return { ok: false, error: "Download action rejected." };
+    }
+    return { ok: true, job };
+  } catch (e) {
+    return { ok: false, error: "Download action rejected." };
+  }
+}
+
+function isUnpromotedStaticVod(item) {
+  if (!item || typeof item !== "object") return false;
+  if (item.kind === "hls") return item.isLive === false;
+  if (item.kind === "dash") return item.isDynamic === false;
+  return false;
+}
+
 // ---- Messaging ----
 
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -2388,16 +2433,40 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, info });
       } else if (msg.type === "download") {
         const { item, tabId, filename, variantUrl } = msg;
-        if (item.kind === "hls") {
+        const itemId = readOwnActionId(item);
+        if (itemId.kind === "string") {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.enqueueDownload(msg, sender)));
+        } else if (itemId.present) {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else if (isUnpromotedStaticVod(item)) {
+          sendResponse({ ok: false, error: "This static media is not ready for the managed download queue." });
+        } else if (item.kind === "hls") {
           downloadHls(item, tabId, filename, variantUrl);
+          sendResponse({ ok: true });
         } else if (item.kind === "dash") {
           downloadDash(item, tabId, filename, msg.variantId);
+          sendResponse({ ok: true });
         } else if (item.kind === "youtube") {
           downloadYouTube(item, tabId, filename, { height: msg.ytHeight, audioOnly: msg.ytAudioOnly });
+          sendResponse({ ok: true });
         } else {
           await downloadDirect(item, tabId, filename);
+          sendResponse({ ok: true });
         }
-        sendResponse({ ok: true });
+      } else if (msg.type === "retry-download") {
+        const retryId = readOwnActionId(msg);
+        if (retryId.kind !== "string") {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.manualRetry(retryId.value)));
+        }
+      } else if (msg.type === "use-firefox") {
+        const firefoxId = readOwnActionId(msg);
+        if (firefoxId.kind !== "string") {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.requestFirefoxHandoff(msg, sender)));
+        }
       } else if (msg.type === "record-live") {
         const { item, tabId, filename, variantUrl } = msg;
         if (!nativePort) promptInstallHelper();   // works in-browser, but the helper is better — nudge once
@@ -2533,7 +2602,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "get-settings") {
         sendResponse({ ok: true, settings, defaults: DEFAULT_SETTINGS });
       } else if (msg.type === "set-settings") {
+        const previousMaxConcurrent = settings.maxConcurrentDownloads;
         await saveSettings(msg.settings);
+        if (liveController && settings.maxConcurrentDownloads !== previousMaxConcurrent) {
+          await liveController.setMaxConcurrent(settings.maxConcurrentDownloads);
+        }
         sendResponse({ ok: true, settings });
       } else if (msg.type === "get-history") {
         const r = await api.storage.local.get("history");
@@ -2542,9 +2615,16 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await api.storage.local.set({ history: [] });
         sendResponse({ ok: true });
       } else if (msg.type === "cancel") {
-        const dl = activeDownloads.get(msg.id);
-        if (dl) dl.status = "cancelled";
-        sendResponse({ ok: true });
+        const cancelId = readOwnActionId(msg);
+        if (cancelId.kind === "string") {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.cancel(cancelId.value)));
+        } else if (cancelId.kind === "number") {
+          const dl = activeDownloads.get(cancelId.value);
+          if (dl) dl.status = "cancelled";
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        }
       } else if (msg.type === "open-file") {
         // Popup "Open" on a helper-saved file. Browser-API saves are opened by
         // the popup itself via downloads.open (that call needs the user-input
