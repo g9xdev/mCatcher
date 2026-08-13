@@ -1133,14 +1133,11 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 
   // Async future stubs return a Promise before rejecting (never throw sync).
   const asyncStubs = [
-    () => ctrl.enqueueDownload({}, {}),
     () => ctrl.handleNativeMessage({}),
     () => ctrl.requestFirefoxHandoff({}, {}),
     () => ctrl.cancel("j1"),
     () => ctrl.manualRetry("j1"),
     () => ctrl.helperDisconnected(),
-    () => ctrl.setMaxConcurrent(3),
-    () => ctrl.pump(),
   ];
   for (const call of asyncStubs) {
     let p;
@@ -7075,7 +7072,7 @@ test("BA05 — opaque variant IDs bind original private URLs and replay cannot r
         false
       );
 
-      // enqueueDownload remains Lease-1 stub; no reads / effects.
+      // Incomplete enqueue (no own-data item.id / tabId) stays effect-free.
       let itemHits = 0;
       const item = {};
       Object.defineProperty(item, "url", {
@@ -7118,9 +7115,15 @@ test("BA05 — opaque variant IDs bind original private URLs and replay cannot r
         }
       );
       assert.ok(rejected instanceof Error);
-      assert.equal(rejected.message, LEASE1_MSG);
+      assert.equal(rejected.message, "invalid background adapter input");
       assert.equal(itemHits, 0);
-      assertEffectBaseline(fx, baseline, "enqueueDownload stub");
+      assert.equal(fx.counts.postNative, baseline.postNative);
+      assert.equal(fx.counts.publishJobs, baseline.publishJobs);
+      assert.equal(
+        fx.counts.getEffectiveDestinationDirectory,
+        baseline.getEffectiveDestinationDirectory
+      );
+      assert.equal(fx.counts.randomToken, baseline.randomToken);
       assert.deepEqual(
         ctrl.popupMedia(tabId)[0].variants.map((v) => v.id),
         rows.map((r) => r.id)
@@ -8058,23 +8061,11 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
 
       // Representative future stubs — await all rejections.
       const stubCalls = [
-        () =>
-          ctrl.enqueueDownload(
-            {
-              url: "https://override.example/SECRET_OVERRIDE_URL.mp4",
-              providerKey: "SECRET_CALLER_PROVIDER",
-              variantUrl: vUrlNet,
-              variantId: netRows[0].id,
-            },
-            {}
-          ),
         () => ctrl.handleNativeMessage({ cookie: "SECRET_COOKIE_ABC" }),
         () => ctrl.requestFirefoxHandoff({ url: vUrlNet }, {}),
         () => ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.helperDisconnected(),
-        () => ctrl.setMaxConcurrent(9),
-        () => ctrl.pump(),
       ];
       const materialBefore = snapshotEffectBaseline(fx);
       for (const call of stubCalls) {
