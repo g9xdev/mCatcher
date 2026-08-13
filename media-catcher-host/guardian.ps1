@@ -22,7 +22,37 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+function Assert-NoReparsePath([string]$Path) {
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    throw "host update path is empty"
+  }
+  $full = [IO.Path]::GetFullPath($Path)
+  $root = [IO.Path]::GetPathRoot($full)
+  if ([string]::IsNullOrWhiteSpace($root)) {
+    throw "host update path must be absolute"
+  }
+  $current = $root
+  $relative = $full.Substring($root.Length)
+  foreach ($part in ($relative -split '[\\/]')) {
+    if (-not $part) { continue }
+    $current = [IO.Path]::Combine($current, $part)
+    try {
+      $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+      break
+    }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "host update path contains a reparse point"
+    }
+  }
+}
+
 $cfg = Get-Content -Raw -LiteralPath $Config | ConvertFrom-Json
+if ($cfg.applyHost) {
+  # Validate before backup/log directory creation or payload access. Checking
+  # the complete string alone follows a junction in an ancestor of hostDir.
+  Assert-NoReparsePath $cfg.hostDir
+}
 $backupRoot = $cfg.backupRoot
 New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
 $logFile = Join-Path $backupRoot "guardian.log"

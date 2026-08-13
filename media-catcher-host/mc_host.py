@@ -262,8 +262,40 @@ def _host_member_destination(host_dir, rel):
     return dest_abs
 
 
+def _reject_reparse_components(path):
+    """Reject a pre-existing symlink/junction anywhere in an absolute path.
+
+    Walk the lexical path from its drive/share root so a junction above the
+    configured host directory is inspected before it can redirect updater I/O.
+    Missing tail components are allowed; the updater may create them later.
+    """
+    if os.name != "nt":
+        return
+    full = os.path.abspath(os.fspath(path))
+    drive, tail = os.path.splitdrive(full)
+    if not drive or not tail.startswith((os.sep, "/", "\\")):
+        raise ValueError("host update path must be absolute")
+
+    current = drive + os.sep
+    parts = [part for part in tail.replace("\\", "/").split("/") if part]
+    for part in parts:
+        current = os.path.join(current, part)
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            break
+        attrs = getattr(info, "st_file_attributes", 0)
+        if attrs & 0x400 or os.path.islink(current):  # FILE_ATTRIBUTE_REPARSE_POINT
+            raise RuntimeError("host update path contains a reparse point")
+
+
 def apply_update(plan, ext_dir, host_dir):
     """Apply only the parts that are newer. Returns {staged: bool}."""
+    if plan["host_newer"]:
+        # Preflight before extension staging, host directory creation, or any
+        # payload write. A junction above host_dir otherwise redirects every
+        # later abspath/open call outside the configured lexical destination.
+        _reject_reparse_components(host_dir)
     staged = False
     if plan["ext_newer"]:
         if not _await_zip(plan["ext_zip"]):

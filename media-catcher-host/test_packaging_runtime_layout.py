@@ -161,6 +161,29 @@ def _make_release_shaped_zip(path: Path, host_body: str = 'VERSION = "9.9.9"\n')
         z.writestr("mchost/cast/backend.py", "# backend\n")
 
 
+def _make_directory_junction(link: Path, target: Path) -> None:
+    env = os.environ.copy()
+    env["MC_JUNCTION_PATH"] = str(link)
+    env["MC_JUNCTION_TARGET"] = str(target)
+    result = subprocess.run(
+        [
+            PS,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:MC_JUNCTION_PATH "
+            "-Target $env:MC_JUNCTION_TARGET -ErrorAction Stop | Out-Null",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"failed to create temporary junction: {result.stdout}\n{result.stderr}"
+    )
+
+
 def test_release_host_zip_stages_mchost_recursively_without_caches():
     """Active release packaging stages host-staging then recursive mchost once."""
     block = _extract_release_package_run_block()
@@ -546,3 +569,100 @@ def test_guardian_preserves_nested_host_package_without_restart(tmp_path):
     assert not (host_dir / "backend.py").exists()
     # fail-closed verification: missing mchost/__init__.py must not pass
     # (covered by production check; nested files present proves non-flatten apply)
+
+
+def test_apply_update_rejects_junction_above_host_directory(tmp_path, monkeypatch):
+    """A pre-existing ancestor junction must not redirect in-process host writes."""
+    mc = load_host()
+    monkeypatch.setattr(mc, "find_profile", lambda: None)
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(mc, "_await_zip", lambda path, tries=10, delay=0.5: True)
+
+    real_parent = tmp_path / "real-parent"
+    real_host = real_parent / "host"
+    real_host.mkdir(parents=True)
+    sentinel = real_host / "mc_host.py"
+    sentinel.write_text('VERSION = "1.0.0"\nKEEP\n', encoding="utf-8")
+    (real_host / "mchost").mkdir()
+    (real_host / "mchost" / "__init__.py").write_text("KEEP_INIT\n", encoding="utf-8")
+
+    alias_parent = tmp_path / "alias-parent"
+    _make_directory_junction(alias_parent, real_parent)
+    configured_host = alias_parent / "host"
+
+    zpath = tmp_path / "media-catcher-host-2.0.0.zip"
+    _make_release_shaped_zip(zpath, 'VERSION = "2.0.0"\nCHANGED\n')
+    plan = {
+        "ext_newer": False,
+        "host_newer": True,
+        "ext_zip": None,
+        "host_zip": str(zpath),
+        "ext_to": None,
+        "host_to": "2.0.0",
+    }
+
+    with pytest.raises(Exception):
+        mc.apply_update(plan, str(tmp_path / "ext"), str(configured_host))
+
+    assert sentinel.read_text(encoding="utf-8") == 'VERSION = "1.0.0"\nKEEP\n'
+    assert (real_host / "mchost" / "__init__.py").read_text(encoding="utf-8") == "KEEP_INIT\n"
+    assert not (real_host / "mchost" / "cast").exists()
+
+
+def test_guardian_rejects_junction_above_host_directory_without_restart(tmp_path):
+    """Guardian must reject an ancestor junction before applying host payloads."""
+    real_parent = tmp_path / "real-parent"
+    real_host = real_parent / "host"
+    real_host.mkdir(parents=True)
+    sentinel = real_host / "mc_host.py"
+    sentinel.write_text('VERSION = "1.0.0"\nKEEP\n', encoding="utf-8")
+    (real_host / "mchost").mkdir()
+    (real_host / "mchost" / "__init__.py").write_text("KEEP_INIT\n", encoding="utf-8")
+
+    alias_parent = tmp_path / "alias-parent"
+    _make_directory_junction(alias_parent, real_parent)
+    configured_host = alias_parent / "host"
+
+    zpath = tmp_path / "media-catcher-host-2.0.0.zip"
+    _make_release_shaped_zip(zpath, 'VERSION = "2.0.0"\nCHANGED\n')
+    cfg = {
+        "applyExt": False,
+        "applyHost": True,
+        "extZip": None,
+        "hostZip": str(zpath),
+        "extDir": str(tmp_path / "ext"),
+        "hostDir": str(configured_host),
+        "profileDir": "",
+        "extId": "{id}",
+        "expectExtVersion": None,
+        "expectHostVersion": "2.0.0",
+        "python": sys.executable,
+        "firefox": "",
+        "restart": False,
+        "backupRoot": str(tmp_path / "backups"),
+        "keep": 3,
+    }
+    confpath = tmp_path / "guardian-config.json"
+    confpath.write_text(json.dumps(cfg), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            PS,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(GUARDIAN),
+            "-Config",
+            str(confpath),
+            "-NoUi",
+            "-NoRestart",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == 'VERSION = "1.0.0"\nKEEP\n'
+    assert (real_host / "mchost" / "__init__.py").read_text(encoding="utf-8") == "KEEP_INIT\n"
+    assert not (real_host / "mchost" / "cast").exists()
