@@ -534,6 +534,7 @@ test("5 pending draining terminal waits on local activity; last release settles 
 // ---------------------------------------------------------------------------
 
 test("6 stale lease after unavailable/needs_user/manualRetry/admission is inert", () => {
+  let clearCalls = 0;
   const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
   s.createJob({
     id: "j",
@@ -541,21 +542,29 @@ test("6 stale lease after unavailable/needs_user/manualRetry/admission is inert"
     intent: intent("a.mp4"),
     segmentConcurrency: 2,
     retries: 1,
+    ephemeral: {
+      clear: function () {
+        clearCalls += 1;
+      },
+    },
   });
   s.enqueue("j");
   const oldLease = s.acquireLocalActivity("j", "assembly");
   assert.equal(s.getJob("j").localActivities, 1);
+  const verBefore = s.getJob("j").stateVersion;
 
-  // Local activity keeps job non-quiescent → hold in pausing, then settle needs_user.
+  // Helper disconnect fences local work immediately: local-only → needs_user.
+  // Old lease must become a false no-op without requiring the dead adapter closure.
   assert.equal(s.onTransportUnavailable("j"), true);
-  assert.equal(s.getJob("j").state, "pausing_provider");
-  assert.equal(s.getJob("j").holdsGlobalSlot, true);
-  assert.equal(s.getJob("j").localActivities, 1);
-
-  // Force needs_user by releasing current activity (settles unavailable path).
-  assert.equal(oldLease.release(), true);
   assert.equal(s.getJob("j").state, "needs_user");
+  assert.equal(s.getJob("j").holdsGlobalSlot, false);
   assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").stateVersion, verBefore + 1);
+  assert.equal(clearCalls, 0); // needs_user retains ephemeral for manualRetry
+  assert.equal(oldLease.release(), false);
+  assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").state, "needs_user");
+  assert.equal(s.getJob("j").stateVersion, verBefore + 1);
 
   // Re-acquire is denied in needs_user; manual retry + admit, then new lease.
   assert.equal(s.acquireLocalActivity("j", "assembly"), null);
@@ -868,4 +877,798 @@ test("10 projection keys include only numeric localActivities; no private fields
   assertProjectionKeys(s.getJob("j"));
   assert.equal(s.getJob("j").localActivities, 0);
   assertSlotInvariant(s);
+});
+
+// ---------------------------------------------------------------------------
+// 11. Defect 1: helper disconnect fences local activities (local-only paths)
+// ---------------------------------------------------------------------------
+
+test("11a running local-only unavailable settles needs_user immediately; old release false", () => {
+  let clearCalls = 0;
+  const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
+  s.createJob({
+    id: "j",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+    ephemeral: {
+      clear: function () {
+        clearCalls += 1;
+      },
+    },
+  });
+  s.enqueue("j");
+  const lease = s.acquireLocalActivity("j", "assembly");
+  assert.equal(s.getJob("j").localActivities, 1);
+  const ver = s.getJob("j").stateVersion;
+  const globalBefore = s.getSnapshot().globalRunning;
+
+  assert.equal(s.onTransportUnavailable("j"), true);
+  assert.equal(s.getJob("j").state, "needs_user");
+  assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").holdsGlobalSlot, false);
+  assert.equal(s.getSnapshot().globalRunning, globalBefore - 1);
+  assert.equal(s.getJob("j").stateVersion, ver + 1);
+  assert.equal(clearCalls, 0);
+  assert.equal(lease.release(), false);
+  assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").stateVersion, ver + 1);
+  assertSlotInvariant(s);
+});
+
+test("11b cancel+unavailable local-only settles cancelled once; old release false", () => {
+  let clearCalls = 0;
+  const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
+  s.createJob({
+    id: "j",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+    ephemeral: {
+      clear: function () {
+        clearCalls += 1;
+      },
+    },
+  });
+  s.enqueue("j");
+  const lease = s.acquireLocalActivity("j", "assembly");
+  s.cancel("j");
+  assert.equal(s.getJob("j").state, "running");
+  const ver = s.getJob("j").stateVersion;
+
+  assert.equal(s.onTransportUnavailable("j"), true);
+  assert.equal(s.getJob("j").state, "cancelled");
+  assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").holdsGlobalSlot, false);
+  assert.equal(s.getJob("j").stateVersion, ver + 1);
+  assert.equal(clearCalls, 1);
+  assert.equal(lease.release(), false);
+  assert.equal(clearCalls, 1);
+  assert.equal(s.getJob("j").stateVersion, ver + 1);
+  assertSlotInvariant(s);
+});
+
+test("11c pausing local-only unavailable settles needs_user; ordinary pause retains local", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 3, now: () => 0 });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  const leaseB = s.acquireLocalActivity("B", "assembly");
+  s.noteNativeOpen("C", 1);
+
+  // Ordinary saturation pause must NOT clear local activities.
+  s.onTransportResult("C", s.getJob("C").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").localActivities, 1);
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+
+  // Helper disconnect on the local-only pausing peer settles needs_user.
+  const ver = s.getJob("B").stateVersion;
+  assert.equal(s.onTransportUnavailable("B"), true);
+  assert.equal(s.getJob("B").state, "needs_user");
+  assert.equal(s.getJob("B").localActivities, 0);
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.getJob("B").stateVersion, ver + 1);
+  assert.equal(leaseB.release(), false);
+  assert.equal(s.getJob("B").localActivities, 0);
+  assertSlotInvariant(s);
+});
+
+test("11d pending completed + local + unavailable preserves completed; old release inert", () => {
+  let clearB = 0;
+  const s = createDownloadScheduler({ maxConcurrent: 3, now: () => 0 });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+    ephemeral: {
+      clear: function () {
+        clearB += 1;
+      },
+    },
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  s.noteNativeOpen("B", 2);
+  const leaseB = s.acquireLocalActivity("B", "assembly");
+  s.noteNativeOpen("C", 1);
+  const bToken = s.getJob("B").attemptToken;
+
+  s.onTransportResult("C", s.getJob("C").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), true);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").localActivities, 1);
+  assert.equal(clearB, 0);
+
+  const ver = s.getJob("B").stateVersion;
+  assert.equal(s.onTransportUnavailable("B"), true);
+  // Completed pending terminal wins; local activity is fenced, not waited on.
+  assert.equal(s.getJob("B").state, "completed");
+  assert.equal(s.getJob("B").localActivities, 0);
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.getJob("B").stateVersion, ver + 1);
+  assert.equal(clearB, 1);
+  assert.equal(leaseB.release(), false);
+  assert.equal(clearB, 1);
+  assert.equal(s.getJob("B").stateVersion, ver + 1);
+  assertSlotInvariant(s);
+});
+
+test("11e wrapper-permit + local unavailable clears only local; slot held until wrapper release", () => {
+  const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
+  s.createJob({
+    id: "j",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+  });
+  s.enqueue("j");
+  const permit = s.acquireProviderPermit("j", "chunk");
+  assert.ok(permit);
+  const lease = s.acquireLocalActivity("j", "assembly");
+  assert.equal(s.getJob("j").localActivities, 1);
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  const ver = s.getJob("j").stateVersion;
+  const globalBefore = s.getSnapshot().globalRunning;
+
+  assert.equal(s.onTransportUnavailable("j"), true);
+  // Provider permit remains: hold pausing/slot; local activity fenced only.
+  assert.equal(s.getJob("j").state, "pausing_provider");
+  assert.equal(s.getJob("j").holdsGlobalSlot, true);
+  assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").inFlightPermits, 1);
+  assert.equal(s.getSnapshot().globalRunning, globalBefore);
+  assert.ok(s.getJob("j").stateVersion >= ver);
+  assert.equal(lease.release(), false);
+  assert.equal(s.getJob("j").localActivities, 0);
+  assert.equal(s.getJob("j").state, "pausing_provider");
+  assert.equal(s.getJob("j").holdsGlobalSlot, true);
+
+  // Final provider release settles needs_user once.
+  permit.release();
+  assert.equal(s.getJob("j").state, "needs_user");
+  assert.equal(s.getJob("j").holdsGlobalSlot, false);
+  assert.equal(s.getJob("j").inFlightPermits, 0);
+  assert.equal(s.getJob("j").localActivities, 0);
+  assertSlotInvariant(s);
+});
+
+// ---------------------------------------------------------------------------
+// Hostile gate helpers for local-release failure atomicity
+// ---------------------------------------------------------------------------
+
+const path = require("node:path");
+
+function installHostileGate(realGate, gatePath, hooks) {
+  hooks = hooks || {};
+  require.cache[require.resolve(gatePath)] = {
+    id: gatePath,
+    filename: gatePath,
+    loaded: true,
+    exports: {
+      createProviderGate: function (opts) {
+        const g = realGate.createProviderGate(opts);
+        if (typeof hooks.onGate === "function") hooks.onGate(g);
+        return {
+          get providerKey() {
+            return g.providerKey;
+          },
+          get state() {
+            return g.state;
+          },
+          get generation() {
+            return g.generation;
+          },
+          get wakeGeneration() {
+            return g.wakeGeneration;
+          },
+          acquire: g.acquire.bind(g),
+          setSaturated: g.setSaturated.bind(g),
+          registerJobLimit: g.registerJobLimit.bind(g),
+          nativeLeaseFor: g.nativeLeaseFor.bind(g),
+          noteNativeOpen: g.noteNativeOpen.bind(g),
+          parkProbe: g.parkProbe.bind(g),
+          completeOwner: g.completeOwner.bind(g),
+          designateRecoveryOwner: g.designateRecoveryOwner.bind(g),
+          recoverToNormal: g.recoverToNormal.bind(g),
+          snapshot: hooks.snapshot
+            ? function () {
+                return hooks.snapshot(g);
+              }
+            : g.snapshot.bind(g),
+        };
+      },
+    },
+  };
+}
+
+function loadSchedulerFresh(schedPath) {
+  delete require.cache[require.resolve(schedPath)];
+  return require(schedPath).createDownloadScheduler;
+}
+
+function restoreModuleCache(gatePath, schedPath, prevGate, prevSched) {
+  if (prevGate) require.cache[require.resolve(gatePath)] = prevGate;
+  else delete require.cache[require.resolve(gatePath)];
+  if (prevSched) require.cache[require.resolve(schedPath)] = prevSched;
+  else delete require.cache[require.resolve(schedPath)];
+  delete require.cache[require.resolve(schedPath)];
+  loadLib("lib/download-scheduler.js");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Defect 2: release is failure-atomic/boolean and never strands waiters
+// ---------------------------------------------------------------------------
+
+test("12a A/B/C local-only B: snapshot throw-after-waiting-transition does not strand; release boolean", () => {
+  // Independent reproduction: A/B/C same provider; B local-only pauses; A completes,
+  // C recovers; gate normal while B still pausing on local. snapshot() throws during
+  // authorize after mutate → must not permanently strand B or mark lease released
+  // without coherent completion (mutate-then finalizes true without duplicate wake).
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let mode = "pass";
+  let snapshotCalls = 0;
+  let authorizeSnapshots = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        snapshotCalls += 1;
+        const snap = g.snapshot();
+        // After B has been moved toward waiting, throw on the authorize snapshot.
+        if (mode === "throw-on-authorize" && snap.state === "normal") {
+          authorizeSnapshots += 1;
+          // First normal-gate authorize attempt during B release throws.
+          if (authorizeSnapshots === 1) {
+            throw new Error("simulated ProviderGate.snapshot throw during authorize");
+          }
+        }
+        return snap;
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const s = create({ maxConcurrent: 3, now: () => 0 });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue("B");
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    const leaseB = s.acquireLocalActivity("B", "assembly");
+    s.noteNativeOpen("C", 1);
+    s.onTransportResult("C", s.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").localActivities, 1);
+    assert.equal(s.getJob("B").holdsGlobalSlot, true);
+
+    // A completes ownership → recovery; C recovers to normal while B still pausing.
+    s.noteNativeOpen("A", 0);
+    s.releasePermit("A");
+    s.onTransportResult("A", s.getJob("A").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    // Drive C through recovery if still waiting/running under reduced ownership.
+    if (s.getJob("C").state === "waiting_provider" || s.getJob("C").state === "running") {
+      // Ensure gate returns to normal so B would authorize on quiesce.
+      const gateState = s.getSnapshot().providers["p.com"].gate.state;
+      if (gateState === "recovering" || gateState === "saturated") {
+        // Complete C if it became recovery owner, else leave as-is.
+        if (s.getJob("C").state === "running") {
+          s.noteNativeOpen("C", 0);
+          s.onTransportResult("C", s.getJob("C").attemptToken, {
+            status: "completed",
+            failureCategory: null,
+          });
+        }
+      }
+    }
+    // B still pausing on local activity with gate eventually normal/recovering-blocked.
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").localActivities, 1);
+
+    mode = "throw-on-authorize";
+    authorizeSnapshots = 0;
+    let threw = false;
+    let releaseResult = undefined;
+    try {
+      releaseResult = leaseB.release();
+    } catch (e) {
+      threw = true;
+    }
+    assert.equal(threw, false, "public release must never throw");
+    assert.equal(typeof releaseResult, "boolean");
+
+    // After coherent mutate-then path: B must not be permanently stranded.
+    // Either release returned true and B progressed, or false and retryable.
+    if (releaseResult === true) {
+      assert.equal(s.getJob("B").localActivities, 0);
+      assert.notEqual(s.getJob("B").state, "pausing_provider");
+      // Waiting under normal/recovering-blocked gate must not stay stranded forever.
+      if (s.getJob("B").state === "waiting_provider") {
+        mode = "pass";
+        s.onQuiesced("B");
+      }
+      // Coherent progress: waiting (authorized next), queued, or re-admitted running.
+      assert.ok(
+        s.getJob("B").state === "waiting_provider" ||
+          s.getJob("B").state === "queued" ||
+          s.getJob("B").state === "running",
+        "B progressed from pausing, state=" + s.getJob("B").state
+      );
+      // Stale second release inert; no negative counts / no double cleanup.
+      assert.equal(leaseB.release(), false);
+      assert.ok(s.getJob("B").localActivities >= 0);
+    } else {
+      // Throw-before coherent completion: lease remains retryable, count restored.
+      assert.equal(s.getJob("B").localActivities, 1);
+      assert.equal(s.getJob("B").state, "pausing_provider");
+      mode = "pass";
+      assert.equal(leaseB.release(), true);
+      assert.equal(s.getJob("B").localActivities, 0);
+      assert.notEqual(s.getJob("B").state, "pausing_provider");
+      assert.equal(leaseB.release(), false);
+    }
+
+    // Pausing slot is released once; running re-admission may hold a fresh slot.
+    if (s.getJob("B").state === "pausing_provider") {
+      assert.equal(s.getJob("B").holdsGlobalSlot, true);
+    } else if (
+      s.getJob("B").state === "waiting_provider" ||
+      s.getJob("B").state === "queued" ||
+      s.getJob("B").state === "needs_user"
+    ) {
+      assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    }
+    mode = "pass";
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("12b snapshot throw-before mutation keeps lease retryable; mutate-then finalizes true", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let mode = "pass";
+  let snapThrows = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (mode === "throw-before") {
+          snapThrows += 1;
+          throw new Error("simulated snapshot throw before any release mutation");
+        }
+        if (mode === "throw-after-once") {
+          const snap = g.snapshot();
+          // Throw only after gate is normal and job path will authorize post-mutate.
+          if (snap.state === "normal") {
+            mode = "pass";
+            throw new Error("simulated snapshot throw after waiting transition");
+          }
+          return snap;
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const s = create({ maxConcurrent: 3, now: () => 0 });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue("B");
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    const leaseB = s.acquireLocalActivity("B", "assembly");
+    s.noteNativeOpen("C", 1);
+    s.onTransportResult("C", s.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.equal(s.getJob("B").state, "pausing_provider");
+
+    // Complete A and C so gate returns to normal while B holds local activity.
+    s.noteNativeOpen("A", 0);
+    s.releasePermit("A");
+    s.onTransportResult("A", s.getJob("A").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    if (s.getJob("C").state === "running") {
+      s.noteNativeOpen("C", 0);
+      s.onTransportResult("C", s.getJob("C").attemptToken, {
+        status: "completed",
+        failureCategory: null,
+      });
+    }
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").localActivities, 1);
+    const verPause = s.getJob("B").stateVersion;
+    const globalBefore = s.getSnapshot().globalRunning;
+
+    // --- throw-before: if release path hits snapshot before counting mutation ---
+    // Ordinary pause→wait does not snapshot before decrement; force a pre-check by
+    // throwing on any snapshot. Public release must not throw; if it returns false
+    // the lease stays retryable with localActivities still 1.
+    mode = "throw-before";
+    snapThrows = 0;
+    let r1;
+    let threw1 = false;
+    try {
+      r1 = leaseB.release();
+    } catch (e) {
+      threw1 = true;
+    }
+    assert.equal(threw1, false);
+    assert.equal(typeof r1, "boolean");
+    mode = "pass"; // projection reads must not keep seeing injected faults
+    if (r1 === false) {
+      assert.equal(s.getJob("B").localActivities, 1);
+      assert.equal(s.getJob("B").state, "pausing_provider");
+      assert.equal(s.getJob("B").holdsGlobalSlot, true);
+      assert.equal(s.getSnapshot().globalRunning, globalBefore);
+      assert.equal(s.getJob("B").stateVersion, verPause);
+    } else {
+      // Implementation may avoid pre-mutation snapshot entirely — then true is fine.
+      assert.equal(s.getJob("B").localActivities, 0);
+      assert.notEqual(s.getJob("B").state, "pausing_provider");
+    }
+
+    // --- mutate-then-throw on authorize: finalize true, no strand, stale inert ---
+    if (s.getJob("B").state === "pausing_provider") {
+      mode = "throw-after-once";
+      let r2;
+      let threw2 = false;
+      try {
+        r2 = leaseB.release();
+      } catch (e) {
+        threw2 = true;
+      }
+      assert.equal(threw2, false);
+      assert.equal(r2, true);
+      mode = "pass";
+      assert.equal(s.getJob("B").localActivities, 0);
+      assert.notEqual(s.getJob("B").state, "pausing_provider");
+      // No permanent stranded waiter under normal/recovering-blocked gate.
+      if (s.getJob("B").state === "waiting_provider") {
+        s.onQuiesced("B");
+      }
+      assert.ok(
+        s.getJob("B").state === "waiting_provider" ||
+          s.getJob("B").state === "queued" ||
+          s.getJob("B").state === "running"
+      );
+      if (
+        s.getJob("B").state === "waiting_provider" ||
+        s.getJob("B").state === "queued"
+      ) {
+        assert.equal(s.getJob("B").holdsGlobalSlot, false);
+      }
+      assert.equal(leaseB.release(), false);
+      assert.ok(s.getJob("B").localActivities >= 0);
+    }
+    mode = "pass";
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("12c pending-drain settlement: snapshot fault before/after mutation is boolean-safe", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let mode = "pass";
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (mode === "throw") {
+          throw new Error("simulated snapshot fault during drain settlement");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    let clearB = 0;
+    const s = create({ maxConcurrent: 3, now: () => 0 });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+      ephemeral: {
+        clear: function () {
+          clearB += 1;
+        },
+      },
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue("B");
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    s.noteNativeOpen("B", 1);
+    const leaseB = s.acquireLocalActivity("B", "assembly");
+    s.noteNativeOpen("C", 1);
+    const bToken = s.getJob("B").attemptToken;
+    s.onTransportResult("C", s.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), true);
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").localActivities, 1);
+
+    // Completed settlement does not require gate.snapshot for authorize; inject
+    // throw anyway — public release must not throw, and must not double-clear.
+    mode = "throw";
+    let r;
+    let threw = false;
+    try {
+      r = leaseB.release();
+    } catch (e) {
+      threw = true;
+    }
+    assert.equal(threw, false);
+    assert.equal(typeof r, "boolean");
+    if (r === true) {
+      assert.equal(s.getJob("B").state, "completed");
+      assert.equal(s.getJob("B").localActivities, 0);
+      assert.equal(clearB, 1);
+      assert.equal(leaseB.release(), false);
+      assert.equal(clearB, 1);
+    } else {
+      // Retryable path under throw-before.
+      assert.equal(s.getJob("B").localActivities, 1);
+      mode = "pass";
+      assert.equal(leaseB.release(), true);
+      assert.equal(s.getJob("B").state, "completed");
+      assert.equal(clearB, 1);
+      assert.equal(leaseB.release(), false);
+    }
+    mode = "pass";
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("12d hostile jobId __proto__ local release + snapshot maps; no strand / no throw", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  const hostileId = "__proto__";
+  let mode = "pass";
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        const snap = g.snapshot();
+        if (mode === "throw-once" && snap.state === "normal") {
+          mode = "pass";
+          throw new Error("simulated snapshot throw for __proto__ job");
+        }
+        return snap;
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const s = create({ maxConcurrent: 3, now: () => 0 });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: hostileId,
+      providerKey: "p.com",
+      intent: intent("h.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue(hostileId);
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    const lease = s.acquireLocalActivity(hostileId, "assembly");
+    assert.ok(lease);
+    assert.equal(lease.jobId, hostileId);
+    s.noteNativeOpen("C", 1);
+    s.onTransportResult("C", s.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.equal(s.getJob(hostileId).state, "pausing_provider");
+    assert.equal(s.getJob(hostileId).localActivities, 1);
+
+    s.noteNativeOpen("A", 0);
+    s.releasePermit("A");
+    s.onTransportResult("A", s.getJob("A").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    if (s.getJob("C").state === "running") {
+      s.noteNativeOpen("C", 0);
+      s.onTransportResult("C", s.getJob("C").attemptToken, {
+        status: "completed",
+        failureCategory: null,
+      });
+    }
+
+    mode = "throw-once";
+    let r;
+    let threw = false;
+    try {
+      r = lease.release();
+    } catch (e) {
+      threw = true;
+    }
+    assert.equal(threw, false);
+    assert.equal(typeof r, "boolean");
+    mode = "pass";
+    if (r === false) {
+      assert.equal(lease.release(), true);
+    }
+    assert.equal(s.getJob(hostileId).localActivities, 0);
+    assert.notEqual(s.getJob(hostileId).state, "pausing_provider");
+    if (
+      s.getJob(hostileId).state === "waiting_provider" ||
+      s.getJob(hostileId).state === "queued" ||
+      s.getJob(hostileId).state === "needs_user"
+    ) {
+      assert.equal(s.getJob(hostileId).holdsGlobalSlot, false);
+    }
+    assert.equal(lease.release(), false);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
 });

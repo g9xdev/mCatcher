@@ -554,7 +554,18 @@
     function maybeAuthorizeReadyWaiter(job) {
       if (!job || job.state !== "waiting_provider") return;
       var gate = getGate(job.providerKey);
-      var snap = gate.snapshot();
+      var snap = null;
+      // Bound snapshot faults: a single injected throw must not permanently
+      // strand a waiter when the gate is already normal/recovering-blocked.
+      // Never throw out of a quiesce/release transaction.
+      for (var snapAttempt = 0; snapAttempt < 2 && !snap; snapAttempt++) {
+        try {
+          snap = gate.snapshot();
+        } catch (errSnap) {
+          snap = null;
+        }
+      }
+      if (!snap) return;
       if (snap.state === "recovering" && snap.ownerJobId == null) {
         // Prefer oldest eligible (skips/terminalizes exhausted FIFO heads).
         var next = oldestEligibleWaiter(job.providerKey);
@@ -568,6 +579,26 @@
     }
 
     /**
+     * Best-effort follow-up after a quiesce transition that may have thrown mid-way.
+     * Never throws. Safe to call when job already left pausing_provider.
+     */
+    function finishQuiesceSideEffects(job) {
+      if (!job) return;
+      if (job.state === "waiting_provider") {
+        try {
+          maybeAuthorizeReadyWaiter(job);
+        } catch (errAuth) {
+          // Nonthrowing by contract; defensive.
+        }
+      }
+      try {
+        drain();
+      } catch (errDrain) {
+        // Admission/drain faults must not escape local-release / quiesce edges.
+      }
+    }
+
+    /**
      * Shared quiesce edge: pausing_provider settles once when total permits and
      * native opens are both zero. A stored draining terminal is dispatched before
      * default pausing → waiting. Transport-unavailable with no pending outcome
@@ -575,56 +606,64 @@
      * State guard only (single-threaded).
      * Late quiesce after owner completion / recovery-to-normal auto-authorizes wake
      * when the gate is recovering-blocked or normal (never while an owner is active).
+     * Internally nonthrowing once state mutation begins: gate/hook faults are
+     * reconciled so a live local-activity release can always observe a coherent
+     * post-state (waiting / terminal / needs_user / still-pausing).
      */
     function maybeQuiesce(job) {
       if (!job) return;
       if (job.state !== "pausing_provider") return;
       if (!isQuiescent(job)) return;
-      // Stored draining terminal settles before default pause-control waiting.
-      if (job.pendingDrainTerminal != null) {
-        settleDrainingTerminal(job);
-        return;
-      }
-      // Fail-closed hold: physical counters are zero but the semantic terminal for
-      // this exact private draining identity has not arrived yet. Do not erase
-      // auth, release the slot, or move to waiting/cancelled — matching
-      // onDrainingTransportResult settles later; onTransportUnavailable escapes.
-      if (
-        typeof job.drainingAttemptToken === "string" &&
-        job.drainingAttemptToken.trim().length > 0
-      ) {
-        return;
-      }
-      // Cancel-requested pausing work finishes as cancelled once quiescent.
-      if (job.cancelRequested === true) {
-        releaseSlotIfHeld(job);
-        removeFromWaitQueue(job);
-        removeFromQueue(job);
-        clearRetryDeadline(job);
+      try {
+        // Stored draining terminal settles before default pause-control waiting.
+        if (job.pendingDrainTerminal != null) {
+          settleDrainingTerminal(job);
+          return;
+        }
+        // Fail-closed hold: physical counters are zero but the semantic terminal for
+        // this exact private draining identity has not arrived yet. Do not erase
+        // auth, release the slot, or move to waiting/cancelled — matching
+        // onDrainingTransportResult settles later; onTransportUnavailable escapes.
+        if (
+          typeof job.drainingAttemptToken === "string" &&
+          job.drainingAttemptToken.trim().length > 0
+        ) {
+          return;
+        }
+        // Cancel-requested pausing work finishes as cancelled once quiescent.
+        if (job.cancelRequested === true) {
+          releaseSlotIfHeld(job);
+          removeFromWaitQueue(job);
+          removeFromQueue(job);
+          clearRetryDeadline(job);
+          clearDrainingState(job);
+          invalidateLocalActivities(job);
+          job.state = "cancelled";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          clearEphemeralOnce(job);
+          finishQuiesceSideEffects(job);
+          return;
+        }
+        // Helper disconnect with no pending outcome: park needs_user once provider
+        // permits also reach zero. Helper disappearance proves native zero only.
+        if (job.drainTransportUnavailable === true) {
+          enterNeedsUser(job);
+          finishQuiesceSideEffects(job);
+          return;
+        }
         clearDrainingState(job);
-        invalidateLocalActivities(job);
-        job.state = "cancelled";
+        job.state = "waiting_provider";
         job.stateVersion += 1;
         job.attemptToken = null;
-        clearEphemeralOnce(job);
-        drain();
-        return;
+        releaseSlotIfHeld(job);
+        appendWaitFifo(job);
+        finishQuiesceSideEffects(job);
+      } catch (errQuiesce) {
+        // Mutate-then-throw: complete authorization/drain without rethrowing so a
+        // local-activity release can seal as true without stranding waiters.
+        finishQuiesceSideEffects(job);
       }
-      // Helper disconnect with no pending outcome: park needs_user once provider
-      // permits also reach zero. Helper disappearance proves native zero only.
-      if (job.drainTransportUnavailable === true) {
-        enterNeedsUser(job);
-        drain();
-        return;
-      }
-      clearDrainingState(job);
-      job.state = "waiting_provider";
-      job.stateVersion += 1;
-      job.attemptToken = null;
-      releaseSlotIfHeld(job);
-      appendWaitFifo(job);
-      maybeAuthorizeReadyWaiter(job);
-      drain();
     }
 
     /**
@@ -1715,12 +1754,71 @@
      * release leaves counts unchanged and can be retried.
      */
     /**
+     * Reconcile a local-activity release after a scheduler/gate fault.
+     * Returns whether the live lease was consumed (true) or remains retryable
+     * (false). Never throws. Sealing the closure `released` flag is the caller's
+     * responsibility when this returns true OR when the lease is known stale.
+     */
+    function reconcileLocalActivityRelease(job, epoch) {
+      if (!job) return false;
+      // Forced fence / generation change: this lease is dead.
+      if ((job.localActivityEpoch || 0) !== epoch) {
+        return false;
+      }
+      // Mutate-then: already left pausing with the decrement applied.
+      if (job.state === "waiting_provider") {
+        finishQuiesceSideEffects(job);
+        return true;
+      }
+      if (
+        job.state === "needs_user" ||
+        job.state === "cancelled" ||
+        job.state === "completed" ||
+        job.state === "failed" ||
+        job.state === "handed_to_firefox"
+      ) {
+        finishQuiesceSideEffects(job);
+        return true;
+      }
+      // Still pausing/running: attempt to complete quiesce once more.
+      if (job.state === "pausing_provider" && isQuiescent(job)) {
+        try {
+          maybeQuiesce(job);
+        } catch (errRetry) {
+          finishQuiesceSideEffects(job);
+        }
+        if (job.state !== "pausing_provider") {
+          return true;
+        }
+        // Still pausing after retry with zero local count and no other activity:
+        // unknown split-brain — restore the decrement so the lease stays retryable.
+        if (isQuiescent(job) && (job.localActivities || 0) === 0) {
+          // Quiesce should have progressed; if it did not, restore for retry.
+          job.localActivities = 1;
+          return false;
+        }
+      }
+      // Throw-before coherent transition (or non-quiescent after decrement only):
+      // restore the count when still on this epoch and state was not advanced.
+      if (
+        (job.state === "pausing_provider" || job.state === "running") &&
+        (job.localActivityEpoch || 0) === epoch
+      ) {
+        job.localActivities = (job.localActivities || 0) + 1;
+        return false;
+      }
+      // Cannot safely restore; do not seal as success.
+      return false;
+    }
+
+    /**
      * Acquire a scheduler-owned local activity lease for assembly / sink cleanup.
      * Not a provider permit or native connection. Only a live running job without
      * cancel or Firefox handoff may acquire. purpose must be a primitive nonblank
      * string (no coercion). Returns a frozen {jobId, purpose, release} or null.
-     * release() is idempotent, never throws for a stale generation, and returns
-     * whether this call actually released the live lease.
+     * release() is failure-atomic: returns a boolean, never propagates gate /
+     * scheduler-hook exceptions, and seals the lease only after the count
+     * decrement and any final quiesce transition are coherent.
      */
     function acquireLocalActivity(jobId, purpose) {
       var job = jobs.get(jobId);
@@ -1743,14 +1841,41 @@
         purpose: purposeValue,
         release: function releaseLocalActivity() {
           if (released) return false;
-          released = true;
-          var current = jobs.get(jobId);
-          if (current !== job) return false;
-          if ((current.localActivityEpoch || 0) !== epoch) return false;
-          if (!(current.localActivities > 0)) return false;
-          current.localActivities -= 1;
-          maybeQuiesce(current);
-          return true;
+          try {
+            var current = jobs.get(jobId);
+            if (current !== job) {
+              released = true;
+              return false;
+            }
+            if ((current.localActivityEpoch || 0) !== epoch) {
+              released = true;
+              return false;
+            }
+            if (!(current.localActivities > 0)) {
+              released = true;
+              return false;
+            }
+            // Decrement first; do not seal until quiesce is coherent.
+            current.localActivities -= 1;
+            try {
+              maybeQuiesce(current);
+              released = true;
+              return true;
+            } catch (errRelease) {
+              var ok = reconcileLocalActivityRelease(current, epoch);
+              if (ok || (current.localActivityEpoch || 0) !== epoch) {
+                released = true;
+              }
+              // Stale epoch after fence: seal as inert false.
+              if ((current.localActivityEpoch || 0) !== epoch) {
+                return false;
+              }
+              return ok;
+            }
+          } catch (errOuter) {
+            // Public release must never throw.
+            return false;
+          }
         },
       });
     }
@@ -2307,6 +2432,8 @@
       // Record a private unavailable-during-drain condition and settle only after
       // full physical quiescence (maybeQuiesce → settleDrainingTerminal).
       // cancelRequested still wins inside settleDrainingTerminal.
+      // Local activities model adapter-local work, not provider sockets: helper
+      // disconnect is a forced invalidation boundary for them (epoch fence).
       if (job.state === "pausing_provider" && job.pendingDrainTerminal != null) {
         if (job.drainTransportUnavailable === true) {
           // Duplicate unavailable while already recorded: false no-op.
@@ -2315,11 +2442,13 @@
         job.drainTransportUnavailable = true;
         // Residual private token is no longer needed; pending outcome is authoritative.
         job.drainingAttemptToken = null;
+        invalidateLocalActivities(job);
         if (!isQuiescent(job)) {
           // Wrapper/observed permits remain: stay pausing, keep slot, preserve pending.
           return true;
         }
-        // Fully quiescent: settle via unified precedence (cancel > completed > unavailable).
+        // Fully quiescent (provider permits/native only): settle via unified
+        // precedence (cancel > completed > unavailable). Local work is already fenced.
         settleDrainingTerminal(job);
         return true;
       }
@@ -2341,6 +2470,13 @@
           if (release.error) throw release.error;
           return false;
         }
+      }
+
+      // Helper disconnect fences local activities before hold-vs-settle. Provider
+      // wrapper/observed permits alone decide whether to retain the global slot.
+      // Ordinary saturation pause does not use this path and retains local work.
+      if (job.state === "running" || job.state === "pausing_provider") {
+        invalidateLocalActivities(job);
       }
 
       // Wrapper/observed permits still live: helper disconnect proved native zero
