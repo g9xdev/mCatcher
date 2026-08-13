@@ -156,6 +156,41 @@ test("Save-As editing never holds a scheduler slot", () => {
   assertSlotInvariant(s);
 });
 
+test("Firefox handoff callback receives the consumed immutable true intent", async () => {
+  const originalIntent = intent("firefox.mp4");
+  const handoffIntent = Object.freeze({
+    requestedFilename: "firefox.mp4",
+    destinationDirectory: null,
+    saveMode: "default",
+    userSelectedFirefox: true,
+    userActionToken: "popup-proof",
+    createdAt: "t0",
+  });
+  const popupTokenStore = new Map([["j", "popup-proof"]]);
+  let adapterInput = null;
+  const s = createDownloadScheduler({
+    maxConcurrent: 1,
+    now: () => 0,
+    popupTokenStore,
+    firefoxDownload(input) {
+      adapterInput = input;
+    },
+  });
+  s.createJob({ id: "j", providerKey: "p.com", intent: originalIntent, segmentConcurrency: 1, retries: 0 });
+  s.enqueue("j");
+  s.onTransportResult("j", s.getJob("j").attemptToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+
+  await s.requestFirefoxHandoff("j", handoffIntent);
+
+  assert.equal(adapterInput.intent, handoffIntent);
+  assert.equal(Object.isFrozen(adapterInput.intent), true);
+  assert.equal(adapterInput.intent.userSelectedFirefox, true);
+  assert.equal(popupTokenStore.has("j"), false);
+});
+
 test("stale attempt tokens are rejected and cannot multiply budget", () => {
   const s = createDownloadScheduler({ maxConcurrent: 1, now: () => 0 });
   s.createJob({ id: "j", providerKey: "p.com", intent: intent("f.mp4"), segmentConcurrency: 2, retries: 2 });

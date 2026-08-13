@@ -1133,7 +1133,6 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 
   // Async future stubs return a Promise before rejecting (never throw sync).
   const asyncStubs = [
-    () => ctrl.requestFirefoxHandoff({}, {}),
     () => ctrl.cancel("j1"),
     () => ctrl.manualRetry("j1"),
     () => ctrl.helperDisconnected(),
@@ -8179,7 +8178,6 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
 
       // Representative future stubs — await all rejections.
       const stubCalls = [
-        () => ctrl.requestFirefoxHandoff({ url: vUrlNet }, {}),
         () => ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.helperDisconnected(),

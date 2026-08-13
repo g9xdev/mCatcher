@@ -3163,7 +3163,7 @@
         var adapterInput = Object.freeze({
           filename: job.intent.requestedFilename,
           saveAs: true,
-          intent: job.intent,
+          intent: handoffIntent,
           sourceHandle: sourceHandle,
         });
 
