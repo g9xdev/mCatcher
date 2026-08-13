@@ -15,7 +15,6 @@
   function (root) {
     "use strict";
 
-    var LEASE1_MSG = "background adapter behavior not implemented in Lease 1";
     var CONTROLLER_KEYS = [
       "captureNetwork",
       "acceptPageSnapshot",
@@ -1376,6 +1375,8 @@
       var startedAttempts = new Set();
       /** @type {Set<string>} jobId\0attemptToken already switched to pget-single */
       var singleStartedAttempts = new Set();
+      /** @type {Set<string>} direct running jobs with a cancel command in flight */
+      var pendingDirectCancels = new Set();
 
       /**
        * Prepare public ID: invoke randomToken and validate base only.
@@ -1979,10 +1980,6 @@
         return deepFreeze(rows);
       }
 
-      function lease1Reject() {
-        return Promise.reject(new Error(LEASE1_MSG));
-      }
-
       function readEphemeralUrl(handle) {
         if (!handle || typeof handle !== "object") throw genericTypeError();
         var url;
@@ -2282,6 +2279,7 @@
               settledDirect.state === "cancelled")
           ) {
             popupTokenStore.delete(decision.jobId);
+            pendingDirectCancels.delete(decision.jobId);
           }
           return Promise.all(switchEffects).then(function () { return pump(); }).then(function () {
             publishJobsIfChanged(beforeSig);
@@ -2369,16 +2367,127 @@
         }
       }
 
-      function cancel(/* jobId */) {
-        return lease1Reject();
+      function cancel(jobId) {
+        return Promise.resolve().then(function () {
+          if (typeof jobId !== "string" || jobId.trim().length === 0) return false;
+          var binding = jobBindings.get(jobId);
+          if (!binding) return false;
+          var activeScheduler = getScheduler();
+          var job = activeScheduler.getJob(jobId);
+          if (
+            !job ||
+            job.mediaKind !== "direct" ||
+            job.state === "completed" ||
+            job.state === "failed" ||
+            job.state === "cancelled" ||
+            pendingDirectCancels.has(jobId)
+          ) {
+            return false;
+          }
+          var beforeSig = jobAdmissionSig();
+          var runningToken =
+            job.state === "running" &&
+            typeof job.attemptToken === "string" &&
+            job.attemptToken.trim().length > 0
+              ? job.attemptToken
+              : null;
+          activeScheduler.cancel(jobId);
+          if (!runningToken) {
+            publishJobsIfChanged(beforeSig);
+            return projectReturnedJob(jobId);
+          }
+          pendingDirectCancels.add(jobId);
+          var command = getMessageRouter().buildNativeStartPayload({
+            kind: "pget-cancel",
+            jobId: jobId,
+            attemptToken: runningToken,
+          });
+          var effect;
+          try {
+            effect = postNative(command);
+          } catch (errSync) {
+            activeScheduler.onTransportUnavailable(jobId);
+            publishJobsIfChanged(beforeSig);
+            throw errSync;
+          }
+          return Promise.resolve(effect).then(
+            function () {
+              publishJobsIfChanged(beforeSig);
+              return projectReturnedJob(jobId);
+            },
+            function (errAsync) {
+              activeScheduler.onTransportUnavailable(jobId);
+              publishJobsIfChanged(beforeSig);
+              throw errAsync;
+            }
+          );
+        });
       }
 
-      function manualRetry(/* jobId */) {
-        return lease1Reject();
+      function manualRetry(jobId) {
+        return Promise.resolve().then(function () {
+          if (typeof jobId !== "string" || jobId.trim().length === 0) return false;
+          var binding = jobBindings.get(jobId);
+          if (!binding) return false;
+          var activeScheduler = getScheduler();
+          var job = activeScheduler.getJob(jobId);
+          if (!job || job.mediaKind !== "direct" || job.state !== "needs_user") {
+            return false;
+          }
+          var beforeSig = jobAdmissionSig();
+          activeScheduler.manualRetry(jobId);
+          pendingDirectCancels.delete(jobId);
+          return pump().then(
+            function () {
+              publishJobsIfChanged(beforeSig);
+              return projectReturnedJob(jobId);
+            },
+            function (err) {
+              activeScheduler.onTransportUnavailable(jobId);
+              publishJobsIfChanged(beforeSig);
+              throw err;
+            }
+          );
+        });
       }
 
       function helperDisconnected() {
-        return lease1Reject();
+        return Promise.resolve().then(function () {
+          if (!scheduler) return deepFreeze(new Array());
+          var beforeSig = jobAdmissionSig();
+          var processed = new Set();
+          var changedIds = [];
+          var found = true;
+          while (found) {
+            found = false;
+            var jobs = scheduler.getSnapshot().jobs || [];
+            for (var i = 0; i < jobs.length; i++) {
+              var job = jobs[i];
+              if (
+                !job ||
+                processed.has(job.id) ||
+                !jobBindings.has(job.id) ||
+                job.mediaKind !== "direct" ||
+                (job.state !== "running" &&
+                  job.state !== "pausing_provider" &&
+                  job.state !== "waiting_provider")
+              ) {
+                continue;
+              }
+              found = true;
+              processed.add(job.id);
+              if (scheduler.onTransportUnavailable(job.id) === true) {
+                changedIds.push(job.id);
+              }
+            }
+          }
+          publishJobsIfChanged(beforeSig);
+          var changed = new Array();
+          for (var j = 0; j < changedIds.length; j++) {
+            changed.push(projectReturnedJob(changedIds[j]));
+          }
+          return deepFreeze(changed);
+        });
       }
 
       function setMaxConcurrent(value) {
