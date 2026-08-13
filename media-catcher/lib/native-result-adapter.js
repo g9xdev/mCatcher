@@ -9,44 +9,137 @@
   function () {
     "use strict";
 
-    var KNOWN_FAILURE_CATEGORIES = {
-      range_unsupported: true,
-      timeout: true,
-      connection_reset: true,
-      short_read: true,
-      http_429: true,
-      http_5xx_temporary: true,
-      local_io: true,
-      cancelled: true,
-      permanent: true
-    };
+    // Null-prototype allowlists: ordinary objects accept inherited keys such as
+    // "__proto__", "constructor", and "toString" as truthy membership.
+    var KNOWN_FAILURE_CATEGORIES = Object.freeze(
+      Object.assign(Object.create(null), {
+        range_unsupported: true,
+        timeout: true,
+        connection_reset: true,
+        short_read: true,
+        http_429: true,
+        http_5xx_temporary: true,
+        local_io: true,
+        cancelled: true,
+        permanent: true,
+      })
+    );
 
-    var ALLOWED_STATUSES = {
-      completed: true,
-      failed: true,
-      cancelled: true
-    };
+    var ALLOWED_STATUSES = Object.freeze(
+      Object.assign(Object.create(null), {
+        completed: true,
+        failed: true,
+        cancelled: true,
+      })
+    );
 
-    var ALLOWED_MODES = {
-      "multi-range": true,
-      "single-connection": true
-    };
+    var ALLOWED_MODES = Object.freeze(
+      Object.assign(Object.create(null), {
+        "multi-range": true,
+        "single-connection": true,
+      })
+    );
 
-    var ALLOWED_PART_STATES = {
-      committed: true,
-      empty: true,
-      partial: true
-    };
+    var ALLOWED_PART_STATES = Object.freeze(
+      Object.assign(Object.create(null), {
+        committed: true,
+        empty: true,
+        partial: true,
+      })
+    );
 
-    function isNonblankString(v) {
+    function isOwnAllowlisted(dict, key) {
+      return (
+        typeof key === "string" &&
+        Object.prototype.hasOwnProperty.call(dict, key) === true &&
+        dict[key] === true
+      );
+    }
+
+    function isPrimitiveString(v) {
+      return typeof v === "string";
+    }
+
+    function isNonblankPrimitiveString(v) {
       return typeof v === "string" && v.trim().length > 0;
     }
 
+    /**
+     * Snapshot one own DATA descriptor value without invoking accessors.
+     * Returns { ok:false } on missing required field, accessor, or trap/error.
+     * Optional fields may be absent (ok with value undefined).
+     */
+    function readOwnDataField(obj, key, required) {
+      try {
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (desc == null) {
+          if (required) return { ok: false };
+          return { ok: true, value: undefined };
+        }
+        // Reject accessors even when the property is optional.
+        if (
+          typeof desc.get === "function" ||
+          typeof desc.set === "function" ||
+          !Object.prototype.hasOwnProperty.call(desc, "value")
+        ) {
+          return { ok: false };
+        }
+        return { ok: true, value: desc.value };
+      } catch (err) {
+        return { ok: false };
+      }
+    }
+
+    /** Running failed path: missing/unknown → permanent after descriptor-safe snapshot. */
     function normalizeFailureCategory(value) {
-      if (typeof value === "string" && KNOWN_FAILURE_CATEGORIES[value]) {
+      if (isPrimitiveString(value) && isOwnAllowlisted(KNOWN_FAILURE_CATEGORIES, value)) {
         return value;
       }
       return "permanent";
+    }
+
+    /**
+     * Validate completed/cancelled/failed category rules shared by running and pausing.
+     * Returns { ok:true, category } or { ok:false }.
+     * Pausing failed requires a known exact category (scheduler contract).
+     * Running failed still normalizes missing/unknown to permanent.
+     */
+    function resolveTerminalCategory(status, partState, failureCategory, pausing) {
+      if (status === "completed") {
+        if (partState !== "committed") return { ok: false };
+        if (failureCategory !== null && failureCategory !== undefined) {
+          return { ok: false };
+        }
+        return { ok: true, category: null };
+      }
+      if (status === "cancelled") {
+        // Accept only absent/undefined/null or exact primitive "cancelled".
+        if (failureCategory === undefined || failureCategory === null) {
+          return { ok: true, category: "cancelled" };
+        }
+        if (
+          isPrimitiveString(failureCategory) &&
+          failureCategory === "cancelled"
+        ) {
+          return { ok: true, category: "cancelled" };
+        }
+        return { ok: false };
+      }
+      if (status === "failed") {
+        // Failed must never carry committed (invalid Task-13 terminal).
+        if (partState === "committed") return { ok: false };
+        if (pausing) {
+          if (
+            !isPrimitiveString(failureCategory) ||
+            !isOwnAllowlisted(KNOWN_FAILURE_CATEGORIES, failureCategory)
+          ) {
+            return { ok: false };
+          }
+          return { ok: true, category: failureCategory };
+        }
+        return { ok: true, category: normalizeFailureCategory(failureCategory) };
+      }
+      return { ok: false };
     }
 
     /**
@@ -62,20 +155,41 @@
         if (!scheduler || typeof scheduler !== "object") return;
         if (!msg || typeof msg !== "object") return;
 
-        var type = msg.type;
-        var id = msg.id;
-        var attemptToken = msg.attemptToken;
-        var status = msg.status;
-        var mode = msg.mode;
-        var failureCategory = msg.failureCategory;
-        var partState = msg.partState;
+        // Snapshot only own DATA descriptors for required wire fields and optional
+        // failureCategory. Accessors/proxies reject fail-closed without invoking.
+        var typeRead = readOwnDataField(msg, "type", true);
+        var idRead = readOwnDataField(msg, "id", true);
+        var tokenRead = readOwnDataField(msg, "attemptToken", true);
+        var statusRead = readOwnDataField(msg, "status", true);
+        var modeRead = readOwnDataField(msg, "mode", true);
+        var partRead = readOwnDataField(msg, "partState", true);
+        var failRead = readOwnDataField(msg, "failureCategory", false);
+        if (
+          !typeRead.ok ||
+          !idRead.ok ||
+          !tokenRead.ok ||
+          !statusRead.ok ||
+          !modeRead.ok ||
+          !partRead.ok ||
+          !failRead.ok
+        ) {
+          return;
+        }
 
-        if (type !== "pget-result") return;
-        if (!isNonblankString(id)) return;
-        if (!isNonblankString(attemptToken)) return;
-        if (!ALLOWED_STATUSES[status]) return;
-        if (!ALLOWED_MODES[mode]) return;
-        if (!ALLOWED_PART_STATES[partState]) return;
+        var type = typeRead.value;
+        var id = idRead.value;
+        var attemptToken = tokenRead.value;
+        var status = statusRead.value;
+        var mode = modeRead.value;
+        var partState = partRead.value;
+        var failureCategory = failRead.value;
+
+        if (!isPrimitiveString(type) || type !== "pget-result") return;
+        if (!isNonblankPrimitiveString(id)) return;
+        if (!isNonblankPrimitiveString(attemptToken)) return;
+        if (!isOwnAllowlisted(ALLOWED_STATUSES, status)) return;
+        if (!isOwnAllowlisted(ALLOWED_MODES, mode)) return;
+        if (!isOwnAllowlisted(ALLOWED_PART_STATES, partState)) return;
 
         if (typeof scheduler.getJob !== "function") return;
 
@@ -95,26 +209,19 @@
           // Ordinary path requires mode match with the job's current mode.
           if (mode !== job.mode) return;
 
-          var drainCategory;
-          if (status === "completed") {
-            if (partState !== "committed") return;
-            if (failureCategory !== null) return;
-            drainCategory = null;
-          } else if (status === "cancelled") {
-            drainCategory = "cancelled";
-          } else if (status === "failed") {
-            // Failed must never carry committed (invalid Task-13 terminal).
-            if (partState === "committed") return;
-            drainCategory = normalizeFailureCategory(failureCategory);
-          } else {
-            return;
-          }
+          var drainResolved = resolveTerminalCategory(
+            status,
+            partState,
+            failureCategory,
+            true
+          );
+          if (!drainResolved.ok) return;
 
           var drainAllowlisted = {
             status: status,
             mode: mode,
-            failureCategory: drainCategory,
-            partState: partState
+            failureCategory: drainResolved.category,
+            partState: partState,
           };
 
           try {
@@ -127,7 +234,7 @@
         }
 
         if (job.state !== "running") return;
-        if (!isNonblankString(job.attemptToken)) return;
+        if (!isNonblankPrimitiveString(job.attemptToken)) return;
         if (job.attemptToken !== attemptToken) return;
 
         // Exact multi-range → single-connection capability switch.
@@ -152,7 +259,7 @@
           try {
             scheduler.onCapabilitySwitch(id, {
               mode: "single-connection",
-              partState: "empty"
+              partState: "empty",
             });
           } catch (e) {
             return;
@@ -175,28 +282,21 @@
           // Ordinary path requires mode match with the job's current mode.
           if (mode !== job.mode) return;
 
-          var outCategory;
-          if (status === "completed") {
-            if (partState !== "committed") return;
-            if (failureCategory !== null) return;
-            outCategory = null;
-          } else if (status === "cancelled") {
-            outCategory = "cancelled";
-          } else if (status === "failed") {
-            // Failed must never carry committed (invalid Task-13 terminal).
-            if (partState === "committed") return;
-            outCategory = normalizeFailureCategory(failureCategory);
-          } else {
-            return;
-          }
+          var runResolved = resolveTerminalCategory(
+            status,
+            partState,
+            failureCategory,
+            false
+          );
+          if (!runResolved.ok) return;
 
           if (typeof scheduler.onTransportResult !== "function") return;
 
           var allowlisted = {
             status: status,
             mode: mode,
-            failureCategory: outCategory,
-            partState: partState
+            failureCategory: runResolved.category,
+            partState: partState,
           };
 
           try {
@@ -216,7 +316,7 @@
     }
 
     return {
-      handlePgetResult: handlePgetResult
+      handlePgetResult: handlePgetResult,
     };
   }
 );
