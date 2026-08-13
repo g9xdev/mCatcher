@@ -90,6 +90,7 @@ const JOB_PROJECTION_KEYS = [
   "id",
   "inFlightPermits",
   "intent",
+  "localActivities",
   "mediaKind",
   "mode",
   "nativeOpenConnections",

@@ -285,6 +285,7 @@
         autoWakeCount: job.autoWakeCount,
         inFlightPermits: totalInFlightPermits(job),
         nativeOpenConnections: job.nativeOpenConnections,
+        localActivities: job.localActivities || 0,
       });
     }
 
@@ -294,6 +295,18 @@
       job.drainingAttemptToken = null;
       job.pendingDrainTerminal = null;
       job.drainTransportUnavailable = false;
+    }
+
+    /**
+     * Invalidate local-activity leases for a physical attempt boundary.
+     * Zeros the projected count and advances the private epoch so stale
+     * release() calls are inert. Never projected.
+     */
+    function invalidateLocalActivities(job) {
+      if (!job) return;
+      job.localActivities = 0;
+      job.localActivityEpoch =
+        (Number.isInteger(job.localActivityEpoch) ? job.localActivityEpoch : 0) + 1;
     }
 
     /**
@@ -446,7 +459,8 @@
     function isQuiescent(job) {
       return (
         totalInFlightPermits(job) <= 0 &&
-        (!job.nativeOpenConnections || job.nativeOpenConnections <= 0)
+        (!job.nativeOpenConnections || job.nativeOpenConnections <= 0) &&
+        (!job.localActivities || job.localActivities <= 0)
       );
     }
 
@@ -481,6 +495,7 @@
           removeFromQueue(job);
           removeFromWaitQueue(job);
           clearDrainingState(job);
+          invalidateLocalActivities(job);
         }
         return false;
       }
@@ -489,6 +504,7 @@
       releaseSlotIfHeld(job);
       clearRetryDeadline(job);
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = "needs_user";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -506,6 +522,7 @@
       releaseSlotIfHeld(job);
       clearRetryDeadline(job);
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -585,6 +602,7 @@
         removeFromQueue(job);
         clearRetryDeadline(job);
         clearDrainingState(job);
+        invalidateLocalActivities(job);
         job.state = "cancelled";
         job.stateVersion += 1;
         job.attemptToken = null;
@@ -624,6 +642,8 @@
       job.pendingDrainTerminal = null;
       job.drainingAttemptToken = null;
       job.drainTransportUnavailable = false;
+      // Physical attempt settles: fence any leftover local-activity leases.
+      invalidateLocalActivities(job);
 
       // User cancel wins over any stored native terminal (and over unavailable).
       if (job.cancelRequested === true) {
@@ -1079,6 +1099,8 @@
       var token = mintAttemptToken();
       // Fresh physical attempt: old draining identity must never re-authenticate.
       clearDrainingState(job);
+      // Fresh local-activity epoch; prior leases cannot decrement this attempt.
+      invalidateLocalActivities(job);
       job.state = "running";
       job.stateVersion += 1;
       job.holdsGlobalSlot = true;
@@ -1266,6 +1288,7 @@
       job.retryDeadlineMs = nowMs + delay;
 
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = "retry_backoff";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -1295,6 +1318,7 @@
       assertRunningOwnsSlot(job);
 
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.holdsGlobalSlot = false;
@@ -1407,6 +1431,7 @@
 
       // Side-effect order: terminalize + release slot, then completeOwner, then wake, then drain.
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = nextState;
       job.stateVersion += 1;
       job.holdsGlobalSlot = false;
@@ -1457,6 +1482,7 @@
       assertRunningOwnsSlot(job);
 
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = "completed";
       job.stateVersion += 1;
       job.holdsGlobalSlot = false;
@@ -1591,6 +1617,9 @@
         wrapperPermits: 0,
         observedPermits: 0,
         nativeOpenConnections: 0,
+        // Local assembly/sink activity accounting (count projected; epoch private).
+        localActivities: 0,
+        localActivityEpoch: 0,
         // Saturation wake bookkeeping (not projected).
         waitEpoch: 0,
         consumeRetryOnWake: false,
@@ -1685,6 +1714,47 @@
      * only on success marks released and decrements wrapper count. Failed raw
      * release leaves counts unchanged and can be retried.
      */
+    /**
+     * Acquire a scheduler-owned local activity lease for assembly / sink cleanup.
+     * Not a provider permit or native connection. Only a live running job without
+     * cancel or Firefox handoff may acquire. purpose must be a primitive nonblank
+     * string (no coercion). Returns a frozen {jobId, purpose, release} or null.
+     * release() is idempotent, never throws for a stale generation, and returns
+     * whether this call actually released the live lease.
+     */
+    function acquireLocalActivity(jobId, purpose) {
+      var job = jobs.get(jobId);
+      if (!job) return null;
+      if (job.state !== "running") return null;
+      if (job.cancelRequested === true) return null;
+      if (job.firefoxHandoffInFlight === true) return null;
+      // Exact primitive string — reject boxed String / objects without coercion.
+      if (typeof purpose !== "string" || purpose.trim().length === 0) {
+        throw new TypeError("purpose must be a nonblank string");
+      }
+
+      job.localActivities = (job.localActivities || 0) + 1;
+      var epoch = job.localActivityEpoch || 0;
+      var released = false;
+      var purposeValue = purpose;
+
+      return Object.freeze({
+        jobId: job.id,
+        purpose: purposeValue,
+        release: function releaseLocalActivity() {
+          if (released) return false;
+          released = true;
+          var current = jobs.get(jobId);
+          if (current !== job) return false;
+          if ((current.localActivityEpoch || 0) !== epoch) return false;
+          if (!(current.localActivities > 0)) return false;
+          current.localActivities -= 1;
+          maybeQuiesce(current);
+          return true;
+        },
+      });
+    }
+
     function acquireProviderPermit(jobId, purpose) {
       var job = jobs.get(jobId);
       if (!job) return null;
@@ -1896,6 +1966,8 @@
               var nowO = now();
               if (typeof nowO !== "number" || !Number.isFinite(nowO)) nowO = 0;
               job.retryDeadlineMs = nowO + delayO;
+              clearDrainingState(job);
+              invalidateLocalActivities(job);
               job.state = "retry_backoff";
               job.stateVersion += 1;
               job.attemptToken = null;
@@ -1905,6 +1977,8 @@
               drain();
               return;
             }
+            clearDrainingState(job);
+            invalidateLocalActivities(job);
             job.state = "needs_user";
             job.stateVersion += 1;
             job.attemptToken = null;
@@ -2038,6 +2112,7 @@
           removeFromQueue(job);
           clearRetryDeadline(job);
           clearDrainingState(job);
+          invalidateLocalActivities(job);
           job.state = "cancelled";
           job.stateVersion += 1;
           job.attemptToken = null;
@@ -2054,6 +2129,7 @@
       releaseSlotIfHeld(job);
       clearRetryDeadline(job);
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = "cancelled";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -2120,6 +2196,7 @@
       removeFromQueue(job);
       clearRetryDeadline(job);
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.state = "cancelled";
       job.stateVersion += 1;
       job.attemptToken = null;
@@ -2543,6 +2620,7 @@
       releaseSlotIfHeld(job);
       job.attemptToken = null;
       clearDrainingState(job);
+      invalidateLocalActivities(job);
       job.firefoxHandoffInFlight = false;
 
       var release = {
@@ -2754,6 +2832,7 @@
           job.stateVersion += 1;
           job.attemptToken = null;
           job.firefoxHandoffInFlight = false;
+          invalidateLocalActivities(job);
           clearEphemeralOnce(job);
         }
         // A handed_to_firefox job must never remain the gate owner.
@@ -2816,6 +2895,7 @@
       notePermitAcquired: notePermitAcquired,
       releasePermit: releasePermit,
       acquireProviderPermit: acquireProviderPermit,
+      acquireLocalActivity: acquireLocalActivity,
       onQuiesced: onQuiesced,
       noteNativeOpen: noteNativeOpen,
       nativeLeaseFor: nativeLeaseFor,
