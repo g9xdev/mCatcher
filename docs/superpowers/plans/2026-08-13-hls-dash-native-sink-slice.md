@@ -64,7 +64,7 @@ The adapter must copy the returned bytes before retaining them. It must map thro
 6. A matching `file-committed` is the only success boundary. It settles the scheduler, releases local activity/capacity exactly once, clears private bytes/session state, and pumps the next queued job.
 7. Browser fetch/assembly rejection uses the real normalized browser failure category, preserving bounded retry policy without raw error text. A matching authenticated host `file-error` or confirmed sink protocol/write/commit failure settles as `local_io`/`needs_user`. A synchronous or asynchronous `postNative` rejection means helper transport unavailable and must use `onTransportUnavailable`, not `local_io`. All paths release local activity before scheduler settlement and never invoke Firefox automatically.
 8. Cancellation makes `shouldAbort()` true immediately. During assembly, wait for the assembler and every started fetch permit to quiesce, release local activity, then submit the matching scheduler `cancelled` terminal; never open or commit. During streaming, send at most one `file-abort`, wait for matching `file-aborted`/`file-error` (or helper-unavailable settlement), release local activity, then submit cancellation. Stale frames remain inert.
-9. Extend `cancel`, `manualRetry`, and `helperDisconnected` to HLS/DASH. Manual retry discards old bytes/session/task state, obtains a fresh scheduler attempt token, and creates a fresh sink; old-sink frames remain inert. Helper disconnect clears active transfer state, releases its local activity, routes through the scheduler unavailable path, and never auto-invokes Firefox.
+9. Extend `cancel`, `manualRetry`, and `helperDisconnected` to HLS/DASH. Once assembly succeeds, retain one private owned byte copy across `needs_user`; manual retry discards the old attempt/session only, obtains a fresh scheduler token, and opens a fresh sink from those retained bytes without refetching. Old-sink frames remain inert. Helper disconnect clears active session/task state but retains already-assembled bytes, releases its local activity, routes through the scheduler unavailable path, and never auto-invokes Firefox. Cancel or a true terminal clears the retained bytes.
 10. Controller `tick(nowMs)` must advance both detection finalization and `scheduler.tick(nowMs)` when the scheduler exists, then call `pump()`. This is the only way transient assembly retry-backoff can wake in the pure controller; existing direct behavior must remain unchanged.
 
 ### Causal tests
@@ -77,7 +77,7 @@ The adapter must copy the returned bytes before retaining them. It must map thro
 6. Wrong/stale/duplicate attempt, sink, ack, commit, abort, and error frames are inert.
 7. Transient assembly rejection follows bounded scheduler retry; malformed/permanent assembly failure terminates without Firefox; native post rejection uses helper-unavailable; matching `file-error` becomes `needs_user`; none call Firefox automatically.
 8. Cancel during assembly prevents `file-open` and reaches `cancelled` after fetch quiescence; cancel during streaming posts one abort and cannot later commit.
-9. Manual retry uses a fresh attempt/sink with stale old frames inert; helper disconnect cleans active HLS/DASH state and leaves a user-actionable job without Firefox.
+9. Manual retry reuses retained assembled bytes with a fresh attempt/sink and stale old frames inert; helper disconnect leaves a user-actionable job without invoking Firefox.
 
 Verification:
 
