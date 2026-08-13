@@ -91,6 +91,12 @@
       throw new Error("McDownloadScheduler is required for BackgroundAdapters");
     }
 
+    function resolveNativeResultAdapter() {
+      if (isCommonJsActive()) return require("./native-result-adapter.js");
+      if (root && root.McNativeResultAdapter) return root.McNativeResultAdapter;
+      throw new Error("McNativeResultAdapter is required for BackgroundAdapters");
+    }
+
     function deepClone(value) {
       if (value == null || typeof value !== "object") return value;
       if (safeIsArray(value)) return value.map(deepClone);
@@ -1260,10 +1266,16 @@
 
       var scheduler = null;
       var MessageRouter = null;
+      var NativeResultAdapter = null;
 
       function getMessageRouter() {
         if (!MessageRouter) MessageRouter = resolveDownloadMessageRouter();
         return MessageRouter;
+      }
+
+      function getNativeResultAdapter() {
+        if (!NativeResultAdapter) NativeResultAdapter = resolveNativeResultAdapter();
+        return NativeResultAdapter;
       }
 
       function getScheduler() {
@@ -1344,6 +1356,8 @@
       var jobBindings = new Map();
       /** @type {Set<string>} jobId\\0attemptToken already posted */
       var startedAttempts = new Set();
+      /** @type {Set<string>} jobId\0attemptToken already switched to pget-single */
+      var singleStartedAttempts = new Set();
 
       /**
        * Prepare public ID: invoke randomToken and validate base only.
@@ -1979,7 +1993,10 @@
         var jobs = snap.jobs || [];
         var out = new Array();
         for (var i = 0; i < jobs.length; i++) {
-          out.push(freezeClone(Privacy.projectPopupJob(jobs[i])));
+          var input = deepClone(jobs[i]);
+          var binding = jobBindings.get(jobs[i].id);
+          if (binding && binding.progress) input.progress = binding.progress;
+          out.push(freezeClone(Privacy.projectPopupJob(input)));
         }
         return deepFreeze(out);
       }
@@ -2156,8 +2173,79 @@
         });
       }
 
-      function handleNativeMessage(/* message */) {
-        return lease1Reject();
+      function handleNativeMessage(message) {
+        return Promise.resolve().then(function () {
+          if (!message || typeof message !== "object" || ownData(message, "type") === undefined) return false;
+          var beforeSig = jobAdmissionSig();
+          var decision = getMessageRouter().routeNativeMessage(message);
+          if (!decision || typeof decision !== "object") return false;
+
+          if (decision.action === "transport-progress") {
+            var progressJob = getScheduler().getJob(decision.jobId);
+            if (!progressJob || progressJob.state !== "running" || progressJob.mediaKind !== "direct" || progressJob.attemptToken !== decision.attemptToken) return false;
+            var progressBinding = jobBindings.get(decision.jobId);
+            if (!progressBinding) return false;
+            var oldProgress = progressBinding.progress;
+            if (oldProgress && (decision.bytes < oldProgress.done || decision.total < oldProgress.total)) return false;
+            progressBinding.progress = Object.freeze({ done: decision.bytes, total: decision.total });
+            publishJobsIfChanged(beforeSig);
+            return true;
+          }
+
+          if (decision.action === "native-limit-ack") {
+            var ackJob = getScheduler().getJob(decision.jobId);
+            if (!ackJob || ackJob.state !== "running" || ackJob.mediaKind !== "direct" || ackJob.attemptToken !== decision.attemptToken) return false;
+            var lease = getScheduler().nativeLeaseFor(decision.jobId);
+            if (lease.providerGeneration !== decision.providerGeneration || lease.maxConnections !== decision.maxConnections) return false;
+            var ackBinding = jobBindings.get(decision.jobId);
+            if (!ackBinding) return false;
+            ackBinding.limitAck = Object.freeze({ providerGeneration: decision.providerGeneration, maxConnections: decision.maxConnections });
+            return true;
+          }
+
+          if (decision.action !== "transport-result" && decision.action !== "start-single-connection") return false;
+          var switchEffects = [];
+          var terminalJob = getScheduler().getJob(decision.jobId);
+          if (terminalJob && terminalJob.state === "running" && terminalJob.attemptToken === decision.attemptToken) {
+            getScheduler().noteNativeOpen(decision.jobId, 0);
+          }
+          var switchStart = function (post) {
+            var job = getScheduler().getJob(post.id);
+            if (!job || job.state !== "running" || job.attemptToken !== post.attemptToken || job.mode !== "single-connection") return;
+            var key = job.id + "\0" + job.attemptToken;
+            if (singleStartedAttempts.has(key)) return;
+            var binding = jobBindings.get(job.id);
+            if (!binding) return;
+            singleStartedAttempts.add(key);
+            var lease = getScheduler().nativeLeaseFor(job.id);
+            var input = { kind: "pget-single", jobId: job.id, attemptToken: job.attemptToken, intent: binding.intent, url: binding.url, providerGeneration: lease.providerGeneration };
+            if (binding.mirrors !== undefined) input.mirrors = binding.mirrors;
+            if (binding.referer !== undefined) input.referer = binding.referer;
+            if (binding.userAgent !== undefined) input.userAgent = binding.userAgent;
+            if (binding.effectiveDir !== undefined) input.effectiveDestinationDirectory = binding.effectiveDir;
+            var effect = postNative(getMessageRouter().buildNativeStartPayload(input));
+            switchEffects.push(Promise.resolve(effect));
+            return effect;
+          };
+          try {
+            getNativeResultAdapter().handlePgetResult(getScheduler(), message, { startSingleConnection: switchStart });
+          } catch (err) {
+            publishJobsIfChanged(beforeSig);
+            throw err;
+          }
+          var terminalBinding = jobBindings.get(decision.jobId);
+          if (terminalBinding) {
+            delete terminalBinding.progress;
+            delete terminalBinding.limitAck;
+          }
+          return Promise.all(switchEffects).then(function () { return pump(); }).then(function () {
+            publishJobsIfChanged(beforeSig);
+            return true;
+          }, function (err) {
+            publishJobsIfChanged(beforeSig);
+            throw err;
+          });
+        });
       }
 
       function requestFirefoxHandoff(/* message, sender */) {

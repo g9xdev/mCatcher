@@ -1133,7 +1133,6 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 
   // Async future stubs return a Promise before rejecting (never throw sync).
   const asyncStubs = [
-    () => ctrl.handleNativeMessage({}),
     () => ctrl.requestFirefoxHandoff({}, {}),
     () => ctrl.cancel("j1"),
     () => ctrl.manualRetry("j1"),
@@ -1157,6 +1156,7 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
     assert.ok(rejected instanceof Error);
     assert.equal(rejected.message, LEASE1_MSG);
   }
+  assert.equal(await ctrl.handleNativeMessage({}), false);
   // Stubs must not invoke effects or mutate by publishing.
   assert.equal(effectHits, 0);
   assert.equal(fx.counts.publishDetection, 0);
@@ -5613,6 +5613,49 @@ function openOwnedMedia(ctrl, fx, opts) {
   return mediaId;
 }
 
+async function enqueueNativeDirect(ctrl, fx, tag) {
+  const tabId = 910;
+  const mediaId = openOwnedMedia(ctrl, fx, {
+    docId: "doc-native-" + tag,
+    tabId,
+    filename: tag + ".mp4",
+  });
+  const job = await ctrl.enqueueDownload(
+    {
+      type: "download",
+      tabId,
+      item: { id: mediaId, proposedFilename: tag + ".mp4" },
+      userActionToken: "native-action-" + tag,
+    },
+    { tab: { id: tabId } }
+  );
+  return job;
+}
+
+test("native direct result switches an eligible attempt to one single command", async () => {
+  const commands = [];
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(
+    fx.options({ postNative(command) { commands.push(command); } })
+  );
+  const job = await enqueueNativeDirect(ctrl, fx, "range-switch");
+  const initial = commands[0];
+  await ctrl.handleNativeMessage({
+    type: "pget-result",
+    id: job.id,
+    attemptToken: initial.attemptToken,
+    status: "failed",
+    mode: "multi-range",
+    failureCategory: "range_unsupported",
+    partState: "empty",
+  });
+  assert.equal(commands.length, 2);
+  assert.equal(commands[1].cmd, "pget-single");
+  assert.equal(commands[1].id, job.id);
+  assert.equal(commands[1].attemptToken, initial.attemptToken);
+  assert.equal(fx.counts.downloadsDownload, 0);
+});
+
 // ---------------------------------------------------------------------------
 // BA05 — opaque variant IDs bind original private URLs; replay cannot replace
 // ---------------------------------------------------------------------------
@@ -8061,7 +8104,6 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
 
       // Representative future stubs — await all rejections.
       const stubCalls = [
-        () => ctrl.handleNativeMessage({ cookie: "SECRET_COOKIE_ABC" }),
         () => ctrl.requestFirefoxHandoff({ url: vUrlNet }, {}),
         () => ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"),
