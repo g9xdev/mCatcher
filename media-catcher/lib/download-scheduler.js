@@ -2094,11 +2094,39 @@
     }
 
     /**
+     * Terminalize cancelRequested running/pausing work after helper disconnect has
+     * confirmed native-open zero and any authenticated owner release. Exact-once
+     * slot/queue/deadline/ephemeral cleanup; never charges retry or calls Firefox.
+     * Caller must not invoke this while ProviderGate still names the job owner.
+     */
+    function terminalizeUnavailableCancelled(job) {
+      if (!job) return false;
+      if (job.state !== "running" && job.state !== "pausing_provider") return false;
+      if (job.cancelRequested !== true) return false;
+      if (isTrulyTerminal(job.state)) return false;
+      releaseSlotIfHeld(job);
+      removeFromWaitQueue(job);
+      removeFromQueue(job);
+      clearRetryDeadline(job);
+      clearDrainingState(job);
+      job.state = "cancelled";
+      job.stateVersion += 1;
+      job.attemptToken = null;
+      clearEphemeralOnce(job);
+      drain();
+      return true;
+    }
+
+    /**
      * Park a live job when the native helper transport disconnects.
      * Applies only to running | pausing_provider | waiting_provider.
-     * One needs_user transition (single stateVersion bump), release held slot once,
-     * clear queues / retry deadline / live attempt token, zero native opens on the
-     * job and its ProviderGate, preserve intent/mode/concurrency/retries/ephemeral.
+     * Default outcome is one needs_user transition (single stateVersion bump),
+     * release held slot once, clear queues / retry deadline / live attempt token,
+     * zero native opens on the job and its ProviderGate, preserve
+     * intent/mode/concurrency/retries/ephemeral.
+     * When cancelRequested is already set on running/pausing work with no pending
+     * authenticated drain terminal, cancellation wins instead of needs_user once
+     * native zero and any owner release are confirmed.
      * Authenticated saturated/recovering owners complete ownership with no recovery
      * successor and do not wake same-provider waiters. Independent-provider capacity
      * is drained. No retry charge, no Firefox, no popup proof. Duplicate/unknown/
@@ -2154,6 +2182,7 @@
       // physical attempt. Helper disconnect must not erase or overwrite it.
       // Record a private unavailable-during-drain condition and settle only after
       // full physical quiescence (maybeQuiesce → settleDrainingTerminal).
+      // cancelRequested still wins inside settleDrainingTerminal.
       if (job.state === "pausing_provider" && job.pendingDrainTerminal != null) {
         if (job.drainTransportUnavailable === true) {
           // Duplicate unavailable while already recorded: false no-op.
@@ -2190,6 +2219,15 @@
           if (release.error) throw release.error;
           return false;
         }
+      }
+
+      // User cancellation always wins once transport unavailability proves the
+      // physical native work is gone (and ownership, if any, has released).
+      if (
+        job.cancelRequested === true &&
+        (job.state === "running" || job.state === "pausing_provider")
+      ) {
+        return terminalizeUnavailableCancelled(job);
       }
 
       // Single stateVersion bump, slot release, queue/token/deadline clear; ephemeral

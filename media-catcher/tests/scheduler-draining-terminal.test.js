@@ -246,7 +246,11 @@ function installHostileGate(realGate, gatePath, hooks) {
               }
             : g.noteNativeOpen.bind(g),
           parkProbe: g.parkProbe.bind(g),
-          completeOwner: g.completeOwner.bind(g),
+          completeOwner: hooks.completeOwner
+            ? function (args) {
+                return hooks.completeOwner(g, args);
+              }
+            : g.completeOwner.bind(g),
           designateRecoveryOwner: g.designateRecoveryOwner.bind(g),
           recoverToNormal: g.recoverToNormal.bind(g),
           snapshot: g.snapshot.bind(g),
@@ -2305,4 +2309,583 @@ test("15C unavailable with pending + noteNativeOpen throw-before retryable; muta
   } finally {
     restoreModuleCache(gatePath, schedPath, prevGate2, prevSched2);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 16. Cancel wins helper disconnect (fail-closed drain-token hold)
+// ---------------------------------------------------------------------------
+
+test("16A cancel after native zero with retained private auth: unavailable → cancelled once", () => {
+  // Exact reported sequence: paused B keeps private drain auth after native zero;
+  // cancel waits for semantic terminal; helper disconnect proves physical work gone
+  // → cancelled (not needs_user), exact-once cleanup; late signals inert.
+  var topo = setupABCPausingB();
+  var s = topo.s;
+  var clearBefore = topo.clearB.n;
+  var retriesBefore = s.getJob("B").retryRemaining;
+  var usedBefore = s.getJob("B").retryUsed;
+  var wakeBefore = s.getJob("B").autoWakeCount;
+  var verBefore = s.getJob("B").stateVersion;
+  var globalBefore = s.getSnapshot().globalRunning;
+
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").attemptToken, null);
+
+  s.cancel("B");
+  // Fail-closed hold: private auth still awaiting semantic terminal.
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(topo.clearB.n, clearBefore);
+
+  assert.equal(s.onTransportUnavailable("B"), true);
+  assert.equal(s.getJob("B").state, "cancelled");
+  assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").attemptToken, null);
+  assert.equal(s.getJob("B").retryRemaining, retriesBefore);
+  assert.equal(s.getJob("B").retryUsed, usedBefore);
+  assert.equal(s.getJob("B").autoWakeCount, wakeBefore);
+  assert.equal(topo.clearB.n, clearBefore + 1);
+  assert.equal(s.getSnapshot().globalRunning, globalBefore - 1);
+  assert.equal(s.getSnapshot().providers["p.com"].waiting.indexOf("B"), -1);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "A");
+  assert.equal(topo.firefoxCalls.n, 0);
+  assertProjectionKeys(s.getJob("B"));
+  assert.equal(JSON.stringify(s.getSnapshot()).indexOf("drainingAttemptToken"), -1);
+  assert.equal(JSON.stringify(s.getSnapshot()).indexOf("pendingDrainTerminal"), -1);
+  assert.equal(JSON.stringify(s.getSnapshot()).indexOf("drainTransportUnavailable"), -1);
+
+  // Late / duplicate signals are inert after cancelled.
+  assert.equal(s.onTransportUnavailable("B"), false);
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), false);
+  s.cancel("B");
+  s.manualRetry("B");
+  assert.equal(s.getJob("B").state, "cancelled");
+  assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+  assert.equal(topo.clearB.n, clearBefore + 1);
+  assert.equal(topo.firefoxCalls.n, 0);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+});
+
+test("16B running cancelRequested then helper unavailable → cancelled with exact-once cleanup", () => {
+  var firefoxCalls = { n: 0 };
+  var clearRun = { n: 0 };
+  var s = createDownloadScheduler({
+    maxConcurrent: 1,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      firefoxCalls.n += 1;
+    },
+  });
+  s.createJob({
+    id: "run",
+    providerKey: "a.com",
+    intent: intent("run.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+    ephemeral: {
+      clear: function () {
+        clearRun.n += 1;
+      },
+    },
+  });
+  s.createJob({
+    id: "peer",
+    providerKey: "b.com",
+    intent: intent("peer.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+  });
+  s.enqueue("run");
+  s.enqueue("peer");
+  assert.equal(s.getJob("run").state, "running");
+  assert.equal(s.getJob("peer").state, "queued");
+  s.noteNativeOpen("run", 2);
+  var oldToken = s.getJob("run").attemptToken;
+  var verBefore = s.getJob("run").stateVersion;
+  var retriesBefore = s.getJob("run").retryRemaining;
+  var usedBefore = s.getJob("run").retryUsed;
+  var wakeBefore = s.getJob("run").autoWakeCount;
+  var clearBefore = clearRun.n;
+
+  s.cancel("run");
+  assert.equal(s.getJob("run").state, "running");
+  assert.equal(s.getJob("run").holdsGlobalSlot, true);
+  assert.equal(s.getJob("run").attemptToken, oldToken);
+  assert.equal(clearRun.n, clearBefore);
+
+  assert.equal(s.onTransportUnavailable("run"), true);
+  assert.equal(s.getJob("run").state, "cancelled");
+  assert.equal(s.getJob("run").stateVersion, verBefore + 1);
+  assert.equal(s.getJob("run").holdsGlobalSlot, false);
+  assert.equal(s.getJob("run").nativeOpenConnections, 0);
+  assert.equal(s.getJob("run").attemptToken, null);
+  assert.equal(s.getJob("run").retryRemaining, retriesBefore);
+  assert.equal(s.getJob("run").retryUsed, usedBefore);
+  assert.equal(s.getJob("run").autoWakeCount, wakeBefore);
+  assert.equal(clearRun.n, clearBefore + 1);
+  // Independent provider fills released global capacity.
+  assert.equal(s.getJob("peer").state, "running");
+  assert.equal(firefoxCalls.n, 0);
+  assertProjectionKeys(s.getJob("run"));
+
+  assert.equal(s.onTransportUnavailable("run"), false);
+  s.onTransportResult("run", oldToken, { status: "completed", failureCategory: null });
+  s.cancel("run");
+  s.manualRetry("run");
+  assert.equal(s.getJob("run").state, "cancelled");
+  assert.equal(s.getJob("run").stateVersion, verBefore + 1);
+  assert.equal(clearRun.n, clearBefore + 1);
+  assert.equal(firefoxCalls.n, 0);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+});
+
+test("16C cancelled saturated owner on unavailable releases ownership without waking same-provider waiter", () => {
+  var firefoxCalls = { n: 0 };
+  var clearOwner = { n: 0 };
+  var s = createDownloadScheduler({
+    maxConcurrent: 2,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      firefoxCalls.n += 1;
+    },
+  });
+  s.createJob({
+    id: "owner",
+    providerKey: "p.com",
+    intent: intent("o.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+    ephemeral: {
+      clear: function () {
+        clearOwner.n += 1;
+      },
+    },
+  });
+  s.createJob({
+    id: "wait",
+    providerKey: "p.com",
+    intent: intent("w.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "peer",
+    providerKey: "other.com",
+    intent: intent("peer.mp4"),
+    segmentConcurrency: 2,
+    retries: 1,
+  });
+  s.enqueue("owner");
+  s.enqueue("wait");
+  s.enqueue("peer");
+  s.notePermitAcquired("owner");
+  s.noteNativeOpen("owner", 1);
+  s.onTransportResult("wait", s.getJob("wait").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  if (s.getJob("wait").state === "pausing_provider") {
+    s.noteNativeOpen("wait", 0);
+    if (s.getJob("wait").state === "pausing_provider") {
+      s.onQuiesced("wait");
+    }
+  }
+  assert.equal(s.getJob("wait").state, "waiting_provider");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.state, "saturated");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+  assert.equal(s.getJob("owner").state, "running");
+  // Peer may be running (global cap 2) or still queued if wait held capacity until park.
+  var waitWakeBefore = s.getJob("wait").autoWakeCount;
+  var waitRetriesBefore = s.getJob("wait").retryRemaining;
+  var ownerRetriesBefore = s.getJob("owner").retryRemaining;
+  var ownerUsedBefore = s.getJob("owner").retryUsed;
+  var verBefore = s.getJob("owner").stateVersion;
+  var clearBefore = clearOwner.n;
+
+  s.cancel("owner");
+  assert.equal(s.getJob("owner").state, "running");
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+
+  assert.equal(s.onTransportUnavailable("owner"), true);
+  assert.equal(s.getJob("owner").state, "cancelled");
+  assert.equal(s.getJob("owner").stateVersion, verBefore + 1);
+  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.equal(s.getJob("owner").attemptToken, null);
+  assert.equal(s.getJob("owner").retryRemaining, ownerRetriesBefore);
+  assert.equal(s.getJob("owner").retryUsed, ownerUsedBefore);
+  assert.equal(clearOwner.n, clearBefore + 1);
+  var gate = s.getSnapshot().providers["p.com"].gate;
+  assert.notEqual(gate.ownerJobId, "owner");
+  assert.equal(gate.ownerJobId, null);
+  // Same-provider waiter stays parked (not woken / not authorized).
+  assert.equal(s.getJob("wait").state, "waiting_provider");
+  assert.equal(s.getJob("wait").autoWakeCount, waitWakeBefore);
+  assert.equal(s.getJob("wait").retryRemaining, waitRetriesBefore);
+  assert.ok(s.getSnapshot().providers["p.com"].waiting.indexOf("wait") !== -1);
+  // Independent provider may fill released global capacity.
+  assert.equal(s.getJob("peer").state, "running");
+  assert.equal(firefoxCalls.n, 0);
+  assert.equal(s.onTransportUnavailable("owner"), false);
+  s.manualRetry("owner");
+  assert.equal(s.getJob("owner").state, "cancelled");
+  assert.equal(clearOwner.n, clearBefore + 1);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+});
+
+test("16D cancel+unavailable gate faults: noteNativeOpen and completeOwner throw-before/mutate-then", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+
+  // --- noteNativeOpen throw-before on cancelRequested pausing job ---
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  try {
+    let gateRef = null;
+    let throwBefore = true;
+    installHostileGate(realGate, gatePath, {
+      onGate: function (g) {
+        gateRef = g;
+      },
+      noteNativeOpen: function (g, jobId, n) {
+        if (throwBefore && n === 0 && jobId === "B") {
+          throw new Error("simulated noteNativeOpen throw before mutation");
+        }
+        return g.noteNativeOpen(jobId, n);
+      },
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    const s = createS({
+      maxConcurrent: 3,
+      now: function () {
+        return 0;
+      },
+      firefoxDownload: function () {},
+    });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+      ephemeral: {
+        clear: function () {},
+      },
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue("B");
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    s.noteNativeOpen("B", 2);
+    s.noteNativeOpen("C", 1);
+    s.onTransportResult("C", s.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    s.cancel("B");
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    var nativeBefore = s.getJob("B").nativeOpenConnections;
+    var gateOpenBefore = gateRef.snapshot().nativeOpen.B;
+    var verBefore = s.getJob("B").stateVersion;
+
+    var threw = false;
+    try {
+      s.onTransportUnavailable("B");
+    } catch (e) {
+      threw = true;
+    }
+    assert.equal(threw, true);
+    // Throw-before: prior coherent state preserved and retryable.
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").holdsGlobalSlot, true);
+    assert.equal(s.getJob("B").nativeOpenConnections, nativeBefore);
+    assert.equal(gateRef.snapshot().nativeOpen.B, gateOpenBefore);
+    assert.equal(s.getJob("B").stateVersion, verBefore);
+
+    throwBefore = false;
+    assert.equal(s.onTransportUnavailable("B"), true);
+    assert.equal(s.getJob("B").state, "cancelled");
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    assert.equal(s.getJob("B").nativeOpenConnections, 0);
+    assert.equal(gateRef.snapshot().nativeOpen.B, 0);
+    assert.equal(s.onTransportUnavailable("B"), false);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+
+  // --- noteNativeOpen mutate-then-throw continues once to cancelled ---
+  const prevGate2 = require.cache[require.resolve(gatePath)];
+  const prevSched2 = require.cache[require.resolve(schedPath)];
+  try {
+    let gateRef2 = null;
+    installHostileGate(realGate, gatePath, {
+      onGate: function (g) {
+        gateRef2 = g;
+      },
+      noteNativeOpen: function (g, jobId, n) {
+        if (n === 0 && jobId === "B") {
+          g.noteNativeOpen(jobId, n);
+          throw new Error("simulated noteNativeOpen throw after mutation");
+        }
+        return g.noteNativeOpen(jobId, n);
+      },
+    });
+    const createS2 = loadSchedulerFresh(schedPath);
+    const s2 = createS2({
+      maxConcurrent: 3,
+      now: function () {
+        return 0;
+      },
+      firefoxDownload: function () {},
+    });
+    s2.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s2.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s2.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s2.enqueue("A");
+    s2.enqueue("B");
+    s2.enqueue("C");
+    s2.notePermitAcquired("A");
+    s2.noteNativeOpen("A", 1);
+    s2.noteNativeOpen("B", 2);
+    s2.noteNativeOpen("C", 1);
+    s2.onTransportResult("C", s2.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    s2.cancel("B");
+    var verBefore2 = s2.getJob("B").stateVersion;
+    assert.equal(s2.onTransportUnavailable("B"), true);
+    assert.equal(s2.getJob("B").state, "cancelled");
+    assert.equal(s2.getJob("B").stateVersion, verBefore2 + 1);
+    assert.equal(s2.getJob("B").nativeOpenConnections, 0);
+    assert.equal(gateRef2.snapshot().nativeOpen.B, 0);
+    assert.equal(s2.onTransportUnavailable("B"), false);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate2, prevSched2);
+  }
+
+  // --- completeOwner throw-before: must not terminalize while still owner ---
+  const prevGate3 = require.cache[require.resolve(gatePath)];
+  const prevSched3 = require.cache[require.resolve(schedPath)];
+  try {
+    let throwBeforeOwner = true;
+    installHostileGate(realGate, gatePath, {
+      completeOwner: function (g, args) {
+        if (throwBeforeOwner) {
+          throw new Error("simulated completeOwner throw before mutation");
+        }
+        return g.completeOwner(args);
+      },
+    });
+    const createS3 = loadSchedulerFresh(schedPath);
+    const s3 = createS3({
+      maxConcurrent: 2,
+      now: function () {
+        return 0;
+      },
+      firefoxDownload: function () {},
+    });
+    s3.createJob({
+      id: "owner",
+      providerKey: "p.com",
+      intent: intent("o.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s3.createJob({
+      id: "wait",
+      providerKey: "p.com",
+      intent: intent("w.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s3.enqueue("owner");
+    s3.enqueue("wait");
+    s3.notePermitAcquired("owner");
+    s3.noteNativeOpen("owner", 1);
+    s3.onTransportResult("wait", s3.getJob("wait").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    if (s3.getJob("wait").state === "pausing_provider") {
+      s3.noteNativeOpen("wait", 0);
+      if (s3.getJob("wait").state === "pausing_provider") {
+        s3.onQuiesced("wait");
+      }
+    }
+    assert.equal(s3.getJob("wait").state, "waiting_provider");
+    assert.equal(s3.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    s3.cancel("owner");
+    var verBefore3 = s3.getJob("owner").stateVersion;
+    var waitWakeBefore = s3.getJob("wait").autoWakeCount;
+
+    var outcome = null;
+    try {
+      outcome = s3.onTransportUnavailable("owner");
+    } catch (e) {
+      outcome = e;
+    }
+    // Must not terminalize while gate still names this owner.
+    assert.equal(s3.getJob("owner").state, "running");
+    assert.equal(s3.getJob("owner").stateVersion, verBefore3);
+    assert.equal(s3.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.ok(outcome === false || outcome instanceof Error);
+    assert.equal(s3.getJob("wait").state, "waiting_provider");
+    assert.equal(s3.getJob("wait").autoWakeCount, waitWakeBefore);
+
+    throwBeforeOwner = false;
+    assert.equal(s3.onTransportUnavailable("owner"), true);
+    assert.equal(s3.getJob("owner").state, "cancelled");
+    assert.equal(s3.getJob("owner").stateVersion, verBefore3 + 1);
+    assert.notEqual(s3.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.equal(s3.getJob("wait").state, "waiting_provider");
+    assert.equal(s3.getJob("wait").autoWakeCount, waitWakeBefore);
+    assert.equal(s3.onTransportUnavailable("owner"), false);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate3, prevSched3);
+  }
+
+  // --- completeOwner mutate-then-throw: terminalize cancelled once after advancement ---
+  const prevGate4 = require.cache[require.resolve(gatePath)];
+  const prevSched4 = require.cache[require.resolve(schedPath)];
+  try {
+    installHostileGate(realGate, gatePath, {
+      completeOwner: function (g, args) {
+        const result = g.completeOwner(args);
+        throw new Error("simulated completeOwner throw after advance");
+      },
+    });
+    const createS4 = loadSchedulerFresh(schedPath);
+    const s4 = createS4({
+      maxConcurrent: 2,
+      now: function () {
+        return 0;
+      },
+      firefoxDownload: function () {},
+    });
+    s4.createJob({
+      id: "owner",
+      providerKey: "p.com",
+      intent: intent("o.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s4.createJob({
+      id: "wait",
+      providerKey: "p.com",
+      intent: intent("w.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s4.enqueue("owner");
+    s4.enqueue("wait");
+    s4.notePermitAcquired("owner");
+    s4.noteNativeOpen("owner", 1);
+    s4.onTransportResult("wait", s4.getJob("wait").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    if (s4.getJob("wait").state === "pausing_provider") {
+      s4.noteNativeOpen("wait", 0);
+      if (s4.getJob("wait").state === "pausing_provider") {
+        s4.onQuiesced("wait");
+      }
+    }
+    assert.equal(s4.getJob("wait").state, "waiting_provider");
+    s4.cancel("owner");
+    var verBefore4 = s4.getJob("owner").stateVersion;
+    var waitWakeBefore4 = s4.getJob("wait").autoWakeCount;
+
+    assert.equal(s4.onTransportUnavailable("owner"), true);
+    assert.equal(s4.getJob("owner").state, "cancelled");
+    assert.equal(s4.getJob("owner").stateVersion, verBefore4 + 1);
+    assert.equal(s4.getJob("owner").holdsGlobalSlot, false);
+    assert.notEqual(s4.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+    assert.equal(s4.getJob("wait").state, "waiting_provider");
+    assert.equal(s4.getJob("wait").autoWakeCount, waitWakeBefore4);
+    assert.equal(s4.onTransportUnavailable("owner"), false);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate4, prevSched4);
+  }
+});
+
+test("16E control: no cancel still needs_user; pending completed + unavailable still completes", () => {
+  // Control: established no-cancel unavailable parks needs_user and retains ephemeral.
+  var topo = setupABCPausingB();
+  var s = topo.s;
+  var clearBefore = topo.clearB.n;
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.onTransportUnavailable("B"), true);
+  assert.equal(s.getJob("B").state, "needs_user");
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(topo.clearB.n, clearBefore); // ephemeral retained
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), false);
+  assert.equal(s.getJob("B").state, "needs_user");
+  assert.equal(topo.firefoxCalls.n, 0);
+  s.manualRetry("B");
+  assert.equal(s.getJob("B").state, "queued");
+  assertSlotInvariant(s);
+
+  // Pending authenticated completion + unavailable still completes after permit release.
+  var topo2 = setupABCPausingBWithPermit();
+  var s2 = topo2.s;
+  var clearBefore2 = topo2.clearB.n;
+  assert.equal(s2.onDrainingTransportResult("B", topo2.bToken, completedResult()), true);
+  assert.equal(s2.onTransportUnavailable("B"), true);
+  assert.equal(s2.getJob("B").state, "pausing_provider");
+  topo2.permit.release();
+  assert.equal(s2.getJob("B").state, "completed");
+  assert.equal(topo2.clearB.n, clearBefore2 + 1);
+  assert.equal(topo2.firefoxCalls.n, 0);
+  assert.equal(s2.onDrainingTransportResult("B", topo2.bToken, completedResult()), false);
+  assertSlotInvariant(s2);
+  assertPermitAndOwnerInvariants(s2);
 });
