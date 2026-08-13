@@ -553,7 +553,9 @@
     /**
      * Shared quiesce edge: pausing_provider settles once when total permits and
      * native opens are both zero. A stored draining terminal is dispatched before
-     * default pausing → waiting. State guard only (single-threaded).
+     * default pausing → waiting. Transport-unavailable with no pending outcome
+     * settles cancel (if requested) or needs_user before ordinary waiting.
+     * State guard only (single-threaded).
      * Late quiesce after owner completion / recovery-to-normal auto-authorizes wake
      * when the gate is recovering-blocked or normal (never while an owner is active).
      */
@@ -587,6 +589,13 @@
         job.stateVersion += 1;
         job.attemptToken = null;
         clearEphemeralOnce(job);
+        drain();
+        return;
+      }
+      // Helper disconnect with no pending outcome: park needs_user once provider
+      // permits also reach zero. Helper disappearance proves native zero only.
+      if (job.drainTransportUnavailable === true) {
+        enterNeedsUser(job);
         drain();
         return;
       }
@@ -2095,9 +2104,11 @@
 
     /**
      * Terminalize cancelRequested running/pausing work after helper disconnect has
-     * confirmed native-open zero and any authenticated owner release. Exact-once
-     * slot/queue/deadline/ephemeral cleanup; never charges retry or calls Firefox.
-     * Caller must not invoke this while ProviderGate still names the job owner.
+     * confirmed native-open zero, any authenticated owner release, AND full
+     * wrapper/observed permit quiescence. Exact-once slot/queue/deadline/ephemeral
+     * cleanup; never charges retry or calls Firefox.
+     * Caller must not invoke this while ProviderGate still names the job owner,
+     * or while totalInFlightPermits remains positive.
      */
     function terminalizeUnavailableCancelled(job) {
       if (!job) return false;
@@ -2118,6 +2129,40 @@
     }
 
     /**
+     * Hold a running/pausing job after helper disconnect when wrapper/observed
+     * permits remain. Helper disappearance proves native zero only — not provider
+     * permit zero. Marks drainTransportUnavailable idempotently, invalidates any
+     * residual private native drain auth (no fabricated drainingAttemptToken),
+     * transitions running → pausing_provider without releasing the global slot,
+     * and leaves final settlement to maybeQuiesce on last permit release.
+     * Duplicate unavailable while already holding returns false.
+     */
+    function holdUnavailableUntilPermitsDrain(job) {
+      if (!job) return false;
+      if (job.state !== "running" && job.state !== "pausing_provider") return false;
+      if (job.drainTransportUnavailable === true) {
+        // Already recorded: residual native drain auth stays invalid; no re-entry.
+        job.drainingAttemptToken = null;
+        return false;
+      }
+      // Invalidate private native drain identity — helper is gone; do not mint a
+      // new drainingAttemptToken (native opens are already zero).
+      job.drainingAttemptToken = null;
+      job.pendingDrainTerminal = null;
+      job.drainTransportUnavailable = true;
+      if (job.state === "running") {
+        job.state = "pausing_provider";
+        job.stateVersion += 1;
+        job.attemptToken = null;
+        // retains global slot and cancelRequested
+      } else {
+        // Already pausing: keep slot/cancelRequested; public token stays null.
+        job.attemptToken = null;
+      }
+      return true;
+    }
+
+    /**
      * Park a live job when the native helper transport disconnects.
      * Applies only to running | pausing_provider | waiting_provider.
      * Default outcome is one needs_user transition (single stateVersion bump),
@@ -2126,11 +2171,13 @@
      * intent/mode/concurrency/retries/ephemeral.
      * When cancelRequested is already set on running/pausing work with no pending
      * authenticated drain terminal, cancellation wins instead of needs_user once
-     * native zero and any owner release are confirmed.
+     * native zero, any owner release, and full wrapper/observed permit quiescence
+     * are confirmed. Outstanding provider permits hold the job in pausing_provider
+     * with the global slot retained until maybeQuiesce settles.
      * Authenticated saturated/recovering owners complete ownership with no recovery
      * successor and do not wake same-provider waiters. Independent-provider capacity
-     * is drained. No retry charge, no Firefox, no popup proof. Duplicate/unknown/
-     * non-eligible → false no-op.
+     * is drained only after the global slot is released. No retry charge, no Firefox,
+     * no popup proof. Duplicate/unknown/non-eligible → false no-op.
      */
     function onTransportUnavailable(jobId) {
       var job = jobs.get(jobId);
@@ -2200,11 +2247,9 @@
         return true;
       }
 
-      // No pending authenticated outcome: private draining identity is invalid.
-      clearDrainingState(job);
-
       // Authenticated saturated/recovering owner: confirmed release with no recovery
       // successor and no same-provider waiter authorization on helper disconnect.
+      // Must run before settlement so ownership never outlives the disconnect ack.
       var snap = gate.snapshot();
       if (
         (snap.state === "saturated" || snap.state === "recovering") &&
@@ -2221,8 +2266,23 @@
         }
       }
 
-      // User cancellation always wins once transport unavailability proves the
-      // physical native work is gone (and ownership, if any, has released).
+      // Wrapper/observed permits still live: helper disconnect proved native zero
+      // only. Hold the global slot in pausing_provider until actual permit release
+      // drives maybeQuiesce (cancelRequested → cancelled; else needs_user).
+      // Do not authorize provider wake or admit independent capacity early.
+      if (
+        (job.state === "running" || job.state === "pausing_provider") &&
+        !isQuiescent(job)
+      ) {
+        return holdUnavailableUntilPermitsDrain(job);
+      }
+
+      // Fully quiescent (native zero + no provider permits): private drain auth is
+      // no longer usable and settlement can proceed immediately.
+      clearDrainingState(job);
+
+      // User cancellation wins once physical native work and provider permits are gone
+      // (and ownership, if any, has released).
       if (
         job.cancelRequested === true &&
         (job.state === "running" || job.state === "pausing_provider")

@@ -7,9 +7,12 @@ const { createDownloadScheduler } = loadLib("lib/download-scheduler.js");
 /**
  * McDownloadScheduler — Task 20 onTransportUnavailable
  * ----------------------------------------------------
- * Native-helper disconnect parks affected live work in needs_user without
- * consuming retries, without Firefox, and without waking same-provider waiters.
- * Frees global capacity so independent providers may admit.
+ * Native-helper disconnect proves native-open zero but never proves
+ * wrapper/observed provider permits zero. Fully quiescent live work parks
+ * needs_user (or cancelled when cancelRequested) without consuming retries,
+ * without Firefox, and without waking same-provider waiters. Outstanding
+ * permits hold pausing_provider + the global slot until actual release;
+ * independent providers admit only after that slot frees.
  */
 
 function intent(n) {
@@ -189,7 +192,7 @@ test("1 running job parks needs_user, releases slot once, retains ephemeral, adm
 });
 
 // ---------------------------------------------------------------------------
-// 2. Pausing job with native opens -> needs_user, zeros opens, releases slot
+// 2. Pausing job with native opens -> native zero hold, then needs_user on permit release
 // ---------------------------------------------------------------------------
 
 test("2 pausing_provider with native opens parks needs_user and zeros native opens", () => {
@@ -246,20 +249,47 @@ test("2 pausing_provider with native opens parks needs_user and zeros native ope
     assert.ok(s.getJob("sib").nativeOpenConnections >= 1);
     const verBefore = s.getJob("sib").stateVersion;
     const globalBefore = s.getSnapshot().globalRunning;
+    const retriesBefore = s.getJob("sib").retryRemaining;
+    const usedBefore = s.getJob("sib").retryUsed;
+    const modeBefore = s.getJob("sib").mode;
 
+    // Helper disconnect zeros native opens but observed permit keeps the job
+    // physically non-quiescent: hold pausing_provider + global slot.
     const ok = s.onTransportUnavailable("sib");
     assert.equal(ok, true);
-    assert.equal(s.getJob("sib").state, "needs_user");
-    assert.equal(s.getJob("sib").stateVersion, verBefore + 1);
-    assert.equal(s.getJob("sib").holdsGlobalSlot, false);
+    assert.equal(s.getJob("sib").state, "pausing_provider");
+    assert.equal(s.getJob("sib").stateVersion, verBefore); // already pausing: no extra bump
+    assert.equal(s.getJob("sib").holdsGlobalSlot, true);
+    assert.ok(s.getJob("sib").inFlightPermits >= 1);
     assert.equal(s.getJob("sib").nativeOpenConnections, 0);
     // Real gate nativeOpen must match job zero (inspect injected gate, not public projection).
     assert.equal(gateRef.snapshot().nativeOpen.sib, 0);
     assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen, undefined);
     assert.equal(s.getJob("sib").attemptToken, null);
-    assert.equal(s.getSnapshot().globalRunning, globalBefore - 1);
-    // still waiting_provider members must not include sib
+    assert.equal(s.getSnapshot().globalRunning, globalBefore);
     assert.equal(s.getSnapshot().providers["p.com"].waiting.indexOf("sib"), -1);
+    assert.equal(s.getJob("sib").retryRemaining, retriesBefore);
+    assert.equal(s.getJob("sib").retryUsed, usedBefore);
+    assert.equal(s.getJob("sib").mode, modeBefore);
+    assert.equal(firefoxCalls, 0);
+    assert.equal(s.onTransportUnavailable("sib"), false); // duplicate while holding
+    assertSlotInvariant(s);
+    assertPermitAndOwnerInvariants(s);
+
+    // Exact observation release for the earlier notePermitAcquired("sib").
+    s.releasePermit("sib");
+    assert.equal(s.getJob("sib").state, "needs_user");
+    assert.equal(s.getJob("sib").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("sib").holdsGlobalSlot, false);
+    assert.equal(s.getJob("sib").inFlightPermits, 0);
+    assert.equal(s.getJob("sib").nativeOpenConnections, 0);
+    assert.equal(gateRef.snapshot().nativeOpen.sib, 0);
+    assert.equal(s.getJob("sib").attemptToken, null);
+    assert.equal(s.getSnapshot().globalRunning, globalBefore - 1);
+    assert.equal(s.getSnapshot().providers["p.com"].waiting.indexOf("sib"), -1);
+    assert.equal(s.getJob("sib").retryRemaining, retriesBefore);
+    assert.equal(s.getJob("sib").retryUsed, usedBefore);
+    assert.equal(s.getJob("sib").mode, modeBefore);
     assert.equal(firefoxCalls, 0);
     assertSlotInvariant(s);
     assertPermitAndOwnerInvariants(s);
@@ -326,12 +356,18 @@ test("4 unavailable saturated owner is no longer gate owner; same-provider waite
   const ownerRetriesBefore = s.getJob("owner").retryRemaining;
   const ownerUsedBefore = s.getJob("owner").retryUsed;
   const verBefore = s.getJob("owner").stateVersion;
+  // saturateOwnerWithWaiter called notePermitAcquired(owner) — live observed permit.
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
 
   const ok = s.onTransportUnavailable("owner");
   assert.equal(ok, true);
-  assert.equal(s.getJob("owner").state, "needs_user");
-  assert.equal(s.getJob("owner").stateVersion, verBefore + 1);
-  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  // Ownership clears immediately; settlement waits for the real observed permit.
+  assert.equal(s.getJob("owner").state, "pausing_provider");
+  assert.equal(s.getJob("owner").stateVersion, verBefore + 1); // running → pausing
+  assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
+  assert.equal(s.getJob("owner").nativeOpenConnections, 0);
+  assert.equal(s.getJob("owner").attemptToken, null);
   assert.equal(s.getJob("owner").retryRemaining, ownerRetriesBefore);
   assert.equal(s.getJob("owner").retryUsed, ownerUsedBefore);
   // Must not remain gate owner — recoveryOwnerJobId null / ownerJobId null.
@@ -340,6 +376,23 @@ test("4 unavailable saturated owner is no longer gate owner; same-provider waite
   assert.equal(gate.ownerJobId, null);
   assert.ok(gate.state === "recovering" || gate.state === "normal");
   // Waiter stays parked (not woken during helper disconnect).
+  assert.equal(s.getJob("wait").state, "waiting_provider");
+  assert.equal(s.getJob("wait").autoWakeCount, waitWakeBefore);
+  assert.equal(s.getJob("wait").retryRemaining, waitRetriesBefore);
+  assert.ok(s.getSnapshot().providers["p.com"].waiting.indexOf("wait") !== -1);
+  assert.equal(firefoxCalls, 0);
+  assert.equal(s.onTransportUnavailable("owner"), false);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+
+  s.releasePermit("owner");
+  assert.equal(s.getJob("owner").state, "needs_user");
+  assert.equal(s.getJob("owner").stateVersion, verBefore + 2); // pausing → needs_user
+  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.equal(s.getJob("owner").inFlightPermits, 0);
+  assert.equal(s.getJob("owner").retryRemaining, ownerRetriesBefore);
+  assert.equal(s.getJob("owner").retryUsed, ownerUsedBefore);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
   assert.equal(s.getJob("wait").state, "waiting_provider");
   assert.equal(s.getJob("wait").autoWakeCount, waitWakeBefore);
   assert.equal(s.getJob("wait").retryRemaining, waitRetriesBefore);
@@ -398,12 +451,34 @@ test("5 manualRetry after reconnection designates fresh recovery owner with reta
   const filenameBefore = s.getJob("owner").intent.requestedFilename;
   assert.equal(modeBefore, "single-connection");
   assert.equal(concBefore, 1);
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
 
   assert.equal(s.onTransportUnavailable("owner"), true);
-  assert.equal(s.getJob("owner").state, "needs_user");
+  // Live observed permit: hold pausing + slot; ownership already cleared.
+  assert.equal(s.getJob("owner").state, "pausing_provider");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
+  assert.equal(s.getJob("owner").nativeOpenConnections, 0);
+  assert.equal(s.getJob("owner").attemptToken, null);
+  assert.equal(s.getJob("owner").mode, modeBefore);
+  assert.equal(s.getJob("owner").effectiveConcurrency, concBefore);
+  assert.equal(s.getJob("owner").intent.requestedFilename, filenameBefore);
   assert.equal(clearCount, 0);
   assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
   assert.equal(s.getJob("wait").state, "waiting_provider");
+  assert.equal(firefoxCalls, 0);
+  assert.equal(s.onTransportUnavailable("owner"), false);
+
+  s.releasePermit("owner");
+  assert.equal(s.getJob("owner").state, "needs_user");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.equal(s.getJob("owner").inFlightPermits, 0);
+  assert.equal(clearCount, 0);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
+  assert.equal(s.getJob("wait").state, "waiting_provider");
+  assert.equal(s.getJob("owner").mode, modeBefore);
+  assert.equal(s.getJob("owner").effectiveConcurrency, concBefore);
+  assert.equal(s.getJob("owner").intent.requestedFilename, filenameBefore);
 
   // Reconnection: user manualRetry parks-to-run as recovery owner with retained context.
   s.manualRetry("owner");
@@ -639,10 +714,29 @@ test("7 retry counters, filename intent, mode, reduced concurrency unchanged", (
   assert.equal(before.mode, "single-connection");
   assert.equal(before.effectiveConcurrency, 1);
   assert.equal(before.intent.requestedFilename, "11238-makemebi.net.mp4");
+  assert.ok(before.inFlightPermits >= 1);
 
   assert.equal(s.onTransportUnavailable("owner"), true);
+  // Hold phase: counters/intent/mode must not change while permits drain.
+  const held = s.getJob("owner");
+  assert.equal(held.state, "pausing_provider");
+  assert.equal(held.holdsGlobalSlot, true);
+  assert.ok(held.inFlightPermits >= 1);
+  assert.equal(held.nativeOpenConnections, 0);
+  assert.equal(held.attemptToken, null);
+  assert.equal(held.retryRemaining, before.retryRemaining);
+  assert.equal(held.retryUsed, before.retryUsed);
+  assert.equal(held.mode, before.mode);
+  assert.equal(held.effectiveConcurrency, before.effectiveConcurrency);
+  assert.equal(held.intent.requestedFilename, before.intent.requestedFilename);
+  assert.equal(firefoxCalls, 0);
+  assert.equal(s.onTransportUnavailable("owner"), false);
+
+  s.releasePermit("owner");
   const after = s.getJob("owner");
   assert.equal(after.state, "needs_user");
+  assert.equal(after.holdsGlobalSlot, false);
+  assert.equal(after.inFlightPermits, 0);
   assert.equal(after.retryRemaining, before.retryRemaining);
   assert.equal(after.retryUsed, before.retryUsed);
   assert.equal(after.mode, before.mode);
@@ -791,13 +885,36 @@ test("10 global slot, permit, wait-queue, and provider-owner invariants hold", (
   }
   assert.equal(s.getJob("wait").state, "waiting_provider");
   assert.equal(s.getJob("owner").state, "running");
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
   // peer may already be running if wait released capacity
   const peerStateBefore = s.getJob("peer").state;
   assert.ok(peerStateBefore === "queued" || peerStateBefore === "running");
+  const globalBefore = s.getSnapshot().globalRunning;
 
   assert.equal(s.onTransportUnavailable("owner"), true);
+  // Observed permit keeps the global slot; independent capacity must not jump early.
+  assert.equal(s.getJob("owner").state, "pausing_provider");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
+  assert.equal(s.getJob("owner").nativeOpenConnections, 0);
+  assert.equal(s.getJob("owner").attemptToken, null);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
+  assert.equal(s.getJob("wait").state, "waiting_provider");
+  if (peerStateBefore === "queued") {
+    assert.equal(s.getJob("peer").state, "queued");
+  } else {
+    assert.equal(s.getJob("peer").state, "running");
+  }
+  assert.equal(s.getSnapshot().globalRunning, globalBefore);
+  assert.equal(firefoxCalls, 0);
+  assert.equal(s.onTransportUnavailable("owner"), false);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+
+  s.releasePermit("owner");
   assert.equal(s.getJob("owner").state, "needs_user");
   assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.equal(s.getJob("owner").inFlightPermits, 0);
   assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
   assert.equal(s.getJob("wait").state, "waiting_provider");
   // Independent peer must be running after capacity free (if not already).
@@ -831,8 +948,23 @@ test("11 recovering owner parks needs_user and clears ownership without waking w
     },
   });
   saturateOwnerWithWaiter(s, "p.com", "owner", "wait");
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
+
   assert.equal(s.onTransportUnavailable("owner"), true);
+  assert.equal(s.getJob("owner").state, "pausing_provider");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+  assert.ok(s.getJob("owner").inFlightPermits >= 1);
+  assert.equal(s.getJob("owner").nativeOpenConnections, 0);
+  assert.equal(s.getJob("owner").attemptToken, null);
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
+  assert.equal(s.getJob("wait").state, "waiting_provider");
+  assert.equal(firefoxCalls, 0);
+  assert.equal(s.onTransportUnavailable("owner"), false);
+
+  s.releasePermit("owner");
   assert.equal(s.getJob("owner").state, "needs_user");
+  assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+  assert.equal(s.getJob("owner").inFlightPermits, 0);
   assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
   assert.equal(s.getJob("wait").state, "waiting_provider");
 
@@ -841,6 +973,8 @@ test("11 recovering owner parks needs_user and clears ownership without waking w
   assert.equal(s.getJob("owner").state, "running");
   assert.equal(s.getSnapshot().providers["p.com"].gate.state, "recovering");
   assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
+  // No new notePermitAcquired after manualRetry — second disconnect settles immediately.
+  assert.equal(s.getJob("owner").inFlightPermits, 0);
   const waitWake = s.getJob("wait").autoWakeCount;
   const waitRetries = s.getJob("wait").retryRemaining;
   const ownerRetries = s.getJob("owner").retryRemaining;
@@ -1153,12 +1287,28 @@ test("14 noteNativeOpen mutates to zero then throws — park completes with cohe
     mode = "throw-after";
     const ok = s.onTransportUnavailable("sib");
     assert.equal(ok, true);
-    // Post-error snapshot confirms zero on both sides; park completed.
+    // Mutate-then-throw still confirms native zero and owner reconciliation,
+    // but the live observed permit keeps the job in pausing_provider.
     assert.equal(gateRef.snapshot().nativeOpen.sib, 0);
     assert.equal(s.getJob("sib").nativeOpenConnections, 0);
+    assert.equal(s.getJob("sib").state, "pausing_provider");
+    assert.equal(s.getJob("sib").stateVersion, verBefore);
+    assert.equal(s.getJob("sib").holdsGlobalSlot, true);
+    assert.ok(s.getJob("sib").inFlightPermits >= 1);
+    assert.equal(s.getJob("sib").attemptToken, null);
+    assert.equal(s.getJob("sib").retryRemaining, retriesBefore);
+    assert.equal(firefoxCalls, 0);
+    assert.equal(s.onTransportUnavailable("sib"), false);
+    assertSlotInvariant(s);
+    assertPermitAndOwnerInvariants(s);
+
+    s.releasePermit("sib");
     assert.equal(s.getJob("sib").state, "needs_user");
     assert.equal(s.getJob("sib").stateVersion, verBefore + 1);
     assert.equal(s.getJob("sib").holdsGlobalSlot, false);
+    assert.equal(s.getJob("sib").inFlightPermits, 0);
+    assert.equal(s.getJob("sib").nativeOpenConnections, 0);
+    assert.equal(gateRef.snapshot().nativeOpen.sib, 0);
     assert.equal(s.getJob("sib").attemptToken, null);
     assert.equal(s.getJob("sib").retryRemaining, retriesBefore);
     assert.equal(firefoxCalls, 0);
@@ -1269,19 +1419,39 @@ test("16 completeOwner advances then throws — park needs_user, no same-provide
     const waitRetries = s.getJob("wait").retryRemaining;
     const ownerRetries = s.getJob("owner").retryRemaining;
     const verBefore = s.getJob("owner").stateVersion;
+    assert.ok(s.getJob("owner").inFlightPermits >= 1);
 
     mode = "throw-after";
     const ok = s.onTransportUnavailable("owner");
     assert.equal(ok, true);
-    // Confirmed advanced: owner cleared; park completed.
+    // Confirmed advanced: owner cleared; settlement waits for observed permit.
     assert.notEqual(s.getSnapshot().providers["p.com"].gate.ownerJobId, "owner");
     assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
-    assert.equal(s.getJob("owner").state, "needs_user");
-    assert.equal(s.getJob("owner").stateVersion, verBefore + 1);
-    assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+    assert.equal(s.getJob("owner").state, "pausing_provider");
+    assert.equal(s.getJob("owner").stateVersion, verBefore + 1); // running → pausing
+    assert.equal(s.getJob("owner").holdsGlobalSlot, true);
+    assert.ok(s.getJob("owner").inFlightPermits >= 1);
+    assert.equal(s.getJob("owner").nativeOpenConnections, 0);
     assert.equal(s.getJob("owner").attemptToken, null);
     assert.equal(s.getJob("owner").retryRemaining, ownerRetries);
     // Disconnect must NOT authorize/wake same-provider waiters (unlike Firefox handoff).
+    assert.equal(s.getJob("wait").state, "waiting_provider");
+    assert.equal(s.getJob("wait").autoWakeCount, waitWake);
+    assert.equal(s.getJob("wait").retryRemaining, waitRetries);
+    assert.ok(s.getSnapshot().providers["p.com"].waiting.indexOf("wait") !== -1);
+    assert.equal(firefoxCalls, 0);
+    assert.equal(s.onTransportUnavailable("owner"), false);
+    assertSlotInvariant(s);
+    assertPermitAndOwnerInvariants(s);
+
+    s.releasePermit("owner");
+    assert.equal(s.getJob("owner").state, "needs_user");
+    assert.equal(s.getJob("owner").stateVersion, verBefore + 2);
+    assert.equal(s.getJob("owner").holdsGlobalSlot, false);
+    assert.equal(s.getJob("owner").inFlightPermits, 0);
+    assert.equal(s.getJob("owner").attemptToken, null);
+    assert.equal(s.getJob("owner").retryRemaining, ownerRetries);
+    assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, null);
     assert.equal(s.getJob("wait").state, "waiting_provider");
     assert.equal(s.getJob("wait").autoWakeCount, waitWake);
     assert.equal(s.getJob("wait").retryRemaining, waitRetries);
