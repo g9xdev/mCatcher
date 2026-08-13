@@ -58,25 +58,25 @@ The adapter must copy the returned bytes before retaining them. It must map thro
 
 1. Admit only owned `direct | hls | dash` records. Preserve opaque media/variant ownership, frozen intent, requested filename, and effective destination.
 2. `pump()` starts each exact HLS/DASH attempt once without awaiting the whole transfer. It records a handled private task so re-pumps cannot duplicate work or create unhandled rejections.
-3. Acquire one scheduler local activity for the complete assembly → sink-commit lifecycle. Every assembler fetch separately acquires `acquireProviderPermit(jobId, "assembly-fetch")` and releases it in `finally`.
+3. Acquire one scheduler local activity for the complete assembly → sink-commit lifecycle. Every assembler fetch separately acquires `acquireProviderPermit(jobId, "assembly-fetch")` and releases it in `finally`. Track every started fetch promise, reject new fetch starts after the assembler settles, and wait until all started fetches have settled/released before any scheduler attempt settlement.
 4. After assembly, recheck `isAttemptActive`. Create a real `FileSinkProtocol` session, post `file-open`, then accept only router-normalized `file-sink-message` frames correlated by job, attempt, and sink.
 5. On `file-opened`, post at most `MAX_UNACKED` chunks. Valid acknowledgements refill the window. Post `file-commit` only when every byte was sent and every chunk acknowledged.
 6. A matching `file-committed` is the only success boundary. It settles the scheduler, releases local activity/capacity exactly once, clears private bytes/session state, and pumps the next queued job.
-7. Browser fetch/assembly rejection uses the real normalized browser failure category, preserving bounded retry policy without raw error text. Sink protocol failure, sink-command post failure, or matching `file-error` settles as `local_io`/`needs_user`, releases capacity, and never invokes Firefox or saturation recovery. When a streaming sink exists, send at most one `file-abort` before cleanup.
-8. Cancellation makes `shouldAbort()` true immediately. During assembly it prevents open/commit. During streaming it sends one `file-abort` and waits for a matching abort/error acknowledgement or helper-unavailable settlement; stale frames remain inert.
-9. Helper disconnect parks active HLS/DASH work through the same scheduler unavailable path, clears local transfer state, and never auto-invokes Firefox.
+7. Browser fetch/assembly rejection uses the real normalized browser failure category, preserving bounded retry policy without raw error text. A matching authenticated host `file-error` or confirmed sink protocol/write/commit failure settles as `local_io`/`needs_user`. A synchronous or asynchronous `postNative` rejection means helper transport unavailable and must use `onTransportUnavailable`, not `local_io`. All paths release local activity before scheduler settlement and never invoke Firefox automatically.
+8. Cancellation makes `shouldAbort()` true immediately. During assembly, wait for the assembler and every started fetch permit to quiesce, release local activity, then submit the matching scheduler `cancelled` terminal; never open or commit. During streaming, send at most one `file-abort`, wait for matching `file-aborted`/`file-error` (or helper-unavailable settlement), release local activity, then submit cancellation. Stale frames remain inert.
+9. Extend `cancel`, `manualRetry`, and `helperDisconnected` to HLS/DASH. Manual retry discards old bytes/session/task state, obtains a fresh scheduler attempt token, and creates a fresh sink; old-sink frames remain inert. Helper disconnect clears active transfer state, releases its local activity, routes through the scheduler unavailable path, and never auto-invokes Firefox.
 
 ### Causal tests
 
 1. Owned HLS and DASH jobs share the global cap; each invokes assembly once and never calls browser download or Firefox.
 2. The assembler receives the exact kind, private source URL, frozen intent-derived inputs, and safe progress callback; `enqueueDownload` returns the running projection before assembly settles.
-3. Every manifest/segment fetch holds exactly one provider permit and releases it on resolve and reject.
+3. Every manifest/segment fetch holds exactly one provider permit and releases it on resolve and reject; assembly failure cannot retry/admit a peer until all started fetches quiesce.
 4. Local activity/global capacity remain held from assembly through `file-open`, four-chunk window, ack-driven refill, and commit.
 5. Matching commit completes and admits a queued independent-provider peer; public projections contain no URL, headers, destination, raw bytes, or sink ID.
 6. Wrong/stale/duplicate attempt, sink, ack, commit, abort, and error frames are inert.
-7. Transient assembly rejection follows bounded scheduler retry; malformed/permanent assembly failure terminates without Firefox; native post rejection and matching `file-error` become `needs_user`, release capacity, and never call Firefox/saturation recovery.
-8. Cancel during assembly prevents `file-open`; cancel during streaming posts one abort and cannot later commit.
-9. Helper disconnect cleans active HLS/DASH state and leaves a user-actionable job without Firefox.
+7. Transient assembly rejection follows bounded scheduler retry; malformed/permanent assembly failure terminates without Firefox; native post rejection uses helper-unavailable; matching `file-error` becomes `needs_user`; none call Firefox automatically.
+8. Cancel during assembly prevents `file-open` and reaches `cancelled` after fetch quiescence; cancel during streaming posts one abort and cannot later commit.
+9. Manual retry uses a fresh attempt/sink with stale old frames inert; helper disconnect cleans active HLS/DASH state and leaves a user-actionable job without Firefox.
 
 Verification:
 
