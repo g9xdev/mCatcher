@@ -235,6 +235,61 @@
     var tokenGuard = 0;
     // Last observed tick time (reject backward only as no-op for due checks).
     var lastTickMs = null;
+    // Private durable progress obligations after a terminal/quiesce mutation whose
+    // authorize/capacity edge was not confirmed. Never projected. Retried from
+    // tick and scheduler drain edges without re-terminalizing.
+    var pendingSchedulerProgress = new Set();
+    var progressRetryActive = false;
+
+    function markPendingSchedulerProgress(jobId) {
+      if (typeof jobId === "string" && jobId.length > 0) {
+        pendingSchedulerProgress.add(jobId);
+      }
+    }
+
+    function clearPendingSchedulerProgress(jobId) {
+      if (typeof jobId === "string") pendingSchedulerProgress.delete(jobId);
+    }
+
+    /**
+     * Bounded one-pass retry of outstanding scheduler progress. Never throws,
+     * never re-settles terminals, never recurses into itself under persistent
+     * faults. Returns true only when the pending set is empty after the pass.
+     */
+    function retryPendingSchedulerProgress() {
+      if (pendingSchedulerProgress.size === 0) return true;
+      if (progressRetryActive) return false;
+      progressRetryActive = true;
+      try {
+        var ids = [];
+        pendingSchedulerProgress.forEach(function (id) {
+          ids.push(id);
+        });
+        for (var i = 0; i < ids.length; i++) {
+          var id = ids[i];
+          var j = jobs.get(id);
+          if (!j) {
+            pendingSchedulerProgress.delete(id);
+            continue;
+          }
+          try {
+            if (j.state === "waiting_provider") {
+              if (!maybeAuthorizeReadyWaiter(j)) continue;
+            }
+            if (!tryDrain()) continue;
+            if (j.state === "waiting_provider" && waitingNeedsAuthorization(j)) {
+              continue;
+            }
+            pendingSchedulerProgress.delete(id);
+          } catch (errProg) {
+            // Keep obligation; next edge retries.
+          }
+        }
+        return pendingSchedulerProgress.size === 0;
+      } finally {
+        progressRetryActive = false;
+      }
+    }
 
     function ensureProvider(providerKey) {
       if (!providerQueues.has(providerKey)) {
@@ -546,56 +601,127 @@
     }
 
     /**
+     * Nonthrowing drain wrapper. Returns false when a gate/scheduler fault
+     * aborts the capacity edge so callers can keep progress retryable.
+     */
+    function tryDrain() {
+      try {
+        drain();
+        // Opportunistically clear durable progress obligations when capacity moves.
+        if (!progressRetryActive && pendingSchedulerProgress.size > 0) {
+          retryPendingSchedulerProgress();
+        }
+        return true;
+      } catch (errDrain) {
+        return false;
+      }
+    }
+
+    /**
+     * True when a waiting job still has an outstanding authorization obligation
+     * under the current gate (normal, or recovering-blocked oldest eligible).
+     * Snapshot faults count as still-needed so release stays retryable.
+     */
+    function waitingNeedsAuthorization(job) {
+      if (!job || job.state !== "waiting_provider") return false;
+      var gate = getGate(job.providerKey);
+      var snap = null;
+      try {
+        snap = gate.snapshot();
+      } catch (errNeed) {
+        return true;
+      }
+      if (snap.state === "normal") {
+        return job.wakeAuthorized !== true;
+      }
+      if (snap.state === "recovering" && snap.ownerJobId == null) {
+        var w = providerWaitQueues.get(job.providerKey) || [];
+        for (var wi = 0; wi < w.length; wi++) {
+          var cand = jobs.get(w[wi]);
+          if (!cand || cand.state !== "waiting_provider") continue;
+          if (cand.cancelRequested === true) continue;
+          if (isExhaustedFailedWaiter(cand)) continue;
+          return cand.wakeAuthorized !== true;
+        }
+        return false;
+      }
+      return false;
+    }
+
+    /**
      * After a job becomes waiting_provider (including late quiesce), authorize
      * progress only when the gate can accept work: recovering-blocked with no
      * owner, or normal after recovery. Never admit directly — wake → queued → drain.
      * Active saturated/recovering owners leave the waiter parked.
+     *
+     * Returns true when no outstanding authorize obligation remains for this
+     * call; false when a required snapshot/authorize fault must be retried.
+     * Never throws.
      */
     function maybeAuthorizeReadyWaiter(job) {
-      if (!job || job.state !== "waiting_provider") return;
+      if (!job || job.state !== "waiting_provider") return true;
       var gate = getGate(job.providerKey);
       var snap = null;
-      // Bound snapshot faults: a single injected throw must not permanently
-      // strand a waiter when the gate is already normal/recovering-blocked.
-      // Never throw out of a quiesce/release transaction.
-      for (var snapAttempt = 0; snapAttempt < 2 && !snap; snapAttempt++) {
-        try {
-          snap = gate.snapshot();
-        } catch (errSnap) {
-          snap = null;
+      try {
+        snap = gate.snapshot();
+      } catch (errSnap) {
+        return false;
+      }
+      try {
+        if (snap.state === "recovering" && snap.ownerJobId == null) {
+          // Prefer oldest eligible (skips/terminalizes exhausted FIFO heads).
+          var next = oldestEligibleWaiter(job.providerKey);
+          if (next) authorizeWake(next);
+          return true;
         }
+        if (snap.state === "normal") {
+          authorizeWake(job);
+          return true;
+        }
+        // saturated with drain owner, or recovering with active owner: remain parked.
+        return true;
+      } catch (errAuth) {
+        return false;
       }
-      if (!snap) return;
-      if (snap.state === "recovering" && snap.ownerJobId == null) {
-        // Prefer oldest eligible (skips/terminalizes exhausted FIFO heads).
-        var next = oldestEligibleWaiter(job.providerKey);
-        if (next) authorizeWake(next);
-        return;
-      }
-      if (snap.state === "normal") {
-        authorizeWake(job);
-      }
-      // saturated with drain owner, or recovering with active owner: remain parked.
     }
 
     /**
      * Best-effort follow-up after a quiesce transition that may have thrown mid-way.
-     * Never throws. Safe to call when job already left pausing_provider.
+     * Never throws. Returns true only when authorize (if required) and drain both
+     * succeed and no waiter authorization obligation remains.
      */
     function finishQuiesceSideEffects(job) {
-      if (!job) return;
+      if (!job) return true;
+      var ok = true;
+      var authClaimed = true;
       if (job.state === "waiting_provider") {
-        try {
-          maybeAuthorizeReadyWaiter(job);
-        } catch (errAuth) {
-          // Nonthrowing by contract; defensive.
-        }
+        authClaimed = maybeAuthorizeReadyWaiter(job);
+        if (!authClaimed) ok = false;
       }
-      try {
-        drain();
-      } catch (errDrain) {
-        // Admission/drain faults must not escape local-release / quiesce edges.
+      if (!tryDrain()) ok = false;
+      // Re-check only after a claimed-success authorize; avoids burning extra
+      // snapshot attempts when authorize already reported failure.
+      if (
+        authClaimed &&
+        job.state === "waiting_provider" &&
+        waitingNeedsAuthorization(job)
+      ) {
+        ok = false;
       }
+      // Cancel/progress edge must not leave a quiescent pausing job holding a slot.
+      if (
+        job.state === "pausing_provider" &&
+        isQuiescent(job) &&
+        job.holdsGlobalSlot === true &&
+        job.pendingDrainTerminal == null &&
+        !(
+          typeof job.drainingAttemptToken === "string" &&
+          job.drainingAttemptToken.trim().length > 0
+        )
+      ) {
+        ok = false;
+      }
+      return ok;
     }
 
     /**
@@ -606,19 +732,21 @@
      * State guard only (single-threaded).
      * Late quiesce after owner completion / recovery-to-normal auto-authorizes wake
      * when the gate is recovering-blocked or normal (never while an owner is active).
-     * Internally nonthrowing once state mutation begins: gate/hook faults are
-     * reconciled so a live local-activity release can always observe a coherent
-     * post-state (waiting / terminal / needs_user / still-pausing).
+     * Internally nonthrowing once state mutation begins. Returns true when the
+     * quiesce edge and its progress obligations are confirmed; false when a
+     * gate/scheduler fault left authorize/drain unconfirmed (retryable).
      */
     function maybeQuiesce(job) {
-      if (!job) return;
-      if (job.state !== "pausing_provider") return;
-      if (!isQuiescent(job)) return;
+      if (!job) return true;
+      if (job.state !== "pausing_provider") return true;
+      if (!isQuiescent(job)) return true;
       try {
         // Stored draining terminal settles before default pause-control waiting.
         if (job.pendingDrainTerminal != null) {
-          settleDrainingTerminal(job);
-          return;
+          var settledOk = settleDrainingTerminal(job);
+          if (!settledOk) markPendingSchedulerProgress(job.id);
+          else clearPendingSchedulerProgress(job.id);
+          return settledOk;
         }
         // Fail-closed hold: physical counters are zero but the semantic terminal for
         // this exact private draining identity has not arrived yet. Do not erase
@@ -628,7 +756,7 @@
           typeof job.drainingAttemptToken === "string" &&
           job.drainingAttemptToken.trim().length > 0
         ) {
-          return;
+          return true;
         }
         // Cancel-requested pausing work finishes as cancelled once quiescent.
         if (job.cancelRequested === true) {
@@ -642,15 +770,19 @@
           job.stateVersion += 1;
           job.attemptToken = null;
           clearEphemeralOnce(job);
-          finishQuiesceSideEffects(job);
-          return;
+          var cancelOk = finishQuiesceSideEffects(job);
+          if (!cancelOk) markPendingSchedulerProgress(job.id);
+          else clearPendingSchedulerProgress(job.id);
+          return cancelOk;
         }
         // Helper disconnect with no pending outcome: park needs_user once provider
         // permits also reach zero. Helper disappearance proves native zero only.
         if (job.drainTransportUnavailable === true) {
           enterNeedsUser(job);
-          finishQuiesceSideEffects(job);
-          return;
+          var unavailOk = finishQuiesceSideEffects(job);
+          if (!unavailOk) markPendingSchedulerProgress(job.id);
+          else clearPendingSchedulerProgress(job.id);
+          return unavailOk;
         }
         clearDrainingState(job);
         job.state = "waiting_provider";
@@ -658,11 +790,16 @@
         job.attemptToken = null;
         releaseSlotIfHeld(job);
         appendWaitFifo(job);
-        finishQuiesceSideEffects(job);
+        var waitOk = finishQuiesceSideEffects(job);
+        if (!waitOk) markPendingSchedulerProgress(job.id);
+        else clearPendingSchedulerProgress(job.id);
+        return waitOk;
       } catch (errQuiesce) {
-        // Mutate-then-throw: complete authorization/drain without rethrowing so a
-        // local-activity release can seal as true without stranding waiters.
-        finishQuiesceSideEffects(job);
+        // Mutate-then-throw: attempt authorize/drain without rethrowing. Incomplete
+        // progress returns false so a local-activity release stays retryable.
+        var catchOk = finishQuiesceSideEffects(job);
+        if (!catchOk) markPendingSchedulerProgress(job.id);
+        return catchOk;
       }
     }
 
@@ -684,6 +821,20 @@
       // Physical attempt settles: fence any leftover local-activity leases.
       invalidateLocalActivities(job);
 
+      // After state mutation, confirm authorize (when required) + capacity drain.
+      function settleProgressAfterWaiting() {
+        var authOk = maybeAuthorizeReadyWaiter(job);
+        var drainOk = tryDrain();
+        if (
+          authOk &&
+          job.state === "waiting_provider" &&
+          waitingNeedsAuthorization(job)
+        ) {
+          authOk = false;
+        }
+        return authOk && drainOk;
+      }
+
       // User cancel wins over any stored native terminal (and over unavailable).
       if (job.cancelRequested === true) {
         releaseSlotIfHeld(job);
@@ -694,8 +845,7 @@
         job.stateVersion += 1;
         job.attemptToken = null;
         clearEphemeralOnce(job);
-        drain();
-        return true;
+        return tryDrain();
       }
 
       var status = outcome.status;
@@ -712,16 +862,14 @@
         job.attemptToken = null;
         job.consumeRetryOnWake = false;
         clearEphemeralOnce(job);
-        drain();
-        return true;
+        return tryDrain();
       }
 
       // Helper unavailable during drain: non-success pending outcomes park
       // needs_user once fully quiescent. No wake, no retry charge, no Firefox.
       if (transportUnavailable) {
         enterNeedsUser(job);
-        drain();
-        return true;
+        return tryDrain();
       }
 
       if (status === "cancelled") {
@@ -731,9 +879,7 @@
         job.attemptToken = null;
         releaseSlotIfHeld(job);
         appendWaitFifo(job);
-        maybeAuthorizeReadyWaiter(job);
-        drain();
-        return true;
+        return settleProgressAfterWaiting();
       }
 
       if (status === "failed") {
@@ -755,24 +901,20 @@
           job.attemptToken = null;
           releaseSlotIfHeld(job);
           appendWaitFifo(job);
-          maybeAuthorizeReadyWaiter(job);
-          drain();
-          return true;
+          return settleProgressAfterWaiting();
         }
 
         // Non-empty range_unsupported follows permanent/needs_user handling.
         if (category === "range_unsupported") {
           enterNeedsUser(job);
           clearDrainingState(job);
-          drain();
-          return true;
+          return tryDrain();
         }
 
         if (category === "local_io" || category === "permanent") {
           enterNeedsUser(job);
           clearDrainingState(job);
-          drain();
-          return true;
+          return tryDrain();
         }
 
         if (FailureClassify.isSaturationCandidate(category)) {
@@ -785,9 +927,7 @@
           job.attemptToken = null;
           releaseSlotIfHeld(job);
           appendWaitFifo(job);
-          maybeAuthorizeReadyWaiter(job);
-          drain();
-          return true;
+          return settleProgressAfterWaiting();
         }
 
         // failed + failureCategory cancelled: permanent-class terminal failed.
@@ -802,15 +942,13 @@
           job.attemptToken = null;
           job.consumeRetryOnWake = false;
           clearEphemeralOnce(job);
-          drain();
-          return true;
+          return tryDrain();
         }
 
         // Unknown/other permanent-class failures: needs_user, never Firefox.
         enterNeedsUser(job);
         clearDrainingState(job);
-        drain();
-        return true;
+        return tryDrain();
       }
 
       // Unknown status should never have been stored; fail closed as waiting.
@@ -819,9 +957,7 @@
       job.attemptToken = null;
       releaseSlotIfHeld(job);
       appendWaitFifo(job);
-      maybeAuthorizeReadyWaiter(job);
-      drain();
-      return true;
+      return settleProgressAfterWaiting();
     }
 
     // Null-prototype allowlists: ordinary objects accept inherited keys such as
@@ -1007,7 +1143,15 @@
       job.pendingDrainTerminal = allowlisted;
 
       if (isQuiescent(job)) {
-        settleDrainingTerminal(job);
+        // Terminal may settle while capacity/authorize progress still fails.
+        // Do not report true (and strand peers) when the progress edge is incomplete;
+        // retain a private durable obligation retried by tick / drain edges.
+        var progressOk = settleDrainingTerminal(job);
+        if (!progressOk) {
+          markPendingSchedulerProgress(job.id);
+          return false;
+        }
+        clearPendingSchedulerProgress(job.id);
       }
       // Else remain pausing_provider holding the global slot until wrapper/observed
       // permits also reach zero; maybeQuiesce dispatches the stored terminal.
@@ -1754,71 +1898,15 @@
      * release leaves counts unchanged and can be retried.
      */
     /**
-     * Reconcile a local-activity release after a scheduler/gate fault.
-     * Returns whether the live lease was consumed (true) or remains retryable
-     * (false). Never throws. Sealing the closure `released` flag is the caller's
-     * responsibility when this returns true OR when the lease is known stale.
-     */
-    function reconcileLocalActivityRelease(job, epoch) {
-      if (!job) return false;
-      // Forced fence / generation change: this lease is dead.
-      if ((job.localActivityEpoch || 0) !== epoch) {
-        return false;
-      }
-      // Mutate-then: already left pausing with the decrement applied.
-      if (job.state === "waiting_provider") {
-        finishQuiesceSideEffects(job);
-        return true;
-      }
-      if (
-        job.state === "needs_user" ||
-        job.state === "cancelled" ||
-        job.state === "completed" ||
-        job.state === "failed" ||
-        job.state === "handed_to_firefox"
-      ) {
-        finishQuiesceSideEffects(job);
-        return true;
-      }
-      // Still pausing/running: attempt to complete quiesce once more.
-      if (job.state === "pausing_provider" && isQuiescent(job)) {
-        try {
-          maybeQuiesce(job);
-        } catch (errRetry) {
-          finishQuiesceSideEffects(job);
-        }
-        if (job.state !== "pausing_provider") {
-          return true;
-        }
-        // Still pausing after retry with zero local count and no other activity:
-        // unknown split-brain — restore the decrement so the lease stays retryable.
-        if (isQuiescent(job) && (job.localActivities || 0) === 0) {
-          // Quiesce should have progressed; if it did not, restore for retry.
-          job.localActivities = 1;
-          return false;
-        }
-      }
-      // Throw-before coherent transition (or non-quiescent after decrement only):
-      // restore the count when still on this epoch and state was not advanced.
-      if (
-        (job.state === "pausing_provider" || job.state === "running") &&
-        (job.localActivityEpoch || 0) === epoch
-      ) {
-        job.localActivities = (job.localActivities || 0) + 1;
-        return false;
-      }
-      // Cannot safely restore; do not seal as success.
-      return false;
-    }
-
-    /**
      * Acquire a scheduler-owned local activity lease for assembly / sink cleanup.
      * Not a provider permit or native connection. Only a live running job without
      * cancel or Firefox handoff may acquire. purpose must be a primitive nonblank
      * string (no coercion). Returns a frozen {jobId, purpose, release} or null.
      * release() is failure-atomic: returns a boolean, never propagates gate /
      * scheduler-hook exceptions, and seals the lease only after the count
-     * decrement and any final quiesce transition are coherent.
+     * decrement and every scheduler-progress obligation are coherent. A false
+     * result leaves this exact closure retryable (decrementApplied + pending
+     * progress) without double-decrement.
      */
     function acquireLocalActivity(jobId, purpose) {
       var job = jobs.get(jobId);
@@ -1834,7 +1922,119 @@
       job.localActivities = (job.localActivities || 0) + 1;
       var epoch = job.localActivityEpoch || 0;
       var released = false;
+      var decrementApplied = false;
+      // Terminal/needs_user state this closure itself settled (not external fence).
+      var ownedSettledState = null;
+      // True once this closure drove a quiesce/authorize transition (so admitJob's
+      // epoch bump is not treated as an external fence).
+      var ownedProgress = false;
       var purposeValue = purpose;
+
+      /**
+       * Drive progress obligations for this lease.
+       * "done" | "retry" | "stale". Never throws. Never fabricates localActivities.
+       */
+      function driveProgress(current) {
+        try {
+          if (current.state === "pausing_provider") {
+            if (!isQuiescent(current)) {
+              return "done";
+            }
+            if (
+              decrementApplied &&
+              (current.localActivityEpoch || 0) !== epoch &&
+              ownedSettledState == null
+            ) {
+              // External epoch fence while still pausing — inert.
+              return "stale";
+            }
+            var beforeState = current.state;
+            var qOk = maybeQuiesce(current);
+            if (current.state !== beforeState) {
+              // This closure drove the quiesce transition (including authorize/drain
+              // that may re-admit and bump localActivityEpoch in admitJob).
+              ownedProgress = true;
+              if (
+                current.state === "completed" ||
+                current.state === "cancelled" ||
+                current.state === "failed" ||
+                current.state === "needs_user" ||
+                current.state === "handed_to_firefox"
+              ) {
+                ownedSettledState = current.state;
+              }
+            }
+            if (current.state === "pausing_provider") {
+              if (
+                typeof current.drainingAttemptToken === "string" &&
+                current.drainingAttemptToken.trim().length > 0
+              ) {
+                return "done";
+              }
+              if ((current.localActivityEpoch || 0) !== epoch) {
+                return "stale";
+              }
+              return qOk ? "done" : "retry";
+            }
+            // Quiesce confirmed authorize+drain for the post-pausing state.
+            // Do not fall through into epoch-mismatch stale after admitJob.
+            if (qOk) return "done";
+            // Fall through with post-quiesce state to finish outstanding progress.
+          }
+
+          if (current.state === "waiting_provider") {
+            if (!maybeAuthorizeReadyWaiter(current)) return "retry";
+            ownedProgress = true;
+            if (!tryDrain()) return "retry";
+            if (waitingNeedsAuthorization(current)) return "retry";
+            return "done";
+          }
+
+          if (
+            current.state === "completed" ||
+            current.state === "cancelled" ||
+            current.state === "failed" ||
+            current.state === "needs_user" ||
+            current.state === "handed_to_firefox"
+          ) {
+            // Only complete drain when this closure owns the settlement. External
+            // unavailable/manual paths that terminalized after our partial wait
+            // fence the lease inert (false), even if epoch advanced.
+            if (ownedSettledState !== current.state) {
+              return "stale";
+            }
+            if (!tryDrain()) return "retry";
+            return "done";
+          }
+
+          if (
+            current.state === "running" ||
+            current.state === "queued" ||
+            current.state === "retry_backoff" ||
+            current.state === "handing_off_firefox" ||
+            current.state === "created"
+          ) {
+            // Fresh attempt after external re-admission: old closure is inert.
+            // admitJob also bumps epoch after *our* authorize/drain — that is
+            // owned progress, not an external fence.
+            if (
+              decrementApplied &&
+              (current.localActivityEpoch || 0) !== epoch &&
+              !ownedProgress
+            ) {
+              return "stale";
+            }
+            // Authorize may have moved us to queued while drain still failed —
+            // confirm the capacity edge before sealing success.
+            if (!tryDrain()) return "retry";
+            return "done";
+          }
+
+          return "done";
+        } catch (errDrive) {
+          return "retry";
+        }
+      }
 
       return Object.freeze({
         jobId: job.id,
@@ -1843,37 +2043,38 @@
           if (released) return false;
           try {
             var current = jobs.get(jobId);
-            if (current !== job) {
+            if (!current || current !== job) {
               released = true;
               return false;
             }
-            if ((current.localActivityEpoch || 0) !== epoch) {
-              released = true;
-              return false;
-            }
-            if (!(current.localActivities > 0)) {
-              released = true;
-              return false;
-            }
-            // Decrement first; do not seal until quiesce is coherent.
-            current.localActivities -= 1;
-            try {
-              maybeQuiesce(current);
-              released = true;
-              return true;
-            } catch (errRelease) {
-              var ok = reconcileLocalActivityRelease(current, epoch);
-              if (ok || (current.localActivityEpoch || 0) !== epoch) {
-                released = true;
-              }
-              // Stale epoch after fence: seal as inert false.
+
+            if (!decrementApplied) {
+              // Pre-decrement fence: epoch change or missing count → inert.
               if ((current.localActivityEpoch || 0) !== epoch) {
+                released = true;
                 return false;
               }
-              return ok;
+              if (!(current.localActivities > 0)) {
+                released = true;
+                return false;
+              }
+              current.localActivities -= 1;
+              decrementApplied = true;
             }
+
+            var status = driveProgress(current);
+            if (status === "done") {
+              released = true;
+              return true;
+            }
+            if (status === "stale") {
+              released = true;
+              return false;
+            }
+            // "retry": progress obligation outstanding; do not seal.
+            return false;
           } catch (errOuter) {
-            // Public release must never throw.
+            // Public release must never throw. Unsealed when progress unconfirmed.
             return false;
           }
         },
@@ -2189,7 +2390,12 @@
         var q = providerQueues.get(job.providerKey);
         if (q.indexOf(job.id) === -1) q.push(job.id);
       }
-      drain();
+      try {
+        drain();
+      } catch (errTickDrain) {
+        // Capacity edge fault: durable progress obligations remain for retry.
+      }
+      retryPendingSchedulerProgress();
     }
 
     /**
