@@ -1172,6 +1172,57 @@ test("pausing_provider failed/cancelled allowlist to draining API; never startSi
   }
 });
 
+test("pausing_provider failed+cancelled category only hits draining API; never start/Firefox", () => {
+  const { handlePgetResult } = loadAdapter();
+  const job = baseJob({
+    id: "jfc",
+    state: "pausing_provider",
+    attemptToken: null,
+  });
+  const sched = fakeScheduler(job);
+  const started = [];
+  const firefoxHits = { count: 0 };
+
+  handlePgetResult(
+    sched,
+    {
+      type: "pget-result",
+      id: "jfc",
+      attemptToken: "old-atk-fc",
+      status: "failed",
+      mode: "multi-range",
+      failureCategory: "cancelled",
+      partState: "partial",
+      cookie: "session=should-not-leak",
+      url: "https://evil.example/x",
+    },
+    optionsBag(started, firefoxHits)
+  );
+
+  assert.equal(started.length, 0);
+  assert.equal(firefoxHits.count, 0);
+  assert.equal(sched.calls.capability.length, 0);
+  assert.equal(sched.calls.transport.length, 0);
+  assert.equal(sched.calls.draining.length, 1);
+  assert.equal(sched.calls.draining[0].id, "jfc");
+  assert.equal(sched.calls.draining[0].token, "old-atk-fc");
+  assert.deepEqual(sched.calls.draining[0].result, {
+    status: "failed",
+    mode: "multi-range",
+    failureCategory: "cancelled",
+    partState: "partial",
+  });
+  assertAllowlistedResult(sched.calls.draining[0].result);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(sched.calls.draining[0].result, "cookie"),
+    false
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(sched.calls.draining[0].result, "url"),
+    false
+  );
+});
+
 test("pausing_provider never accepts public null as identity; never Firefox; malformed inert", () => {
   const { handlePgetResult } = loadAdapter();
   const job = baseJob({
