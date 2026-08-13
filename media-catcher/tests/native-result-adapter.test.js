@@ -937,7 +937,7 @@ test("cancelled with empty/partial/committed part states normalizes category", (
         attemptToken: "atk-z",
         status: "cancelled",
         mode: "single-connection",
-        failureCategory: "timeout",
+        failureCategory: "cancelled",
         partState,
       },
       optionsBag(started, firefoxHits)
@@ -1452,5 +1452,654 @@ test("replayed/wrong-state draining messages remain inert for non-pausing jobs",
       optionsBag(started, firefoxHits)
     );
     assertNoEffects(sched, firefoxHits, started);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 12. Task20 hardening: null-proto allowlists, own DATA descriptors, category rules
+// ---------------------------------------------------------------------------
+
+function baseWireMsg(overrides) {
+  return Object.assign(
+    {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-1",
+      status: "completed",
+      mode: "multi-range",
+      failureCategory: null,
+      partState: "committed",
+    },
+    overrides || {}
+  );
+}
+
+test("inherited Object.prototype keys are rejected in every enum position (running + pausing)", () => {
+  const { handlePgetResult } = loadAdapter();
+  const inheritedKeys = ["__proto__", "constructor", "toString", "valueOf"];
+
+  // status / mode / partState: inherited membership must never pass either path.
+  const enumPositions = [
+    { field: "status", rest: { mode: "multi-range", partState: "committed", failureCategory: null } },
+    { field: "mode", rest: { status: "completed", partState: "committed", failureCategory: null } },
+    {
+      field: "partState",
+      rest: { status: "cancelled", mode: "multi-range", failureCategory: "cancelled" },
+    },
+  ];
+
+  for (const state of ["running", "pausing_provider"]) {
+    for (const pos of enumPositions) {
+      for (const key of inheritedKeys) {
+        const job = baseJob({
+          state,
+          attemptToken: state === "pausing_provider" ? null : "atk-1",
+        });
+        const sched = fakeScheduler(job);
+        const started = [];
+        const firefoxHits = { count: 0 };
+        const msg = baseWireMsg(
+          Object.assign({}, pos.rest, {
+            [pos.field]: key,
+            attemptToken: state === "pausing_provider" ? "atk-drain" : "atk-1",
+          })
+        );
+        handlePgetResult(sched, msg, optionsBag(started, firefoxHits));
+        assertNoEffects(sched, firefoxHits, started);
+      }
+    }
+  }
+
+  // failureCategory inherited keys: pausing rejects (no permanent launder).
+  // Running intentionally normalizes unknown to permanent after own-membership check.
+  for (const key of inheritedKeys) {
+    {
+      const job = baseJob({ state: "pausing_provider", attemptToken: null });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      handlePgetResult(
+        sched,
+        baseWireMsg({
+          attemptToken: "atk-drain",
+          status: "failed",
+          mode: "multi-range",
+          partState: "partial",
+          failureCategory: key,
+        }),
+        optionsBag(started, firefoxHits)
+      );
+      assertNoEffects(sched, firefoxHits, started);
+    }
+    {
+      const job = baseJob({ state: "running", attemptToken: "atk-1" });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      handlePgetResult(
+        sched,
+        baseWireMsg({
+          attemptToken: "atk-1",
+          status: "failed",
+          mode: "multi-range",
+          partState: "partial",
+          failureCategory: key,
+        }),
+        optionsBag(started, firefoxHits)
+      );
+      assert.equal(started.length, 0);
+      assert.equal(firefoxHits.count, 0);
+      assert.equal(sched.calls.capability.length, 0);
+      assert.equal(sched.calls.draining.length, 0);
+      assert.equal(sched.calls.transport.length, 1, `running unknown ${key}`);
+      assert.equal(sched.calls.transport[0].result.failureCategory, "permanent");
+      // Must not echo the inherited key name as a "known" category.
+      assert.notEqual(sched.calls.transport[0].result.failureCategory, key);
+    }
+  }
+});
+
+test("own accessor fields fail closed without invoking getters or leaking secrets", () => {
+  const { handlePgetResult } = loadAdapter();
+  const SECRET = "SECRET_ACCESSOR_LEAK_NEVER";
+  const fields = [
+    "type",
+    "id",
+    "attemptToken",
+    "status",
+    "mode",
+    "partState",
+    "failureCategory",
+  ];
+
+  for (const state of ["running", "pausing_provider"]) {
+    for (const field of fields) {
+      const hits = { n: 0 };
+      const job = baseJob({
+        state,
+        attemptToken: state === "pausing_provider" ? null : "atk-1",
+      });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      const msg = baseWireMsg({
+        attemptToken: state === "pausing_provider" ? "atk-drain" : "atk-1",
+      });
+      Object.defineProperty(msg, field, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          hits.n += 1;
+          throw new Error(SECRET + ":" + field);
+        },
+      });
+
+      assert.doesNotThrow(() => {
+        handlePgetResult(sched, msg, optionsBag(started, firefoxHits));
+      });
+      assert.equal(hits.n, 0, `accessor for ${field} must never run (state=${state})`);
+      assertNoEffects(sched, firefoxHits, started);
+
+      // Ensure secret text never appeared in any captured call payload.
+      const all = JSON.stringify(sched.calls);
+      assert.equal(all.includes(SECRET), false);
+    }
+  }
+});
+
+test("proxy getOwnPropertyDescriptor traps fail closed without leaking secrets", () => {
+  const { handlePgetResult } = loadAdapter();
+  const SECRET = "SECRET_GOPD_TRAP_LEAK";
+  for (const state of ["running", "pausing_provider"]) {
+    const job = baseJob({
+      state,
+      attemptToken: state === "pausing_provider" ? null : "atk-1",
+    });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    const proxyHits = { n: 0 };
+    const target = baseWireMsg({
+      attemptToken: state === "pausing_provider" ? "atk-drain" : "atk-1",
+    });
+    const proxy = new Proxy(target, {
+      getOwnPropertyDescriptor() {
+        proxyHits.n += 1;
+        throw new Error(SECRET);
+      },
+      get() {
+        throw new Error(SECRET + "_GET");
+      },
+      ownKeys() {
+        throw new Error(SECRET + "_KEYS");
+      },
+    });
+
+    assert.doesNotThrow(() => {
+      handlePgetResult(sched, proxy, optionsBag(started, firefoxHits));
+    });
+    assertNoEffects(sched, firefoxHits, started);
+    assert.equal(JSON.stringify(sched.calls).includes(SECRET), false);
+  }
+});
+
+test("boxed strings and non-primitive hostile enum values are rejected", () => {
+  const { handlePgetResult } = loadAdapter();
+  const hostiles = [
+    { status: new String("completed") },
+    { mode: new String("multi-range") },
+    { partState: new String("committed") },
+    { status: "completed", partState: "committed", failureCategory: new String("") },
+    { status: 0 },
+    { status: false },
+    { status: ["completed"] },
+    { status: { toString: () => "completed" } },
+    { mode: 1 },
+    { partState: true },
+  ];
+
+  for (const state of ["running", "pausing_provider"]) {
+    for (const h of hostiles) {
+      const job = baseJob({
+        state,
+        attemptToken: state === "pausing_provider" ? null : "atk-1",
+      });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      const msg = baseWireMsg(
+        Object.assign(
+          {
+            attemptToken: state === "pausing_provider" ? "atk-drain" : "atk-1",
+          },
+          h
+        )
+      );
+      handlePgetResult(sched, msg, optionsBag(started, firefoxHits));
+      assertNoEffects(sched, firefoxHits, started);
+    }
+  }
+});
+
+test("completed/committed accepts omitted, own undefined, and own null failureCategory (running + pausing)", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  function makeMsg(variant, attemptToken) {
+    const msg = {
+      type: "pget-result",
+      id: "j1",
+      attemptToken,
+      status: "completed",
+      mode: "multi-range",
+      partState: "committed",
+    };
+    if (variant === "null") msg.failureCategory = null;
+    else if (variant === "undefined") msg.failureCategory = undefined;
+    // omitted: do not set
+    return msg;
+  }
+
+  for (const state of ["running", "pausing_provider"]) {
+    for (const variant of ["omitted", "undefined", "null"]) {
+      const job = baseJob({
+        state,
+        attemptToken: state === "pausing_provider" ? null : "atk-1",
+      });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      const token = state === "pausing_provider" ? "atk-drain" : "atk-1";
+      handlePgetResult(
+        sched,
+        makeMsg(variant, token),
+        optionsBag(started, firefoxHits)
+      );
+      assert.equal(started.length, 0, `${state}/${variant}`);
+      assert.equal(firefoxHits.count, 0, `${state}/${variant}`);
+      assert.equal(sched.calls.capability.length, 0, `${state}/${variant}`);
+      if (state === "running") {
+        assert.equal(sched.calls.transport.length, 1, `running ${variant}`);
+        assert.equal(sched.calls.draining.length, 0);
+        assert.deepEqual(sched.calls.transport[0].result, {
+          status: "completed",
+          mode: "multi-range",
+          failureCategory: null,
+          partState: "committed",
+        });
+      } else {
+        assert.equal(sched.calls.draining.length, 1, `pausing ${variant}`);
+        assert.equal(sched.calls.transport.length, 0);
+        assert.deepEqual(sched.calls.draining[0].result, {
+          status: "completed",
+          mode: "multi-range",
+          failureCategory: null,
+          partState: "committed",
+        });
+      }
+    }
+  }
+});
+
+test("completed rejects any non-null failureCategory value", () => {
+  const { handlePgetResult } = loadAdapter();
+  for (const bad of ["", "permanent", "cancelled", 0, false, {}, [], "timeout"]) {
+    for (const state of ["running", "pausing_provider"]) {
+      const job = baseJob({
+        state,
+        attemptToken: state === "pausing_provider" ? null : "atk-1",
+      });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      handlePgetResult(
+        sched,
+        baseWireMsg({
+          attemptToken: state === "pausing_provider" ? "atk-drain" : "atk-1",
+          status: "completed",
+          partState: "committed",
+          failureCategory: bad,
+        }),
+        optionsBag(started, firefoxHits)
+      );
+      assertNoEffects(sched, firefoxHits, started);
+    }
+  }
+});
+
+test("cancelled accepts absent/undefined/null/exact cancelled and rejects other categories", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  function cancelledMsg(token, categoryVariant) {
+    const msg = {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: token,
+      status: "cancelled",
+      mode: "multi-range",
+      partState: "partial",
+    };
+    if (categoryVariant === "null") msg.failureCategory = null;
+    else if (categoryVariant === "undefined") msg.failureCategory = undefined;
+    else if (categoryVariant === "cancelled") msg.failureCategory = "cancelled";
+    // absent: omit
+    return msg;
+  }
+
+  for (const state of ["running", "pausing_provider"]) {
+    for (const variant of ["absent", "undefined", "null", "cancelled"]) {
+      const job = baseJob({
+        state,
+        attemptToken: state === "pausing_provider" ? null : "atk-1",
+      });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      const token = state === "pausing_provider" ? "atk-drain" : "atk-1";
+      handlePgetResult(
+        sched,
+        cancelledMsg(token, variant),
+        optionsBag(started, firefoxHits)
+      );
+      assert.equal(started.length, 0);
+      assert.equal(firefoxHits.count, 0);
+      assert.equal(sched.calls.capability.length, 0);
+      const bucket =
+        state === "running" ? sched.calls.transport : sched.calls.draining;
+      assert.equal(bucket.length, 1, `${state}/${variant}`);
+      assert.deepEqual(bucket[0].result, {
+        status: "cancelled",
+        mode: "multi-range",
+        failureCategory: "cancelled",
+        partState: "partial",
+      });
+    }
+
+    for (const bad of [
+      "timeout",
+      "permanent",
+      "arbitrary",
+      "",
+      0,
+      false,
+      {},
+      new String("cancelled"),
+    ]) {
+      const job = baseJob({
+        state,
+        attemptToken: state === "pausing_provider" ? null : "atk-1",
+      });
+      const sched = fakeScheduler(job);
+      const started = [];
+      const firefoxHits = { count: 0 };
+      handlePgetResult(
+        sched,
+        {
+          type: "pget-result",
+          id: "j1",
+          attemptToken: state === "pausing_provider" ? "atk-drain" : "atk-1",
+          status: "cancelled",
+          mode: "multi-range",
+          failureCategory: bad,
+          partState: "partial",
+        },
+        optionsBag(started, firefoxHits)
+      );
+      assertNoEffects(sched, firefoxHits, started);
+    }
+  }
+});
+
+test("pausing valid terminal delegates exactly once; invalid fields cause zero call; never start/Firefox", () => {
+  const { handlePgetResult } = loadAdapter();
+  const job = baseJob({ state: "pausing_provider", attemptToken: null });
+  let drainCalls = 0;
+  const sched = fakeScheduler(job, {
+    onDrainingTransportResult() {
+      drainCalls += 1;
+      return true;
+    },
+  });
+  const started = [];
+  const firefoxHits = { count: 0 };
+
+  // Valid completed with omitted failureCategory — exactly one drain.
+  handlePgetResult(
+    sched,
+    {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-drain-once",
+      status: "completed",
+      mode: "multi-range",
+      partState: "committed",
+    },
+    optionsBag(started, firefoxHits)
+  );
+  assert.equal(drainCalls, 1);
+  assert.equal(sched.calls.draining.length, 1);
+  assert.equal(started.length, 0);
+  assert.equal(firefoxHits.count, 0);
+  assert.equal(sched.calls.capability.length, 0);
+  assert.equal(sched.calls.transport.length, 0);
+
+  // Invalid inherited status — zero additional drain / start / Firefox.
+  handlePgetResult(
+    sched,
+    {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-drain-once",
+      status: "toString",
+      mode: "multi-range",
+      failureCategory: null,
+      partState: "committed",
+    },
+    optionsBag(started, firefoxHits)
+  );
+  assert.equal(drainCalls, 1, "invalid must not call drain again");
+  assert.equal(started.length, 0);
+  assert.equal(firefoxHits.count, 0);
+  assert.equal(sched.calls.capability.length, 0);
+});
+
+test("pausing failed requires known exact category; does not launder unknown via permanent", () => {
+  const { handlePgetResult } = loadAdapter();
+  for (const bad of [undefined, null, "weird", "RANGE_UNSUPPORTED", "", "constructor"]) {
+    const job = baseJob({ state: "pausing_provider", attemptToken: null });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    const msg = {
+      type: "pget-result",
+      id: "j1",
+      attemptToken: "atk-drain",
+      status: "failed",
+      mode: "multi-range",
+      partState: "partial",
+    };
+    if (bad !== undefined) msg.failureCategory = bad;
+    handlePgetResult(sched, msg, optionsBag(started, firefoxHits));
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // Known exact category still drains once.
+  {
+    const job = baseJob({ state: "pausing_provider", attemptToken: null });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      {
+        type: "pget-result",
+        id: "j1",
+        attemptToken: "atk-drain",
+        status: "failed",
+        mode: "multi-range",
+        failureCategory: "timeout",
+        partState: "partial",
+      },
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(sched.calls.draining.length, 1);
+    assert.equal(sched.calls.draining[0].result.failureCategory, "timeout");
+    assert.equal(started.length, 0);
+    assert.equal(firefoxHits.count, 0);
+  }
+});
+
+test("integration: omitted completed reaches real scheduler draining API; hostile keys do not", () => {
+  const { createDownloadScheduler } = loadLib("lib/download-scheduler.js");
+  const { handlePgetResult } = loadAdapter();
+
+  function intent(n) {
+    return Object.freeze({
+      requestedFilename: n,
+      destinationDirectory: null,
+      saveMode: "default",
+      userSelectedFirefox: false,
+      userActionToken: "t",
+      createdAt: "t0",
+    });
+  }
+
+  function setupPausingB() {
+    const firefoxCalls = { n: 0 };
+    const s = createDownloadScheduler({
+      maxConcurrent: 3,
+      now() {
+        return 0;
+      },
+      firefoxDownload() {
+        firefoxCalls.n += 1;
+      },
+    });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+      ephemeral: { clear() {} },
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue("B");
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    s.noteNativeOpen("B", 2);
+    s.noteNativeOpen("C", 1);
+    const bToken = s.getJob("B").attemptToken;
+    s.onTransportResult("C", s.getJob("C").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").attemptToken, null);
+    return { s, bToken, firefoxCalls };
+  }
+
+  // Omitted failureCategory completed must reach draining and settle.
+  {
+    const { s, bToken, firefoxCalls } = setupPausingB();
+    const started = [];
+    handlePgetResult(
+      s,
+      {
+        type: "pget-result",
+        id: "B",
+        attemptToken: bToken,
+        status: "completed",
+        mode: "multi-range",
+        partState: "committed",
+        // failureCategory intentionally omitted
+        secret: "SHOULD-NOT-LEAK",
+      },
+      {
+        startSingleConnection(j) {
+          started.push(j);
+        },
+        firefoxDownload() {
+          firefoxCalls.n += 1;
+        },
+      }
+    );
+    assert.equal(s.getJob("B").state, "completed");
+    assert.equal(started.length, 0);
+    assert.equal(firefoxCalls.n, 0);
+  }
+
+  // Hostile inherited enum key must not settle or start/Firefox.
+  {
+    const { s, bToken, firefoxCalls } = setupPausingB();
+    const started = [];
+    const before = s.getJob("B").stateVersion;
+    handlePgetResult(
+      s,
+      {
+        type: "pget-result",
+        id: "B",
+        attemptToken: bToken,
+        status: "toString",
+        mode: "multi-range",
+        failureCategory: null,
+        partState: "committed",
+      },
+      {
+        startSingleConnection(j) {
+          started.push(j);
+        },
+        firefoxDownload() {
+          firefoxCalls.n += 1;
+        },
+      }
+    );
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(s.getJob("B").stateVersion, before);
+    assert.equal(started.length, 0);
+    assert.equal(firefoxCalls.n, 0);
+  }
+
+  // Hostile failureCategory constructor must not drain-settle.
+  {
+    const { s, bToken, firefoxCalls } = setupPausingB();
+    const started = [];
+    handlePgetResult(
+      s,
+      {
+        type: "pget-result",
+        id: "B",
+        attemptToken: bToken,
+        status: "failed",
+        mode: "multi-range",
+        failureCategory: "constructor",
+        partState: "partial",
+      },
+      {
+        startSingleConnection(j) {
+          started.push(j);
+        },
+        firefoxDownload() {
+          firefoxCalls.n += 1;
+        },
+      }
+    );
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    assert.equal(started.length, 0);
+    assert.equal(firefoxCalls.n, 0);
   }
 });
