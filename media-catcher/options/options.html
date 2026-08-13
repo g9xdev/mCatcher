@@ -35,11 +35,13 @@
           <span class="label">Parallel downloads</span>
           <input id="maxConcurrentDownloads" type="number" min="1" max="6" />
         </label>
+        <p class="hint">Maximum mCatcher downloads running at once. Extra jobs wait in the queue until a slot frees. Already-running jobs are not cancelled if you lower this.</p>
 
         <label class="row">
-          <span class="label">Segment retries</span>
+          <span class="label">Automatic retries</span>
           <input id="retries" type="number" min="0" max="10" />
         </label>
+        <p class="hint">Finite automatic retries for transient network failures and provider wait wake-ups (0–10). Exhausted jobs need manual Retry.</p>
 
         <label class="row">
           <span class="label">Filename template</span>
