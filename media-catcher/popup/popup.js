@@ -7,8 +7,24 @@ let currentTabId = null;
 let pageTitle = "";
 let allTabs = false;
 const downloadState = new Map();   // id -> download
-const itemDownloadId = new Map();  // item.url -> download id (progress binding)
-const itemElements = new Map();    // item.url -> rendered element
+const itemDownloadId = new Map();  // item identity -> download id (progress binding)
+const itemElements = new Map();    // item identity -> rendered element
+
+function isSafeOpaqueId(value) {
+  return typeof value === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function itemIdentity(item) {
+  if (item && isSafeOpaqueId(item.id)) return "id:" + item.id;
+  return "url:" + (item && typeof item.url === "string" ? item.url : "");
+}
+
+function downloadItemIdentity(download) {
+  if (download && isSafeOpaqueId(download.mediaId)) return "id:" + download.mediaId;
+  if (download && typeof download.url === "string" && download.url) return "url:" + download.url;
+  return null;
+}
 
 // Web Crypto user-action token — minted only on Download / Save-As Confirm / Use Firefox click.
 function mintUserActionToken() {
@@ -259,7 +275,8 @@ async function refresh() {
   if (resp && resp.downloads) {
     for (const d of resp.downloads) {
       downloadState.set(d.id, d);
-      if (d.url) itemDownloadId.set(d.url, d.id); // rebind so in-flight jobs re-render
+      const identity = downloadItemIdentity(d);
+      if (identity) itemDownloadId.set(identity, d.id); // rebind so in-flight jobs re-render
     }
   }
   render(items);
@@ -287,7 +304,7 @@ function render(items) {
   }
   // Promote any item with an active recording to the top; dim the idle rest.
   const isHot = (item) => {
-    const id = itemDownloadId.get(item.url);
+    const id = itemDownloadId.get(itemIdentity(item));
     const dl = id != null && downloadState.get(id);
     return dl && dl.live && (dl.status === "recording" || dl.status === "stopped" || dl.status === "saving" || dl.status === "converting" || dl.status === "downloading");
   };
@@ -302,7 +319,7 @@ function render(items) {
   for (const item of ordered) {
     const el = renderItem(item);
     if (anyHot && !isHot(item)) el.classList.add("dim");
-    itemElements.set(item.url, el);
+    itemElements.set(itemIdentity(item), el);
     listEl.appendChild(el);
   }
 }
@@ -364,6 +381,8 @@ function bitrateLabel(item) {
 function renderItem(item) {
   const kind = item.kind || "direct";
   const kindLabel = kind === "youtube" ? "YouTube" : kind.toUpperCase();
+  const hasUrl = typeof item.url === "string" && item.url.length > 0;
+  const identity = itemIdentity(item);
 
   // Amber data readout: KIND · quality · bitrate · duration.
   const quality = item.height ? item.height + "p" : (item.resolution || "");
@@ -408,13 +427,15 @@ function renderItem(item) {
     chips,
   ]);
 
-  const el = h("div", { class: "item" + (item.junk ? " junk" : ""), dataset: { url: item.url } }, [
+  const itemDataset = { identity };
+  if (hasUrl) itemDataset.url = item.url;
+  const el = h("div", { class: "item" + (item.junk ? " junk" : ""), dataset: itemDataset }, [
     h("div", { class: "item-head" }, [thumb, info]),
     actions,
     slot,
   ]);
 
-  const copyBtn = h("button", {
+  const copyBtn = hasUrl ? h("button", {
     class: "btn ghost sm",
     text: "Copy URL",
     onClick: () => {
@@ -423,13 +444,19 @@ function renderItem(item) {
         setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
       });
     },
-  });
+  }) : null;
 
-  const cmdBtn = h("button", {
+  const cmdBtn = hasUrl ? h("button", {
     class: "btn ghost sm",
     title: "Copy a yt-dlp / ffmpeg / streamlink command",
     onClick: () => toggleCommandMenu(item, el),
-  }, [h("span", { class: "cmd", text: "⌘ cmd" })]);
+  }, [h("span", { class: "cmd", text: "⌘ cmd" })]) : null;
+
+  function appendUrlActions() {
+    if (!hasUrl) return;
+    actions.appendChild(cmdBtn);
+    actions.appendChild(copyBtn);
+  }
 
   function appendSaveAs(selection) {
     actions.appendChild(h("button", {
@@ -442,24 +469,23 @@ function renderItem(item) {
 
   if (item.drm) {
     // DRM can't be saved by any downloader; be explicit and offer command/URL.
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
-    showLabel(el, "DRM-protected — can't be saved. Copy URL / command for reference only.", "error");
+    appendUrlActions();
+    showLabel(el, hasUrl
+      ? "DRM-protected — can't be saved. Copy URL / command for reference only."
+      : "DRM-protected — can't be saved.", "error");
   } else if ((kind === "hls" || kind === "dash") && item.variants && item.variants.length) {
     // Qualities shown inline (works for HLS masters and DASH).
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
       onClick: () => startDownload(item, el, {}) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
     slot.appendChild(renderQualities(item, el, item.variants));
     if (item.hasAudio) appendNote(slot, "Has separate audio — saved as 2 files; a merge command is provided on completion.");
   } else if ((kind === "hls" || kind === "dash") && item.enrichState === "loading") {
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
       onClick: () => handleDownload(item, el) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
     showLabel(el, "Reading qualities…", "");
   } else if (kind === "hls" && item.isMaster === false) {
     if (item.isLive) {
@@ -471,21 +497,18 @@ function renderItem(item) {
         onClick: () => handleDownload(item, el) }));
       appendSaveAs({});
     }
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
   } else if (kind === "dash") {
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
       onClick: () => startDownload(item, el, {}) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
   } else if (kind === "youtube") {
     actions.appendChild(h("button", { class: "btn amber",
       text: item.height ? "Download " + item.height + "p" : "Download highest quality",
       onClick: () => startDownload(item, el, {}) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
     if (item.enrichState === "loading") appendNote(slot, "Reading formats…");
     else if (item.ytFormats && item.ytFormats.length) slot.appendChild(renderYtQualities(item, el));
     else if (item.enrichState === "error") appendNote(slot, "Couldn't read formats — the highest-quality download still works.");
@@ -496,13 +519,12 @@ function renderItem(item) {
       onClick: () => handleDownload(item, el),
     }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
   }
 
   // Cast: direct video files only for now — DLNA renderers play a plain URL,
   // while HLS/DASH manifests and YouTube pages need a remux/serve step (future).
-  if (castUiReady && kind === "direct" && !item.drm && !item.junk) {
+  if (hasUrl && castUiReady && kind === "direct" && !item.drm && !item.junk) {
     actions.appendChild(h("button", {
       class: "btn cast-btn",
       title: "Cast to a TV on your network",
@@ -510,7 +532,7 @@ function renderItem(item) {
     }, "Cast"));
   }
 
-  const existingId = itemDownloadId.get(item.url);
+  const existingId = itemDownloadId.get(identity);
   if (existingId && downloadState.has(existingId)) {
     renderProgress(el, downloadState.get(existingId));
   }
@@ -525,11 +547,14 @@ function appendNote(slot, text) {
 function renderQualities(item, el, variants) {
   const wrap = h("div", { class: "qualities" });
   for (const v of variants) {
+    const selection = typeof item.url === "string" && item.url
+      ? (v.uri ? { variantUrl: v.uri } : { variantId: v.id })
+      : { variantId: v.id };
     wrap.appendChild(
       h("button", {
         class: "q-btn",
         text: v.label,
-        onClick: () => startDownload(item, el, v.uri ? { variantUrl: v.uri } : { variantId: v.id }),
+        onClick: () => startDownload(item, el, selection),
       })
     );
   }
@@ -1604,8 +1629,9 @@ api.runtime.onMessage.addListener((msg) => {
   } else if (msg.type === "download-update") {
     const dl = msg.download;
     downloadState.set(dl.id, dl);
-    if (dl.url) itemDownloadId.set(dl.url, dl.id);
-    const el = itemElements.get(dl.url);
+    const identity = downloadItemIdentity(dl);
+    if (identity) itemDownloadId.set(identity, dl.id);
+    const el = identity ? itemElements.get(identity) : null;
     if (el) renderProgress(el, dl);
     renderQueue();
   } else if (msg.type === "cast-update") {
