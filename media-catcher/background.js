@@ -842,7 +842,10 @@ function addMedia(tabId, item, networkEvidence) {
     const mirrors = existing.mirrors || [existing.url];
     if (item.kind === "direct" && item.url && !mirrors.includes(item.url)) mirrors.push(item.url);
     Object.assign(existing, item, { url: stableUrl, key, mirrors });
-    if (networkEvidence && !liveNetworkEvidence.has(existing)) {
+    if (networkEvidence &&
+        existing.enrichState !== "done" &&
+        existing.enrichState !== "error" &&
+        !liveNetworkEvidence.has(existing)) {
       liveNetworkEvidence.set(existing, networkEvidence);
     }
   } else {
@@ -1029,6 +1032,7 @@ async function enrichDash(tabId, key) {
     item.enrichState = "error";
     item.enrichError = e.message || String(e);
   } finally {
+    liveNetworkEvidence.delete(item);
     enriching.delete(key);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -1209,6 +1213,7 @@ async function enrichDirect(tabId, key) {
     item.probeError = e.message || String(e);
     item.junk = true;
   } finally {
+    liveNetworkEvidence.delete(item);
     enriching.delete(key);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -1336,6 +1341,7 @@ async function enrichHls(tabId, key) {
     item.enrichError = e.message || String(e);
     dlog("enrich ERROR", item.url, "→", item.enrichError);
   } finally {
+    liveNetworkEvidence.delete(item);
     enriching.delete(key);
     dlog("enriched", { url: item.url, master: item.isMaster, live: item.isLive,
       estKbps: item.estKbps, group: renditionGroup(item.url), state: item.enrichState });
