@@ -397,3 +397,68 @@ test("promotes only static non-DRM HLS and DASH and binds private quality source
   const allTabs = await h.send({ type: "get-media", tabId: 20, allTabs: true });
   assert.equal(allTabs.items.some((item) => item.id === "media:opaque:3" && item.tabId === 99), true);
 });
+
+test("clear then tab reuse publishes only newly captured controller rows", async () => {
+  const h = createHarness();
+  await settle();
+  const tabId = 61;
+  const sender = {
+    tab: { id: tabId, url: "https://site.example/first" },
+    frameId: 0,
+    documentId: "doc-first",
+  };
+  const firstSnapshot = Object.assign({}, pageSnapshot(), {
+    tabId,
+    frameId: 0,
+    documentId: "doc-first",
+    pageUrl: "https://site.example/first",
+    topLevelPageUrl: "https://site.example/first",
+  });
+
+  await h.send({
+    type: "content-media",
+    item: { url: "https://cdn.example/first.mp4", kind: "direct" },
+    snapshot: firstSnapshot,
+    referrerUrl: firstSnapshot.pageUrl,
+    frameOrigin: "https://site.example",
+  }, sender);
+  const oldRow = Object.freeze({
+    id: "media:opaque:1",
+    proposedFilename: "First.mp4",
+    kind: "direct",
+    variants: Object.freeze([]),
+  });
+  h.popupRows.set(tabId, Object.freeze([oldRow]));
+  let result = await h.send({ type: "get-media", tabId });
+  assert.deepEqual(result.items.map((item) => item.id), ["media:opaque:1"]);
+
+  await h.send({ type: "clear", tabId });
+  result = await h.send({ type: "get-media", tabId });
+  assert.deepEqual(result.items, [], "cleared controller rows stay hidden");
+
+  sender.tab.url = "https://site.example/second";
+  sender.documentId = "doc-second";
+  const secondSnapshot = Object.assign({}, firstSnapshot, {
+    documentId: "doc-second",
+    pageUrl: "https://site.example/second",
+    topLevelPageUrl: "https://site.example/second",
+  });
+  await h.send({
+    type: "content-media",
+    item: { url: "https://cdn.example/second.mp4", kind: "direct" },
+    snapshot: secondSnapshot,
+    referrerUrl: secondSnapshot.pageUrl,
+    frameOrigin: "https://site.example",
+  }, sender);
+  const newRow = Object.freeze({
+    id: "media:opaque:2",
+    proposedFilename: "Second.mp4",
+    kind: "direct",
+    variants: Object.freeze([]),
+  });
+  // The controller intentionally retains its session rows. Background ownership
+  // must prevent the old one from resurfacing when this tab ID is reused.
+  h.popupRows.set(tabId, Object.freeze([oldRow, newRow]));
+  result = await h.send({ type: "get-media", tabId });
+  assert.deepEqual(result.items.map((item) => item.id), ["media:opaque:2"]);
+});
