@@ -2099,7 +2099,7 @@
         } catch (e) {
           throw genericTypeError();
         }
-        if (looked === null || looked === undefined) return null;
+        if (looked === null) return null;
         if (typeof looked !== "string" || looked.trim().length === 0 || hasControlChars(looked)) {
           throw genericTypeError();
         }
@@ -2143,10 +2143,16 @@
           });
           jobBindings.set(jobId, binding);
           getScheduler().enqueue(jobId);
-          return pump().then(function () {
-            publishJobsIfChanged(beforeSig);
-            return projectReturnedJob(jobId);
-          });
+          return pump().then(
+            function () {
+              publishJobsIfChanged(beforeSig);
+              return projectReturnedJob(jobId);
+            },
+            function (err) {
+              publishJobsIfChanged(beforeSig);
+              throw err;
+            }
+          );
         });
       }
 
@@ -2176,9 +2182,15 @@
           var beforeSig = jobAdmissionSig();
           getScheduler().setMaxConcurrent(value);
           settings.maxConcurrent = value;
-          return pump().then(function () {
-            publishJobsIfChanged(beforeSig);
-          });
+          return pump().then(
+            function () {
+              publishJobsIfChanged(beforeSig);
+            },
+            function (err) {
+              publishJobsIfChanged(beforeSig);
+              throw err;
+            }
+          );
         });
       }
 

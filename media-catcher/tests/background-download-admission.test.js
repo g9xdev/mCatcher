@@ -510,3 +510,138 @@ test("unauthorized or unowned requests are effect-free", async () => {
     );
   });
 });
+
+test("default destination callback rejects explicit undefined before admission effects", async () => {
+  const h = makeHarness();
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 51,
+    docId: "doc-undefined-destination",
+    filename: "undefined.mp4",
+  });
+  h.setDest(undefined);
+  const baseline = { ...h.counts };
+
+  await expectGenericReject(
+    h.ctrl.enqueueDownload(
+      {
+        type: "download",
+        tabId: 51,
+        item: { id: mediaId },
+        intent: defaultIntent("undefined.mp4"),
+      },
+      {}
+    )
+  );
+
+  assert.equal(h.counts.getEffectiveDestinationDirectory, baseline.getEffectiveDestinationDirectory + 1);
+  assert.equal(h.counts.postNative, baseline.postNative);
+  assert.equal(h.counts.publishJobs, baseline.publishJobs);
+  assert.equal(h.counts.randomToken, baseline.randomToken);
+  assert.equal(h.ctrl.popupJobs().length, 0);
+});
+
+test("enqueue publishes its committed safe running job when native post rejects", async () => {
+  const effectError = new Error("native post rejected");
+  const h = makeHarness({
+    postNative() {
+      throw effectError;
+    },
+  });
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 52,
+    docId: "doc-enqueue-native-failure",
+    filename: "failure.mp4",
+  });
+
+  await assert.rejects(
+    h.ctrl.enqueueDownload(
+      {
+        type: "download",
+        tabId: 52,
+        item: { id: mediaId },
+        intent: defaultIntent("failure.mp4"),
+      },
+      {}
+    ),
+    (err) => err === effectError
+  );
+
+  assert.equal(h.counts.publishJobs, 1);
+  assert.equal(h.published.length, 1);
+  assert.equal(h.published[0].length, 1);
+  assert.equal(h.published[0][0].state, "running");
+  assertSafeProjection(h.published[0], "failed enqueue publication");
+});
+
+test("raising capacity publishes committed running jobs when native post rejects", async () => {
+  const effectError = new Error("raised native post rejected");
+  let calls = 0;
+  const h = makeHarness({
+    maxConcurrent: 1,
+    postNative(command) {
+      calls += 1;
+      if (calls === 2) return Promise.reject(effectError);
+      return command;
+    },
+  });
+  const firstId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 53,
+    docId: "doc-raise-a",
+    filename: "first.mp4",
+  });
+  const secondId = captureDirect(h.ctrl, {
+    url: VM_SIGNED,
+    pageUrl: VM_PAGE,
+    tabId: 54,
+    docId: "doc-raise-b",
+    filename: "second.mp4",
+  });
+  await h.ctrl.enqueueDownload({ type: "download", tabId: 53, item: { id: firstId }, intent: defaultIntent("first.mp4") }, {});
+  await h.ctrl.enqueueDownload({ type: "download", tabId: 54, item: { id: secondId }, intent: defaultIntent("second.mp4") }, {});
+  const publishedBeforeRaise = h.published.length;
+
+  await assert.rejects(h.ctrl.setMaxConcurrent(2), (err) => err === effectError);
+
+  assert.equal(h.published.length, publishedBeforeRaise + 1);
+  const rows = h.published[h.published.length - 1];
+  assert.deepEqual(rows.map((row) => row.state), ["running", "running"]);
+  assertSafeProjection(rows, "failed capacity publication");
+});
+
+test("overlapping pumps post one live attempt while the first effect is unsettled", async () => {
+  let resolvePost;
+  let postStarted;
+  const commands = [];
+  const started = new Promise((resolve) => { postStarted = resolve; });
+  const deferred = new Promise((resolve) => { resolvePost = resolve; });
+  const h = makeHarness({
+    postNative(command) {
+      commands.push(command);
+      postStarted(command);
+      return deferred;
+    },
+  });
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 55,
+    docId: "doc-overlap",
+    filename: "overlap.mp4",
+  });
+  const enqueue = h.ctrl.enqueueDownload(
+    { type: "download", tabId: 55, item: { id: mediaId }, intent: defaultIntent("overlap.mp4") },
+    {}
+  );
+  await started;
+  const secondPump = h.ctrl.pump();
+  resolvePost();
+
+  await Promise.all([enqueue, secondPump]);
+  assert.equal(commands.length, 1);
+});
