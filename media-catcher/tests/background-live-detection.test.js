@@ -45,6 +45,7 @@ function createHarness() {
   const popupRows = new Map();
   const textBodies = new Map();
   const dashParsed = new Map();
+  const directProbeGates = new Map();
   const controllerJobs = Object.freeze([{ id: "job:opaque:1", state: "queued" }]);
   let mediaSeq = 0;
 
@@ -105,22 +106,30 @@ function createHarness() {
     setTimeout() { return 1; }, clearTimeout() {},
     fetch(url) {
       if (url === "https://cdn.example/movie.mp4") {
-        const head = new Uint8Array([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70]);
-        let sent = false;
-        return Promise.resolve({
-          ok: true,
-          status: 206,
-          headers: { get(name) {
-            if (String(name).toLowerCase() === "content-type") return "video/mp4";
-            if (String(name).toLowerCase() === "content-range") return "bytes 0-7/10485760";
-            return null;
-          } },
-          body: { getReader() { return { read() {
-            if (sent) return Promise.resolve({ done: true });
-            sent = true;
-            return Promise.resolve({ done: false, value: head });
-          } }; } },
-        });
+        const makeResponse = () => {
+          const head = new Uint8Array([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70]);
+          let sent = false;
+          return {
+            ok: true,
+            status: 206,
+            headers: { get(name) {
+              if (String(name).toLowerCase() === "content-type") return "video/mp4";
+              if (String(name).toLowerCase() === "content-range") return "bytes 0-7/10485760";
+              return null;
+            } },
+            body: { getReader() { return { read() {
+              if (sent) return Promise.resolve({ done: true });
+              sent = true;
+              return Promise.resolve({ done: false, value: head });
+            } }; } },
+          };
+        };
+        const gate = directProbeGates.get(url);
+        if (gate) {
+          gate.markStarted();
+          return gate.releasePromise.then(makeResponse);
+        }
+        return Promise.resolve(makeResponse());
       }
       if (textBodies.has(url)) {
         const bytes = new TextEncoder().encode(textBodies.get(url));
@@ -166,6 +175,14 @@ function createHarness() {
   return {
     send, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
     registerVariants, broadcasts, popupRows, controllerJobs, textBodies, dashParsed,
+    holdDirectProbe(url) {
+      let release;
+      let markStarted;
+      const started = new Promise((resolve) => { markStarted = resolve; });
+      const releasePromise = new Promise((resolve) => { release = resolve; });
+      directProbeGates.set(url, { markStarted, releasePromise });
+      return { started, release };
+    },
   };
 }
 
@@ -343,13 +360,53 @@ test("matching network and DOM direct detections reach the controller once in ei
 
   await domFirst.send(Object.assign({}, domMessage, {
     item: {
-      url: "https://cdn.example/other/movie.mp4",
+      url: mediaUrl + "?edition=other",
       kind: "direct",
       name: "movie.mp4",
       source: "dom",
     },
   }), sender);
   assert.equal(domFirst.captureDomMedia.length, 2, "different media URL remains a distinct row");
+});
+
+test("DOM ownership or clear during an in-flight direct probe cannot resurrect a network row", async () => {
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const sender = {
+    tab: { id: 7, url: "https://site.example/watch", title: "Movie Night" },
+    frameId: 2,
+    documentId: "doc-7",
+    url: "https://frame.example/player",
+  };
+  const domMessage = {
+    type: "content-media",
+    item: { url: mediaUrl, kind: "direct", name: "movie.mp4", source: "dom" },
+    referrerUrl: sender.url,
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  };
+
+  const domWins = createHarness();
+  await settle();
+  const domRace = domWins.holdDirectProbe(mediaUrl);
+  emitNetwork(domWins, 7, mediaUrl, "video/mp4", "doc-7");
+  await domRace.started;
+  await domWins.send(domMessage, sender);
+  assert.equal(domWins.captureDomMedia.length, 1);
+  domRace.release();
+  await settle();
+  await settle();
+  assert.equal(domWins.captureNetwork.length, 0, "late probe cannot overwrite the DOM winner");
+
+  const cleared = createHarness();
+  await settle();
+  const clearRace = cleared.holdDirectProbe(mediaUrl);
+  emitNetwork(cleared, 7, mediaUrl, "video/mp4", "doc-7");
+  await clearRace.started;
+  await cleared.send({ type: "clear", tabId: 7 });
+  clearRace.release();
+  await settle();
+  await settle();
+  assert.equal(cleared.captureNetwork.length, 0, "cleared in-flight evidence stays cleared");
 });
 
 test("promotes only static non-DRM HLS and DASH and binds private quality sources", async () => {

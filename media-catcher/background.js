@@ -188,6 +188,7 @@ const liveNetworkEvidence = new WeakMap();
 const liveControllerTabs = new Set();
 const liveControllerMediaIds = new Map();
 const livePromotedKeys = new Map();
+const liveDirectSourceKeys = new Map();
 // tabId -> { referer, origin, userAgent, cookieUrl, pageTitle, ogTitle }
 const tabContext = new Map();
 // tabId -> JPEG data URL of the playing video (from content script)
@@ -803,22 +804,44 @@ function directGroupKey(url) {
   }
 }
 
+function directSourceKey(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.href;
+  } catch (e) {
+    return url;
+  }
+}
+
 function hasLiveMediaKey(tabId, key) {
   const keys = livePromotedKeys.get(tabId);
   return !!keys && keys.has(key);
 }
 
+function hasLiveDirectSource(tabId, url) {
+  const keys = liveDirectSourceKeys.get(tabId);
+  return !!keys && keys.has(directSourceKey(url));
+}
+
 // Network and DOM are independent evidence producers for the same direct file.
 // Claim their shared tab-scoped identity at ingress so the controller receives
 // one source, while different directGroupKey values remain separate media.
-function claimLiveMediaKey(tabId, key, mediaId) {
+function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
   liveControllerTabs.add(tabId);
   const ids = liveControllerMediaIds.get(tabId) || new Set();
   ids.add(mediaId);
   liveControllerMediaIds.set(tabId, ids);
-  const keys = livePromotedKeys.get(tabId) || new Set();
-  keys.add(key);
-  livePromotedKeys.set(tabId, keys);
+  if (claimGroupKey !== false) {
+    const keys = livePromotedKeys.get(tabId) || new Set();
+    keys.add(key);
+    livePromotedKeys.set(tabId, keys);
+  }
+  if (Array.isArray(directUrls) && directUrls.length) {
+    const sources = liveDirectSourceKeys.get(tabId) || new Set();
+    for (const url of directUrls) sources.add(directSourceKey(url));
+    liveDirectSourceKeys.set(tabId, sources);
+  }
 
   const map = mediaByTab.get(tabId);
   const legacy = map && map.get(key);
@@ -836,6 +859,7 @@ function addMedia(tabId, item, networkEvidence) {
   const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url)
             : item.kind === "direct" ? directGroupKey(item.url) : item.url;
   item.key = key;
+  if (item.kind === "direct" && hasLiveDirectSource(tabId, item.url)) return;
   if (hasLiveMediaKey(tabId, key)) return;
   // Stash any audio-track playlist URL (even one we're about to suppress) so the
   // recorder can pair it with the video by directory.
@@ -931,8 +955,17 @@ async function promoteLiveNetworkItem(tabId, key, item, variants) {
   const controller = liveController;
   const evidence = liveNetworkEvidence.get(item);
   if (!controller || !evidence) return false;
+  // The candidate must still be the live legacy owner after enrichment I/O.
+  // Clear/navigation or a DOM claim removes it and invalidates this result.
+  const current = mediaByTab.get(tabId);
+  if (!current || current.get(key) !== item) {
+    liveNetworkEvidence.delete(item);
+    return false;
+  }
   // A matching DOM report may have claimed this file while the network probe
   // awaited I/O. Recheck after the await and before minting a second media ID.
+  if (item.kind === "direct" && Array.isArray(item.mirrors) &&
+      item.mirrors.some((url) => hasLiveDirectSource(tabId, url))) return false;
   if (hasLiveMediaKey(tabId, key)) return false;
   if (item.kind === "direct" && Array.isArray(item.mirrors)) {
     evidence.transport.mirrors = item.mirrors.slice();
@@ -950,7 +983,13 @@ async function promoteLiveNetworkItem(tabId, key, item, variants) {
     catch (e) { dlog("live variant registration rejected", item.kind, e && e.message); }
   }
 
-  claimLiveMediaKey(tabId, key, mediaId);
+  claimLiveMediaKey(
+    tabId,
+    key,
+    mediaId,
+    item.kind === "direct" ? (item.mirrors || [item.url]) : null,
+    true
+  );
   liveNetworkEvidence.delete(item);
   return true;
 }
@@ -2661,6 +2700,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         liveControllerTabs.delete(msg.tabId);
         liveControllerMediaIds.delete(msg.tabId);
         livePromotedKeys.delete(msg.tabId);
+        liveDirectSourceKeys.delete(msg.tabId);
         childUrls.delete(msg.tabId);
         updateBadge(msg.tabId);
         sendResponse({ ok: true });
@@ -2674,7 +2714,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (item && item.kind === "direct" && msg.snapshot && liveController) {
             const mediaUrl = item.url;
             const key = directGroupKey(mediaUrl);
-            if (!hasLiveMediaKey(sender.tab.id, key)) {
+            if (!hasLiveDirectSource(sender.tab.id, mediaUrl)) {
               let mediaOrigin = "";
               try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
               const mediaId = liveController.captureDomMedia({
@@ -2687,7 +2727,10 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 snapshot: msg.snapshot,
                 transport: { mediaKind: "direct", requestHeaders: null },
               });
-              claimLiveMediaKey(sender.tab.id, key, mediaId);
+              // DOM owns only this exact canonical media URL. The broader
+              // directGroupKey is a network mirror policy and must not collapse
+              // distinct query-addressed DOM media.
+              claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false);
             }
           } else {
             item.name = item.name || shortName(item.url);
@@ -2744,6 +2787,7 @@ api.tabs.onRemoved.addListener((tabId) => {
   liveControllerTabs.delete(tabId);
   liveControllerMediaIds.delete(tabId);
   livePromotedKeys.delete(tabId);
+  liveDirectSourceKeys.delete(tabId);
   tabContext.delete(tabId);
   childUrls.delete(tabId);
   tabThumbs.delete(tabId);
@@ -2758,6 +2802,7 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
     liveControllerTabs.delete(tabId);
     liveControllerMediaIds.delete(tabId);
     livePromotedKeys.delete(tabId);
+    liveDirectSourceKeys.delete(tabId);
     tabContext.delete(tabId);
     childUrls.delete(tabId);
     tabThumbs.delete(tabId);
