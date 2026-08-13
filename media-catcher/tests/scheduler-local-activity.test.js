@@ -1142,7 +1142,11 @@ function installHostileGate(realGate, gatePath, hooks) {
           parkProbe: g.parkProbe.bind(g),
           completeOwner: g.completeOwner.bind(g),
           designateRecoveryOwner: g.designateRecoveryOwner.bind(g),
-          recoverToNormal: g.recoverToNormal.bind(g),
+          recoverToNormal: hooks.recoverToNormal
+            ? function (args) {
+                return hooks.recoverToNormal(g, args);
+              }
+            : g.recoverToNormal.bind(g),
           snapshot: hooks.snapshot
             ? function () {
                 return hooks.snapshot(g);
@@ -2243,4 +2247,389 @@ test("14c controls: running decrement, saturation retain, disconnect, wrapper pe
   assertSlotInvariant(s2);
   assertSlotInvariant(s3);
   assertSlotInvariant(s4);
+});
+
+// ---------------------------------------------------------------------------
+// 15. Normal-gate durable retry preserves same-provider FIFO (head, not pending id)
+// ---------------------------------------------------------------------------
+
+test("15a normal-gate durable retry authorizes oldest waiter; later obligation stays durable", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let recoverThrow = false;
+  let armPostConfirmFault = false;
+  let normalSnapDuringArm = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      recoverToNormal: function (g, args) {
+        const result = g.recoverToNormal(args);
+        if (recoverThrow) throw new Error("recoverToNormal mutate-then-throw");
+        return result;
+      },
+      snapshot: function (g) {
+        const snap = g.snapshot();
+        if (armPostConfirmFault && snap.state === "normal") {
+          normalSnapDuringArm += 1;
+          if (normalSnapDuringArm >= 2) {
+            throw new Error("post-confirm authorize fault");
+          }
+        }
+        return snap;
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    // maxConcurrent=1 so after head is authorized it runs alone; later waiter stays waiting
+    // until the next legitimate edge — proves the later obligation remains durable.
+    const s = create({
+      maxConcurrent: 1,
+      now: () => 0,
+      firefoxDownload: () => assert.fail("no Firefox"),
+    });
+    ["O", "R", "A", "B"].forEach((id) => {
+      s.createJob({
+        id,
+        providerKey: "p.com",
+        intent: intent(id + ".mp4"),
+        segmentConcurrency: 4,
+        retries: 3,
+      });
+    });
+    // Admit all four first, then shrink capacity so only one re-admits after recovery.
+    s.setMaxConcurrent(4);
+    s.enqueue("O");
+    s.enqueue("R");
+    s.enqueue("A");
+    s.enqueue("B");
+    s.noteNativeOpen("O", 1);
+    s.noteNativeOpen("B", 1);
+    const bToken = s.getJob("B").attemptToken;
+    s.onTransportResult("R", s.getJob("R").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    assert.deepEqual(s.getSnapshot().providers["p.com"].waiting, ["R", "A"]);
+    assert.equal(s.getJob("B").state, "pausing_provider");
+    s.noteNativeOpen("O", 0);
+    s.onTransportResult("O", s.getJob("O").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    assert.equal(s.getJob("R").state, "running");
+    recoverThrow = true;
+    try {
+      s.onTransportResult("R", s.getJob("R").attemptToken, {
+        status: "completed",
+        failureCategory: null,
+      });
+    } catch (e) {
+      /* gate mutated to normal; authorize loop skipped */
+    }
+    recoverThrow = false;
+    assert.equal(s.getSnapshot().providers["p.com"].gate.state, "normal");
+    assert.equal(s.getJob("A").state, "waiting_provider");
+    assert.equal(s.getJob("B").state, "pausing_provider");
+
+    // Cap to 1 before B's pending settle so only oldest can run.
+    s.setMaxConcurrent(1);
+    armPostConfirmFault = true;
+    normalSnapDuringArm = 0;
+    const drainOk = s.onDrainingTransportResult("B", bToken, cancelledResult());
+    armPostConfirmFault = false;
+    assert.equal(drainOk, false);
+    assert.deepEqual(s.getSnapshot().providers["p.com"].waiting, ["A", "B"]);
+    assert.equal(s.getJob("A").autoWakeCount, 0);
+    assert.equal(s.getJob("B").autoWakeCount, 0);
+    // Public surface must not expose the private pending obligation.
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(s.getJob("B"), "pendingSchedulerProgress"),
+      false
+    );
+
+    // First retry/tick selects oldest eligible waiter A — not the pending-id job B.
+    s.tick(0);
+    assert.equal(s.getJob("A").autoWakeCount, 1);
+    assert.equal(s.getJob("A").state, "running");
+    assert.equal(s.getJob("B").state, "waiting_provider");
+    assert.equal(s.getJob("B").autoWakeCount, 0, "later obligation must not erase B or wake B early");
+    assert.deepEqual(s.getSnapshot().providers["p.com"].waiting, ["B"]);
+    assertSlotInvariant(s);
+
+    // Complete A; next legitimate edge advances B exactly once.
+    s.onTransportResult("A", s.getJob("A").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    // B may wake on the completion drain or need an extra tick if still pending.
+    if (s.getJob("B").state === "waiting_provider") {
+      s.tick(1);
+    }
+    assert.equal(s.getJob("B").autoWakeCount, 1);
+    assert.ok(
+      s.getJob("B").state === "running" || s.getJob("B").state === "queued",
+      "B state=" + s.getJob("B").state
+    );
+    const bWake = s.getJob("B").autoWakeCount;
+    const bUsed = s.getJob("B").retryUsed;
+    s.tick(2);
+    s.tick(3);
+    assert.equal(s.getJob("B").autoWakeCount, bWake, "no double-wake");
+    assert.equal(s.getJob("B").retryUsed, bUsed, "no double retry charge");
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("15b throw-before and mutate-then-throw around FIFO authorize stay nonthrowing; no double wake", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let recoverThrow = false;
+  // throw-before-authorize: pass confirmNativeOpenZero (first normal snap), throw on authorize.
+  // mutate-then-throw-once: same first-pass, throw once on authorize after B is waiting.
+  let faultMode = "pass";
+  let normalSnapN = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      recoverToNormal: function (g, args) {
+        const result = g.recoverToNormal(args);
+        if (recoverThrow) throw new Error("recoverToNormal mutate-then-throw");
+        return result;
+      },
+      snapshot: function (g) {
+        const snap = g.snapshot();
+        if (
+          (faultMode === "throw-before-authorize" ||
+            faultMode === "mutate-then-throw-once") &&
+          snap.state === "normal"
+        ) {
+          normalSnapN += 1;
+          // SNAP#1 is confirmNativeOpenZero (pre-waiting). Authorize is SNAP#2+.
+          if (normalSnapN >= 2) {
+            if (faultMode === "mutate-then-throw-once") {
+              faultMode = "pass";
+            }
+            throw new Error("FIFO authorize-edge snapshot fault");
+          }
+        }
+        return snap;
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const s = create({
+      maxConcurrent: 4,
+      now: () => 0,
+      firefoxDownload: () => assert.fail("no Firefox"),
+    });
+    ["O", "R", "A", "B"].forEach((id) => {
+      s.createJob({
+        id,
+        providerKey: "p.com",
+        intent: intent(id + ".mp4"),
+        segmentConcurrency: 4,
+        retries: 3,
+      });
+    });
+    s.enqueue("O");
+    s.enqueue("R");
+    s.enqueue("A");
+    s.enqueue("B");
+    s.noteNativeOpen("O", 1);
+    s.noteNativeOpen("B", 1);
+    const bToken = s.getJob("B").attemptToken;
+    s.onTransportResult("R", s.getJob("R").attemptToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    s.noteNativeOpen("O", 0);
+    s.onTransportResult("O", s.getJob("O").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    recoverThrow = true;
+    try {
+      s.onTransportResult("R", s.getJob("R").attemptToken, {
+        status: "completed",
+        failureCategory: null,
+      });
+    } catch (e) {
+      /* expected */
+    }
+    recoverThrow = false;
+    assert.equal(s.getSnapshot().providers["p.com"].gate.state, "normal");
+
+    // throw-before authorize (after confirm): public call nonthrowing, B waiting, no wakes.
+    faultMode = "throw-before-authorize";
+    normalSnapN = 0;
+    let threw1 = false;
+    let r1;
+    try {
+      r1 = s.onDrainingTransportResult("B", bToken, cancelledResult());
+    } catch (e) {
+      threw1 = true;
+    }
+    faultMode = "pass";
+    assert.equal(threw1, false);
+    assert.equal(r1, false);
+    assert.equal(s.getJob("B").state, "waiting_provider");
+    assert.deepEqual(s.getSnapshot().providers["p.com"].waiting, ["A", "B"]);
+    assert.equal(s.getJob("A").autoWakeCount, 0);
+    assert.equal(s.getJob("B").autoWakeCount, 0);
+
+    // mutate-then-throw once more on a tick/retry authorize edge must stay nonthrowing.
+    faultMode = "mutate-then-throw-once";
+    normalSnapN = 1; // next normal snap is authorize (no confirm in tick path)
+    let threwTick = false;
+    try {
+      s.tick(0);
+    } catch (e) {
+      threwTick = true;
+    }
+    faultMode = "pass";
+    assert.equal(threwTick, false);
+
+    // Cap to 1 so only FIFO head can admit; later waiter may queue but must not run ahead.
+    s.setMaxConcurrent(1);
+
+    // Cleared faults: repeated tick must authorize head A first, never double-wake/skip.
+    const aWake0 = s.getJob("A").autoWakeCount;
+    const bWake0 = s.getJob("B").autoWakeCount;
+    s.tick(1);
+    s.tick(1);
+    s.tick(2);
+    assert.equal(s.getJob("A").autoWakeCount, 1, "head A must wake once");
+    assert.ok(s.getJob("A").autoWakeCount >= aWake0);
+    assert.ok(
+      s.getJob("B").autoWakeCount <= s.getJob("A").autoWakeCount,
+      "B must not overtake A"
+    );
+    assert.notEqual(s.getJob("B").state, "running");
+    const aWake = s.getJob("A").autoWakeCount;
+    const bWake = s.getJob("B").autoWakeCount;
+    const aUsed = s.getJob("A").retryUsed;
+    const bUsed = s.getJob("B").retryUsed;
+    s.tick(3);
+    s.tick(4);
+    assert.equal(s.getJob("A").autoWakeCount, aWake, "no double-wake A");
+    assert.ok(s.getJob("B").autoWakeCount - bWake <= 1);
+    assert.equal(s.getJob("A").retryUsed, aUsed);
+    assert.equal(s.getJob("B").retryUsed, bUsed);
+    assert.equal(s.onDrainingTransportResult("B", bToken, cancelledResult()), false);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("15c hostile ids __proto__/constructor: normal-gate FIFO authorize without prototype leakage", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  const cases = [
+    { O: "O", R: "R", A: "__proto__", B: "constructor", providerKey: "p.com" },
+    { O: "O2", R: "R2", A: "constructor", B: "__proto__", providerKey: "__proto__" },
+  ];
+  for (const c of cases) {
+    let recoverThrow = false;
+    let armPostConfirmFault = false;
+    let normalSnapDuringArm = 0;
+    try {
+      installHostileGate(realGate, gatePath, {
+        recoverToNormal: function (g, args) {
+          const result = g.recoverToNormal(args);
+          if (recoverThrow) throw new Error("recoverToNormal mutate-then-throw");
+          return result;
+        },
+        snapshot: function (g) {
+          const snap = g.snapshot();
+          if (armPostConfirmFault && snap.state === "normal") {
+            normalSnapDuringArm += 1;
+            if (normalSnapDuringArm >= 2) {
+              throw new Error("post-confirm authorize fault");
+            }
+          }
+          return snap;
+        },
+      });
+      const create = loadSchedulerFresh(schedPath);
+      const protoNamesBefore = Object.getOwnPropertyNames(Object.prototype).slice().sort();
+      const s = create({
+        maxConcurrent: 4,
+        now: () => 0,
+        firefoxDownload: () => assert.fail("no Firefox"),
+      });
+      [c.O, c.R, c.A, c.B].forEach((id) => {
+        s.createJob({
+          id,
+          providerKey: c.providerKey,
+          intent: intent(String(id) + ".mp4"),
+          segmentConcurrency: 4,
+          retries: 3,
+        });
+      });
+      s.enqueue(c.O);
+      s.enqueue(c.R);
+      s.enqueue(c.A);
+      s.enqueue(c.B);
+      s.noteNativeOpen(c.O, 1);
+      s.noteNativeOpen(c.B, 1);
+      const bToken = s.getJob(c.B).attemptToken;
+      s.onTransportResult(c.R, s.getJob(c.R).attemptToken, {
+        status: "failed",
+        failureCategory: "http_429",
+      });
+      assert.deepEqual(s.getSnapshot().providers[c.providerKey].waiting, [c.R, c.A]);
+      s.noteNativeOpen(c.O, 0);
+      s.onTransportResult(c.O, s.getJob(c.O).attemptToken, {
+        status: "completed",
+        failureCategory: null,
+      });
+      recoverThrow = true;
+      try {
+        s.onTransportResult(c.R, s.getJob(c.R).attemptToken, {
+          status: "completed",
+          failureCategory: null,
+        });
+      } catch (e) {
+        /* expected */
+      }
+      recoverThrow = false;
+      armPostConfirmFault = true;
+      normalSnapDuringArm = 0;
+      assert.equal(
+        s.onDrainingTransportResult(c.B, bToken, cancelledResult()),
+        false
+      );
+      armPostConfirmFault = false;
+      assert.deepEqual(s.getSnapshot().providers[c.providerKey].waiting, [c.A, c.B]);
+      // Hostile ids must not install new own properties on Object.prototype.
+      assert.deepEqual(
+        Object.getOwnPropertyNames(Object.prototype).slice().sort(),
+        protoNamesBefore
+      );
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(Object.prototype, "pendingSchedulerProgress"),
+        false
+      );
+
+      s.tick(0);
+      assert.equal(s.getJob(c.A).autoWakeCount, 1);
+      assert.ok(
+        s.getJob(c.A).state === "running" || s.getJob(c.A).state === "queued"
+      );
+      assert.notEqual(s.getJob(c.B).state, "running");
+      assert.ok(s.getJob(c.B).autoWakeCount <= 1);
+      assert.equal(Object.prototype.hasOwnProperty.call(s.getJob(c.A), "pendingSchedulerProgress"), false);
+      assertSlotInvariant(s);
+    } finally {
+      restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+    }
+  }
 });
