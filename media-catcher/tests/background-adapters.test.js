@@ -5654,6 +5654,81 @@ test("native direct result switches an eligible attempt to one single command", 
   assert.equal(commands[1].id, job.id);
   assert.equal(commands[1].attemptToken, initial.attemptToken);
   assert.equal(fx.counts.downloadsDownload, 0);
+  assert.equal(ctrl.popupJobs()[0].mode, "single-connection");
+  await ctrl.handleNativeMessage({
+    type: "pget-result", id: job.id, attemptToken: initial.attemptToken,
+    status: "failed", mode: "multi-range", failureCategory: "range_unsupported", partState: "empty",
+  });
+  assert.equal(commands.length, 2);
+});
+
+test("native direct messages keep stale and wrong-mode results inert", async () => {
+  const fx = makeEffects();
+  const commands = [];
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ postNative(c) { commands.push(c); } }));
+  const job = await enqueueNativeDirect(ctrl, fx, "native-inert");
+  const token = commands[0].attemptToken;
+  const before = JSON.stringify(ctrl.popupJobs());
+  const published = fx.counts.publishJobs;
+  for (const message of [
+    { type: "pget-result", id: job.id, attemptToken: "old-token", status: "completed", mode: "multi-range", partState: "committed" },
+    { type: "pget-result", id: job.id, attemptToken: token, status: "completed", mode: "single-connection", partState: "committed" },
+    { type: "pget-result", id: job.id, attemptToken: token, status: "bad", mode: "multi-range", partState: "committed" },
+  ]) assert.equal(await ctrl.handleNativeMessage(message), false);
+  assert.equal(JSON.stringify(ctrl.popupJobs()), before);
+  assert.equal(fx.counts.publishJobs, published);
+});
+
+test("native direct progress and current limit acknowledgement have safe bounded effects", async () => {
+  const commands = [];
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ postNative(c) { commands.push(c); } }));
+  const job = await enqueueNativeDirect(ctrl, fx, "native-progress");
+  const start = commands[0];
+  assert.equal(await ctrl.handleNativeMessage({ type: "pget-progress", id: job.id, attemptToken: start.attemptToken, bytes: 4, total: 10 }), true);
+  const row = ctrl.popupJobs()[0];
+  assert.deepEqual(row.progress, { done: 4, total: 10 });
+  assert.equal(Object.isFrozen(row.progress), true);
+  assert.equal(await ctrl.handleNativeMessage({ type: "pget-progress", id: job.id, attemptToken: start.attemptToken, bytes: 3, total: 10 }), false);
+  assert.equal(await ctrl.handleNativeMessage({ type: "pget-limit-ack", id: job.id, attemptToken: start.attemptToken, providerGeneration: start.providerGeneration, maxConnections: start.maxConnections }), true);
+  assert.equal(await ctrl.handleNativeMessage({ type: "pget-limit-ack", id: job.id, attemptToken: "old", providerGeneration: start.providerGeneration, maxConnections: start.maxConnections }), false);
+  assert.equal(JSON.stringify(ctrl.popupJobs()).includes("https://"), false);
+});
+
+test("completed native direct result releases capacity and starts a queued peer", async () => {
+  const commands = [];
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ maxConcurrent: 1, postNative(c) { commands.push(c); } }));
+  const first = await enqueueNativeDirect(ctrl, fx, "native-complete-a");
+  const second = await enqueueNativeDirect(ctrl, fx, "native-complete-b");
+  assert.equal(commands.length, 1);
+  await ctrl.handleNativeMessage({ type: "pget-result", id: first.id, attemptToken: commands[0].attemptToken, status: "completed", mode: "multi-range", partState: "committed" });
+  assert.equal(commands.length, 2);
+  assert.equal(commands[1].id, second.id);
+  assert.equal(fx.counts.downloadsDownload, 0);
+});
+
+test("timeout native direct result follows scheduler retry policy without Firefox", async () => {
+  const commands = [];
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ postNative(c) { commands.push(c); } }));
+  const job = await enqueueNativeDirect(ctrl, fx, "native-timeout");
+  await ctrl.handleNativeMessage({ type: "pget-result", id: job.id, attemptToken: commands[0].attemptToken, status: "failed", mode: "multi-range", failureCategory: "timeout", partState: "partial" });
+  assert.equal(ctrl.popupJobs()[0].state, "retry_backoff");
+  assert.equal(fx.counts.downloadsDownload, 0);
+});
+
+test("single native post failure preserves committed safe mode and replay fence", async () => {
+  const commands = [];
+  const effectError = new Error("single effect failure");
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ postNative(c) { commands.push(c); if (c.cmd === "pget-single") return Promise.reject(effectError); } }));
+  const job = await enqueueNativeDirect(ctrl, fx, "native-post-fail");
+  const start = commands[0];
+  await assert.rejects(ctrl.handleNativeMessage({ type: "pget-result", id: job.id, attemptToken: start.attemptToken, status: "failed", mode: "multi-range", failureCategory: "range_unsupported", partState: "empty" }), effectError);
+  assert.equal(ctrl.popupJobs()[0].mode, "single-connection");
+  await ctrl.handleNativeMessage({ type: "pget-result", id: job.id, attemptToken: start.attemptToken, status: "failed", mode: "multi-range", failureCategory: "range_unsupported", partState: "empty" });
+  assert.equal(commands.filter((c) => c.cmd === "pget-single").length, 1);
 });
 
 // ---------------------------------------------------------------------------
