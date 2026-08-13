@@ -181,6 +181,13 @@ function convertSpec() {
 
 // tabId -> Map(url -> mediaItem)
 const mediaByTab = new Map();
+// Raw webRequest evidence is kept off the enumerable legacy item until the
+// existing enrichment path has proved that the candidate is usable media.
+const liveNetworkEvidence = new WeakMap();
+// Tabs with controller-owned rows may have no remaining legacy map entry.
+const liveControllerTabs = new Set();
+const liveControllerMediaIds = new Map();
+const livePromotedKeys = new Map();
 // tabId -> { referer, origin, userAgent, cookieUrl, pageTitle, ogTitle }
 const tabContext = new Map();
 // tabId -> JPEG data URL of the playing video (from content script)
@@ -796,7 +803,7 @@ function directGroupKey(url) {
   }
 }
 
-function addMedia(tabId, item) {
+function addMedia(tabId, item, networkEvidence) {
   if (tabId < 0) return;
   // De-dup key collapses Low-Latency HLS reloads of one playlist (differing only
   // by _HLS_msn / cache-bust params) into a single item. The item keeps its
@@ -804,6 +811,8 @@ function addMedia(tabId, item) {
   const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url)
             : item.kind === "direct" ? directGroupKey(item.url) : item.url;
   item.key = key;
+  const promoted = livePromotedKeys.get(tabId);
+  if (promoted && promoted.has(key)) return;
   // Stash any audio-track playlist URL (even one we're about to suppress) so the
   // recorder can pair it with the video by directory.
   if (item.kind === "hls" && isAudioUrl(item.url)) rememberAudioTrack(tabId, item.url);
@@ -833,8 +842,12 @@ function addMedia(tabId, item) {
     const mirrors = existing.mirrors || [existing.url];
     if (item.kind === "direct" && item.url && !mirrors.includes(item.url)) mirrors.push(item.url);
     Object.assign(existing, item, { url: stableUrl, key, mirrors });
+    if (networkEvidence && !liveNetworkEvidence.has(existing)) {
+      liveNetworkEvidence.set(existing, networkEvidence);
+    }
   } else {
     if (item.kind === "direct") item.mirrors = [item.url];
+    if (networkEvidence) liveNetworkEvidence.set(item, networkEvidence);
     map.set(key, item);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -843,6 +856,81 @@ function addMedia(tabId, item) {
     else if (item.kind === "direct") enrichDirect(tabId, key);
     else if (item.kind === "youtube") enrichYouTube(tabId, key);
   }
+}
+
+function copyLiveResponseHeaders(headers) {
+  if (!Array.isArray(headers)) return [];
+  const out = [];
+  for (const header of headers) {
+    if (!header || typeof header.name !== "string" || typeof header.value !== "string") continue;
+    out.push({ name: header.name, value: header.value });
+  }
+  return out;
+}
+
+function buildLiveNetworkEvidence(details, mediaKind) {
+  const ctx = tabContext.get(details.tabId) || {};
+  const safeDetails = {
+    url: details.url,
+    tabId: details.tabId,
+    frameId: Number.isInteger(details.frameId) ? details.frameId : 0,
+    timeStamp: Number.isFinite(details.timeStamp) ? details.timeStamp : Date.now(),
+    responseHeaders: copyLiveResponseHeaders(details.responseHeaders),
+  };
+  if (typeof details.documentId === "string") safeDetails.documentId = details.documentId;
+  if (typeof details.documentUrl === "string") safeDetails.documentUrl = details.documentUrl;
+  if (typeof details.originUrl === "string") safeDetails.originUrl = details.originUrl;
+
+  const hints = {
+    topLevelUrlHint: typeof ctx.topLevelPageUrl === "string"
+      ? ctx.topLevelPageUrl
+      : (typeof details.documentUrl === "string" ? details.documentUrl : ""),
+    frameOrigin: "",
+  };
+  try {
+    hints.frameOrigin = new URL(details.originUrl || details.documentUrl).origin;
+  } catch (e) {
+    hints.frameOrigin = typeof ctx.origin === "string" ? ctx.origin : "";
+  }
+  const transport = { mediaKind, requestHeaders: null };
+  if (mediaKind === "direct") transport.mirrors = [details.url];
+  if (typeof ctx.referer === "string" && ctx.referer) transport.referer = ctx.referer;
+  if (typeof ctx.userAgent === "string" && ctx.userAgent) transport.userAgent = ctx.userAgent;
+  return { details: safeDetails, hints, transport };
+}
+
+async function promoteLiveNetworkItem(tabId, key, item, variants) {
+  await settingsReady;
+  const controller = liveController;
+  const evidence = liveNetworkEvidence.get(item);
+  if (!controller || !evidence) return false;
+  if (item.kind === "direct" && Array.isArray(item.mirrors)) {
+    evidence.transport.mirrors = item.mirrors.slice();
+  }
+
+  let mediaId;
+  try {
+    mediaId = controller.captureNetwork(evidence);
+  } catch (e) {
+    dlog("live promotion rejected", item.kind, e && e.message);
+    return false;
+  }
+  if (Array.isArray(variants) && variants.length) {
+    try { controller.registerVariants(mediaId, variants); }
+    catch (e) { dlog("live variant registration rejected", item.kind, e && e.message); }
+  }
+
+  liveControllerTabs.add(tabId);
+  const ids = liveControllerMediaIds.get(tabId) || new Set();
+  ids.add(mediaId);
+  liveControllerMediaIds.set(tabId, ids);
+  const keys = livePromotedKeys.get(tabId) || new Set();
+  keys.add(key);
+  livePromotedKeys.set(tabId, keys);
+  const map = mediaByTab.get(tabId);
+  if (map && map.get(key) === item) map.delete(key);
+  liveNetworkEvidence.delete(item);
+  return true;
 }
 
 // Ask the helper (yt-dlp -J) for a YouTube URL's real formats so the popup can show
@@ -918,9 +1006,25 @@ async function enrichDash(tabId, key) {
     item.variants = parsed.variants;      // {id,label,height,bandwidth,resolution}
     item.codec = codecLabel((parsed.variants[0] || {}).codecs || "");
     item.drm = parsed.drm;
+    item.isDynamic = parsed.isDynamic;
     item.hasAudio = parsed.audio.length > 0;
     item.duration = parsed.duration;
+    item.unsupported = !Array.isArray(parsed.video) || parsed.video.length === 0;
     item.enrichState = "done";
+    if (!item.isDynamic && !item.drm && !item.unsupported) {
+      const variants = parsed.video.map((v) => {
+        const out = { url: item.url };
+        if (v.width > 0 && v.height > 0) out.label = v.width + "x" + v.height +
+          (v.bandwidth > 0 ? " · " + Math.round(v.bandwidth / 1000) + " kbps" : "");
+        else if (v.height > 0) out.label = v.height + "p";
+        if (v.width > 0) out.width = v.width;
+        if (v.height > 0) out.height = v.height;
+        if (v.bandwidth > 0) out.bandwidth = v.bandwidth;
+        if (/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(v.mimeType || "")) out.mime = v.mimeType;
+        return out;
+      });
+      await promoteLiveNetworkItem(tabId, key, item, variants);
+    }
   } catch (e) {
     item.enrichState = "error";
     item.enrichError = e.message || String(e);
@@ -1098,6 +1202,7 @@ async function enrichDirect(tabId, key) {
       if (codec) item.codec = codec;
     }
     item.enrichState = "done";
+    if (!item.junk) await promoteLiveNetworkItem(tabId, key, item, null);
     dlog("probed direct", { url: item.url, status: r.status, size: item.size, container, junk: item.junk, kbps: item.estKbps });
   } catch (e) {
     item.enrichState = "error";
@@ -1185,6 +1290,10 @@ async function enrichHls(tabId, key) {
           const vparsed = self.HLS.parsePlaylist(vtext, top.uri);
           if (vparsed.type === "media") {
             item.isLive = vparsed.isLive;
+            item.encrypted = !!vparsed.encryption;
+            item.drm = !!(vparsed.encryption &&
+              (vparsed.encryption.method !== "AES-128" ||
+               (vparsed.encryption.keyFormat && vparsed.encryption.keyFormat !== "identity")));
             registerSegments(tabId, vparsed);
           }
         } catch (e) { /* best-effort — pattern-based filtering still applies */ }
@@ -1209,6 +1318,19 @@ async function enrichHls(tabId, key) {
       }
     }
     item.enrichState = "done";
+    if (item.isLive === false && !item.drm) {
+      const variants = parsed.type === "master" ? parsed.variants.map((v) => {
+        const out = { url: v.uri };
+        const resolution = typeof v.resolution === "string" ? v.resolution.match(/^(\d+)x(\d+)$/) : null;
+        if (resolution) out.width = parseInt(resolution[1], 10);
+        if (v.height > 0) out.height = v.height;
+        if (v.bandwidth > 0) out.bandwidth = v.bandwidth;
+        out.label = (v.resolution || (v.height > 0 ? v.height + "p" : "auto")) +
+          (v.bandwidth > 0 ? " · " + Math.round(v.bandwidth / 1000) + " kbps" : "");
+        return out;
+      }) : [];
+      await promoteLiveNetworkItem(tabId, key, item, variants);
+    }
   } catch (e) {
     item.enrichState = "error";
     item.enrichError = e.message || String(e);
@@ -1223,7 +1345,7 @@ async function enrichHls(tabId, key) {
 }
 
 function updateBadge(tabId) {
-  const count = visibleFor(tabId).length;
+  const count = visibleFor(tabId).length + liveRowsForTab(tabId).length;
   const text = count > 0 ? String(count) : "";
   try {
     api.browserAction.setBadgeText({ tabId, text });
@@ -1278,7 +1400,7 @@ api.webRequest.onHeadersReceived.addListener(
       name: shortName(details.url),
       source: "network",
       ts: Date.now(),
-    });
+    }, buildLiveNetworkEvidence(details, kind));
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -2102,12 +2224,62 @@ function keepHighestRendition(items) {
   return passthrough.concat(kept);
 }
 
+function copyLiveVariantRow(row) {
+  const out = {};
+  if (!row || typeof row !== "object") return out;
+  for (const key of ["id", "label", "width", "height", "bandwidth", "mime"]) {
+    const value = row[key];
+    if (typeof value === "string" || (typeof value === "number" && Number.isFinite(value))) out[key] = value;
+  }
+  return out;
+}
+
+function liveRowsForTab(tabId) {
+  if (!liveController || !liveControllerTabs.has(tabId)) return [];
+  try {
+    const rows = liveController.popupMedia(tabId);
+    const ids = liveControllerMediaIds.get(tabId);
+    return Array.isArray(rows) && ids ? rows.filter((row) => row && ids.has(row.id)) : [];
+  } catch (e) {
+    dlog("live popupMedia failed", e && e.message);
+    return [];
+  }
+}
+
+function decorateLiveRow(row, tabId) {
+  if (!row || typeof row !== "object" || typeof row.id !== "string") return null;
+  const out = {
+    id: row.id,
+    proposedFilename: typeof row.proposedFilename === "string" ? row.proposedFilename : "download",
+    kind: typeof row.kind === "string" ? row.kind : "direct",
+    variants: Array.isArray(row.variants) ? row.variants.map(copyLiveVariantRow) : [],
+    tabId,
+    thumb: tabThumbs.get(tabId) || null,
+  };
+  const title = tabTitle(tabId);
+  if (title) out.pageTitle = title;
+  return out;
+}
+
+function livePopupJobs() {
+  if (!liveController) return [];
+  try {
+    const jobs = liveController.popupJobs();
+    if (!Array.isArray(jobs)) return [];
+    return jobs.map((job) => Object.assign({}, job));
+  } catch (e) {
+    dlog("live popupJobs failed", e && e.message);
+    return [];
+  }
+}
+
 // ---- Messaging ----
 
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "get-media") {
+        await settingsReady;
         const tabId = msg.tabId;
         let items;
         // decorate() attaches per-tab extras: thumbnail + backfilled title for
@@ -2122,16 +2294,57 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const kickYt = (tid) => { const m = mediaByTab.get(tid); if (m) for (const [k, it] of m) if (it.kind === "youtube") enrichYouTube(tid, k); };
         if (msg.allTabs) {
           items = [];
-          for (const tid of mediaByTab.keys()) {
+          const tids = new Set(mediaByTab.keys());
+          for (const tid of liveControllerTabs) tids.add(tid);
+          for (const tid of tids) {
             kickYt(tid);
             for (const it of visibleFor(tid)) items.push(decorate(it, tid));
+            for (const row of liveRowsForTab(tid)) {
+              const safe = decorateLiveRow(row, tid);
+              if (safe) items.push(safe);
+            }
           }
         } else {
           kickYt(tabId);
           items = visibleFor(tabId).map((it) => decorate(it, tabId));
+          for (const row of liveRowsForTab(tabId)) {
+            const safe = decorateLiveRow(row, tabId);
+            if (safe) items.push(safe);
+          }
         }
-        items.sort((a, b) => b.ts - a.ts);
-        sendResponse({ items, downloads: Array.from(activeDownloads.values()), helper: helperStatus(), cast: castState });
+        items.sort((a, b) => (Number.isFinite(b.ts) ? b.ts : 0) - (Number.isFinite(a.ts) ? a.ts : 0));
+        sendResponse({
+          items,
+          downloads: livePopupJobs().concat(Array.from(activeDownloads.values())),
+          helper: helperStatus(),
+          cast: castState,
+        });
+      } else if (msg.type === "page-snapshot-context") {
+        if (!sender.tab || !Number.isInteger(sender.tab.id)) {
+          sendResponse({ ok: false });
+        } else {
+          if (typeof sender.tab.url === "string") {
+            const ctx = tabContext.get(sender.tab.id) || {};
+            ctx.topLevelPageUrl = sender.tab.url;
+            tabContext.set(sender.tab.id, ctx);
+          }
+          sendResponse({
+            ok: true,
+            tabId: sender.tab.id,
+            frameId: Number.isInteger(sender.frameId) ? sender.frameId : 0,
+            documentId: typeof sender.documentId === "string" ? sender.documentId : null,
+            topLevelPageUrl: typeof sender.tab.url === "string" ? sender.tab.url : "",
+          });
+        }
+      } else if (msg.type === "page-snapshot") {
+        await settingsReady;
+        if (sender.tab && Number.isInteger(sender.tab.id) && typeof msg.topLevelPageUrl === "string") {
+          const ctx = tabContext.get(sender.tab.id) || {};
+          ctx.topLevelPageUrl = msg.topLevelPageUrl;
+          tabContext.set(sender.tab.id, ctx);
+        }
+        if (liveController) liveController.acceptPageSnapshot(msg);
+        sendResponse({ ok: true });
       } else if (msg.type === "helper-status") {
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "recheck-helper") {
@@ -2340,6 +2553,9 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } else if (msg.type === "clear") {
         mediaByTab.delete(msg.tabId);
+        liveControllerTabs.delete(msg.tabId);
+        liveControllerMediaIds.delete(msg.tabId);
+        livePromotedKeys.delete(msg.tabId);
         childUrls.delete(msg.tabId);
         updateBadge(msg.tabId);
         sendResponse({ ok: true });
@@ -2347,8 +2563,31 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // From content script: a <video> element src.
         if (sender.tab) {
           const item = msg.item;
-          item.name = item.name || shortName(item.url);
-          addMedia(sender.tab.id, item);
+          if (item && item.kind === "direct" && msg.snapshot) {
+            await settingsReady;
+          }
+          if (item && item.kind === "direct" && msg.snapshot && liveController) {
+            const mediaUrl = item.url;
+            let mediaOrigin = "";
+            try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
+            const mediaId = liveController.captureDomMedia({
+              mediaUrl,
+              mediaOrigin,
+              contentDisposition: null,
+              referrerUrl: typeof msg.referrerUrl === "string" ? msg.referrerUrl : "",
+              frameOrigin: typeof msg.frameOrigin === "string" ? msg.frameOrigin : "",
+              ts: Number.isFinite(item.ts) ? item.ts : 0,
+              snapshot: msg.snapshot,
+              transport: { mediaKind: "direct", requestHeaders: null },
+            });
+            liveControllerTabs.add(sender.tab.id);
+            const ids = liveControllerMediaIds.get(sender.tab.id) || new Set();
+            ids.add(mediaId);
+            liveControllerMediaIds.set(sender.tab.id, ids);
+          } else {
+            item.name = item.name || shortName(item.url);
+            addMedia(sender.tab.id, item);
+          }
         }
         sendResponse({ ok: true });
       } else if (msg.type === "page-info") {
@@ -2397,6 +2636,9 @@ function endTabRecordings(tabId) {
 api.tabs.onRemoved.addListener((tabId) => {
   endTabRecordings(tabId);
   mediaByTab.delete(tabId);
+  liveControllerTabs.delete(tabId);
+  liveControllerMediaIds.delete(tabId);
+  livePromotedKeys.delete(tabId);
   tabContext.delete(tabId);
   childUrls.delete(tabId);
   tabThumbs.delete(tabId);
@@ -2408,6 +2650,9 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url) {
     endTabRecordings(tabId);
     mediaByTab.delete(tabId);
+    liveControllerTabs.delete(tabId);
+    liveControllerMediaIds.delete(tabId);
+    livePromotedKeys.delete(tabId);
     tabContext.delete(tabId);
     childUrls.delete(tabId);
     tabThumbs.delete(tabId);
