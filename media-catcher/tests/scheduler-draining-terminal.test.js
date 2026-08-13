@@ -969,3 +969,809 @@ test("10 getJob and getSnapshot never expose drainingAttemptToken or pendingDrai
   assert.equal(s2.getJob("B").state, "completed");
   assertProjectionKeys(s2.getJob("B"));
 });
+
+// ---------------------------------------------------------------------------
+// 11. Race: already-consumed failed job must not capture a private drain token
+// ---------------------------------------------------------------------------
+
+test("11A fresh saturation: failed job C keeps no private drain auth; one wake charge", () => {
+  var fx = { n: 0 };
+  var s = createDownloadScheduler({
+    maxConcurrent: 3,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      fx.n += 1;
+    },
+  });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  // B paused-only sibling keeps a live physical attempt (control for 11C).
+  s.noteNativeOpen("B", 1);
+  // C non-quiescent so it parks pausing_provider after its own failure is consumed.
+  s.noteNativeOpen("C", 1);
+  var cToken = s.getJob("C").attemptToken;
+  var bToken = s.getJob("B").attemptToken;
+  assert.equal(typeof cToken, "string");
+  assert.ok(cToken.trim().length > 0);
+  var cRetries = s.getJob("C").retryRemaining;
+  var cUsed = s.getJob("C").retryUsed;
+  var cMode = s.getJob("C").mode;
+
+  s.onTransportResult("C", cToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "A");
+  assert.equal(s.getJob("C").state, "pausing_provider");
+  assert.equal(s.getJob("C").attemptToken, null);
+  assert.equal(s.getJob("C").holdsGlobalSlot, true);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").attemptToken, null);
+  // Baselines after the consumed failure / pause transition.
+  var cVer = s.getJob("C").stateVersion;
+  var cSlot = s.getJob("C").holdsGlobalSlot;
+  var cNative = s.getJob("C").nativeOpenConnections;
+
+  // Old-token contradictions for the already-consumed failed job are inert.
+  assert.equal(s.onDrainingTransportResult("C", cToken, completedResult()), false);
+  assert.equal(s.onDrainingTransportResult("C", cToken, cancelledResult()), false);
+  assert.equal(
+    s.onDrainingTransportResult("C", cToken, failedResult("timeout", "partial")),
+    false
+  );
+  assert.equal(s.getJob("C").state, "pausing_provider");
+  assert.equal(s.getJob("C").attemptToken, null);
+  assert.equal(s.getJob("C").retryRemaining, cRetries);
+  assert.equal(s.getJob("C").retryUsed, cUsed);
+  assert.equal(s.getJob("C").mode, cMode);
+  assert.equal(s.getJob("C").stateVersion, cVer);
+  assert.equal(s.getJob("C").holdsGlobalSlot, cSlot);
+  assert.equal(s.getJob("C").nativeOpenConnections, cNative);
+  assertProjectionKeys(s.getJob("C"));
+
+  // Physical counters drain → waiting with exactly one consume-on-wake charge.
+  s.noteNativeOpen("C", 0);
+  assert.equal(s.getJob("C").state, "waiting_provider");
+  assert.equal(s.getJob("C").holdsGlobalSlot, false);
+  assert.equal(s.getJob("C").retryRemaining, cRetries);
+  assert.equal(s.getJob("C").retryUsed, cUsed);
+  // Still no private drain auth after waiting.
+  assert.equal(s.onDrainingTransportResult("C", cToken, completedResult()), false);
+
+  // Release paused-only B so C is the sole same-provider waiter, then complete owner.
+  assert.equal(s.onDrainingTransportResult("B", bToken, cancelledResult()), true);
+  assert.equal(s.getJob("B").state, "waiting_provider");
+  s.onTransportResult("A", s.getJob("A").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  // B (cancelled pause-ack, no consume flag) is FIFO head; complete it if admitted
+  // so C receives its failed-job wake charge.
+  var b = s.getJob("B");
+  if (b.state === "running") {
+    s.onTransportResult("B", b.attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+  } else if (b.state === "queued") {
+    // Drain should have admitted under recovering; if not, free capacity.
+    if (s.getJob("C").state === "waiting_provider") {
+      // B may be recovery owner queued behind global cap — force via unavailable of peers.
+    }
+  }
+  var c = s.getJob("C");
+  if (c.state === "waiting_provider") {
+    b = s.getJob("B");
+    if (b.state === "running") {
+      s.onTransportResult("B", b.attemptToken, {
+        status: "completed",
+        failureCategory: null,
+      });
+    }
+    c = s.getJob("C");
+  }
+  assert.ok(c.state === "queued" || c.state === "running");
+  assert.equal(c.retryRemaining, cRetries - 1);
+  assert.equal(c.retryUsed, cUsed + 1);
+  assert.equal(c.autoWakeCount, 1);
+  assert.equal(fx.n, 0);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+});
+
+test("11B joinExistingSaturationWait: already-consumed late failer has no private auth; one wake charge", () => {
+  // Public enterSaturation always pauses running non-owners. To exercise the
+  // joinExistingSaturationWait path a non-owner must still be running under an
+  // already-saturated gate (same fixture style as hostile-gate tests in this file).
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  try {
+    let gateRef = null;
+    installHostileGate(realGate, gatePath, {
+      onGate: function (g) {
+        gateRef = g;
+      },
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    var fx = { n: 0 };
+    var s = createS({
+      maxConcurrent: 3,
+      now: function () {
+        return 0;
+      },
+      firefoxDownload: function () {
+        fx.n += 1;
+      },
+    });
+    s.createJob({
+      id: "A",
+      providerKey: "p.com",
+      intent: intent("a.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "B",
+      providerKey: "p.com",
+      intent: intent("b.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "C",
+      providerKey: "p.com",
+      intent: intent("c.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("A");
+    s.enqueue("B");
+    s.enqueue("C");
+    s.notePermitAcquired("A");
+    s.noteNativeOpen("A", 1);
+    s.noteNativeOpen("C", 1);
+    assert.equal(s.getJob("A").state, "running");
+    assert.equal(s.getJob("C").state, "running");
+
+    // Pre-saturate without the enterSaturation pause loop so C remains a live
+    // running non-owner; C's own failure then takes joinExistingSaturationWait.
+    gateRef.setSaturated({ drainOwnerJobId: "A", reducedConcurrency: 2 });
+    assert.equal(gateRef.state, "saturated");
+    assert.equal(gateRef.snapshot().ownerJobId, "A");
+    assert.equal(s.getJob("C").state, "running");
+    var cToken = s.getJob("C").attemptToken;
+    var cRetries = s.getJob("C").retryRemaining;
+    var cUsed = s.getJob("C").retryUsed;
+    var gen = gateRef.snapshot().generation;
+
+    s.onTransportResult("C", cToken, {
+      status: "failed",
+      failureCategory: "http_429",
+    });
+    // joinExisting: no generation bump / re-halving owner bookkeeping.
+    assert.equal(s.getSnapshot().providers["p.com"].gate.state, "saturated");
+    assert.equal(s.getSnapshot().providers["p.com"].gate.generation, gen);
+    assert.equal(s.getSnapshot().providers["p.com"].gate.ownerJobId, "A");
+    assert.equal(s.getJob("C").state, "pausing_provider");
+    assert.equal(s.getJob("C").attemptToken, null);
+    // Baselines after joinExisting pause (stateVersion already advanced once).
+    var cVer = s.getJob("C").stateVersion;
+    var cNative = s.getJob("C").nativeOpenConnections;
+
+    assert.equal(s.onDrainingTransportResult("C", cToken, completedResult()), false);
+    assert.equal(s.onDrainingTransportResult("C", cToken, cancelledResult()), false);
+    assert.equal(
+      s.onDrainingTransportResult("C", cToken, failedResult("timeout", "partial")),
+      false
+    );
+    assert.equal(s.getJob("C").state, "pausing_provider");
+    assert.equal(s.getJob("C").retryRemaining, cRetries);
+    assert.equal(s.getJob("C").retryUsed, cUsed);
+    assert.equal(s.getJob("C").stateVersion, cVer);
+    assert.equal(s.getJob("C").nativeOpenConnections, cNative);
+    assert.equal(s.getJob("C").holdsGlobalSlot, true);
+    assertProjectionKeys(s.getJob("C"));
+
+    s.noteNativeOpen("C", 0);
+    assert.equal(s.getJob("C").state, "waiting_provider");
+    assert.equal(s.getJob("C").holdsGlobalSlot, false);
+    assert.equal(s.getJob("C").retryRemaining, cRetries);
+
+    // Owner completion → C is wake-FIFO head (B still running under forced sat).
+    if (s.getJob("B").state === "running") {
+      s.onTransportUnavailable("B");
+    }
+    s.onTransportResult("A", s.getJob("A").attemptToken, {
+      status: "completed",
+      failureCategory: null,
+    });
+    var c = s.getJob("C");
+    assert.ok(c.state === "queued" || c.state === "running");
+    assert.equal(c.retryRemaining, cRetries - 1);
+    assert.equal(c.retryUsed, cUsed + 1);
+    assert.equal(c.autoWakeCount, 1);
+    assert.equal(fx.n, 0);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("11C paused-only sibling still authenticates exactly one old-token terminal", () => {
+  var topo = setupABCPausingB();
+  var s = topo.s;
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").attemptToken, null);
+  // Single matching terminal authenticates.
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), true);
+  assert.equal(s.getJob("B").state, "completed");
+  // Replay inert.
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), false);
+  assert.equal(topo.firefoxCalls.n, 0);
+  assertSlotInvariant(s);
+});
+
+// ---------------------------------------------------------------------------
+// 12. Race: late semantic terminal after physical counters reach zero
+// ---------------------------------------------------------------------------
+
+test("12D late terminal after early native zero: hold pausing auth until match", () => {
+  var topo = setupABCPausingB();
+  var s = topo.s;
+  var verBefore = s.getJob("B").stateVersion;
+  var retriesBefore = s.getJob("B").retryRemaining;
+
+  // Physical native opens drain before the pget semantic terminal arrives.
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").attemptToken, null);
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").stateVersion, verBefore);
+  assert.equal(s.getJob("B").retryRemaining, retriesBefore);
+  assertProjectionKeys(s.getJob("B"));
+
+  // Matching old-token completed settles once.
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), true);
+  assert.equal(s.getJob("B").state, "completed");
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  // Replay inert.
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), false);
+  assert.equal(s.getJob("B").state, "completed");
+  assert.equal(topo.firefoxCalls.n, 0);
+  assert.equal(topo.clearB.n, 1);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+});
+
+test("12E late terminal after final wrapper/observed permit release: hold then settle", () => {
+  var fx = { n: 0 };
+  var s = createDownloadScheduler({
+    maxConcurrent: 3,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      fx.n += 1;
+    },
+  });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  // B: positive native opens at pause entry (captures drain token) plus wrapper/observed permits.
+  s.noteNativeOpen("B", 1);
+  s.noteNativeOpen("C", 1);
+  var permit = s.acquireProviderPermit("B", "segment");
+  assert.ok(permit);
+  s.notePermitAcquired("B");
+  assert.ok(s.getJob("B").inFlightPermits >= 2);
+  assert.ok(s.getJob("B").nativeOpenConnections > 0);
+  var bToken = s.getJob("B").attemptToken;
+
+  s.onTransportResult("C", s.getJob("C").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").attemptToken, null);
+  assert.ok(s.getJob("B").inFlightPermits >= 2);
+  assert.ok(s.getJob("B").nativeOpenConnections > 0);
+
+  // Native zero first while permits remain — private drain auth retained.
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+
+  // Drain observed permit, then wrapper — physical zero before semantic terminal.
+  s.releasePermit("B");
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  permit.release();
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(s.getJob("B").inFlightPermits, 0);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").attemptToken, null);
+
+  assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), true);
+  assert.equal(s.getJob("B").state, "completed");
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), false);
+  assert.equal(fx.n, 0);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+});
+
+test("12I permit-only pause does not capture drain token; native-positive still holds", () => {
+  var fx = { n: 0 };
+  var s = createDownloadScheduler({
+    maxConcurrent: 3,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      fx.n += 1;
+    },
+  });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  // B: wrapper/observed permits only — never noteNativeOpen > 0.
+  s.noteNativeOpen("B", 0);
+  s.noteNativeOpen("C", 1);
+  var permit = s.acquireProviderPermit("B", "segment");
+  assert.ok(permit);
+  s.notePermitAcquired("B");
+  assert.ok(s.getJob("B").inFlightPermits >= 2);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  var bToken = s.getJob("B").attemptToken;
+  assert.equal(typeof bToken, "string");
+  assert.ok(bToken.trim().length > 0);
+
+  s.onTransportResult("C", s.getJob("C").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").attemptToken, null);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.ok(s.getJob("B").inFlightPermits >= 2);
+
+  // Last physical permits release → ordinary quiesce to waiting (no native terminal wait).
+  s.releasePermit("B");
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  permit.release();
+  assert.equal(s.getJob("B").state, "waiting_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.getJob("B").inFlightPermits, 0);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").attemptToken, null);
+  // Old public token must not authenticate via the private draining channel.
+  assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), false);
+  assert.equal(s.getJob("B").state, "waiting_provider");
+  assert.equal(fx.n, 0);
+  assertSlotInvariant(s);
+  assertPermitAndOwnerInvariants(s);
+
+  // Native-positive control in the same suite: 12D holds pausing after native zero
+  // until the matching terminal. Repeat a minimal native-positive sibling here.
+  var topo = setupABCPausingB();
+  var s2 = topo.s;
+  s2.noteNativeOpen("B", 0);
+  assert.equal(s2.getJob("B").state, "pausing_provider");
+  assert.equal(s2.getJob("B").holdsGlobalSlot, true);
+  assert.equal(s2.getJob("B").attemptToken, null);
+  assert.equal(s2.onDrainingTransportResult("B", topo.bToken, completedResult()), true);
+  assert.equal(s2.getJob("B").state, "completed");
+  assert.equal(s2.getJob("B").holdsGlobalSlot, false);
+  assert.equal(topo.firefoxCalls.n, 0);
+  assertSlotInvariant(s2);
+});
+
+test("12F cancel after counters zero but before terminal remains pausing then cancels once", () => {
+  var topo = setupABCPausingB();
+  var s = topo.s;
+
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(s.getJob("B").attemptToken, null);
+
+  s.cancel("B");
+  // Must remain pausing/slot-held until the matching semantic terminal arrives.
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(s.getJob("B").attemptToken, null);
+  assert.equal(topo.clearB.n, 0);
+
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), true);
+  assert.equal(s.getJob("B").state, "cancelled");
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(topo.clearB.n, 1);
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), false);
+  assert.equal(topo.firefoxCalls.n, 0);
+  assertSlotInvariant(s);
+});
+
+test("12G transport unavailable in retained-token/quiescent state parks needs_user", () => {
+  var topo = setupABCPausingB();
+  var s = topo.s;
+
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+
+  assert.equal(s.onTransportUnavailable("B"), true);
+  assert.equal(s.getJob("B").state, "needs_user");
+  assert.equal(s.getJob("B").holdsGlobalSlot, false);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").attemptToken, null);
+  // Old terminal inert after unavailable cleared auth.
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, completedResult()), false);
+  assert.equal(s.getJob("B").state, "needs_user");
+  assert.equal(topo.firefoxCalls.n, 0);
+  assert.equal(topo.clearB.n, 0); // ephemeral retained for manualRetry
+  assertSlotInvariant(s);
+});
+
+test("12H failed-job with no private token still moves to waiting on counter zero", () => {
+  var s = createDownloadScheduler({
+    maxConcurrent: 3,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {},
+  });
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.noteNativeOpen("A", 1);
+  s.noteNativeOpen("B", 0);
+  s.noteNativeOpen("C", 1);
+  var cToken = s.getJob("C").attemptToken;
+  s.onTransportResult("C", cToken, {
+    status: "failed",
+    failureCategory: "timeout",
+  });
+  assert.equal(s.getJob("C").state, "pausing_provider");
+  assert.equal(s.getJob("C").attemptToken, null);
+  // No private drain identity → counter zero must not strand in pausing.
+  s.noteNativeOpen("C", 0);
+  assert.equal(s.getJob("C").state, "waiting_provider");
+  assert.equal(s.getJob("C").holdsGlobalSlot, false);
+  assert.equal(s.onDrainingTransportResult("C", cToken, completedResult()), false);
+  assertSlotInvariant(s);
+});
+
+// ---------------------------------------------------------------------------
+// 13. validateDrainingResult descriptor hardening (via onDrainingTransportResult)
+// ---------------------------------------------------------------------------
+
+test("13I descriptor hardening: accessors/proxy traps never mutate; cancelled category rules", () => {
+  var topo = setupABCPausingB();
+  var s = topo.s;
+  var snap = s.getJob("B");
+  var nativeBefore = snap.nativeOpenConnections;
+  var verBefore = snap.stateVersion;
+  var retriesBefore = snap.retryRemaining;
+  var modeBefore = snap.mode;
+
+  function assertUnchanged() {
+    var j = s.getJob("B");
+    assert.equal(j.state, "pausing_provider");
+    assert.equal(j.nativeOpenConnections, nativeBefore);
+    assert.equal(j.stateVersion, verBefore);
+    assert.equal(j.holdsGlobalSlot, true);
+    assert.equal(j.attemptToken, null);
+    assert.equal(j.retryRemaining, retriesBefore);
+    assert.equal(j.mode, modeBefore);
+  }
+
+  // Accessor getters for each of the four fields must never be invoked.
+  ["status", "mode", "partState", "failureCategory"].forEach(function (key) {
+    var hits = { n: 0 };
+    var hostile = {
+      status: "completed",
+      mode: "multi-range",
+      partState: "committed",
+      failureCategory: null,
+    };
+    Object.defineProperty(hostile, key, {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        hits.n += 1;
+        throw new Error("SECRET_ACCESSOR_" + key);
+      },
+    });
+    var threw = false;
+    var ok;
+    try {
+      ok = s.onDrainingTransportResult("B", topo.bToken, hostile);
+    } catch (e) {
+      threw = true;
+    }
+    assert.equal(threw, false, "accessor trap must not propagate for " + key);
+    assert.equal(ok, false);
+    assert.equal(hits.n, 0, "accessor for " + key + " must never run");
+    assertUnchanged();
+  });
+
+  // Proxy getOwnPropertyDescriptor traps cannot leak thrown Error.
+  var proxyHits = { n: 0 };
+  var proxy = new Proxy(
+    {
+      status: "completed",
+      mode: "multi-range",
+      partState: "committed",
+      failureCategory: null,
+    },
+    {
+      getOwnPropertyDescriptor: function () {
+        proxyHits.n += 1;
+        throw new Error("SECRET_GOPD");
+      },
+      get: function () {
+        throw new Error("SECRET_GET");
+      },
+      ownKeys: function () {
+        throw new Error("SECRET_KEYS");
+      },
+    }
+  );
+  var proxyThrew = false;
+  var proxyOk;
+  try {
+    proxyOk = s.onDrainingTransportResult("B", topo.bToken, proxy);
+  } catch (e) {
+    proxyThrew = true;
+  }
+  assert.equal(proxyThrew, false);
+  assert.equal(proxyOk, false);
+  assertUnchanged();
+
+  // Missing / invalid data fails false without mutation.
+  assert.equal(s.onDrainingTransportResult("B", topo.bToken, {}), false);
+  assertUnchanged();
+  assert.equal(
+    s.onDrainingTransportResult("B", topo.bToken, {
+      status: "completed",
+      mode: "multi-range",
+      partState: "committed",
+      // failureCategory absent ok for completed; but wrong partState tested elsewhere
+    }),
+    true
+  );
+  // First valid completed consumed — rebuild topology for cancelled rules.
+  assert.equal(s.getJob("B").state, "completed");
+
+  // Cancelled category allowlist: null / absent / exact "cancelled" accepted;
+  // timeout / arbitrary / object / boxed rejected.
+  function setupPausedB() {
+    return setupABCPausingB();
+  }
+
+  // null category
+  var t1 = setupPausedB();
+  assert.equal(
+    t1.s.onDrainingTransportResult("B", t1.bToken, {
+      status: "cancelled",
+      mode: "multi-range",
+      partState: "partial",
+      failureCategory: null,
+    }),
+    true
+  );
+  assert.equal(t1.s.getJob("B").state, "waiting_provider");
+
+  // absent category
+  var t2 = setupPausedB();
+  assert.equal(
+    t2.s.onDrainingTransportResult("B", t2.bToken, {
+      status: "cancelled",
+      mode: "multi-range",
+      partState: "partial",
+    }),
+    true
+  );
+  assert.equal(t2.s.getJob("B").state, "waiting_provider");
+
+  // exact primitive "cancelled"
+  var t3 = setupPausedB();
+  assert.equal(
+    t3.s.onDrainingTransportResult("B", t3.bToken, cancelledResult()),
+    true
+  );
+  assert.equal(t3.s.getJob("B").state, "waiting_provider");
+
+  // rejected cancelled categories
+  [
+    "timeout",
+    "arbitrary",
+    { x: 1 },
+    new String("cancelled"),
+    0,
+    false,
+    "",
+  ].forEach(function (badCat) {
+    var t = setupPausedB();
+    var before = t.s.getJob("B");
+    var n = before.nativeOpenConnections;
+    var v = before.stateVersion;
+    assert.equal(
+      t.s.onDrainingTransportResult("B", t.bToken, {
+        status: "cancelled",
+        mode: "multi-range",
+        partState: "partial",
+        failureCategory: badCat,
+      }),
+      false
+    );
+    assert.equal(t.s.getJob("B").state, "pausing_provider");
+    assert.equal(t.s.getJob("B").nativeOpenConnections, n);
+    assert.equal(t.s.getJob("B").stateVersion, v);
+    assert.equal(t.firefoxCalls.n, 0);
+  });
+});
+
+test("13J allowlist rejects inherited Object.prototype keys as membership", () => {
+  // Cancelled with partState "__proto__" must not pass via prototype chain.
+  var t1 = setupABCPausingB();
+  var before1 = t1.s.getJob("B");
+  assert.equal(
+    t1.s.onDrainingTransportResult("B", t1.bToken, {
+      status: "cancelled",
+      mode: "multi-range",
+      partState: "__proto__",
+      failureCategory: "cancelled",
+    }),
+    false
+  );
+  assert.equal(t1.s.getJob("B").state, "pausing_provider");
+  assert.equal(t1.s.getJob("B").nativeOpenConnections, before1.nativeOpenConnections);
+  assert.equal(t1.s.getJob("B").stateVersion, before1.stateVersion);
+  assert.equal(t1.s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(t1.firefoxCalls.n, 0);
+
+  // Failed with category "constructor" must not pass via Object.prototype.constructor.
+  var t2 = setupABCPausingB();
+  var before2 = t2.s.getJob("B");
+  assert.equal(
+    t2.s.onDrainingTransportResult("B", t2.bToken, {
+      status: "failed",
+      mode: "multi-range",
+      partState: "partial",
+      failureCategory: "constructor",
+    }),
+    false
+  );
+  assert.equal(t2.s.getJob("B").state, "pausing_provider");
+  assert.equal(t2.s.getJob("B").nativeOpenConnections, before2.nativeOpenConnections);
+  assert.equal(t2.s.getJob("B").stateVersion, before2.stateVersion);
+  assert.equal(t2.s.getJob("B").holdsGlobalSlot, true);
+  assert.equal(t2.firefoxCalls.n, 0);
+
+  // toString must also be inert for status membership.
+  var t3 = setupABCPausingB();
+  var before3 = t3.s.getJob("B");
+  assert.equal(
+    t3.s.onDrainingTransportResult("B", t3.bToken, {
+      status: "toString",
+      mode: "multi-range",
+      partState: "committed",
+      failureCategory: null,
+    }),
+    false
+  );
+  assert.equal(t3.s.getJob("B").state, "pausing_provider");
+  assert.equal(t3.s.getJob("B").stateVersion, before3.stateVersion);
+
+  // Exact valid built-in primitives still accepted after hardening.
+  assert.equal(
+    t3.s.onDrainingTransportResult("B", t3.bToken, completedResult()),
+    true
+  );
+  assert.equal(t3.s.getJob("B").state, "completed");
+  assert.equal(t3.firefoxCalls.n, 0);
+  assertSlotInvariant(t1.s);
+  assertSlotInvariant(t2.s);
+  assertSlotInvariant(t3.s);
+});
