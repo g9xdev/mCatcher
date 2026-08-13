@@ -38,8 +38,10 @@ const DEFAULT_SETTINGS = {
   enableCasting: false,         // panel: Now-Casting transport + per-item Cast buttons (preview — network backend pending)
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
+let liveController = null;
+let liveControllerInitialized = false;
 
-api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
+const settingsReady = api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
   // One-time migrations to newer defaults, each guarded by its own flag so a later
   // deliberate choice is respected (won't be re-applied on the next load).
@@ -53,7 +55,59 @@ api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
     flags.dq1done = true;
   }
   if (Object.keys(flags).length) api.storage.local.set(Object.assign({ settings }, flags)).catch(() => {});
-}).catch(() => {});
+}, () => {}).then(() => initializeLiveController());
+
+function mintLiveToken() {
+  const secure = typeof crypto !== "undefined" ? crypto : self.crypto;
+  if (secure && typeof secure.randomUUID === "function") return secure.randomUUID();
+  if (secure && typeof secure.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    secure.getRandomValues(bytes);
+    return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  throw new Error("Secure token generation unavailable.");
+}
+
+function isExtensionPopupSender(sender) {
+  return !!sender && sender.id === api.runtime.id &&
+    sender.url === api.runtime.getURL("popup/popup.html");
+}
+
+function initializeLiveController() {
+  if (liveControllerInitialized) return liveController;
+  liveControllerInitialized = true;
+  const liveAssembler = self.McLiveMediaAssembler.createLiveMediaAssembler({
+    HLS: self.HLS,
+    DASH: self.DASH,
+    Mux: self.Mux,
+  });
+  liveController = self.McBackgroundAdapters.createBackgroundAdapters({
+    maxConcurrent: settings.maxConcurrentDownloads,
+    segmentConcurrency: settings.concurrency,
+    retries: settings.retries,
+    now: () => Date.now(),
+    randomToken: () => mintLiveToken(),
+    postNative: (command) => {
+      if (!nativePort) throw new Error("Native helper unavailable.");
+      return nativePort.postMessage(command);
+    },
+    downloadsDownload: (options) => api.downloads.download(options),
+    createObjectURL: (blob) => URL.createObjectURL(blob),
+    revokeObjectURL: (url) => URL.revokeObjectURL(url),
+    fetchArrayBuffer: (tabId, url, options) => makeOneShotFetchFn(tabId)(url, options),
+    assembleMedia: liveAssembler,
+    isPopupSender: isExtensionPopupSender,
+    getEffectiveDestinationDirectory: () => settings.saveFolder || null,
+    publishDetection: () => broadcast({ type: "live-media-updated" }),
+    publishJobs: (jobs) => broadcast({ type: "live-jobs-updated", jobs }),
+    persistHistory: (entry) => addHistory(entry),
+    reportDiagnostic: (diagnostic) => mclog(
+      "warn",
+      "policy: " + String(diagnostic && diagnostic.code || "unknown")
+    ),
+  });
+  return liveController;
+}
 
 // ---- diagnostics log + update history (Settings "Log console" panel) -------
 // A rolling buffer of structured log lines (extension + host + guardian) and a
@@ -235,6 +289,12 @@ function connectNative() {
     nativePort = api.runtime.connectNative(NATIVE_HOST);
     nativePort.onMessage.addListener(onNativeMessage);
     nativePort.onDisconnect.addListener(() => {
+      const controller = liveController;
+      if (controller) {
+        Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
+          mclog("warn", "policy disconnect: " + (e && e.message ? e.message : String(e)));
+        });
+      }
       const err = api.runtime.lastError && api.runtime.lastError.message;
       dlog("native host disconnected", err || "");
       mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
@@ -257,6 +317,19 @@ function connectNative() {
 }
 
 function onNativeMessage(msg) {
+  const controller = liveController;
+  if (!controller) {
+    onLegacyNativeMessage(msg);
+    return;
+  }
+  Promise.resolve().then(() => controller.handleNativeMessage(msg)).then((handled) => {
+    if (handled !== true) onLegacyNativeMessage(msg);
+  }).catch((e) => {
+    mclog("warn", "policy native frame: " + (e && e.message ? e.message : String(e)));
+  });
+}
+
+function onLegacyNativeMessage(msg) {
   if (!msg) return;
   if (msg.type === "log") {
     // a structured line from the host or guardian → the live console
@@ -1266,6 +1339,26 @@ function makeFetchFn(tabId) {
       }
     }
     throw lastErr;
+  };
+}
+
+// One authenticated browser fetch bound to the immutable source tab context.
+// Retry ownership belongs to the live scheduler/assembler path.
+function makeOneShotFetchFn(tabId) {
+  const ctx = tabContext.get(tabId) || {};
+  return async function (url, opts) {
+    opts = opts || {};
+    const token = "mc_" + mintLiveToken();
+    taggedRequests.set(token, { referer: ctx.referer, origin: ctx.origin });
+    try {
+      const headers = { "X-MC-Token": token };
+      if (opts.range) headers.Range = opts.range;
+      const resp = await fetch(url, { credentials: "include", headers });
+      if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
+      return await resp.arrayBuffer();
+    } finally {
+      taggedRequests.delete(token);
+    }
   };
 }
 
