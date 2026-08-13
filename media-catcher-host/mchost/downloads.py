@@ -1071,9 +1071,11 @@ _YTDL_DELETE = 0x00010000
 _YTDL_SYNCHRONIZE = 0x00100000
 _YTDL_FILE_LIST_DIRECTORY = 0x0001
 _YTDL_FILE_ADD_FILE = 0x0002
+_YTDL_FILE_ADD_SUBDIRECTORY = 0x0004
 _YTDL_FILE_TRAVERSE = 0x0020
 _YTDL_FILE_READ_ATTRIBUTES = 0x0080
 _YTDL_FILE_READ_DATA = 0x0001
+_YTDL_FILE_WRITE_DATA = 0x0002
 _YTDL_FILE_SHARE_READ = 0x00000001
 _YTDL_FILE_SHARE_WRITE = 0x00000002
 _YTDL_OPEN_EXISTING = 3
@@ -1091,13 +1093,31 @@ _YTDL_FILE_CREATE = 2
 _YTDL_FILE_OPEN = 1
 _YTDL_OBJ_CASE_INSENSITIVE = 0x00000040
 
+_YTDL_FileDirectoryInformation = 1  # NtQueryDirectoryFile class; 64-byte header
 _YTDL_FileStandardInfo = 1
 _YTDL_FileDispositionInfo = 4
 _YTDL_FileAttributeTagInfo = 9
-_YTDL_FileNamesInformation = 12
 _YTDL_FileIdInfo = 18
 _YTDL_FileRenameInformation = 10  # NtSetInformationFile class (not Win32 FileRenameInfo=3)
 _YTDL_INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+# FileDirectoryInformation fixed header: NextEntryOffset@0, FileNameLength@60, FileName@64.
+_YTDL_DIR_INFO_HEADER = 64
+_YTDL_DIR_INFO_NAME_LEN_OFF = 60
+_YTDL_DIR_INFO_NAME_OFF = 64
+
+# Finite cleanup bounds — exhaustion returns False and safely leaks.
+_YTDL_CLEANUP_MAX_DEPTH = 64
+_YTDL_CLEANUP_MAX_QUERIES = 4096
+_YTDL_CLEANUP_MAX_ENTRIES = 65536
+_YTDL_CLEANUP_BUF_SIZE = 4096
+
+# DOS device reserved basenames (case-insensitive), including extension variants.
+_YTDL_DOS_RESERVED = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
 
 
 class _YTDL_UNICODE_STRING(ctypes.Structure):
@@ -1169,15 +1189,6 @@ class _YTDL_FILE_RENAME_INFORMATION(ctypes.Structure):
     ]
 
 
-class _YTDL_FILE_NAMES_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("NextEntryOffset", wintypes.ULONG),
-        ("FileIndex", wintypes.ULONG),
-        ("FileNameLength", wintypes.ULONG),
-        ("FileName", wintypes.WCHAR * 1),
-    ]
-
-
 def _ytdl_rename_info_offsets():
     """Portable FILE_RENAME_INFORMATION field offsets for tests/ABI checks."""
     return {
@@ -1201,7 +1212,6 @@ def _ytdl_build_rename_buffer(root_handle, leaf):
     off = _YTDL_FILE_RENAME_INFORMATION.FileName.offset
     size = max(ctypes.sizeof(_YTDL_FILE_RENAME_INFORMATION), off + len(enc))
     buf = ctypes.create_string_buffer(size)
-    # ReplaceIfExists already 0; store RootDirectory + FileNameLength portably.
     root_v = wintypes.HANDLE(int(root_handle))
     ctypes.memmove(
         ctypes.addressof(buf) + _YTDL_FILE_RENAME_INFORMATION.RootDirectory.offset,
@@ -1219,6 +1229,14 @@ def _ytdl_build_rename_buffer(root_handle, leaf):
     return buf, size, len(enc), enc
 
 
+def _ytdl_is_dos_device_name(name):
+    """True for CON/PRN/AUX/NUL/COM1-9/LPT1-9 including extension variants."""
+    if type(name) is not str or not name:
+        return False
+    stem = name.split(".", 1)[0]
+    return stem.upper() in _YTDL_DOS_RESERVED
+
+
 def _ytdl_is_safe_relative_leaf(name):
     """True for a single built-in nonblank control-free path leaf (no ADS/traversal)."""
     if type(name) is not str or not name or not name.strip():
@@ -1229,36 +1247,89 @@ def _ytdl_is_safe_relative_leaf(name):
         return False
     if "/" in name or "\\" in name or "\x00" in name:
         return False
-    if ":" in name:  # ADS / drive-qualified
+    if ":" in name:
         return False
     if name.rstrip(" .") != name:
+        return False
+    if _ytdl_is_dos_device_name(name):
         return False
     return True
 
 
-def _ytdl_is_local_abs_win_path(path):
-    """Built-in absolute local Windows path; UNC/network shapes fail closed."""
-    if type(path) is not str or not path.strip():
-        return False
-    if not _ytdl_control_free_str(path):
-        return False
+def _ytdl_norm_seps_case(path):
+    """Case-insensitive separator normalization that does not collapse components."""
+    if type(path) is not str:
+        return None
     try:
-        if not os.path.isabs(path):
-            return False
+        return os.path.normcase(path.replace("/", "\\"))
     except Exception:
-        return False
-    # Reject UNC \\server\share and //server/share (no network path support).
-    if path.startswith("\\\\") or path.startswith("//"):
-        # Allow long-path local \\?\C:\... only.
-        if path.startswith("\\\\?\\") and len(path) > 6 and path[5] == ":" and path[4].isalpha():
-            return True
-        if path.startswith("\\\\.\\"):
-            return False
-        return False
-    # Drive-letter absolute: C:\...
-    if len(path) >= 3 and path[1] == ":" and path[0].isalpha() and path[2] in "\\/":
-        return True
-    return False
+        return None
+
+
+def _ytdl_split_dest_path(path):
+    """Split an ordinary absolute DOS or UNC path into (root, components).
+
+    Returns None for device/global-root/drive-relative/ADS/control/dot-dot/
+    reserved/trailing-dot-space shapes. Components are validated leaves.
+    """
+    if type(path) is not str or not path or not path.strip():
+        return None
+    if not _ytdl_control_free_str(path):
+        return None
+    p = path.replace("/", "\\")
+    if p.startswith("\\\\.\\") or p.startswith("\\\\?\\"):
+        return None
+    if "\x00" in p:
+        return None
+
+    root = None
+    rest = None
+    if p.startswith("\\\\"):
+        body = p[2:]
+        if not body or body.startswith("\\"):
+            return None
+        parts = [x for x in body.split("\\")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return None
+        if any(x == "" for x in parts):
+            return None
+        server, share = parts[0], parts[1]
+        if server in (".", "..") or share in (".", ".."):
+            return None
+        if ":" in server or ":" in share:
+            return None
+        root = "\\\\" + server + "\\" + share
+        rest = parts[2:]
+    else:
+        if len(p) < 3 or p[1] != ":" or not p[0].isalpha() or p[2] != "\\":
+            return None
+        if ":" in p[2:]:
+            return None
+        root = p[:3]
+        rest = [x for x in p[3:].split("\\")] if len(p) > 3 else []
+        if rest == [""]:
+            rest = []
+        elif any(x == "" for x in rest):
+            return None
+
+    comps = []
+    for c in rest:
+        if c in (".", ".."):
+            return None
+        if not _ytdl_is_safe_relative_leaf(c):
+            return None
+        comps.append(c)
+    return root, comps
+
+
+def _ytdl_is_allowed_dest_path(path):
+    """Ordinary absolute DOS drive or UNC share path suitable for Save As."""
+    return _ytdl_split_dest_path(path) is not None
+
+
+def _ytdl_is_local_abs_win_path(path):
+    """Backward-compatible name: allowed structured destination path shapes."""
+    return _ytdl_is_allowed_dest_path(path)
 
 
 def _ytdl_canon_path_key(path):
@@ -1266,6 +1337,16 @@ def _ytdl_canon_path_key(path):
         return os.path.normcase(os.path.abspath(path))
     except Exception:
         return None
+
+
+def _ytdl_display_join(base, leaf):
+    """Join base display path with a single leaf using native separators."""
+    if type(base) is not str or type(leaf) is not str:
+        raise TypeError("display join")
+    b = base.replace("/", "\\")
+    if b.endswith("\\"):
+        return b + leaf
+    return b + "\\" + leaf
 
 
 class _YtdlWinApi:
@@ -1379,7 +1460,7 @@ def _ytdl_set_disposition_delete(handle):
 
 
 def _ytdl_query_tag_std(handle):
-    """Return (attrs, is_dir, delete_pending, is_reparse) or None."""
+    """Return (attrs, is_dir, delete_pending, is_reparse, std) or None."""
     api = _ytdl_winapi()
     if not api or not handle:
         return None
@@ -1426,7 +1507,7 @@ def _ytdl_query_file_id(handle):
 
 
 def _ytdl_final_path(handle):
-    """Optional diagnostic GetFinalPathNameByHandleW; never vetoes a commit."""
+    """Optional diagnostic GetFinalPathNameByHandleW; never authority for validation."""
     api = _ytdl_winapi()
     if not api or not handle:
         return None
@@ -1454,10 +1535,10 @@ def _ytdl_paths_compatible(requested_abs, final_path):
     try:
         a = os.path.normcase(os.path.abspath(requested_abs))
         b = final_path
-        if b.startswith("\\\\?\\"):
-            b = b[4:]
         if b.startswith("\\\\?\\UNC\\"):
-            return False
+            b = "\\\\" + b[8:]
+        elif b.startswith("\\\\?\\"):
+            b = b[4:]
         b = os.path.normcase(os.path.abspath(b))
         return a == b
     except Exception:
@@ -1465,13 +1546,22 @@ def _ytdl_paths_compatible(requested_abs, final_path):
 
 
 def _ytdl_make_unicode_string(leaf, keep):
-    """Build UNICODE_STRING for a relative leaf; keep holds the buffer alive."""
-    buf = ctypes.create_unicode_buffer(leaf)
+    """Build UNICODE_STRING for a relative leaf; keep holds the buffer alive.
+
+    Length/MaximumLength use the exact UTF-16LE byte length (surrogate-aware),
+    not Python code-point count.
+    """
+    if type(leaf) is not str:
+        raise TypeError("leaf")
+    enc = leaf.encode("utf-16-le")
+    raw = ctypes.create_string_buffer(len(enc) + 2)
+    if enc:
+        ctypes.memmove(raw, enc, len(enc))
     us = _YTDL_UNICODE_STRING()
-    us.Length = len(leaf) * 2
-    us.MaximumLength = us.Length + 2
-    us.Buffer = ctypes.addressof(buf)
-    keep.append(buf)
+    us.Length = len(enc)
+    us.MaximumLength = len(enc) + 2
+    us.Buffer = ctypes.addressof(raw)
+    keep.append(raw)
     return us
 
 
@@ -1480,11 +1570,23 @@ def _ytdl_nt_create_relative(
     file_attributes=0,
 ):
     """NtCreateFile relative to root_handle for a single safe leaf. Returns handle or None."""
+    h, code = _ytdl_nt_create_relative_status(
+        root_handle, leaf, desired_access, share_access, create_disposition,
+        create_options, file_attributes=file_attributes,
+    )
+    return h
+
+
+def _ytdl_nt_create_relative_status(
+    root_handle, leaf, desired_access, share_access, create_disposition, create_options,
+    file_attributes=0,
+):
+    """Like _ytdl_nt_create_relative but returns (handle_or_None, ntstatus_code)."""
     api = _ytdl_winapi()
     if not api or not root_handle:
-        return None
+        return None, 0xC0000001
     if not _ytdl_is_safe_relative_leaf(leaf):
-        return None
+        return None, 0xC0000001
     keep = []
     try:
         us = _ytdl_make_unicode_string(leaf, keep)
@@ -1510,34 +1612,177 @@ def _ytdl_nt_create_relative(
             None,
             0,
         )
-        if (status & 0xFFFFFFFF) != _YTDL_STATUS_SUCCESS:
-            return None
-        return int(handle.value)
+        code = status & 0xFFFFFFFF
+        if code != _YTDL_STATUS_SUCCESS:
+            return None, code
+        return int(handle.value), code
     except Exception:
+        return None, 0xC0000001
+
+
+def _ytdl_validate_dir_handle(handle):
+    """Require disk directory, non-reparse, non-delete-pending. FileId required."""
+    meta = _ytdl_query_tag_std(handle)
+    if meta is None:
+        return False
+    _attrs, is_dir, delete_pending, is_reparse, _std = meta
+    if not is_dir or delete_pending or is_reparse:
+        return False
+    if _ytdl_query_file_id(handle) is None:
+        return False
+    return True
+
+
+def _ytdl_dir_access_min():
+    """Traverse/list access sufficient to pin an ancestor without SHARE_DELETE."""
+    return (
+        _YTDL_FILE_LIST_DIRECTORY
+        | _YTDL_FILE_TRAVERSE
+        | _YTDL_FILE_READ_ATTRIBUTES
+        | _YTDL_SYNCHRONIZE
+    )
+
+
+def _ytdl_dir_access_full():
+    """Full dir access for create/rename-root/stage parents when granted."""
+    return (
+        _YTDL_DELETE
+        | _YTDL_FILE_LIST_DIRECTORY
+        | _YTDL_FILE_ADD_FILE
+        | _YTDL_FILE_ADD_SUBDIRECTORY
+        | _YTDL_FILE_TRAVERSE
+        | _YTDL_FILE_READ_ATTRIBUTES
+        | _YTDL_SYNCHRONIZE
+    )
+
+
+def _ytdl_open_path_root(root_display):
+    """Open a DOS drive root or UNC share root with no SHARE_DELETE.
+
+    Drive roots commonly deny DELETE/ADD; open with traverse/list only and
+    BACKUP_SEMANTICS. OPEN_REPARSE_POINT is attempted as a secondary option.
+    """
+    api = _ytdl_winapi()
+    if not api or type(root_display) is not str:
         return None
+    access = _ytdl_dir_access_min()
+    share = _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE
+    for flags in (
+        _YTDL_FILE_FLAG_BACKUP_SEMANTICS,
+        _YTDL_FILE_FLAG_BACKUP_SEMANTICS | _YTDL_FILE_FLAG_OPEN_REPARSE_POINT,
+    ):
+        try:
+            h = api.k32.CreateFileW(
+                root_display, access, share, None, _YTDL_OPEN_EXISTING, flags, None,
+            )
+        except Exception:
+            continue
+        hv = int(h) if h else 0
+        if not hv or hv == int(_YTDL_INVALID_HANDLE_VALUE):
+            continue
+        if not _ytdl_validate_dir_handle(hv):
+            _ytdl_close_handle(hv)
+            continue
+        return hv
+    return None
+
+
+def _ytdl_open_or_create_component(parent_handle, leaf):
+    """Open existing or atomically create a directory component relative to parent.
+
+    Never exists-checks via pathname. On FILE_CREATE name collision, reopen + validate.
+    Prefer full access; fall back to traverse/list when the object denies ADD/DELETE.
+    """
+    share = _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE
+    options_open = (
+        _YTDL_FILE_DIRECTORY_FILE
+        | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+        | _YTDL_FILE_OPEN_REPARSE_POINT
+    )
+    options_open_plain = (
+        _YTDL_FILE_DIRECTORY_FILE
+        | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+    )
+
+    def _try_open(desired, options):
+        return _ytdl_nt_create_relative(
+            parent_handle, leaf, desired, share, _YTDL_FILE_OPEN, options,
+        )
+
+    h = None
+    for desired in (_ytdl_dir_access_full(), _ytdl_dir_access_min()):
+        for options in (options_open, options_open_plain):
+            h = _try_open(desired, options)
+            if h:
+                break
+        if h:
+            break
+    if h:
+        if not _ytdl_validate_dir_handle(h):
+            _ytdl_close_handle(h)
+            return None
+        return h
+
+    # Missing: atomic create with full access.
+    options_create = (
+        _YTDL_FILE_DIRECTORY_FILE
+        | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+        | _YTDL_FILE_OPEN_REPARSE_POINT
+    )
+    h, code = _ytdl_nt_create_relative_status(
+        parent_handle, leaf, _ytdl_dir_access_full(), share,
+        _YTDL_FILE_CREATE, options_create,
+        file_attributes=_YTDL_FILE_ATTRIBUTE_DIRECTORY,
+    )
+    if h:
+        if not _ytdl_validate_dir_handle(h):
+            _ytdl_set_disposition_delete(h)
+            _ytdl_close_handle(h)
+            return None
+        return h
+    if code == _YTDL_STATUS_OBJECT_NAME_COLLISION:
+        for desired in (_ytdl_dir_access_full(), _ytdl_dir_access_min()):
+            h = _try_open(desired, options_open)
+            if h:
+                break
+        if not h:
+            return None
+        if not _ytdl_validate_dir_handle(h):
+            _ytdl_close_handle(h)
+            return None
+        return h
+    return None
+
+
+def _ytdl_close_chain(chain):
+    """Close handles in reverse order exactly once."""
+    if not chain:
+        return
+    for h in reversed(list(chain)):
+        if h:
+            _ytdl_close_handle(h)
 
 
 def _ytdl_acquire_dest_lease(out_path):
-    """Pin destination directory handle with shared process-local refcount.
+    """Pin the full destination directory chain by handle with process-local refcount.
 
-    Access: DELETE|LIST|ADD_FILE|TRAVERSE|READ_ATTRIBUTES|SYNCHRONIZE
-    Share: READ|WRITE (no SHARE_DELETE)
-    Flags: BACKUP_SEMANTICS|OPEN_REPARSE_POINT
+    Opens the immutable drive/UNC root, then each component relative to its retained
+    parent (FILE_OPEN + OPEN_REPARSE_POINT, no SHARE_DELETE). Missing components are
+    created with FILE_CREATE|FILE_DIRECTORY_FILE (collision -> reopen). Never uses
+    os.makedirs. GetFinalPathNameByHandleW is diagnostic only.
     """
     api = _ytdl_winapi()
     if not api:
         return None
-    if not _ytdl_is_local_abs_win_path(out_path):
+    split = _ytdl_split_dest_path(out_path)
+    if split is None:
         return None
-    try:
-        os.makedirs(out_path, exist_ok=True)
-    except Exception:
-        return None
-    key = _ytdl_canon_path_key(out_path)
+    root_display, components = split
+    display = root_display
+    for c in components:
+        display = _ytdl_display_join(display, c)
+    key = _ytdl_canon_path_key(display)
     if not key:
-        return None
-    display = os.path.abspath(out_path)
-    if type(display) is not str:
         return None
 
     with _YTDL_DEST_LOCK:
@@ -1546,55 +1791,39 @@ def _ytdl_acquire_dest_lease(out_path):
             existing["refcount"] += 1
             return existing
 
-        access = (
-            _YTDL_DELETE
-            | _YTDL_FILE_LIST_DIRECTORY
-            | _YTDL_FILE_ADD_FILE
-            | _YTDL_FILE_TRAVERSE
-            | _YTDL_FILE_READ_ATTRIBUTES
-            | _YTDL_SYNCHRONIZE
-        )
-        share = _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE
-        flags = _YTDL_FILE_FLAG_BACKUP_SEMANTICS | _YTDL_FILE_FLAG_OPEN_REPARSE_POINT
+        chain = []
         try:
-            h = api.k32.CreateFileW(
-                display, access, share, None, _YTDL_OPEN_EXISTING, flags, None,
-            )
+            root_h = _ytdl_open_path_root(root_display)
+            if not root_h:
+                return None
+            chain.append(root_h)
+            parent = root_h
+            for leaf in components:
+                child = _ytdl_open_or_create_component(parent, leaf)
+                if not child:
+                    _ytdl_close_chain(chain)
+                    return None
+                chain.append(child)
+                parent = child
+            final_h = chain[-1]
+            try:
+                _ytdl_final_path(final_h)
+            except Exception:
+                pass
+
+            lease = {
+                "key": key,
+                "handle": final_h,
+                "chain": list(chain),
+                "refcount": 1,
+                "display_path": display,
+                "closed": False,
+            }
+            _YTDL_DEST_LEASES[key] = lease
+            return lease
         except Exception:
+            _ytdl_close_chain(chain)
             return None
-        hv = int(h) if h else 0
-        if not hv or hv == int(_YTDL_INVALID_HANDLE_VALUE):
-            return None
-
-        meta = _ytdl_query_tag_std(hv)
-        if meta is None:
-            _ytdl_close_handle(hv)
-            return None
-        _attrs, is_dir, delete_pending, is_reparse, _std = meta
-        if not is_dir or delete_pending or is_reparse:
-            _ytdl_close_handle(hv)
-            return None
-
-        # One optional path consistency check at acquisition only.
-        # Diagnostic failures must not fail closed here — only a concrete
-        # incompatible resolved path rejects the lease.
-        try:
-            final = _ytdl_final_path(hv)
-        except Exception:
-            final = None
-        if final is not None and not _ytdl_paths_compatible(display, final):
-            _ytdl_close_handle(hv)
-            return None
-
-        lease = {
-            "key": key,
-            "handle": hv,
-            "refcount": 1,
-            "display_path": display,
-            "closed": False,
-        }
-        _YTDL_DEST_LEASES[key] = lease
-        return lease
 
 
 def _ytdl_release_dest_lease(lease):
@@ -1604,7 +1833,6 @@ def _ytdl_release_dest_lease(lease):
         key = lease.get("key")
         cur = _YTDL_DEST_LEASES.get(key) if key else None
         if cur is not lease:
-            # Still decrement if we hold a stale view of the same object.
             if lease.get("closed"):
                 return
             rc = int(lease.get("refcount") or 0) - 1
@@ -1613,10 +1841,11 @@ def _ytdl_release_dest_lease(lease):
             lease["refcount"] = rc
             if rc == 0 and not lease.get("closed"):
                 lease["closed"] = True
-                h = lease.get("handle")
+                chain = list(lease.get("chain") or [])
                 lease["handle"] = None
-                if h:
-                    _ytdl_close_handle(h)
+                lease["chain"] = []
+                if chain:
+                    _ytdl_close_chain(chain)
             return
         rc = int(cur.get("refcount") or 0) - 1
         if rc < 0:
@@ -1625,14 +1854,15 @@ def _ytdl_release_dest_lease(lease):
         if rc == 0:
             _YTDL_DEST_LEASES.pop(key, None)
             cur["closed"] = True
-            h = cur.get("handle")
+            chain = list(cur.get("chain") or [])
             cur["handle"] = None
-            if h:
-                _ytdl_close_handle(h)
+            cur["chain"] = []
+            if chain:
+                _ytdl_close_chain(chain)
 
 
 def _ytdl_create_stage_dir(dest_lease):
-    """Create `.mc-ytdl-<uuid>` relative to the pinned destination handle."""
+    """Create `.mc-ytdl-<uuid>` relative to the pinned final destination handle."""
     if not dest_lease or not dest_lease.get("handle"):
         return None, None, None
     leaf = ".mc-ytdl-%s" % uuid.uuid4().hex
@@ -1658,47 +1888,65 @@ def _ytdl_create_stage_dir(dest_lease):
     )
     if not h:
         return None, None, None
-    meta = _ytdl_query_tag_std(h)
-    if meta is None:
-        _ytdl_close_handle(h)
-        return None, None, None
-    _attrs, is_dir, delete_pending, is_reparse, _std = meta
-    if not is_dir or delete_pending or is_reparse:
+    if not _ytdl_validate_dir_handle(h):
         _ytdl_set_disposition_delete(h)
         _ytdl_close_handle(h)
         return None, None, None
-    display = os.path.join(dest_lease["display_path"], leaf)
+    display = _ytdl_display_join(dest_lease["display_path"], leaf)
     return h, leaf, display
+
+
+def _ytdl_raw_direct_child_leaf(parent_display, child_path):
+    """Return leaf if child_path is an exact absolute direct child of parent_display.
+
+    Rejects raw dot/dotdot/nested/ADS/relative/device/trailing-dot-space forms
+    before any NtCreateFile. Case-insensitive separator normalization only —
+    does not collapse components via abspath.
+    """
+    if type(parent_display) is not str or type(child_path) is not str:
+        return None
+    if not child_path or not child_path.strip():
+        return None
+    if not _ytdl_control_free_str(child_path):
+        return None
+    c = child_path.replace("/", "\\")
+    if c.startswith("\\\\.\\") or c.startswith("\\\\?\\"):
+        return None
+    is_unc = c.startswith("\\\\")
+    is_drive = len(c) >= 3 and c[1] == ":" and c[0].isalpha() and c[2] == "\\"
+    if not is_unc and not is_drive:
+        return None
+    if is_drive and ":" in c[2:]:
+        return None
+    if c.endswith("\\") or c.endswith(" "):
+        return None
+    idx = c.rfind("\\")
+    if idx < 0:
+        return None
+    raw_parent = c[:idx]
+    leaf = c[idx + 1:]
+    if not leaf:
+        return None
+    pn = _ytdl_norm_seps_case(parent_display.rstrip("\\/"))
+    cn = _ytdl_norm_seps_case(raw_parent.rstrip("\\/"))
+    if pn is None or cn is None or pn != cn:
+        return None
+    if not _ytdl_is_safe_relative_leaf(leaf):
+        return None
+    return leaf
 
 
 def _ytdl_open_stage_source(stage_handle, stage_display, filepath):
     """Open @@FILE@@ as a direct child of the pinned stage handle.
 
     Returns dict(handle, size, leaf) or None. Handle authority only — no path
-    stat/lstat/realpath/getsize after open.
+    stat/lstat/realpath/getsize after open. Raw marker must be an exact absolute
+    direct child; abspath is never used to normalize traversal away.
     """
     if not stage_handle or type(stage_display) is not str:
         return None
-    if type(filepath) is not str or not filepath.strip():
-        return None
-    if not _ytdl_control_free_str(filepath):
-        return None
-    try:
-        if not os.path.isabs(filepath):
-            return None
-        filepath_abs = os.path.abspath(filepath)
-        stage_abs = os.path.abspath(stage_display)
-    except Exception:
-        return None
-    # Lexical parent must equal the pinned stage display path.
-    try:
-        parent = os.path.dirname(filepath_abs)
-        if os.path.normcase(parent) != os.path.normcase(stage_abs):
-            return None
-        leaf = os.path.basename(filepath_abs)
-    except Exception:
-        return None
-    if not _ytdl_is_safe_relative_leaf(leaf):
+    leaf = _ytdl_raw_direct_child_leaf(stage_display, filepath)
+    if leaf is None:
         return None
 
     desired = (
@@ -1707,7 +1955,6 @@ def _ytdl_open_stage_source(stage_handle, stage_display, filepath):
         | _YTDL_DELETE
         | _YTDL_SYNCHRONIZE
     )
-    # Share READ only — deny write/delete sharing after subprocess exit.
     share = _YTDL_FILE_SHARE_READ
     options = (
         _YTDL_FILE_NON_DIRECTORY_FILE
@@ -1757,6 +2004,39 @@ def _ytdl_candidate_leaves(safe_name, max_attempts=32):
     return out[:limit]
 
 
+def _ytdl_prebuild_commit_candidates(dest_lease, safe_name, max_attempts=32):
+    """Prebuild rename buffers and display paths before acquiring ytdl_lock.
+
+    Every leaf, UTF-16 rename buffer, and full display path is constructed here
+    so the lock-held commit path never performs path construction after NT success.
+    """
+    if not dest_lease or not dest_lease.get("handle"):
+        return []
+    base = dest_lease.get("display_path")
+    dest_h = dest_lease["handle"]
+    if type(base) is not str:
+        return []
+    leaves = _ytdl_candidate_leaves(safe_name, max_attempts=max_attempts)
+    out = []
+    for leaf in leaves:
+        try:
+            buf, size, flen, enc = _ytdl_build_rename_buffer(dest_h, leaf)
+            display = _ytdl_display_join(base, leaf)
+        except Exception:
+            return []
+        if type(display) is not str or not display:
+            return []
+        out.append({
+            "leaf": leaf,
+            "buf": buf,
+            "size": size,
+            "display": display,
+            "flen": flen,
+            "enc": enc,
+        })
+    return out
+
+
 def _ytdl_nt_rename_no_replace(source_handle, dest_handle, leaf):
     """NtSetInformationFile FileRenameInformation=10 relative no-replace rename.
 
@@ -1787,46 +2067,148 @@ def _ytdl_nt_rename_no_replace(source_handle, dest_handle, leaf):
         return "error"
 
 
-def _ytdl_commit_source(source_handle, dest_lease, safe_name, max_attempts=32):
-    """Atomic bounded no-replace commit under the caller's ytdl_lock.
+def _ytdl_commit_with_candidates(source_handle, candidates, op=None):
+    """Lock-held bounded no-replace commit using prebuilt candidates.
 
-    On success returns (display_path, size_from_source) and leaves source_handle
-    open on the committed object. On failure returns None (caller disposes source).
+    On NT success, when op is provided, `op['commit_claimed'] = True` is the
+    immediately adjacent Python state mutation before any path construction,
+    allocation, helper call, diagnostic, logging, cleanup, or lock release.
+    Returns the prebuilt display path on success, or None.
     """
-    if not source_handle or not dest_lease or not dest_lease.get("handle"):
+    api = _ytdl_winapi()
+    if not api or not source_handle or not candidates:
         return None
-    leaves = _ytdl_candidate_leaves(safe_name, max_attempts=max_attempts)
-    if not leaves:
-        return None
-    dest_h = dest_lease["handle"]
-    base = dest_lease["display_path"]
-    for leaf in leaves:
-        result = _ytdl_nt_rename_no_replace(source_handle, dest_h, leaf)
-        if result == "ok":
-            path = os.path.join(base, leaf)
-            return path
-        if result == "collision":
+    for cand in candidates:
+        buf = cand.get("buf")
+        size = cand.get("size")
+        display = cand.get("display")
+        if buf is None or not size or type(display) is not str:
+            return None
+        try:
+            iosb = _YTDL_IO_STATUS_BLOCK()
+            status = api.ntdll.NtSetInformationFile(
+                wintypes.HANDLE(int(source_handle)),
+                ctypes.byref(iosb),
+                buf,
+                int(size),
+                _YTDL_FileRenameInformation,
+            )
+            code = status & 0xFFFFFFFF
+        except Exception:
+            return None
+        if code == _YTDL_STATUS_SUCCESS:
+            if op is not None:
+                op["commit_claimed"] = True
+            return display
+        if code == _YTDL_STATUS_OBJECT_NAME_COLLISION:
             continue
         return None
     return None
 
 
+def _ytdl_commit_source(source_handle, dest_lease, safe_name, max_attempts=32, op=None):
+    """Atomic bounded no-replace commit.
+
+    Prefer calling _ytdl_prebuild_commit_candidates outside the lock, then
+    _ytdl_commit_with_candidates under the lock. This helper still prebuilds
+    first (before any rename) so post-rename path construction cannot run.
+    On success returns the prebuilt display path and leaves source_handle open
+    on the committed object. On failure returns None.
+    """
+    candidates = _ytdl_prebuild_commit_candidates(
+        dest_lease, safe_name, max_attempts=max_attempts,
+    )
+    if not candidates:
+        return None
+    return _ytdl_commit_with_candidates(source_handle, candidates, op=op)
+
+
 def _ytdl_dispose_handle(handle, delete=False):
-    """Idempotent exact-once close; optional disposition-delete first."""
+    """Idempotent exact-once close; optional disposition-delete first.
+
+    Disposition and close are best-effort. A raise from close accounting must
+    not skip releasing the OS handle (retry once) or propagate to demote a
+    committed final.
+    """
     if not handle:
         return
-    if delete:
-        _ytdl_set_disposition_delete(handle)
-    _ytdl_close_handle(handle)
+    try:
+        if delete:
+            try:
+                _ytdl_set_disposition_delete(handle)
+            except Exception:
+                pass
+        _ytdl_close_handle(handle)
+    except Exception:
+        try:
+            _ytdl_close_handle(handle)
+        except Exception:
+            pass
+
+
+def _ytdl_dir_is_empty(dir_handle, api):
+    """Recheck directory emptiness from the handle. Returns True/False/None(uncertain)."""
+    buf = ctypes.create_string_buffer(_YTDL_CLEANUP_BUF_SIZE)
+    iosb = _YTDL_IO_STATUS_BLOCK()
+    try:
+        status = api.ntdll.NtQueryDirectoryFile(
+            wintypes.HANDLE(int(dir_handle)),
+            None, None, None,
+            ctypes.byref(iosb),
+            buf, _YTDL_CLEANUP_BUF_SIZE,
+            _YTDL_FileDirectoryInformation,
+            False,
+            None,
+            True,
+        )
+    except Exception:
+        return None
+    code = status & 0xFFFFFFFF
+    if code == _YTDL_STATUS_NO_MORE_FILES:
+        return True
+    if code not in (_YTDL_STATUS_SUCCESS, _YTDL_STATUS_BUFFER_OVERFLOW):
+        return None
+    info = int(iosb.Information)
+    if info < 0 or info > _YTDL_CLEANUP_BUF_SIZE:
+        return None
+    offset = 0
+    while offset < info:
+        if offset + _YTDL_DIR_INFO_HEADER > info:
+            return None
+        next_off = int.from_bytes(bytes(buf[offset:offset + 4]), "little")
+        name_len = int.from_bytes(
+            bytes(buf[offset + _YTDL_DIR_INFO_NAME_LEN_OFF:offset + _YTDL_DIR_INFO_NAME_LEN_OFF + 4]),
+            "little",
+        )
+        if name_len <= 0 or (name_len & 1) != 0:
+            return None
+        name_off = offset + _YTDL_DIR_INFO_NAME_OFF
+        if name_off + name_len > info:
+            return None
+        try:
+            name = bytes(buf[name_off:name_off + name_len]).decode("utf-16-le")
+        except Exception:
+            return None
+        if name not in (".", ".."):
+            return False
+        if next_off == 0:
+            break
+        if next_off < _YTDL_DIR_INFO_HEADER or (next_off & 7) != 0:
+            return None
+        if offset + next_off > info:
+            return None
+        offset += next_off
+    return True
 
 
 def _ytdl_cleanup_stage_tree(stage_handle):
     """Handle-relative stage cleanup. Safe-leak on any uncertainty.
 
-    Enumerate via NtQueryDirectoryFile, open each child with OPEN_REPARSE_POINT
-    + DELETE, dispose reparse as the reparse object (never traverse), recurse
-    only non-reparse directories, then disposition the stage directory itself.
-    Returns True when the stage handle was fully disposed; False on safe leak.
+    Enumerates via NtQueryDirectoryFile FileDirectoryInformation (class 1) with
+    strict Information bounds. Opens each child with OPEN_REPARSE_POINT + DELETE,
+    disposes reparse as the reparse object (never traverse), recurses only
+    non-reparse directories, checks every disposition result, rechecks emptiness
+    before disposing directories. Returns True only when fully disposed.
     """
     if not stage_handle:
         return True
@@ -1835,61 +2217,83 @@ def _ytdl_cleanup_stage_tree(stage_handle):
         _ytdl_close_handle(stage_handle)
         return False
 
+    stats = {"queries": 0, "entries": 0}
+
     def _enum_and_clean(dir_handle, depth=0):
-        if depth > 64:
+        if depth > _YTDL_CLEANUP_MAX_DEPTH:
             return False
-        buf_size = 4096
-        buf = ctypes.create_string_buffer(buf_size)
         restart = True
         while True:
+            if stats["queries"] >= _YTDL_CLEANUP_MAX_QUERIES:
+                return False
+            stats["queries"] += 1
+            buf = ctypes.create_string_buffer(_YTDL_CLEANUP_BUF_SIZE)
             iosb = _YTDL_IO_STATUS_BLOCK()
-            status = api.ntdll.NtQueryDirectoryFile(
-                wintypes.HANDLE(int(dir_handle)),
-                None, None, None,
-                ctypes.byref(iosb),
-                buf, buf_size,
-                _YTDL_FileNamesInformation,
-                False,
-                None,
-                restart,
-            )
+            try:
+                status = api.ntdll.NtQueryDirectoryFile(
+                    wintypes.HANDLE(int(dir_handle)),
+                    None, None, None,
+                    ctypes.byref(iosb),
+                    buf, _YTDL_CLEANUP_BUF_SIZE,
+                    _YTDL_FileDirectoryInformation,
+                    False,
+                    None,
+                    restart,
+                )
+            except Exception:
+                return False
             restart = False
             code = status & 0xFFFFFFFF
-            if code in (
-                _YTDL_STATUS_NO_MORE_FILES,
-                0x80000006,
-            ):
+            if code == _YTDL_STATUS_NO_MORE_FILES:
                 break
-            # STATUS_NO_MORE_FILES as signed long may be negative.
-            if status in (-2147483642,):  # 0x80000006 as INT32
+            if code not in (_YTDL_STATUS_SUCCESS, _YTDL_STATUS_BUFFER_OVERFLOW):
+                return False
+            info = int(iosb.Information)
+            if info < 0 or info > _YTDL_CLEANUP_BUF_SIZE:
+                return False
+            if info == 0:
                 break
-            if code != _YTDL_STATUS_SUCCESS and code != _YTDL_STATUS_BUFFER_OVERFLOW:
-                # Treat NT_WARNING NO_MORE_FILES variants.
-                if code & 0xC0000000 == 0x80000000 and (code == _YTDL_STATUS_NO_MORE_FILES):
-                    break
-                # Rtl classification is optional; unknown => safe leak.
-                if code != 0:
-                    # 0x80000006 often arrives as status with high bit; accept both.
-                    if (status & 0xFFFFFFFF) == _YTDL_STATUS_NO_MORE_FILES:
-                        break
-                    return False
-            # Walk entries
             offset = 0
-            while True:
-                if offset + 12 > buf_size:
+            saw_entry = False
+            while offset < info:
+                if offset + _YTDL_DIR_INFO_HEADER > info:
                     return False
-                next_off = int.from_bytes(buf[offset:offset + 4], "little")
-                name_len = int.from_bytes(buf[offset + 8:offset + 12], "little")
-                name_off = offset + 12
-                if name_len <= 0 or name_off + name_len > buf_size:
+                next_off = int.from_bytes(bytes(buf[offset:offset + 4]), "little")
+                name_len = int.from_bytes(
+                    bytes(buf[offset + _YTDL_DIR_INFO_NAME_LEN_OFF:
+                              offset + _YTDL_DIR_INFO_NAME_LEN_OFF + 4]),
+                    "little",
+                )
+                if name_len <= 0 or (name_len & 1) != 0:
+                    return False
+                name_off = offset + _YTDL_DIR_INFO_NAME_OFF
+                entry_end = name_off + name_len
+                if entry_end > info:
                     return False
                 try:
                     name = bytes(buf[name_off:name_off + name_len]).decode("utf-16-le")
                 except Exception:
                     return False
+                saw_entry = True
+                # Validate linkage before acting on the name.
+                if next_off == 0:
+                    leftover = info - entry_end
+                    if leftover < 0 or leftover > 7:
+                        return False
+                else:
+                    if next_off < _YTDL_DIR_INFO_HEADER:
+                        return False
+                    if (next_off & 7) != 0:
+                        return False
+                    if offset + next_off > info:
+                        return False
+                    if next_off < (entry_end - offset):
+                        return False
                 if name not in (".", ".."):
+                    if stats["entries"] >= _YTDL_CLEANUP_MAX_ENTRIES:
+                        return False
+                    stats["entries"] += 1
                     if not _ytdl_is_safe_relative_leaf(name):
-                        # Hostile name: do not open by string path; leak.
                         return False
                     child = _ytdl_nt_create_relative(
                         dir_handle,
@@ -1905,7 +2309,6 @@ def _ytdl_cleanup_stage_tree(stage_handle):
                         _YTDL_FILE_SYNCHRONOUS_IO_NONALERT | _YTDL_FILE_OPEN_REPARSE_POINT,
                     )
                     if not child:
-                        # Retry as non-directory open for files.
                         child = _ytdl_nt_create_relative(
                             dir_handle,
                             name,
@@ -1927,23 +2330,32 @@ def _ytdl_cleanup_stage_tree(stage_handle):
                         return False
                     _attrs, is_dir, _dp, is_reparse, _std = meta
                     if is_reparse:
-                        # Dispose the reparse object itself; never traverse.
-                        _ytdl_set_disposition_delete(child)
+                        if not _ytdl_set_disposition_delete(child):
+                            _ytdl_close_handle(child)
+                            return False
                         _ytdl_close_handle(child)
                     elif is_dir:
                         if not _enum_and_clean(child, depth + 1):
                             _ytdl_close_handle(child)
                             return False
-                        _ytdl_set_disposition_delete(child)
+                        empty = _ytdl_dir_is_empty(child, api)
+                        if empty is not True:
+                            _ytdl_close_handle(child)
+                            return False
+                        if not _ytdl_set_disposition_delete(child):
+                            _ytdl_close_handle(child)
+                            return False
                         _ytdl_close_handle(child)
                     else:
-                        _ytdl_set_disposition_delete(child)
+                        if not _ytdl_set_disposition_delete(child):
+                            _ytdl_close_handle(child)
+                            return False
                         _ytdl_close_handle(child)
                 if next_off == 0:
                     break
                 offset += next_off
-                if offset >= buf_size:
-                    return False
+            if not saw_entry and info > 0:
+                return False
         return True
 
     try:
@@ -1954,7 +2366,21 @@ def _ytdl_cleanup_stage_tree(stage_handle):
                 pass
             _ytdl_close_handle(stage_handle)
             return False
-        _ytdl_set_disposition_delete(stage_handle)
+        empty = _ytdl_dir_is_empty(stage_handle, api)
+        if empty is not True:
+            try:
+                _h()._hlog("info", "yt-dlp: stage cleanup leaked private debris")
+            except Exception:
+                pass
+            _ytdl_close_handle(stage_handle)
+            return False
+        if not _ytdl_set_disposition_delete(stage_handle):
+            try:
+                _h()._hlog("info", "yt-dlp: stage cleanup leaked private debris")
+            except Exception:
+                pass
+            _ytdl_close_handle(stage_handle)
+            return False
         _ytdl_close_handle(stage_handle)
         return True
     except Exception:
@@ -1962,8 +2388,13 @@ def _ytdl_cleanup_stage_tree(stage_handle):
             _h()._hlog("info", "yt-dlp: stage cleanup leaked private debris")
         except Exception:
             pass
-        _ytdl_close_handle(stage_handle)
+        try:
+            _ytdl_close_handle(stage_handle)
+        except Exception:
+            pass
         return False
+
+
 
 
 def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
@@ -2146,6 +2577,8 @@ def _handle_ytdl_structured(req):
         stage_display = None
         source_handle = None
         committed_handle = None
+        done_path = None
+        done_size = None
         close_counts = op.setdefault("_ytdl_close_counts", {
             "source": 0, "final": 0, "stage": 0, "dest": 0,
         })
@@ -2227,15 +2660,7 @@ def _handle_ytdl_structured(req):
                 except Exception:
                     emit_error("local_io", "Couldn't create the save folder.")
                     return
-                if not _ytdl_is_local_abs_win_path(out_abs):
-                    emit_error("local_io", "Couldn't create the save folder.")
-                    return
-
-                try:
-                    os.makedirs(out_abs, exist_ok=True)
-                    if not os.path.isdir(out_abs):
-                        raise OSError("not a directory")
-                except Exception:
+                if not _ytdl_is_allowed_dest_path(out_abs):
                     emit_error("local_io", "Couldn't create the save folder.")
                     return
 
@@ -2243,6 +2668,8 @@ def _handle_ytdl_structured(req):
                     emit_error("cancelled", "Cancelled.")
                     return
 
+                # Full destination chain is opened/created handle-relative inside
+                # the lease helper — never os.makedirs / pathname exists-check.
                 dest_lease = _ytdl_acquire_dest_lease(out_abs)
                 if dest_lease is None:
                     emit_error("local_io", "Couldn't prepare the save path.")
@@ -2258,7 +2685,11 @@ def _handle_ytdl_structured(req):
                 if not _ytdl_is_safe_relative_leaf(safe_name):
                     emit_error("local_io", "Couldn't prepare the save path.")
                     return
-                stage_file = os.path.join(stage_display, safe_name)
+                try:
+                    stage_file = _ytdl_display_join(stage_display, safe_name)
+                except Exception:
+                    emit_error("local_io", "Couldn't prepare the save path.")
+                    return
 
                 pot = start_pot_provider()
                 if cancelled():
@@ -2298,11 +2729,19 @@ def _handle_ytdl_structured(req):
                     for line in p.stdout:
                         if cancelled():
                             break
-                        s = line.strip() if isinstance(line, str) else str(line).strip()
-                        if not s:
+                        raw = line if isinstance(line, str) else str(line)
+                        # Preserve trailing spaces/dots on @@FILE@@ paths for validation.
+                        if raw.lstrip().startswith("@@FILE@@"):
+                            marker = raw.lstrip()
+                            # Drop only line endings from the marker line.
+                            marker = marker.rstrip("\r\n")
+                            rest = marker[len("@@FILE@@"):]
+                            if rest.startswith(" "):
+                                rest = rest[1:]
+                            filepath = rest
                             continue
-                        if s.startswith("@@FILE@@"):
-                            filepath = s[len("@@FILE@@"):].strip()
+                        s = raw.strip()
+                        if not s:
                             continue
                         if s.startswith("[download]"):
                             prog = _parse_yt_progress(s)
@@ -2356,21 +2795,34 @@ def _handle_ytdl_structured(req):
                     outcome = None
                     done_path = None
                     done_size = None
+                    # Prebuild every leaf/buffer/display path BEFORE ytdl_lock so
+                    # post-rename path construction cannot run under the lock.
+                    try:
+                        candidates = _ytdl_prebuild_commit_candidates(
+                            dest_lease, safe_name, max_attempts=32,
+                        )
+                    except Exception:
+                        candidates = []
+                    if not candidates:
+                        _close_source(delete=True)
+                        emit_error(
+                            "local_io",
+                            "Download finished but the file could not be verified.",
+                        )
+                        return
                     # Holding the op-local lock across bounded Nt rename is intended.
                     with op["ytdl_lock"]:
                         if op.get("cancel_requested") or op.get("commit_claimed"):
                             outcome = "cancelled"
                         else:
-                            final_path = _ytdl_commit_source(
-                                source_handle, dest_lease, safe_name, max_attempts=32,
+                            final_path = _ytdl_commit_with_candidates(
+                                source_handle, candidates, op=op,
                             )
                             if not final_path:
                                 outcome = "local_io"
                             else:
-                                # Successful Nt rename moved the exact held object.
-                                # Precomputed path + prevalidated size are authority;
-                                # no post-rename path/identity lookup may veto.
-                                op["commit_claimed"] = True
+                                # commit_claimed already set adjacent to NT success.
+                                # Prebuilt path + prevalidated size are authority.
                                 outcome = "done"
                                 done_path = final_path
                                 done_size = owned_size
@@ -2388,12 +2840,23 @@ def _handle_ytdl_structured(req):
                         return
                     if outcome == "done":
                         # Hold committed handle through terminal so replacement is denied.
-                        emit_done(done_path, done_size)
-                        _close_committed()
+                        # Send/log/cleanup/close failures after claim cannot demote done
+                        # or disposition-delete the committed final.
+                        try:
+                            emit_done(done_path, done_size)
+                        except Exception:
+                            pass
+                        try:
+                            _close_committed()
+                        except Exception:
+                            committed_handle = None
                         try:
                             _h()._hlog(
                                 "info",
-                                "yt-dlp: saved %s" % os.path.basename(done_path),
+                                "yt-dlp: saved %s" % (
+                                    os.path.basename(done_path)
+                                    if type(done_path) is str else "file"
+                                ),
                             )
                         except Exception:
                             pass
@@ -2412,21 +2875,52 @@ def _handle_ytdl_structured(req):
                 )
                 emit_error(reason, msg)
             except Exception:
-                if cancelled():
+                # Once Nt rename claimed the final, fallible post-claim work must
+                # not demote success into an error terminal.
+                if op.get("commit_claimed"):
+                    if (
+                        not terminal["sent"]
+                        and done_path is not None
+                        and type(done_size) is int
+                        and done_size >= 0
+                    ):
+                        try:
+                            emit_done(done_path, done_size)
+                        except Exception:
+                            pass
+                elif cancelled():
                     emit_error("cancelled", "Cancelled.")
                 else:
                     emit_error("permanent", "Download failed.")
         finally:
             # Never delete a committed final. Dispose only uncommitted source.
-            if source_handle is not None:
-                _close_source(delete=True)
-            if committed_handle is not None:
-                _close_committed()
-            if stage_handle is not None:
-                _close_stage()
-            if dest_lease is not None:
-                _release_dest()
-            _pget_unregister(jid, op)
+            # After commit_claimed, the source handle is a committed final even if
+            # transferring locals/diagnostics/send/log/cleanup/close raises.
+            try:
+                if source_handle is not None:
+                    delete_src = not bool(op.get("commit_claimed"))
+                    _close_source(delete=delete_src)
+            except Exception:
+                source_handle = None
+            try:
+                if committed_handle is not None:
+                    _close_committed()
+            except Exception:
+                committed_handle = None
+            try:
+                if stage_handle is not None:
+                    _close_stage()
+            except Exception:
+                stage_handle = None
+            try:
+                if dest_lease is not None:
+                    _release_dest()
+            except Exception:
+                dest_lease = None
+            try:
+                _pget_unregister(jid, op)
+            except Exception:
+                pass
 
     threading.Thread(target=worker, daemon=True).start()
 
