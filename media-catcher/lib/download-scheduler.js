@@ -565,6 +565,16 @@
         settleDrainingTerminal(job);
         return;
       }
+      // Fail-closed hold: physical counters are zero but the semantic terminal for
+      // this exact private draining identity has not arrived yet. Do not erase
+      // auth, release the slot, or move to waiting/cancelled — matching
+      // onDrainingTransportResult settles later; onTransportUnavailable escapes.
+      if (
+        typeof job.drainingAttemptToken === "string" &&
+        job.drainingAttemptToken.trim().length > 0
+      ) {
+        return;
+      }
       // Cancel-requested pausing work finishes as cancelled once quiescent.
       if (job.cancelRequested === true) {
         releaseSlotIfHeld(job);
@@ -715,45 +725,118 @@
       return true;
     }
 
-    var ALLOWED_DRAIN_STATUSES = {
-      completed: true,
-      cancelled: true,
-      failed: true,
-    };
-    var ALLOWED_DRAIN_MODES = {
-      "multi-range": true,
-      "single-connection": true,
-    };
-    var ALLOWED_DRAIN_PART_STATES = {
-      committed: true,
-      empty: true,
-      partial: true,
-    };
-    var KNOWN_DRAIN_FAILURE_CATEGORIES = {
-      range_unsupported: true,
-      timeout: true,
-      connection_reset: true,
-      short_read: true,
-      http_429: true,
-      http_5xx_temporary: true,
-      local_io: true,
-      cancelled: true,
-      permanent: true,
-    };
+    // Null-prototype allowlists: ordinary objects accept inherited keys such as
+    // "__proto__", "constructor", and "toString" as truthy membership.
+    var ALLOWED_DRAIN_STATUSES = Object.freeze(
+      Object.assign(Object.create(null), {
+        completed: true,
+        cancelled: true,
+        failed: true,
+      })
+    );
+    var ALLOWED_DRAIN_MODES = Object.freeze(
+      Object.assign(Object.create(null), {
+        "multi-range": true,
+        "single-connection": true,
+      })
+    );
+    var ALLOWED_DRAIN_PART_STATES = Object.freeze(
+      Object.assign(Object.create(null), {
+        committed: true,
+        empty: true,
+        partial: true,
+      })
+    );
+    var KNOWN_DRAIN_FAILURE_CATEGORIES = Object.freeze(
+      Object.assign(Object.create(null), {
+        range_unsupported: true,
+        timeout: true,
+        connection_reset: true,
+        short_read: true,
+        http_429: true,
+        http_5xx_temporary: true,
+        local_io: true,
+        cancelled: true,
+        permanent: true,
+      })
+    );
+
+    function isOwnAllowlisted(dict, key) {
+      return (
+        typeof key === "string" &&
+        Object.prototype.hasOwnProperty.call(dict, key) === true &&
+        dict[key] === true
+      );
+    }
+
+    /**
+     * Snapshot one own DATA descriptor value without invoking accessors.
+     * Returns { ok:false } on missing required field, accessor, or trap/error.
+     * Optional fields may be absent (ok with value undefined).
+     */
+    function readOwnDataField(obj, key, required) {
+      try {
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (desc == null) {
+          if (required) return { ok: false };
+          return { ok: true, value: undefined };
+        }
+        // Reject accessors even when the property is optional.
+        if (
+          typeof desc.get === "function" ||
+          typeof desc.set === "function" ||
+          !Object.prototype.hasOwnProperty.call(desc, "value")
+        ) {
+          return { ok: false };
+        }
+        return { ok: true, value: desc.value };
+      } catch (err) {
+        return { ok: false };
+      }
+    }
 
     /**
      * Validate a draining terminal result into a scheduler-owned allowlist.
      * Never coerces hostile values; returns null when invalid.
+     * Reads only own DATA descriptors for status/mode/partState/failureCategory —
+     * never executes accessors or propagates proxy/getter errors.
      */
     function validateDrainingResult(result) {
       if (!result || typeof result !== "object") return null;
-      var status = result.status;
-      var mode = result.mode;
-      var partState = result.partState;
-      var failureCategory = result.failureCategory;
-      if (typeof status !== "string" || !ALLOWED_DRAIN_STATUSES[status]) return null;
-      if (typeof mode !== "string" || !ALLOWED_DRAIN_MODES[mode]) return null;
-      if (typeof partState !== "string" || !ALLOWED_DRAIN_PART_STATES[partState]) {
+
+      var statusRead;
+      var modeRead;
+      var partRead;
+      var failRead;
+      try {
+        statusRead = readOwnDataField(result, "status", true);
+        modeRead = readOwnDataField(result, "mode", true);
+        partRead = readOwnDataField(result, "partState", true);
+        failRead = readOwnDataField(result, "failureCategory", false);
+      } catch (err) {
+        return null;
+      }
+      if (!statusRead.ok || !modeRead.ok || !partRead.ok || !failRead.ok) {
+        return null;
+      }
+
+      var status = statusRead.value;
+      var mode = modeRead.value;
+      var partState = partRead.value;
+      var failureCategory = failRead.value;
+
+      // Exact built-in primitive strings only — no boxed String coercion.
+      // Own-membership only so inherited Object.prototype keys never match.
+      if (typeof status !== "string" || !isOwnAllowlisted(ALLOWED_DRAIN_STATUSES, status)) {
+        return null;
+      }
+      if (typeof mode !== "string" || !isOwnAllowlisted(ALLOWED_DRAIN_MODES, mode)) {
+        return null;
+      }
+      if (
+        typeof partState !== "string" ||
+        !isOwnAllowlisted(ALLOWED_DRAIN_PART_STATES, partState)
+      ) {
         return null;
       }
 
@@ -763,21 +846,23 @@
         if (failureCategory !== null && failureCategory !== undefined) return null;
         outCategory = null;
       } else if (status === "cancelled") {
-        // Accept null/cancelled category; store canonical cancelled.
-        if (
-          failureCategory != null &&
-          failureCategory !== "cancelled" &&
+        // Accept only absent/undefined/null or exact primitive "cancelled".
+        if (failureCategory === undefined || failureCategory === null) {
+          outCategory = "cancelled";
+        } else if (
           typeof failureCategory === "string" &&
-          !KNOWN_DRAIN_FAILURE_CATEGORIES[failureCategory]
+          failureCategory === "cancelled"
         ) {
-          // Unknown non-null still normalizes only for cancelled status via adapter;
-          // scheduler accepts cancelled status with any partState.
+          outCategory = "cancelled";
+        } else {
+          return null;
         }
-        outCategory = "cancelled";
       } else if (status === "failed") {
         if (partState === "committed") return null;
         if (typeof failureCategory !== "string") return null;
-        if (!KNOWN_DRAIN_FAILURE_CATEGORIES[failureCategory]) return null;
+        if (!isOwnAllowlisted(KNOWN_DRAIN_FAILURE_CATEGORIES, failureCategory)) {
+          return null;
+        }
         outCategory = failureCategory;
       } else {
         return null;
@@ -1068,14 +1153,25 @@
         return;
       }
       beginWaitEpoch(job);
-      // Capture the live physical attempt token before public nulling so a late
-      // native terminal can authenticate privately. Never overwrite an existing
-      // draining identity on repeat pause calls.
-      if (
+      // transportTerminalConsumed: this job's own transport terminal was already
+      // accepted (e.g. saturation failure via onTransportResult). Never capture
+      // or preserve a private drain identity for that physical attempt — late
+      // old-token contradictions must not re-authenticate. Clear any stale
+      // private drain state before public token nulling.
+      if (opts.transportTerminalConsumed === true) {
+        clearDrainingState(job);
+      } else if (
         job.drainingAttemptToken == null &&
         typeof job.attemptToken === "string" &&
-        job.attemptToken.trim().length > 0
+        job.attemptToken.trim().length > 0 &&
+        Number.isInteger(job.nativeOpenConnections) &&
+        job.nativeOpenConnections > 0
       ) {
+        // Paused-only sibling with a live native open at pause entry: capture the
+        // physical attempt token before public nulling so a late native terminal
+        // can authenticate privately. Permit-only non-quiescence (native opens
+        // already zero) has no native pget terminal to await — do not capture.
+        // Never overwrite an existing draining identity on repeat pause calls.
         job.drainingAttemptToken = job.attemptToken;
       }
       job.state = "pausing_provider";
@@ -1354,7 +1450,11 @@
       if (snap.reducedConcurrency != null) {
         applyReducedConcurrency(failedJob, snap.reducedConcurrency);
       }
-      pauseOrWaitNonOwner(failedJob, { consumeRetryOnWake: true });
+      // Own failure already consumed by onTransportResult — no private drain auth.
+      pauseOrWaitNonOwner(failedJob, {
+        consumeRetryOnWake: true,
+        transportTerminalConsumed: true,
+      });
       drain();
     }
 
@@ -1395,8 +1495,11 @@
         // Apply reduced cap to competitors.
         applyReducedConcurrency(j, reduced);
         var isFailed = j.id === failedJob.id;
+        // Failed job: transport terminal already consumed — no private drain token.
+        // Paused-only siblings: capture drain token for late native terminals.
         pauseOrWaitNonOwner(j, {
           consumeRetryOnWake: isFailed,
+          transportTerminalConsumed: isFailed,
         });
       }
 
@@ -1876,6 +1979,15 @@
           // settleDrainingTerminal's cancelRequested branch.
           if (job.pendingDrainTerminal != null) {
             settleDrainingTerminal(job);
+            return;
+          }
+          // Physical counters zero but private drain identity still awaiting its
+          // semantic terminal: remain pausing/slot-held until that terminal;
+          // cancelRequested then wins inside settleDrainingTerminal.
+          if (
+            typeof job.drainingAttemptToken === "string" &&
+            job.drainingAttemptToken.trim().length > 0
+          ) {
             return;
           }
           releaseSlotIfHeld(job);
