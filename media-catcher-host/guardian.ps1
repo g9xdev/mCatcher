@@ -74,6 +74,329 @@ function Prune-Backups {
     ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# Handle-authority helpers for host destination containment (no pathname write fallback).
+$script:HostSafeTypeReady = $false
+function Ensure-HostSafeType {
+  if ($script:HostSafeTypeReady) { return }
+  $zipAsm = [System.Reflection.Assembly]::LoadWithPartialName('System.IO.Compression').Location
+  $zipFsAsm = [System.Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem').Location
+  Add-Type -ReferencedAssemblies @($zipAsm, $zipFsAsm) -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Collections.Generic;
+using System.IO.Compression;
+
+public static class McHostSafe {
+  const uint GENERIC_READ = 0x80000000;
+  const uint GENERIC_WRITE = 0x40000000;
+  const uint FILE_SHARE_READ = 0x1;
+  const uint FILE_SHARE_WRITE = 0x2;
+  const uint OPEN_EXISTING = 3;
+  const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+  const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+  const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+  const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+  const int FileStandardInfo = 1; // FILE_INFO_BY_HANDLE_CLASS
+  const int FileAttributeTagInfo = 9;
+  const uint FILE_OPEN = 1;
+  const uint FILE_CREATE = 2;
+  const uint FILE_OPEN_IF = 3;
+  const uint FILE_DIRECTORY_FILE = 0x1;
+  const uint FILE_NON_DIRECTORY_FILE = 0x40;
+  const uint FILE_OPEN_REPARSE_POINT = 0x00200000;
+  const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x20;
+  const uint FILE_OPEN_FOR_BACKUP_INTENT = 0x4000;
+  const uint OBJ_CASE_INSENSITIVE = 0x40;
+  const uint SYNCHRONIZE = 0x100000;
+  const uint FILE_READ_ATTRIBUTES = 0x80;
+  const uint FILE_WRITE_DATA = 0x2;
+  const uint FILE_READ_DATA = 0x1;
+  const uint FILE_APPEND_DATA = 0x4;
+  const int STATUS_OBJECT_NAME_NOT_FOUND = unchecked((int)0xC0000034);
+  const int STATUS_OBJECT_PATH_NOT_FOUND = unchecked((int)0xC000003A);
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct FILE_ATTRIBUTE_TAG_INFO {
+    public uint FileAttributes;
+    public uint ReparseTag;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  struct FILE_STANDARD_INFO {
+    public long AllocationSize;
+    public long EndOfFile;
+    public uint NumberOfLinks;
+    public byte DeletePending;
+    public byte Directory;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  struct IO_STATUS_BLOCK {
+    public int Status;
+    public IntPtr Information;
+  }
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct UNICODE_STRING {
+    public ushort Length;
+    public ushort MaximumLength;
+    public IntPtr Buffer;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  struct OBJECT_ATTRIBUTES {
+    public int Length;
+    public IntPtr RootDirectory;
+    public IntPtr ObjectName;
+    public uint Attributes;
+    public IntPtr SecurityDescriptor;
+    public IntPtr SecurityQualityOfService;
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+    IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool CloseHandle(IntPtr hObject);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool GetFileInformationByHandleEx(IntPtr hFile, int FileInformationClass, IntPtr lpFileInformation, uint dwBufferSize);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool SetEndOfFile(IntPtr hFile);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool SetFilePointerEx(IntPtr hFile, long liDistanceToMove, IntPtr lpNewFilePointer, uint dwMoveMethod);
+  [DllImport("ntdll.dll")]
+  static extern int NtCreateFile(out IntPtr FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes,
+    ref IO_STATUS_BLOCK IoStatusBlock, IntPtr AllocationSize, uint FileAttributes, uint ShareAccess,
+    uint CreateDisposition, uint CreateOptions, IntPtr EaBuffer, uint EaLength);
+
+  static readonly HashSet<string> DosDevices = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+    "CON","PRN","AUX","NUL",
+    "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+    "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+  };
+
+  static string Win32Key(string part) {
+    var s = part.ToLowerInvariant();
+    while (s.EndsWith(".") || s.EndsWith(" ")) s = s.Substring(0, s.Length - 1);
+    return s;
+  }
+
+  public static string[] ValidateMember(string name) {
+    if (string.IsNullOrEmpty(name)) throw new InvalidOperationException("empty member");
+    foreach (var ch in name) {
+      int o = (int)ch;
+      if (o < 0x20 || o == 0x7F || (o >= 0x80 && o <= 0x9F))
+        throw new InvalidOperationException("control character in member");
+    }
+    bool isDir = name.EndsWith("/") || name.EndsWith("\\");
+    string core = isDir ? name.Substring(0, name.Length - 1) : name;
+    if (core.Length == 0) throw new InvalidOperationException("empty member");
+    if (core[0] == '/' || core[0] == '\\') throw new InvalidOperationException("absolute member");
+    if (core.Length >= 2 && core[1] == ':') throw new InvalidOperationException("drive member");
+    if (core.IndexOf(':') >= 0) throw new InvalidOperationException("colon/ADS member");
+    string unified = core.Replace('\\', '/');
+    var parts = unified.Split('/');
+    foreach (var p in parts) {
+      if (p.Length == 0) throw new InvalidOperationException("empty component");
+      if (p == "." || p == "..") throw new InvalidOperationException("dot component");
+      if (p.IndexOf(':') >= 0) throw new InvalidOperationException("colon component");
+      if (p.EndsWith(".") || p.EndsWith(" ")) throw new InvalidOperationException("trailing dot/space");
+      foreach (var ch in p) {
+        int o = (int)ch;
+        if (o < 0x20 || o == 0x7F || (o >= 0x80 && o <= 0x9F))
+          throw new InvalidOperationException("control in component");
+      }
+      string stem = p.Split('.')[0];
+      if (DosDevices.Contains(stem)) throw new InvalidOperationException("DOS device member");
+    }
+    if (isDir) return null;
+    return parts;
+  }
+
+  static void ValidateHandle(IntPtr h, bool expectDir, bool finalFile) {
+    int size = Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO));
+    IntPtr buf = Marshal.AllocHGlobal(size);
+    try {
+      if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, buf, (uint)size))
+        throw new InvalidOperationException("FileAttributeTagInfo failed");
+      var tag = (FILE_ATTRIBUTE_TAG_INFO)Marshal.PtrToStructure(buf, typeof(FILE_ATTRIBUTE_TAG_INFO));
+      if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        throw new InvalidOperationException("reparse point in destination");
+      bool isDir = (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      if (expectDir && !isDir) throw new InvalidOperationException("not a directory");
+      if (!expectDir && isDir) throw new InvalidOperationException("final is directory");
+    } finally { Marshal.FreeHGlobal(buf); }
+    size = Marshal.SizeOf(typeof(FILE_STANDARD_INFO));
+    buf = Marshal.AllocHGlobal(size);
+    try {
+      if (!GetFileInformationByHandleEx(h, FileStandardInfo, buf, (uint)size))
+        throw new InvalidOperationException("FileStandardInfo failed");
+      var std = (FILE_STANDARD_INFO)Marshal.PtrToStructure(buf, typeof(FILE_STANDARD_INFO));
+      if (std.DeletePending != 0) throw new InvalidOperationException("delete-pending");
+      if (finalFile && std.NumberOfLinks != 1)
+        throw new InvalidOperationException("hard-link alias");
+    } finally { Marshal.FreeHGlobal(buf); }
+  }
+
+  static IntPtr OpenRoot(string hostDir) {
+    string path = Path.GetFullPath(hostDir);
+    IntPtr h = CreateFileW(path, GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+    if (h == IntPtr.Zero || h == new IntPtr(-1))
+      throw new InvalidOperationException("CreateFileW hostDir failed");
+    try { ValidateHandle(h, true, false); }
+    catch { CloseHandle(h); throw; }
+    return h;
+  }
+
+  static IntPtr NtOpenRel(IntPtr root, string name, bool directory, uint disposition, bool write) {
+    IntPtr nameBuf = Marshal.StringToHGlobalUni(name);
+    try {
+      var us = new UNICODE_STRING();
+      us.Length = (ushort)(name.Length * 2);
+      us.MaximumLength = (ushort)((name.Length + 1) * 2);
+      us.Buffer = nameBuf;
+      IntPtr usPtr = Marshal.AllocHGlobal(Marshal.SizeOf(us));
+      try {
+        Marshal.StructureToPtr(us, usPtr, false);
+        var oa = new OBJECT_ATTRIBUTES();
+        oa.Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));
+        oa.RootDirectory = root;
+        oa.ObjectName = usPtr;
+        oa.Attributes = OBJ_CASE_INSENSITIVE;
+        var iosb = new IO_STATUS_BLOCK();
+        uint access = FILE_READ_ATTRIBUTES | SYNCHRONIZE | GENERIC_READ;
+        if (write) access = FILE_READ_ATTRIBUTES | SYNCHRONIZE | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_READ_DATA;
+        if (directory) access |= FILE_READ_DATA;
+        uint options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT;
+        options |= directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE;
+        IntPtr handle;
+        int st = NtCreateFile(out handle, access, ref oa, ref iosb, IntPtr.Zero,
+          directory ? FILE_ATTRIBUTE_DIRECTORY : 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+          disposition, options, IntPtr.Zero, 0);
+        if (st == STATUS_OBJECT_NAME_NOT_FOUND || st == STATUS_OBJECT_PATH_NOT_FOUND) return IntPtr.Zero;
+        if (st < 0) throw new InvalidOperationException(string.Format("NtCreateFile 0x{0:X8} for {1}", st, name));
+        return handle;
+      } finally { Marshal.FreeHGlobal(usPtr); }
+    } finally { Marshal.FreeHGlobal(nameBuf); }
+  }
+
+  static void PreflightChain(IntPtr root, string[] parts) {
+    IntPtr cur = root;
+    var owned = new List<IntPtr>();
+    try {
+      for (int i = 0; i < parts.Length; i++) {
+        bool isFinal = (i == parts.Length - 1);
+        IntPtr h = NtOpenRel(cur, parts[i], !isFinal, FILE_OPEN, false);
+        if (h == IntPtr.Zero) return;
+        owned.Add(h);
+        ValidateHandle(h, !isFinal, isFinal);
+        cur = h;
+      }
+    } finally {
+      foreach (var h in owned) CloseHandle(h);
+    }
+  }
+
+  static void WriteChain(IntPtr root, string[] parts, byte[] data) {
+    IntPtr cur = root;
+    var owned = new List<IntPtr>();
+    IntPtr fileH = IntPtr.Zero;
+    try {
+      for (int i = 0; i < parts.Length - 1; i++) {
+        IntPtr h = NtOpenRel(cur, parts[i], true, FILE_OPEN_IF, false);
+        if (h == IntPtr.Zero) throw new InvalidOperationException("dir create failed: " + parts[i]);
+        owned.Add(h);
+        ValidateHandle(h, true, false);
+        cur = h;
+      }
+      string finalName = parts[parts.Length - 1];
+      IntPtr existing = NtOpenRel(cur, finalName, false, FILE_OPEN, false);
+      if (existing != IntPtr.Zero) {
+        try { ValidateHandle(existing, false, true); }
+        finally { CloseHandle(existing); }
+        fileH = NtOpenRel(cur, finalName, false, FILE_OPEN, true);
+        if (fileH == IntPtr.Zero) throw new InvalidOperationException("reopen write failed");
+      } else {
+        fileH = NtOpenRel(cur, finalName, false, FILE_CREATE, true);
+        if (fileH == IntPtr.Zero) throw new InvalidOperationException("create failed");
+      }
+      ValidateHandle(fileH, false, true);
+      if (!SetFilePointerEx(fileH, 0, IntPtr.Zero, 0)) throw new InvalidOperationException("seek failed");
+      if (!SetEndOfFile(fileH)) throw new InvalidOperationException("truncate failed");
+      if (data != null && data.Length > 0) {
+        uint written;
+        if (!WriteFile(fileH, data, (uint)data.Length, out written, IntPtr.Zero) || written != data.Length)
+          throw new InvalidOperationException("WriteFile failed");
+      }
+    } finally {
+      if (fileH != IntPtr.Zero) CloseHandle(fileH);
+      foreach (var h in owned) CloseHandle(h);
+    }
+  }
+
+  public static void PreflightHost(string hostDir, string zipPath) {
+    var seen = new Dictionary<string, string>(StringComparer.Ordinal);
+    using (var fs = File.OpenRead(zipPath))
+    using (var zip = new ZipArchive(fs, ZipArchiveMode.Read)) {
+      var members = new List<string[]>();
+      foreach (var e in zip.Entries) {
+        var parts = ValidateMember(e.FullName);
+        if (parts == null) continue;
+        var key = string.Join("\\", Array.ConvertAll(parts, Win32Key));
+        if (seen.ContainsKey(key))
+          throw new InvalidOperationException("duplicate destination");
+        seen[key] = e.FullName;
+        members.Add(parts);
+      }
+      IntPtr root = OpenRoot(hostDir);
+      try {
+        foreach (var parts in members) PreflightChain(root, parts);
+      } finally { CloseHandle(root); }
+    }
+  }
+
+  public static void ApplyHostZip(string hostDir, string zipPath) {
+    var seen = new Dictionary<string, string>(StringComparer.Ordinal);
+    using (var fs = File.OpenRead(zipPath))
+    using (var zip = new ZipArchive(fs, ZipArchiveMode.Read)) {
+      var items = new List<KeyValuePair<string[], ZipArchiveEntry>>();
+      foreach (var e in zip.Entries) {
+        var parts = ValidateMember(e.FullName);
+        if (parts == null) continue;
+        var key = string.Join("\\", Array.ConvertAll(parts, Win32Key));
+        if (seen.ContainsKey(key))
+          throw new InvalidOperationException("duplicate destination");
+        seen[key] = e.FullName;
+        items.Add(new KeyValuePair<string[], ZipArchiveEntry>(parts, e));
+      }
+      IntPtr root = OpenRoot(hostDir);
+      try {
+        foreach (var it in items) PreflightChain(root, it.Key);
+        foreach (var it in items) {
+          byte[] data;
+          using (var s = it.Value.Open())
+          using (var ms = new MemoryStream()) {
+            s.CopyTo(ms);
+            data = ms.ToArray();
+          }
+          WriteChain(root, it.Key, data);
+        }
+      } finally { CloseHandle(root); }
+    }
+  }
+}
+'@ -ErrorAction Stop
+  $script:HostSafeTypeReady = $true
+}
+
+function Assert-HostDestinationSafe {
+  param([string]$HostDir, [string]$HostZip)
+  Ensure-HostSafeType
+  [McHostSafe]::PreflightHost($HostDir, $HostZip)
+}
+
 function Apply-Update {
   if ($cfg.applyExt) {
     Expand-Archive -LiteralPath $cfg.extZip -DestinationPath $cfg.extDir -Force
@@ -84,20 +407,8 @@ function Apply-Update {
     }
   }
   if ($cfg.applyHost) {
-    $tmp = Join-Path $env:TEMP ("mc-host-" + $stamp)
-    Expand-Archive -LiteralPath $cfg.hostZip -DestinationPath $tmp -Force
-    # Preserve archive-relative trees into hostDir (no basename flattening).
-    $tmpRoot = (Resolve-Path -LiteralPath $tmp).Path
-    Get-ChildItem -LiteralPath $tmpRoot -Recurse -File | ForEach-Object {
-      $rel = $_.FullName.Substring($tmpRoot.Length).TrimStart('\', '/')
-      $dest = Join-Path $cfg.hostDir $rel
-      $parent = Split-Path -Parent $dest
-      if (-not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-      }
-      Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
-    }
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Ensure-HostSafeType
+    [McHostSafe]::ApplyHostZip([string]$cfg.hostDir, [string]$cfg.hostZip)
   }
 }
 
@@ -236,6 +547,21 @@ try { $haveLock = $guardMutex.WaitOne(0) } catch [System.Threading.AbandonedMute
 if (-not $haveLock) { Log 'another guardian is already running - deferring this update'; exit 0 }
 Log ("start: applyExt={0} applyHost={1} extZip={2} hostZip={3}" -f $cfg.applyExt, $cfg.applyHost, $cfg.extZip, $cfg.hostZip)
 Log-Landscape
+# Security preflight for host destinations BEFORE backup/apply/revert so a
+# reparse/hardlink/alias rejection never walks path-based backup/revert through
+# the same alias. Ordinary trees continue into backup/apply as before.
+if ($cfg.applyHost) {
+  try {
+    Assert-HostDestinationSafe -HostDir ([string]$cfg.hostDir) -HostZip ([string]$cfg.hostZip)
+  } catch {
+    Log ("FATAL: host destination security preflight failed, aborting without backup/apply: {0}" -f $_)
+    if (-not $NoUi) {
+      Dialog-Info "Media Catcher - update aborted" `
+        "Host update refused: unsafe destination or archive member.`n`n$_"
+    }
+    exit 1
+  }
+}
 try {
   Do-Backup
   Prune-Backups
