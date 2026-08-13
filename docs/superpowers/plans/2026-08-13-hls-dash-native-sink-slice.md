@@ -92,4 +92,10 @@ git diff --check
 
 Only after Task 2 is green, adapt the existing `background.js` HLS/DASH fetch/assembly functions to the injected `assembleMedia` contract. Keep authenticated browser fetches browser-side. Remove the assembled-media `browser.downloads` save path. Add one narrow live-wiring test proving the controller receives the real effect and native sink commands.
 
+Execute this in three bounded substeps rather than one broad rewrite:
+
+1. Add the locked policy globals and `background-adapters.js` to manifest order; instantiate exactly one live controller with real settings/effects and route native frames to it.
+2. Extract/adapt one-file VOD HLS/DASH assembly behind the documented effect. Mux separate compatible fMP4 audio/video with the existing `Mux.combineFmp4`; an unsupported split-track or sidecar-only combination must fail safely and visibly rather than silently discard audio or write through `browser.downloads`.
+3. Route popup download/save-as/cancel/retry/use-Firefox and finalized media snapshots through the controller while leaving YouTube and live-recording flows legacy until separately migrated.
+
 Task 3 does not redesign HLS/DASH parsers. Any parser defect discovered is reported separately instead of expanding this slice.
