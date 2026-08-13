@@ -1097,10 +1097,31 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 
   // Synchronous contracts
   assert.equal(ctrl.acceptPageSnapshot(null), undefined);
-  assert.throws(
-    () => ctrl.registerVariants("media-x", []),
-    (err) => err instanceof Error && err.message === LEASE1_MSG
-  );
+  // Lease 2: unknown media fails generically without reading variants.
+  {
+    let unknownHits = 0;
+    const hostileVariants = new Proxy([], {
+      getOwnPropertyDescriptor() {
+        unknownHits += 1;
+        throw new Error("HOSTILE_SECRET_UNKNOWN_MEDIA_READ");
+      },
+      ownKeys() {
+        unknownHits += 1;
+        throw new Error("HOSTILE_SECRET_UNKNOWN_MEDIA_KEYS");
+      },
+      get() {
+        unknownHits += 1;
+        throw new Error("HOSTILE_SECRET_UNKNOWN_MEDIA_GET");
+      },
+    });
+    assert.throws(
+      () => ctrl.registerVariants("media-x", hostileVariants),
+      (err) =>
+        err instanceof TypeError &&
+        err.message === "invalid media variant registration"
+    );
+    assert.equal(unknownHits, 0, "unknown media must not inspect variants");
+  }
   const jobs = ctrl.popupJobs();
   assert.ok(Array.isArray(jobs));
   assert.equal(jobs.length, 0);
@@ -4752,6 +4773,3548 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
         const p = inst2.pendingRecords();
         assert.equal(p[p.length - 1].detectionId, 1);
       }
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// BA05 / BA06 helpers — Lease 2 variant registration + privacy projection
+// ---------------------------------------------------------------------------
+
+const VARIANT_REG_MSG = "invalid media variant registration";
+
+const VARIANT_SENTINELS = Object.freeze([
+  "SECRET_SIGNED_QUERY_XYZ",
+  "SECRET_COOKIE_ABC",
+  "SECRET_AUTH_BEARER_TOKEN",
+  "SECRET_REFERER_PATH",
+  "SECRET_PAGE_PATH",
+  "SECRET_MEDIA_ORIGIN_HOST",
+  "SECRET_VARIANT_USERINFO",
+  "SECRET_VARIANT_QUERY",
+  "SECRET_VARIANT_FRAGMENT",
+  "SECRET_CALLER_VARIANT_ID",
+  "SECRET_CALLER_PROVIDER",
+  "SECRET_OVERRIDE_URL",
+  "SECRET_UNSAFE_LABEL",
+  "SECRET_HOSTILE_TRAP_MSG",
+  "SECRET_PRIVACY_FAIL",
+  "hostilesecret-cause",
+]);
+
+function assertVariantRegError(err, opts) {
+  assert.ok(err instanceof TypeError, "expected TypeError, got " + err);
+  assert.equal(err.name, "TypeError");
+  assert.equal(err.message, VARIANT_REG_MSG);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(err, "cause") ? err.cause : undefined,
+    undefined,
+    "variant registration TypeError must not retain cause"
+  );
+  if (opts && opts.notSameAs != null) {
+    assert.notEqual(err, opts.notSameAs, "must not rethrow hostile identity");
+  }
+  const blob = String(err.message) + "\n" + String(err.stack || "");
+  for (const s of VARIANT_SENTINELS) {
+    assert.equal(blob.includes(s), false, "error must not leak " + s);
+  }
+  assert.equal(
+    /Cannot perform|revoked proxy|Proxy\s*handler|HOSTILE_SECRET|hostilesecret/i.test(
+      blob
+    ),
+    false,
+    "adapter error must not leak engine/trap text"
+  );
+}
+
+function assertNoVariantSentinels(value, label) {
+  const raw = typeof value === "string" ? value : JSON.stringify(value);
+  for (const s of VARIANT_SENTINELS) {
+    assert.equal(raw.includes(s), false, label + " must not contain " + s);
+  }
+  for (const s of SECRET_SENTINELS) {
+    assert.equal(raw.includes(s), false, label + " must not contain " + s);
+  }
+  const forbidden = [
+    "mediaUrl",
+    "requestHeaders",
+    "sourceContext",
+    "Cookie",
+    "Authorization",
+    "referrer",
+    "referer",
+    "topLevelPageUrl",
+    "immediateReferrerUrl",
+    "mediaOrigin",
+    "documentUrl",
+    "pageUrl",
+    "variantUrl",
+    "sourceHandle",
+  ];
+  for (const name of forbidden) {
+    assert.equal(
+      raw.includes('"' + name + '"'),
+      false,
+      label + " must not expose field " + name
+    );
+  }
+}
+
+/** True foreign realm: host Object/Array not injected into the sandbox. */
+function createForeignRealm() {
+  const foreign = vm.runInNewContext(
+    [
+      "(function () {",
+      "  function assign(dst, src) {",
+      "    if (!src) return dst;",
+      "    var keys = Object.keys(src);",
+      "    for (var i = 0; i < keys.length; i++) dst[keys[i]] = src[keys[i]];",
+      "    return dst;",
+      "  }",
+      "  return {",
+      "    Array: Array,",
+      "    Object: Object,",
+      "    makeArray: function (items) {",
+      "      var a = new Array(items.length);",
+      "      for (var i = 0; i < items.length; i++) a[i] = items[i];",
+      "      return a;",
+      "    },",
+      "    makeOrdinary: function (props) { return assign({}, props); },",
+      "    makeNullProto: function (props) { return assign(Object.create(null), props); },",
+      "    makeFunction: function () { return function foreignFn() { return 1; }; },",
+      "    makeDate: function () { return new Date(0); },",
+      "    makeMap: function () { return new Map(); },",
+      "    makeSet: function () { return new Set(); },",
+      "    makeTyped: function () { return new Uint8Array([1, 2]); },",
+      "    makeClassInstance: function () {",
+      "      function C() { this.x = 1; }",
+      "      return new C();",
+      "    },",
+      "    makeCustomProto: function () {",
+      "      function C() {}",
+      "      C.prototype = { marker: 'custom-proto', enumerableMarker: true };",
+      "      return new C();",
+      "    },",
+      "    makeNullRootCustom: function () {",
+      "      var p = Object.create(null);",
+      "      p.marker = 'null-root';",
+      "      function C() {}",
+      "      C.prototype = p;",
+      "      return new C();",
+      "    }",
+      "  };",
+      "})()",
+    ].join("\n"),
+    Object.create(null)
+  );
+  assert.notEqual(foreign.Array, Array, "foreign Array intrinsic");
+  assert.notEqual(foreign.Object, Object, "foreign Object intrinsic");
+  return foreign;
+}
+
+/**
+ * Classic-script load with Privacy + Map instrumentation for variant binding.
+ * Privacy.createEphemeral delegates to the real factory and records exact args
+ * plus distinct returned private handle objects.
+ */
+function loadVariantInstrumentedClassic(hooks) {
+  const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const root = Object.create(null);
+  const sandbox = classicVmBuiltins(root);
+
+  const trackedMaps = [];
+  class TrackingMap extends Map {
+    constructor() {
+      super();
+      this._sets = [];
+      trackedMaps.push(this);
+    }
+    set(key, value) {
+      this._sets.push({ key: key, value: value });
+      return super.set(key, value);
+    }
+  }
+  sandbox.Map = TrackingMap;
+
+  loadClassicDependencies(sandbox, root);
+
+  const registryHits = {
+    observe: 0,
+    lookup: 0,
+    clear: 0,
+    snapshot: 0,
+    create: 0,
+  };
+  const RealPR = root.McProviderRegistry;
+  const realCreatePR = RealPR.createProviderRegistry;
+  root.McProviderRegistry = {
+    createProviderRegistry() {
+      registryHits.create += 1;
+      const reg = realCreatePR.call(RealPR);
+      return {
+        observe(mediaOrigin, providerKey) {
+          registryHits.observe += 1;
+          return reg.observe(mediaOrigin, providerKey);
+        },
+        lookup(mediaOrigin) {
+          registryHits.lookup += 1;
+          return reg.lookup(mediaOrigin);
+        },
+        clear() {
+          registryHits.clear += 1;
+          return reg.clear();
+        },
+        snapshot() {
+          registryHits.snapshot += 1;
+          return reg.snapshot();
+        },
+      };
+    },
+  };
+
+  const privacyCalls = [];
+  const ephemeralHandles = [];
+  const RealPrivacy = root.McPrivacy;
+  const realCreateEph = RealPrivacy.createEphemeral;
+  root.McPrivacy = {
+    createEphemeral(mediaUrl, requestHeaders) {
+      privacyCalls.push({
+        mediaUrl: mediaUrl,
+        requestHeaders: requestHeaders,
+      });
+      if (hooks && typeof hooks.onEphemeral === "function") {
+        hooks.onEphemeral(mediaUrl, requestHeaders, privacyCalls.length);
+      }
+      const handle = realCreateEph.call(RealPrivacy, mediaUrl, requestHeaders);
+      ephemeralHandles.push(handle);
+      return handle;
+    },
+    projectSafeHistory: RealPrivacy.projectSafeHistory,
+    projectPopupJob: RealPrivacy.projectPopupJob,
+    redactUrlForLog: RealPrivacy.redactUrlForLog,
+    assertNoSentinels: RealPrivacy.assertNoSentinels,
+    clearEphemeralOnTerminal: RealPrivacy.clearEphemeralOnTerminal,
+  };
+
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  assert.equal(typeof root.McBackgroundAdapters, "object");
+
+  return {
+    api: root.McBackgroundAdapters,
+    trackedMaps,
+    registryHits,
+    privacyCalls,
+    ephemeralHandles,
+  };
+}
+
+function assertRegistryDormant(registryHits, label) {
+  const prefix = label ? label + " " : "";
+  assert.equal(registryHits.observe, 0, prefix + "registry observe");
+  assert.equal(registryHits.lookup, 0, prefix + "registry lookup");
+  assert.equal(registryHits.clear, 0, prefix + "registry clear");
+  assert.equal(registryHits.snapshot, 0, prefix + "registry snapshot");
+}
+
+function assertPrivateEphemeralHandle(handle, expectedUrl, label) {
+  assert.ok(handle && typeof handle === "object", label + " handle object");
+  assert.ok(Object.isFrozen(handle), label + " handle frozen");
+  const enumKeys = Object.keys(handle);
+  assert.equal(enumKeys.includes("mediaUrl"), false, label + " mediaUrl non-enum");
+  assert.equal(enumKeys.includes("requestHeaders"), false, label + " headers non-enum");
+  assert.equal(
+    Object.prototype.propertyIsEnumerable.call(handle, "mediaUrl"),
+    false,
+    label + " mediaUrl not enumerable"
+  );
+  assert.equal(handle.mediaUrl, expectedUrl, label + " exact private URL");
+  assert.equal(
+    JSON.stringify(handle),
+    "{}",
+    label + " handle public-serializes empty"
+  );
+}
+
+/**
+ * Scan test-private TrackingMap._sets for Lease-2 ownership shapes after a bind.
+ * Maps alone do not prove source control flow — paired with structural source scan.
+ * Mutable Maps/arrays/in-flight booleans need not be frozen. Provider evidence is
+ * covered by registry dormancy elsewhere, not here.
+ */
+function isRealmSafeMapLike(value) {
+  return (
+    value != null &&
+    typeof value === "object" &&
+    typeof value.get === "function" &&
+    typeof value.has === "function" &&
+    typeof value.size === "number"
+  );
+}
+
+const SAFE_VARIANT_OWN_KEYS = new Set([
+  "id",
+  "label",
+  "width",
+  "height",
+  "bandwidth",
+  "mime",
+]);
+const POPUP_MEDIA_OWN_KEYS = ["id", "proposedFilename", "kind", "variants"];
+
+/**
+ * Exact frozen public-row correspondence: ordered own keys, data descriptors only
+ * (no accessor invocation), matching flags, and Object.is values. Objects may be
+ * nonidentical copies.
+ */
+function assertFrozenPublicFieldEquivalence(actual, expected, label) {
+  assert.ok(actual && typeof actual === "object", label + " actual object");
+  assert.ok(expected && typeof expected === "object", label + " expected object");
+  assert.ok(Object.isFrozen(actual), label + " actual frozen");
+  assert.ok(Object.isFrozen(expected), label + " expected frozen");
+  const aKeys = Reflect.ownKeys(actual);
+  const eKeys = Reflect.ownKeys(expected);
+  assert.deepEqual(aKeys, eKeys, label + " ordered ownKeys");
+  for (let i = 0; i < eKeys.length; i++) {
+    const k = eKeys[i];
+    const ad = Object.getOwnPropertyDescriptor(actual, k);
+    const ed = Object.getOwnPropertyDescriptor(expected, k);
+    assert.ok(ad, label + " actual descriptor " + String(k));
+    assert.ok(ed, label + " expected descriptor " + String(k));
+    const aIsData = Object.prototype.hasOwnProperty.call(ad, "value");
+    const eIsData = Object.prototype.hasOwnProperty.call(ed, "value");
+    assert.equal(aIsData, true, label + " actual data descriptor " + String(k));
+    assert.equal(eIsData, true, label + " expected data descriptor " + String(k));
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(ad, "get"),
+      false,
+      label + " actual not accessor " + String(k)
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(ed, "get"),
+      false,
+      label + " expected not accessor " + String(k)
+    );
+    assert.equal(ad.enumerable, ed.enumerable, label + " enumerable " + String(k));
+    assert.equal(
+      ad.configurable,
+      ed.configurable,
+      label + " configurable " + String(k)
+    );
+    assert.equal(ad.writable, ed.writable, label + " writable " + String(k));
+    assert.equal(ad.writable, false, label + " non-writable " + String(k));
+    assert.equal(ad.configurable, false, label + " non-configurable " + String(k));
+    assert.equal(
+      Object.is(ad.value, ed.value),
+      true,
+      label + " Object.is value " + String(k)
+    );
+  }
+}
+
+function assertSafeVariantPublicShape(row, label) {
+  assert.ok(row && typeof row === "object", label + " row object");
+  assert.ok(Object.isFrozen(row), label + " row frozen");
+  const keys = Reflect.ownKeys(row);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    assert.equal(typeof k, "string", label + " string key");
+    assert.equal(
+      SAFE_VARIANT_OWN_KEYS.has(k),
+      true,
+      label + " unexpected own key " + String(k)
+    );
+    const d = Object.getOwnPropertyDescriptor(row, k);
+    assert.ok(d, label + " descriptor " + k);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(d, "value"),
+      true,
+      label + " data descriptor " + k
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(d, "get"),
+      false,
+      label + " not accessor " + k
+    );
+    assert.equal(d.writable, false, label + " non-writable " + k);
+    assert.equal(d.configurable, false, label + " non-configurable " + k);
+    assert.equal(
+      d.value !== null && typeof d.value === "object",
+      false,
+      label + " no object-valued ownership field " + k
+    );
+  }
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(row, "url"),
+    false,
+    label + " no url key"
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(row, "sourceHandle"),
+    false,
+    label + " no sourceHandle key"
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(row, "mediaUrl"),
+    false,
+    label + " no mediaUrl key"
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(row, "safeProjection"),
+    false,
+    label + " no safeProjection key"
+  );
+}
+
+function assertVariantOwnershipMaps(
+  inst,
+  mediaId,
+  rows,
+  expectedUrls,
+  popupSurface,
+  label
+) {
+  const prefix = label ? label + " " : "";
+  assert.ok(Array.isArray(rows) && rows.length > 0, prefix + "rows present");
+  const n = rows.length;
+  const rowIds = rows.map((r) => r.id);
+  for (let i = 0; i < n; i++) {
+    assert.ok(typeof rowIds[i] === "string" && rowIds[i].length > 0, prefix + "row id");
+  }
+  assert.ok(typeof mediaId === "string" && mediaId.length > 0, prefix + "mediaId");
+
+  // Independently supplied original URL sequence — never derived from private output.
+  assert.ok(Array.isArray(expectedUrls), prefix + "expectedUrls is Array");
+  assert.equal(expectedUrls.length, n, prefix + "expectedUrls length exact N");
+  for (let i = 0; i < n; i++) {
+    assert.equal(
+      typeof expectedUrls[i],
+      "string",
+      prefix + "expectedUrls[" + i + "] primitive string"
+    );
+    assert.equal(
+      expectedUrls[i] !== null &&
+        typeof expectedUrls[i] === "string" &&
+        (typeof expectedUrls[i] !== "object"),
+      true,
+      prefix + "expectedUrls[" + i + "] not boxed"
+    );
+  }
+
+  assert.ok(Array.isArray(popupSurface), prefix + "popup surface array");
+
+  const orderedHits = [];
+  const byIdHits = [];
+
+  for (const m of inst.trackedMaps) {
+    assert.ok(Array.isArray(m._sets), prefix + "TrackingMap._sets log");
+    for (const entry of m._sets) {
+      const k = entry.key;
+      const v = entry.value;
+      if (v == null) continue;
+
+      // Primitive string values first so ownership-log branch is reachable before
+      // any typeof !== "object" skip. Ownership exactness is proven separately.
+      if (typeof v === "string") {
+        continue;
+      }
+      if (typeof v === "boolean") {
+        // in-flight marker values may be booleans — not required frozen
+        continue;
+      }
+      if (typeof v !== "object") continue;
+
+      if (Array.isArray(v)) {
+        // mediaId -> ordered array of exactly N immutable private records
+        if (k === mediaId && v.length === n) {
+          let ok = true;
+          for (let i = 0; i < n; i++) {
+            const r = v[i];
+            if (
+              !r ||
+              typeof r !== "object" ||
+              !Object.prototype.hasOwnProperty.call(r, "safeProjection") ||
+              !Object.prototype.hasOwnProperty.call(r, "sourceHandle") ||
+              !r.safeProjection ||
+              !r.sourceHandle ||
+              typeof r.safeProjection !== "object" ||
+              r.safeProjection.id !== rowIds[i]
+            ) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) orderedHits.push({ map: m, key: k, value: v });
+        }
+        continue;
+      }
+
+      const keys = Object.keys(v).slice().sort();
+      // Finalizer/pending/source Lease-1 shapes — allowed evidence, not variant ownership.
+      if (
+        (keys.includes("event") && keys.includes("deadline")) ||
+        (keys.includes("detectionId") && keys.includes("mediaUrl")) ||
+        (keys.includes("mediaId") &&
+          keys.includes("proposedFilename") &&
+          keys.includes("mediaKind") &&
+          !keys.includes("safeProjection"))
+      ) {
+        continue;
+      }
+
+      // mediaId -> realm-safe Map-like of variant id -> same private record.
+      // Classify via get/has/size only — never host-realm constructor checks.
+      if (isRealmSafeMapLike(v) && k === mediaId && v.size === n) {
+        let ok = true;
+        const mapped = [];
+        for (let i = 0; i < n; i++) {
+          const id = rowIds[i];
+          if (!v.has(id)) {
+            ok = false;
+            break;
+          }
+          const r = v.get(id);
+          if (
+            !r ||
+            typeof r !== "object" ||
+            !Object.prototype.hasOwnProperty.call(r, "safeProjection") ||
+            !Object.prototype.hasOwnProperty.call(r, "sourceHandle") ||
+            !r.safeProjection ||
+            !r.sourceHandle ||
+            typeof r.safeProjection !== "object" ||
+            r.safeProjection.id !== id
+          ) {
+            ok = false;
+            break;
+          }
+          mapped.push(r);
+        }
+        if (ok) byIdHits.push({ map: m, key: k, inner: v, records: mapped });
+      }
+    }
+  }
+
+  assert.equal(orderedHits.length >= 1, true, prefix + "mediaId-keyed ordered records");
+  assert.equal(byIdHits.length >= 1, true, prefix + "mediaId-keyed by-id Map-like");
+
+  const ordered = orderedHits[0].value;
+  assert.equal(ordered.length, n, prefix + "ordered length exact N");
+  const byId = byIdHits[0];
+  assert.equal(byId.inner.size, n, prefix + "by-id size exact N");
+
+  // Same corresponding private record identity across ordered + by-id.
+  for (let i = 0; i < n; i++) {
+    assert.equal(
+      ordered[i],
+      byId.inner.get(rowIds[i]),
+      prefix + "ordered/byId private record identity " + i
+    );
+  }
+
+  // Exact ownership log on a single TrackingMap: relevance solely by rowId key
+  // membership (never by value/mediaId). Exact pair count N and unique-key count N
+  // must hold before any value assertion; longer duplicate logs fail.
+  let ownerHit = null;
+  for (const m of inst.trackedMaps) {
+    const relevant = [];
+    for (const entry of m._sets) {
+      if (typeof entry.key === "string" && rowIds.indexOf(entry.key) !== -1) {
+        relevant.push({ key: entry.key, value: entry.value });
+      }
+    }
+    const uniqueKeys = new Set();
+    for (let i = 0; i < relevant.length; i++) {
+      uniqueKeys.add(relevant[i].key);
+    }
+    if (relevant.length !== n || uniqueKeys.size !== n) {
+      continue;
+    }
+    let everyIdOnce = true;
+    for (let i = 0; i < n; i++) {
+      if (!uniqueKeys.has(rowIds[i])) {
+        everyIdOnce = false;
+        break;
+      }
+    }
+    if (!everyIdOnce) continue;
+    // Counts established — only now may values equal mediaId.
+    let valuesOk = true;
+    for (let i = 0; i < relevant.length; i++) {
+      if (relevant[i].value !== mediaId) {
+        valuesOk = false;
+        break;
+      }
+    }
+    if (!valuesOk) continue;
+    if (typeof m.get === "function" && typeof m.has === "function") {
+      for (let i = 0; i < n; i++) {
+        if (!m.has(rowIds[i]) || m.get(rowIds[i]) !== mediaId) {
+          valuesOk = false;
+          break;
+        }
+      }
+    }
+    if (!valuesOk) continue;
+    ownerHit = { map: m, pairs: relevant };
+    break;
+  }
+  assert.ok(ownerHit, prefix + "ownership Map exact rowId->mediaId log");
+  assert.equal(ownerHit.pairs.length, n, prefix + "ownership pair count exact N");
+  assert.equal(
+    new Set(ownerHit.pairs.map((p) => p.key)).size,
+    n,
+    prefix + "ownership unique keys exact N"
+  );
+
+  const handles = [];
+  for (let i = 0; i < n; i++) {
+    const r = ordered[i];
+    assert.ok(Object.isFrozen(r), prefix + "private record frozen " + i);
+    assert.ok(
+      Object.isFrozen(r.safeProjection),
+      prefix + "safeProjection frozen " + i
+    );
+    // Full safe-projection correspondence to independently returned row (not id-only).
+    assertFrozenPublicFieldEquivalence(
+      r.safeProjection,
+      rows[i],
+      prefix + "safeProjection~rows[" + i + "]"
+    );
+    assertSafeVariantPublicShape(
+      r.safeProjection,
+      prefix + "safeProjection shape " + i
+    );
+    assertSafeVariantPublicShape(rows[i], prefix + "returned row shape " + i);
+    // Independent original URL proof — never derive expected from the handle itself.
+    assertPrivateEphemeralHandle(
+      r.sourceHandle,
+      expectedUrls[i],
+      prefix + "record sourceHandle " + i
+    );
+    handles.push(r.sourceHandle);
+  }
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      assert.notEqual(
+        handles[i],
+        handles[j],
+        prefix + "distinct source handles " + i + "/" + j
+      );
+    }
+  }
+
+  // Causal public-surface exclusion via independently obtained popup surface.
+  const popupMatches = [];
+  for (let i = 0; i < popupSurface.length; i++) {
+    const row = popupSurface[i];
+    if (row && row.id === mediaId) popupMatches.push(row);
+  }
+  assert.equal(
+    popupMatches.length,
+    1,
+    prefix + "exactly one popup media row for mediaId"
+  );
+  const popRow = popupMatches[0];
+  assert.deepEqual(
+    Reflect.ownKeys(popRow),
+    POPUP_MEDIA_OWN_KEYS,
+    prefix + "popup media own-key list"
+  );
+  assert.ok(Object.isFrozen(popRow), prefix + "popup media row frozen");
+  for (let i = 0; i < POPUP_MEDIA_OWN_KEYS.length; i++) {
+    const k = POPUP_MEDIA_OWN_KEYS[i];
+    const d = Object.getOwnPropertyDescriptor(popRow, k);
+    assert.ok(d, prefix + "popup desc " + k);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(d, "value"),
+      true,
+      prefix + "popup data descriptor " + k
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(d, "get"),
+      false,
+      prefix + "popup not accessor " + k
+    );
+    assert.equal(d.writable, false, prefix + "popup non-writable " + k);
+    assert.equal(d.configurable, false, prefix + "popup non-configurable " + k);
+  }
+  assert.ok(Array.isArray(popRow.variants), prefix + "popup variants array");
+  assert.equal(popRow.variants.length, n, prefix + "popup variants length exact N");
+  assert.ok(Object.isFrozen(popRow.variants), prefix + "popup variants frozen");
+  for (let i = 0; i < n; i++) {
+    assertFrozenPublicFieldEquivalence(
+      popRow.variants[i],
+      rows[i],
+      prefix + "popup variant~rows[" + i + "]"
+    );
+    assertSafeVariantPublicShape(
+      popRow.variants[i],
+      prefix + "popup variant shape " + i
+    );
+  }
+
+  // Complete public JSON: no independently supplied private URLs or private keys.
+  // JSON serializes a Map as {}; do not treat toString Map tags as ownership evidence.
+  const rowsJson = JSON.stringify(rows);
+  const popupJson = JSON.stringify(popupSurface);
+  const privateKeys = [
+    "sourceHandle",
+    "mediaUrl",
+    "safeProjection",
+    "requestHeaders",
+  ];
+  for (let i = 0; i < privateKeys.length; i++) {
+    const pk = privateKeys[i];
+    assert.equal(rowsJson.includes(pk), false, prefix + "rows JSON no " + pk);
+    assert.equal(popupJson.includes(pk), false, prefix + "popup JSON no " + pk);
+  }
+  for (let i = 0; i < n; i++) {
+    assert.equal(
+      rowsJson.includes(expectedUrls[i]),
+      false,
+      prefix + "rows omit independent url " + i
+    );
+    assert.equal(
+      popupJson.includes(expectedUrls[i]),
+      false,
+      prefix + "popup omit independent url " + i
+    );
+    assert.equal(
+      JSON.stringify(handles[i]),
+      "{}",
+      prefix + "handle serializes empty " + i
+    );
+  }
+}
+
+function variantNetworkCapture(docId, tabId, overrides) {
+  const page =
+    "https://site.example/SECRET_PAGE_PATH/watch?q=SECRET_SIGNED_QUERY_XYZ";
+  const base = {
+    details: {
+      url:
+        "https://SECRET_MEDIA_ORIGIN_HOST.cdn.example/base.mp4?token=SECRET_SIGNED_QUERY_XYZ",
+      documentUrl: page,
+      originUrl: page + "&ref=SECRET_REFERER_PATH",
+      tabId: tabId,
+      frameId: 0,
+      documentId: docId,
+      timeStamp: 1_000_000,
+      responseHeaders: [{ name: "Content-Type", value: "video/mp4" }],
+    },
+    hints: {
+      topLevelUrlHint: page,
+      frameOrigin: "https://site.example",
+    },
+    transport: {
+      mediaKind: "direct",
+      requestHeaders: {
+        Cookie: "session=SECRET_COOKIE_ABC",
+        Authorization: "Bearer SECRET_AUTH_BEARER_TOKEN",
+      },
+    },
+  };
+  return Object.assign(base, overrides || {});
+}
+
+function variantNetworkSnapshot(docId, tabId, filename) {
+  const page =
+    "https://site.example/SECRET_PAGE_PATH/watch?q=SECRET_SIGNED_QUERY_XYZ";
+  return {
+    documentId: docId,
+    tabId: tabId,
+    frameId: 0,
+    pageUrl: page,
+    topLevelPageUrl: page,
+    documentNonce: "n-" + docId,
+    candidates: [{ kind: "visible-filename", value: filename || "safe-net.mp4" }],
+    capturedAt: "2026-08-12T12:00:00.000Z",
+  };
+}
+
+function variantDomCapture(docId, tabId, overrides) {
+  const page =
+    "https://dom.example/SECRET_PAGE_PATH/v?token=SECRET_SIGNED_QUERY_XYZ";
+  const base = {
+    mediaUrl:
+      "https://SECRET_MEDIA_ORIGIN_HOST.cdn.example/dom.mp4?token=SECRET_SIGNED_QUERY_XYZ",
+    mediaOrigin: "https://SECRET_MEDIA_ORIGIN_HOST.cdn.example",
+    contentDisposition: null,
+    referrerUrl: page + "#SECRET_REFERER_PATH",
+    frameOrigin: "https://dom.example",
+    ts: 1_000_100,
+    snapshot: {
+      documentId: docId,
+      tabId: tabId,
+      frameId: 0,
+      pageUrl: page,
+      topLevelPageUrl: page,
+      documentNonce: "n-" + docId,
+      candidates: [{ kind: "visible-filename", value: "safe-dom.mp4" }],
+      capturedAt: "2026-08-12T12:00:01.000Z",
+    },
+    transport: {
+      mediaKind: "direct",
+      requestHeaders: {
+        Cookie: "session=SECRET_COOKIE_ABC",
+        Authorization: "Bearer SECRET_AUTH_BEARER_TOKEN",
+      },
+    },
+  };
+  return Object.assign(base, overrides || {});
+}
+
+function assertSafeVariantRow(row, expected) {
+  const keys = Object.keys(row);
+  assert.deepEqual(keys, expected.keys);
+  assert.ok(isSafeOpaqueId(row.id));
+  if (expected.label !== undefined) assert.equal(row.label, expected.label);
+  if (expected.width !== undefined) assert.equal(row.width, expected.width);
+  if (expected.height !== undefined) assert.equal(row.height, expected.height);
+  if (expected.bandwidth !== undefined) {
+    assert.equal(row.bandwidth, expected.bandwidth);
+  }
+  if (expected.mime !== undefined) assert.equal(row.mime, expected.mime);
+  assert.equal(Object.prototype.hasOwnProperty.call(row, "url"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(row, "mediaId"), false);
+  assertDeepFrozen(row, "variant row");
+}
+
+function assertFreshFrozenCopy(a, b, label) {
+  assert.notEqual(a, b, label + " must be fresh array");
+  assert.deepEqual(a, b);
+  assertDeepFrozen(a, label + " a");
+  assertDeepFrozen(b, label + " b");
+  if (a.length > 0) {
+    assert.notEqual(a[0], b[0], label + " rows must be fresh");
+  }
+}
+
+function openOwnedMedia(ctrl, fx, opts) {
+  const docId = opts.docId;
+  const tabId = opts.tabId;
+  const kind = opts.kind || "network";
+  let mediaId;
+  if (kind === "dom") {
+    mediaId = ctrl.captureDomMedia(
+      variantDomCapture(docId, tabId, opts.captureOverrides)
+    );
+    assert.equal(fx.counts.publishDetection >= 1, true);
+  } else {
+    mediaId = ctrl.captureNetwork(
+      variantNetworkCapture(docId, tabId, opts.captureOverrides)
+    );
+    if (opts.finalize !== false) {
+      ctrl.acceptPageSnapshot(
+        variantNetworkSnapshot(docId, tabId, opts.filename)
+      );
+      assert.equal(
+        fx.publishDetections.some((p) => p.id === mediaId),
+        true,
+        "intended media " + mediaId + " must be finalized before variants"
+      );
+    }
+  }
+  assert.ok(isSafeOpaqueId(mediaId));
+  return mediaId;
+}
+
+// ---------------------------------------------------------------------------
+// BA05 — opaque variant IDs bind original private URLs; replay cannot replace
+// ---------------------------------------------------------------------------
+
+test("BA05 — opaque variant IDs bind original private URLs and replay cannot replace the owned set", async (t) => {
+  // Mutation caught: caller ID/URL authority, normalized URL, partial
+  // registration, replay reads, same-media reentrant takeover, cross-media ID
+  // collision, premature selection/enqueue, or secret projection.
+
+  await t.test(
+    "successful multi-variant bind, order, opaque IDs, Privacy spelling, popup",
+    async () => {
+      const foreign = createForeignRealm();
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      let variantTokenCalls = 0;
+      const ctrl = inst.api.createBackgroundAdapters(
+        fx.options({
+          randomToken(ns) {
+            fx.counts.randomToken += 1;
+            if (ns === "variant") variantTokenCalls += 1;
+            return "tok-repeat";
+          },
+        })
+      );
+      assert.equal(inst.registryHits.create, 1, "ProviderRegistry constructed once");
+      assertRegistryDormant(inst.registryHits, "bind pre");
+
+      const docId = "doc-ba05-bind";
+      const tabId = 201;
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId,
+        tabId,
+        filename: "bind-main.mp4",
+      });
+      assert.equal(
+        ctrl.popupMedia(tabId).some((r) => r.id === mediaId),
+        true
+      );
+
+      const urlA =
+        "https://SECRET_VARIANT_USERINFO:pw@cdn-a.example/v.mp4?sig=SECRET_VARIANT_QUERY&exp=1#SECRET_VARIANT_FRAGMENT";
+      const urlB =
+        "https://cdn-b.example/other.mp4?token=SECRET_VARIANT_QUERY&x=2";
+      const urlSpaced = "  https://x.example/a.mp4";
+      // Independent original-URL sequence for ownership proof (not from outputs).
+      const expectedBindUrls = [urlA, urlB, urlSpaced];
+
+      // Counter-backed ignored caller authority — must never be read.
+      const authorityHits = {
+        id: 0,
+        variantId: 0,
+        variantUrl: 0,
+        mediaId: 0,
+        providerKey: 0,
+        item: 0,
+        pageUrl: 0,
+        sourceContext: 0,
+        headers: 0,
+        Cookie: 0,
+        Authorization: 0,
+      };
+      const entry0 = {
+        url: urlA,
+        label: "  1080p Safe  ",
+        width: 1920,
+        height: 1080,
+        bandwidth: 5_000_000,
+        mime: "video/mp4",
+      };
+      for (const name of Object.keys(authorityHits)) {
+        Object.defineProperty(entry0, name, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            authorityHits[name] += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG authority-" + name);
+          },
+        });
+      }
+
+      const entry1 = foreign.makeOrdinary({
+        url: urlB,
+        label: "720p",
+        width: 1280,
+        height: 0, // unsafe optional — omit
+        bandwidth: -1, // omit
+        mime: "video/mp4; codecs=avc1", // unsafe MIME — omit
+      });
+      const entry2 = foreign.makeNullProto({
+        url: urlSpaced,
+        label: null,
+        width: 640.5, // omit
+        mime: "VIDEO/MP4",
+      });
+
+      const variants = foreign.makeArray([entry0, entry1, entry2]);
+      assert.equal(Array.isArray(variants), true);
+      assert.notEqual(variants.constructor, Array);
+
+      const tokenBefore = fx.counts.randomToken;
+      const ephBefore = inst.privacyCalls.length;
+      const handlesBefore = inst.ephemeralHandles.length;
+      const materialBefore = snapshotEffectBaseline(fx);
+      const variantTokensBefore = variantTokenCalls;
+      const popupBefore = ctrl.popupMedia(tabId).find((r) => r.id === mediaId);
+      assert.equal(popupBefore.variants.length, 0);
+
+      let err = null;
+      let rows = null;
+      try {
+        rows = ctrl.registerVariants(mediaId, variants);
+      } catch (e) {
+        err = e;
+      }
+
+      // Authority getters and registry must stay dormant even when Lease-1 stubs.
+      for (const name of Object.keys(authorityHits)) {
+        assert.equal(authorityHits[name], 0, "ignored authority " + name);
+      }
+      assertRegistryDormant(inst.registryHits, "bind attempt");
+
+      // Deliberately RED against Lease-1 stub; GREEN reaches full proofs.
+      assert.equal(err, null, "registerVariants must succeed for owned media");
+      assert.ok(Array.isArray(rows));
+      assert.equal(rows.length, 3);
+      assertDeepFrozen(rows, "registerVariants return");
+      assert.equal(fx.counts.randomToken, tokenBefore + 3);
+      assert.equal(variantTokenCalls, variantTokensBefore + 3);
+      // Exactly 3 variant ephemerals (base capture already created one).
+      const variantEph = inst.privacyCalls.slice(ephBefore);
+      assert.equal(variantEph.length, 3);
+      assert.equal(variantEph[0].mediaUrl, urlA);
+      assert.equal(variantEph[1].mediaUrl, urlB);
+      assert.equal(variantEph[2].mediaUrl, urlSpaced);
+      for (const c of variantEph) {
+        assert.equal(c.requestHeaders, null);
+      }
+      const variantHandles = inst.ephemeralHandles.slice(handlesBefore);
+      assert.equal(variantHandles.length, 3);
+      assert.notEqual(variantHandles[0], variantHandles[1]);
+      assert.notEqual(variantHandles[1], variantHandles[2]);
+      assert.notEqual(variantHandles[0], variantHandles[2]);
+      assertPrivateEphemeralHandle(variantHandles[0], urlA, "bind handle0");
+      assertPrivateEphemeralHandle(variantHandles[1], urlB, "bind handle1");
+      assertPrivateEphemeralHandle(variantHandles[2], urlSpaced, "bind handle2");
+      assertEffectBaseline(fx, {
+        ...materialBefore,
+        randomToken: materialBefore.randomToken + 3,
+      }, "bind material");
+      assert.equal(fx.counts.publishDetection, materialBefore.publishDetection);
+      assert.equal(fx.counts.postNative, materialBefore.postNative);
+      assert.equal(fx.counts.downloadsDownload, materialBefore.downloadsDownload);
+      assert.equal(fx.counts.publishJobs, materialBefore.publishJobs);
+      assert.equal(fx.counts.persistHistory, materialBefore.persistHistory);
+      assert.equal(fx.counts.reportDiagnostic, materialBefore.reportDiagnostic);
+      assert.equal(fx.counts.isPopupSender, materialBefore.isPopupSender);
+      assert.equal(
+        fx.counts.getEffectiveDestinationDirectory,
+        materialBefore.getEffectiveDestinationDirectory
+      );
+
+      assertSafeVariantRow(rows[0], {
+        keys: ["id", "label", "width", "height", "bandwidth", "mime"],
+        label: "1080p Safe",
+        width: 1920,
+        height: 1080,
+        bandwidth: 5_000_000,
+        mime: "video/mp4",
+      });
+      assertSafeVariantRow(rows[1], {
+        keys: ["id", "label", "width"],
+        label: "720p",
+        width: 1280,
+      });
+      assertSafeVariantRow(rows[2], {
+        keys: ["id", "mime"],
+        mime: "VIDEO/MP4",
+      });
+      assert.equal(new Set(rows.map((r) => r.id)).size, 3);
+      for (const r of rows) {
+        assert.notEqual(r.id, mediaId);
+        assert.equal(r.id.includes("SECRET_CALLER_VARIANT_ID"), false);
+        assert.match(r.id, /^variant:/);
+      }
+      // Contiguous suffix minting despite repeated token.
+      assert.match(rows[0].id, /:1$/);
+      assert.match(rows[1].id, /:2$/);
+      assert.match(rows[2].id, /:3$/);
+
+      const pop1 = ctrl.popupMedia(tabId);
+      const pop2 = ctrl.popupMedia(tabId);
+      assertFreshFrozenCopy(pop1, pop2, "popupMedia");
+      const row = pop1.find((r) => r.id === mediaId);
+      assert.ok(row);
+      assert.equal(row.variants.length, 3);
+      assert.deepEqual(
+        row.variants.map((v) => v.id),
+        rows.map((r) => r.id)
+      );
+      assertDeepFrozen(row.variants, "popup variants");
+      assertNoVariantSentinels(rows, "registerVariants rows");
+      assertNoVariantSentinels(pop1, "popup after bind");
+      assertNoVariantSentinels(fx.publishDetections, "publish after bind");
+      // No ignored-authority sentinels reach public/callback surfaces.
+      assert.equal(
+        JSON.stringify(rows).includes("SECRET_CALLER"),
+        false
+      );
+      assertVariantOwnershipMaps(
+        inst,
+        mediaId,
+        rows,
+        expectedBindUrls,
+        pop1,
+        "bind maps"
+      );
+      assertRegistryDormant(inst.registryHits, "bind post");
+    }
+  );
+
+  await t.test(
+    "pending media keeps registered set invisible until finalize",
+    async () => {
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      const docId = "doc-ba05-pending";
+      const tabId = 202;
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId,
+        tabId,
+        finalize: false,
+      });
+      // Length only — classic-VM arrays are cross-realm vs host literals.
+      assert.equal(ctrl.popupMedia(tabId).length, 0);
+      const rows = ctrl.registerVariants(mediaId, [
+        { url: "https://cdn.example/pend-a.mp4", label: "p" },
+        { url: "https://cdn.example/pend-b.mp4", label: "q" },
+      ]);
+      assert.equal(rows.length, 2);
+      assert.equal(ctrl.popupMedia(tabId).length, 0);
+      ctrl.acceptPageSnapshot(
+        variantNetworkSnapshot(docId, tabId, "pend-final.mp4")
+      );
+      assert.equal(
+        fx.publishDetections.some((p) => p.id === mediaId),
+        true
+      );
+      const pop = ctrl.popupMedia(tabId);
+      assert.equal(pop.length, 1);
+      assert.equal(pop[0].id, mediaId);
+      assert.equal(pop[0].variants.length, 2);
+      assert.deepEqual(
+        pop[0].variants.map((v) => v.id),
+        rows.map((r) => r.id)
+      );
+    }
+  );
+
+  await t.test(
+    "completed-set replay returns fresh frozen copy and reads nothing",
+    async () => {
+      const fx = makeEffects();
+      const api = loadAdapters();
+      const ctrl = api.createBackgroundAdapters(fx.options());
+      const docId = "doc-ba05-replay";
+      const tabId = 203;
+      const mediaId = openOwnedMedia(ctrl, fx, { docId, tabId });
+      const first = ctrl.registerVariants(mediaId, [
+        { url: "https://cdn.example/r1.mp4", label: "one", width: 1 },
+        { url: "https://cdn.example/r2.mp4", label: "two", height: 2 },
+      ]);
+      assert.equal(first.length, 2);
+      const ids = first.map((r) => r.id);
+
+      let trapHits = 0;
+      const hostile = new Proxy([], {
+        getOwnPropertyDescriptor() {
+          trapHits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG replay-gopd");
+        },
+        ownKeys() {
+          trapHits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG replay-keys");
+        },
+        get() {
+          trapHits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG replay-get");
+        },
+        getPrototypeOf() {
+          trapHits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG replay-proto");
+        },
+      });
+      const tokenBefore = fx.counts.randomToken;
+      const second = ctrl.registerVariants(mediaId, hostile);
+      assert.equal(trapHits, 0, "completed replay must not touch variants");
+      assert.equal(fx.counts.randomToken, tokenBefore);
+      assertFreshFrozenCopy(first, second, "completed replay");
+      assert.deepEqual(
+        second.map((r) => r.id),
+        ids
+      );
+
+      const rev = Proxy.revocable(
+        [{ url: "https://cdn.example/should-not-read.mp4" }],
+        {
+          get() {
+            trapHits += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG revoked-get");
+          },
+        }
+      );
+      rev.revoke();
+      const third = ctrl.registerVariants(mediaId, rev.proxy);
+      assert.equal(trapHits, 0);
+      assert.deepEqual(
+        third.map((r) => r.id),
+        ids
+      );
+      assert.notEqual(third, second);
+      assertDeepFrozen(third, "third replay");
+    }
+  );
+
+  await t.test(
+    "same-media reentrant fails without read; cross-media reentrant binds",
+    async () => {
+      const fx = makeEffects();
+      const api = loadAdapters();
+      let ctrl;
+      let mediaA;
+      let mediaB;
+      let nestedAErr = null;
+      let nestedBRows = null;
+      let nestedBTrapHits = 0;
+      let phase = "idle";
+      ctrl = api.createBackgroundAdapters(
+        fx.options({
+          randomToken(ns) {
+            fx.counts.randomToken += 1;
+            if (phase === "outer-A" && ns === "variant") {
+              phase = "reenter";
+              // Same-media reentrant: must fail without reading input.
+              let hits = 0;
+              const nestedHostile = new Proxy(
+                [{ url: "https://evil.example/nested-a.mp4" }],
+                {
+                  getOwnPropertyDescriptor() {
+                    hits += 1;
+                    throw new Error("SECRET_HOSTILE_TRAP_MSG nested-A");
+                  },
+                  ownKeys() {
+                    hits += 1;
+                    return ["0", "length"];
+                  },
+                  get() {
+                    hits += 1;
+                    throw new Error("SECRET_HOSTILE_TRAP_MSG nested-A-get");
+                  },
+                }
+              );
+              try {
+                ctrl.registerVariants(mediaA, nestedHostile);
+              } catch (e) {
+                nestedAErr = e;
+              }
+              assert.equal(hits, 0, "same-media reentry must not read variants");
+
+              // Cross-media reentrant registration while A is in-flight.
+              const nestedBInput = [
+                {
+                  url: "https://cdn.example/cross-b1.mp4",
+                  label: "b1",
+                },
+              ];
+              const bProxy = new Proxy(nestedBInput, {
+                get(t, p, r) {
+                  if (p === "length" || p === "0" || typeof p === "symbol") {
+                    return Reflect.get(t, p, r);
+                  }
+                  nestedBTrapHits += 1;
+                  return Reflect.get(t, p, r);
+                },
+              });
+              nestedBRows = ctrl.registerVariants(mediaB, bProxy);
+              phase = "outer-A-resume";
+              return "tok-A";
+            }
+            return "tok-" + ns + "-" + fx.counts.randomToken;
+          },
+        })
+      );
+
+      mediaA = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-re-a",
+        tabId: 210,
+        filename: "re-a.mp4",
+      });
+      mediaB = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-re-b",
+        tabId: 211,
+        filename: "re-b.mp4",
+      });
+      assert.notEqual(mediaA, mediaB);
+
+      phase = "outer-A";
+      const rowsA = ctrl.registerVariants(mediaA, [
+        { url: "https://cdn.example/a1.mp4", label: "a1" },
+        { url: "https://cdn.example/a2.mp4", label: "a2" },
+      ]);
+      assert.equal(rowsA.length, 2);
+      assertVariantRegError(nestedAErr);
+      assert.ok(nestedBRows);
+      assert.equal(nestedBRows.length, 1);
+      assert.ok(isSafeOpaqueId(nestedBRows[0].id));
+      assert.equal(
+        nestedBTrapHits,
+        0,
+        "cross-media reentrant input must not probe unexpected keys"
+      );
+      const allIds = [
+        ...rowsA.map((r) => r.id),
+        ...nestedBRows.map((r) => r.id),
+      ];
+      assert.equal(new Set(allIds).size, 3, "globally unique variant IDs");
+      for (const id of rowsA.map((r) => r.id)) {
+        assert.equal(nestedBRows.some((r) => r.id === id), false);
+      }
+    }
+  );
+
+  await t.test(
+    "invalid structures and token failure are atomic; open-set retry works",
+    async () => {
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      assert.equal(inst.registryHits.create, 1);
+      assertRegistryDormant(inst.registryHits, "invalid pre");
+
+      // --- unknown media / wrong type: no read ---
+      {
+        let hits = 0;
+        const hostile = new Proxy([], {
+          get() {
+            hits += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG unknown");
+          },
+          getOwnPropertyDescriptor() {
+            hits += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG unknown-d");
+          },
+        });
+        const baseline = snapshotEffectBaseline(fx);
+        const ephBefore = inst.privacyCalls.length;
+        let errUnknown = null;
+        try {
+          ctrl.registerVariants("not-owned", hostile);
+        } catch (e) {
+          errUnknown = e;
+        }
+        assert.equal(hits, 0);
+        assert.equal(inst.privacyCalls.length, ephBefore);
+        assert.equal(fx.counts.randomToken, baseline.randomToken);
+        assert.equal(fx.counts.reportDiagnostic, baseline.reportDiagnostic);
+        assert.equal(fx.counts.isPopupSender, baseline.isPopupSender);
+        assert.equal(
+          fx.counts.getEffectiveDestinationDirectory,
+          baseline.getEffectiveDestinationDirectory
+        );
+        assertRegistryDormant(inst.registryHits, "unknown media");
+        assertVariantRegError(errUnknown);
+        let errType = null;
+        try {
+          ctrl.registerVariants(12, [{ url: "https://x.example/a.mp4" }]);
+        } catch (e) {
+          errType = e;
+        }
+        assert.equal(hits, 0);
+        assertVariantRegError(errType);
+        assertEffectBaseline(fx, baseline, "unknown media");
+      }
+
+      // Fresh open media for invalid matrix
+      const docId = "doc-ba05-invalid";
+      const tabId = 220;
+      const mediaId = openOwnedMedia(ctrl, fx, { docId, tabId });
+
+      function assertRejectsAtomic(variants, label, hits) {
+        const baseline = snapshotEffectBaseline(fx);
+        const ephBefore = inst.privacyCalls.length;
+        const tokenBefore = fx.counts.randomToken;
+        const popBeforeLen = ctrl.popupMedia(tabId).find((r) => r.id === mediaId)
+          .variants.length;
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, variants);
+        } catch (e) {
+          err = e;
+        }
+        // Effect/hook evidence before error classification.
+        if (hits) {
+          for (const k of Object.keys(hits)) {
+            assert.equal(hits[k], 0, label + " hit " + k);
+          }
+        }
+        assert.equal(fx.counts.randomToken, tokenBefore, label + " token");
+        assert.equal(inst.privacyCalls.length, ephBefore, label + " privacy");
+        assert.equal(
+          fx.counts.publishDetection,
+          baseline.publishDetection,
+          label + " publish"
+        );
+        assert.equal(fx.counts.postNative, baseline.postNative, label + " native");
+        assert.equal(
+          fx.counts.reportDiagnostic,
+          baseline.reportDiagnostic,
+          label + " reportDiagnostic"
+        );
+        assert.equal(
+          fx.counts.isPopupSender,
+          baseline.isPopupSender,
+          label + " isPopupSender"
+        );
+        assert.equal(
+          fx.counts.getEffectiveDestinationDirectory,
+          baseline.getEffectiveDestinationDirectory,
+          label + " getEffectiveDestinationDirectory"
+        );
+        assert.equal(
+          fx.counts.publishJobs,
+          baseline.publishJobs,
+          label + " publishJobs"
+        );
+        assert.equal(
+          fx.counts.persistHistory,
+          baseline.persistHistory,
+          label + " persistHistory"
+        );
+        assertRegistryDormant(inst.registryHits, label);
+        assert.equal(
+          ctrl.popupMedia(tabId).find((r) => r.id === mediaId).variants.length,
+          popBeforeLen,
+          label + " popup ownership unchanged"
+        );
+        assert.ok(err, label + " must throw");
+        // Deliberately RED: fresh generic TypeError (Lease-1 stub fails here).
+        assertVariantRegError(err);
+        // Set still open — empty register returns []
+        const empty = ctrl.registerVariants(mediaId, []);
+        assert.deepEqual(empty, []);
+        assertDeepFrozen(empty, label + " empty open set");
+      }
+
+      // Not an array
+      assertRejectsAtomic({ 0: { url: "https://x.example/a.mp4" } }, "object shell");
+      assertRejectsAtomic(null, "null");
+      assertRejectsAtomic("https://x.example/a.mp4", "string");
+
+      // Sparse / accessor index
+      {
+        const sparse = [];
+        sparse.length = 1;
+        assertRejectsAtomic(sparse, "sparse");
+      }
+      {
+        const hits = { idx: 0 };
+        const arr = [];
+        Object.defineProperty(arr, "0", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.idx += 1;
+            return { url: "https://x.example/a.mp4" };
+          },
+        });
+        assertRejectsAtomic(arr, "index accessor", hits);
+      }
+      {
+        const arr = [{ url: "https://x.example/a.mp4" }];
+        arr.extra = true;
+        assertRejectsAtomic(arr, "unexpected own key");
+      }
+      {
+        const arr = [{ url: "https://x.example/a.mp4" }];
+        arr[Symbol("s")] = 1;
+        assertRejectsAtomic(arr, "symbol key");
+      }
+
+      // Dense own-data length greater than 64 (malformed Array length redefinition
+      // is not feasible: Array length is non-configurable and must be uint32).
+      {
+        const dense = [];
+        for (let i = 0; i < 65; i++) {
+          dense.push({ url: "https://cdn.example/dense-" + i + ".mp4" });
+        }
+        assert.equal(dense.length, 65);
+        assertRejectsAtomic(dense, "length greater than 64");
+      }
+
+      // URL rejects: blank, all-whitespace, C0/DEL/C1, non-HTTP, missing, inherited,
+      // non-string kinds (null/undefined/numeric/boxed/object)
+      const badUrls = [
+        "",
+        "   ",
+        "\t\n",
+        "https://x.example/\u0001a.mp4",
+        "https://x.example/\u007fa.mp4",
+        "https://x.example/\u0085a.mp4",
+        "ftp://x.example/a.mp4",
+        "file:///tmp/a.mp4",
+        "data:video/mp4,aaa",
+        "blob:https://x.example/u",
+        "not-a-url",
+        "/relative.mp4",
+        null,
+        undefined,
+        12,
+        0,
+        true,
+        { href: "https://x.example/obj.mp4" },
+        Object("https://x.example/boxed.mp4"),
+      ];
+      for (let i = 0; i < badUrls.length; i++) {
+        assertRejectsAtomic(
+          [{ url: badUrls[i] }],
+          "bad url kind #" + i
+        );
+      }
+      {
+        // missing required own-data url
+        assertRejectsAtomic([{ label: "no-url" }], "missing url");
+      }
+      {
+        const entry = Object.create({ url: "https://x.example/inherited.mp4" });
+        assertRejectsAtomic([entry], "inherited url");
+      }
+      {
+        const hits = { valueOf: 0, toString: 0 };
+        const coerced = {
+          valueOf() {
+            hits.valueOf += 1;
+            return "https://x.example/coerced.mp4";
+          },
+          toString() {
+            hits.toString += 1;
+            return "https://x.example/coerced.mp4";
+          },
+        };
+        assertRejectsAtomic([{ url: coerced }], "url coercion", hits);
+      }
+
+      // Leading-space URL is a positive control (not in invalid table).
+      {
+        const spaced = "  https://x.example/a.mp4";
+        const rows = ctrl.registerVariants(mediaId, [{ url: spaced }]);
+        assert.equal(rows.length, 1);
+        assert.equal(
+          inst.privacyCalls.some((c) => c.mediaUrl === spaced),
+          true,
+          "leading-space exact Privacy spelling"
+        );
+        // After bind, replay must not re-validate.
+        const again = ctrl.registerVariants(mediaId, [
+          { url: "https://should-not-bind.example/x.mp4" },
+        ]);
+        assert.equal(again[0].id, rows[0].id);
+      }
+
+      // Token failure atomicity on a dedicated open media (assert ownership).
+      {
+        const tokenErr = new Error("TOKEN_INJECTED_VARIANT_BOOM");
+        let mode = "throw";
+        const fx2 = makeEffects();
+        const inst2 = loadVariantInstrumentedClassic();
+        const c2 = inst2.api.createBackgroundAdapters(
+          fx2.options({
+            randomToken(ns) {
+              fx2.counts.randomToken += 1;
+              if (mode === "throw" && ns === "variant") throw tokenErr;
+              return "tok-ok";
+            },
+          })
+        );
+        const m = openOwnedMedia(c2, fx2, {
+          docId: "doc-ba05-tokfail2",
+          tabId: 222,
+        });
+        const ephBefore = inst2.privacyCalls.length;
+        const popBefore = c2.popupMedia(222)[0].variants.length;
+        let threw = null;
+        try {
+          c2.registerVariants(m, [
+            { url: "https://cdn.example/t1.mp4" },
+            { url: "https://cdn.example/t2.mp4" },
+          ]);
+        } catch (e) {
+          threw = e;
+        }
+        assert.equal(threw, tokenErr, "token failure preserves identity");
+        assert.equal(c2.popupMedia(222)[0].variants.length, popBefore);
+        assert.equal(c2.popupMedia(222)[0].variants.length, 0);
+        // Token failure is post-validation: Privacy must not commit ownership.
+        assert.equal(
+          c2.popupMedia(222)[0].variants.length,
+          0,
+          "no committed variants after token failure"
+        );
+        assertRegistryDormant(inst2.registryHits, "token fail");
+        mode = "ok";
+        const rows = c2.registerVariants(m, [
+          { url: "https://cdn.example/t1.mp4" },
+          { url: "https://cdn.example/t2.mp4" },
+        ]);
+        assert.equal(rows.length, 2);
+        assert.match(rows[0].id, /:1$/);
+        assert.match(rows[1].id, /:2$/);
+        assert.ok(inst2.privacyCalls.length > ephBefore);
+      }
+    }
+  );
+
+  // Independent known-field accessors — each field is its own causal subtest.
+  // Combined multi-accessor entries must not allow url rejection to mask others.
+  for (const field of ["url", "label", "width", "height", "bandwidth", "mime"]) {
+    await t.test(
+      "independent known-field accessor reject: " + field,
+      async () => {
+        const inst = loadVariantInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const tabId = 400 + ["url", "label", "width", "height", "bandwidth", "mime"].indexOf(field);
+        const mediaId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba05-acc-" + field,
+          tabId,
+        });
+        const hits = { [field]: 0 };
+        const entry = {};
+        if (field !== "url") {
+          Object.defineProperty(entry, "url", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: "https://cdn.example/acc-" + field + ".mp4",
+          });
+        }
+        Object.defineProperty(entry, field, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits[field] += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG accessor-" + field);
+          },
+        });
+        const baseline = snapshotEffectBaseline(fx);
+        const ephBefore = inst.privacyCalls.length;
+        const popBefore = ctrl.popupMedia(tabId).find((r) => r.id === mediaId)
+          .variants.length;
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entry]);
+        } catch (e) {
+          err = e;
+        }
+        assert.equal(hits[field], 0, field + " getter must not run");
+        assert.equal(inst.privacyCalls.length, ephBefore);
+        assert.equal(fx.counts.randomToken, baseline.randomToken);
+        assert.equal(fx.counts.reportDiagnostic, baseline.reportDiagnostic);
+        assert.equal(fx.counts.isPopupSender, baseline.isPopupSender);
+        assert.equal(
+          fx.counts.getEffectiveDestinationDirectory,
+          baseline.getEffectiveDestinationDirectory
+        );
+        assertRegistryDormant(inst.registryHits, "acc " + field);
+        assert.equal(
+          ctrl.popupMedia(tabId).find((r) => r.id === mediaId).variants.length,
+          popBefore
+        );
+        assert.ok(err, field + " must reject");
+        // Deliberately RED fresh-generic TypeError; Lease-1 stops before recovery.
+        assertVariantRegError(err);
+        const recovered = ctrl.registerVariants(mediaId, [
+          { url: "https://cdn.example/acc-recover-" + field + ".mp4", label: "r" },
+        ]);
+        assert.equal(recovered.length, 1);
+        assert.match(recovered[0].id, /:1$/);
+      }
+    );
+  }
+
+  await t.test(
+    "realm classification: accepted plain record with classification hooks binds",
+    async () => {
+      // Accepted genuine plain record + non-invoked classification hooks.
+      // Zero-hooks-before-deliberate-RED ordering is required.
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      const tabId = 280;
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-class-ok",
+        tabId,
+      });
+      const hits = {
+        constructor: 0,
+        toString: 0,
+        valueOf: 0,
+        toStringTag: 0,
+        iterator: 0,
+      };
+      const entry = {
+        url: "https://cdn.example/class-plain.mp4",
+        label: "plain",
+      };
+      Object.defineProperty(entry, "constructor", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          hits.constructor += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG constructor");
+        },
+      });
+      Object.defineProperty(entry, "toString", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          hits.toString += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG toString");
+        },
+      });
+      Object.defineProperty(entry, "valueOf", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          hits.valueOf += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG valueOf");
+        },
+      });
+      Object.defineProperty(entry, Symbol.toStringTag, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          hits.toStringTag += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG toStringTag");
+        },
+      });
+      Object.defineProperty(entry, Symbol.iterator, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          hits.iterator += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG iterator");
+        },
+      });
+      let err = null;
+      let rows = null;
+      try {
+        rows = ctrl.registerVariants(mediaId, [entry]);
+      } catch (e) {
+        err = e;
+      }
+      for (const k of Object.keys(hits)) {
+        assert.equal(hits[k], 0, "plain " + k + " must not run");
+      }
+      assertRegistryDormant(inst.registryHits, "plain class");
+      // Deliberately RED: no error and safe projection (Lease-1 fails here).
+      assert.equal(err, null, "plain record must bind");
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].label, "plain");
+      assertNoVariantSentinels(rows, "plain class rows");
+    }
+  );
+
+  await t.test(
+    "realm classification: forbidden foreign custom-prototype record rejects",
+    async () => {
+      // Forbidden form: foreign custom-prototype entry with classification hooks.
+      // Zero-hooks-before-deliberate-RED ordering; recovery starts :1 on GREEN.
+      {
+        const foreign = createForeignRealm();
+        const inst = loadVariantInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const tabId = 281;
+        const mediaId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba05-class-bad",
+          tabId,
+        });
+        const hits = {
+          constructor: 0,
+          toString: 0,
+          valueOf: 0,
+          toStringTag: 0,
+          iterator: 0,
+        };
+        const entry = foreign.makeCustomProto();
+        Object.defineProperty(entry, "url", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: "https://cdn.example/class-custom.mp4",
+        });
+        Object.defineProperty(entry, "constructor", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.constructor += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG f-constructor");
+          },
+        });
+        Object.defineProperty(entry, "toString", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.toString += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG f-toString");
+          },
+        });
+        Object.defineProperty(entry, "valueOf", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.valueOf += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG f-valueOf");
+          },
+        });
+        Object.defineProperty(entry, Symbol.toStringTag, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.toStringTag += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG f-toStringTag");
+          },
+        });
+        Object.defineProperty(entry, Symbol.iterator, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.iterator += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG f-iterator");
+          },
+        });
+        const baseline = snapshotEffectBaseline(fx);
+        const ephBefore = inst.privacyCalls.length;
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entry]);
+        } catch (e) {
+          err = e;
+        }
+        for (const k of Object.keys(hits)) {
+          assert.equal(hits[k], 0, "custom " + k + " must not run");
+        }
+        assert.equal(inst.privacyCalls.length, ephBefore);
+        assert.equal(fx.counts.randomToken, baseline.randomToken);
+        assertRegistryDormant(inst.registryHits, "custom class");
+        assert.ok(err, "custom proto must reject");
+        assertVariantRegError(err);
+        const recovered = ctrl.registerVariants(mediaId, [
+          { url: "https://cdn.example/class-recover.mp4" },
+        ]);
+        assert.equal(recovered.length, 1);
+        assert.match(recovered[0].id, /:1$/);
+      }
+
+      // Local custom-proto control folded into forbidden named subtest.
+      {
+        const fx = makeEffects();
+        const api = loadAdapters();
+        const ctrl = api.createBackgroundAdapters(fx.options());
+        const tabId = 282;
+        const mediaId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba05-class-local",
+          tabId,
+        });
+        function LocalCustom() {}
+        LocalCustom.prototype = { marker: "local-custom" };
+        const hits = { toStringTag: 0 };
+        const entry = new LocalCustom();
+        Object.defineProperty(entry, "url", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: "https://cdn.example/class-local.mp4",
+        });
+        Object.defineProperty(entry, Symbol.toStringTag, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.toStringTag += 1;
+            return "Array";
+          },
+        });
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entry]);
+        } catch (e) {
+          err = e;
+        }
+        assert.equal(hits.toStringTag, 0);
+        assert.ok(err);
+        assertVariantRegError(err);
+        const recovered = ctrl.registerVariants(mediaId, [
+          { url: "https://cdn.example/class-local-recover.mp4" },
+        ]);
+        assert.equal(recovered.length, 1);
+        assert.match(recovered[0].id, /:1$/);
+      }
+    }
+  );
+
+  await t.test(
+    "hostile reflection traps produce fresh generic errors; message accessor never runs",
+    async () => {
+      const fx = makeEffects();
+      const api = loadAdapters();
+      const ctrl = api.createBackgroundAdapters(fx.options());
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-hostile",
+        tabId: 230,
+      });
+
+      // Array-shell GOPD trap with exact-text TypeError + sentinel cause/stack.
+      {
+        const sentinel = { mark: "hostilesecret-cause" };
+        const hostileErr = new TypeError(VARIANT_REG_MSG);
+        hostileErr.cause = sentinel;
+        hostileErr.stack =
+          "TypeError: invalid media variant registration\n    at HOSTILE_SECRET_STACK";
+        let gopdHits = 0;
+        const arr = [{ url: "https://cdn.example/h.mp4" }];
+        const proxied = new Proxy(arr, {
+          getOwnPropertyDescriptor(t, p) {
+            gopdHits += 1;
+            throw hostileErr;
+          },
+        });
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, proxied);
+        } catch (e) {
+          err = e;
+        }
+        // Deliberately RED TypeError first; GREEN then proves the trap ran.
+        assert.ok(err, "array shell hostile must reject");
+        assertVariantRegError(err, { notSameAs: hostileErr });
+        assert.ok(gopdHits >= 1, "array gopd trap must run");
+        assert.equal(err.cause, undefined);
+      }
+
+      // Entry url own-descriptor path: exact-text hostile TypeError with hit counter.
+      {
+        const hostileErr = new TypeError(VARIANT_REG_MSG);
+        hostileErr.secret = "SECRET_HOSTILE_TRAP_MSG";
+        let urlGopdHits = 0;
+        const entry = {};
+        Object.defineProperty(entry, "url", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: "https://cdn.example/direct-gopd.mp4",
+        });
+        const entryProxy = new Proxy(entry, {
+          getOwnPropertyDescriptor(t, p) {
+            if (p === "url") {
+              urlGopdHits += 1;
+              throw hostileErr;
+            }
+            return Reflect.getOwnPropertyDescriptor(t, p);
+          },
+        });
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entryProxy]);
+        } catch (e) {
+          err = e;
+        }
+        // Deliberately RED TypeError first; GREEN proves url descriptor path.
+        assert.ok(err, "url gopd hostile must reject");
+        assertVariantRegError(err, { notSameAs: hostileErr });
+        assert.equal(urlGopdHits, 1, "url getOwnPropertyDescriptor must be consulted");
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(err, "secret"),
+          false
+        );
+      }
+
+      // Hostile thrown object whose message is an accessor — counter stays 0.
+      {
+        let messageHits = 0;
+        const hostileObj = {};
+        Object.defineProperty(hostileObj, "message", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            messageHits += 1;
+            return "SECRET_HOSTILE_TRAP_MSG message-accessor";
+          },
+        });
+        Object.defineProperty(hostileObj, "name", {
+          value: "TypeError",
+          enumerable: false,
+        });
+        Object.setPrototypeOf(hostileObj, TypeError.prototype);
+        const entry = {};
+        const entryProxy = new Proxy(entry, {
+          getOwnPropertyDescriptor() {
+            throw hostileObj;
+          },
+          ownKeys() {
+            throw hostileObj;
+          },
+          getPrototypeOf() {
+            throw hostileObj;
+          },
+        });
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entryProxy]);
+        } catch (e) {
+          err = e;
+        }
+        assertVariantRegError(err, { notSameAs: hostileObj });
+        assert.equal(messageHits, 0, "hostile message getter must never run");
+      }
+
+      // Still open after hostiles — valid bind once.
+      const rows = ctrl.registerVariants(mediaId, [
+        { url: "https://cdn.example/after-hostile.mp4", label: "ok" },
+      ]);
+      assert.equal(rows.length, 1);
+    }
+  );
+
+  await t.test(
+    "realm-neutral rejection matrix: local and foreign forbidden entry types",
+    async () => {
+      const foreign = createForeignRealm();
+      const fx = makeEffects();
+      const api = loadAdapters();
+      const ctrl = api.createBackgroundAdapters(fx.options());
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-realm",
+        tabId: 240,
+      });
+
+      class LocalClass {
+        constructor() {
+          this.url = "https://cdn.example/cls.mp4";
+        }
+      }
+      function LocalCustom() {}
+      LocalCustom.prototype = { marker: true, url: "https://cdn.example/p.mp4" };
+
+      const nullRootProto = Object.create(null);
+      nullRootProto.marker = "null-root-local";
+      function LocalNullRoot() {}
+      LocalNullRoot.prototype = nullRootProto;
+
+      const cases = [
+        { label: "local array entry", entry: [{ url: "https://cdn.example/a.mp4" }] },
+        { label: "foreign array entry", entry: foreign.makeArray([{ url: "https://cdn.example/a.mp4" }]) },
+        { label: "local function", entry: function fn() {} },
+        { label: "foreign function", entry: foreign.makeFunction() },
+        { label: "local Date", entry: new Date(0) },
+        { label: "foreign Date", entry: foreign.makeDate() },
+        { label: "local Map", entry: new Map() },
+        { label: "foreign Map", entry: foreign.makeMap() },
+        { label: "local Set", entry: new Set() },
+        { label: "foreign Set", entry: foreign.makeSet() },
+        { label: "local typed array", entry: new Uint8Array([1]) },
+        { label: "foreign typed array", entry: foreign.makeTyped() },
+        { label: "local class instance", entry: new LocalClass() },
+        { label: "foreign class instance", entry: foreign.makeClassInstance() },
+        { label: "local custom proto", entry: new LocalCustom() },
+        { label: "foreign custom proto", entry: foreign.makeCustomProto() },
+        { label: "local null-root custom", entry: new LocalNullRoot() },
+        { label: "foreign null-root custom", entry: foreign.makeNullRootCustom() },
+      ];
+
+      for (const c of cases) {
+        const baseline = snapshotEffectBaseline(fx);
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [c.entry]);
+        } catch (e) {
+          err = e;
+        }
+        assert.ok(err, c.label + " must reject");
+        assertVariantRegError(err);
+        assert.equal(fx.counts.randomToken, baseline.randomToken, c.label);
+      }
+
+      // Positive: foreign ordinary + foreign null-proto accepted together.
+      const urlF1 =
+        "https://foreign.example/a.mp4?sig=SECRET_VARIANT_QUERY";
+      const urlF2 =
+        "https://foreign.example/b.mp4?sig=SECRET_VARIANT_QUERY2";
+      const rows = ctrl.registerVariants(
+        mediaId,
+        foreign.makeArray([
+          foreign.makeOrdinary({ url: urlF1, label: "f1" }),
+          foreign.makeNullProto({ url: urlF2, label: "f2", width: 10 }),
+        ])
+      );
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].label, "f1");
+      assert.equal(rows[1].label, "f2");
+      assert.equal(rows[1].width, 10);
+      assertNoVariantSentinels(rows, "foreign accept rows");
+    }
+  );
+
+  await t.test(
+    "Privacy handle-preparation failure is atomic; retry starts at :1 contiguous",
+    async () => {
+      const failErr = new Error("SECRET_PRIVACY_FAIL prep");
+      // Fail only on first *variant* ephemeral: allow base capture, fail first
+      // variant prep, then succeed. Use onEphemeral gate (not a dead failCount path).
+      let variantPhase = false;
+      let failOnce = true;
+      let failedPrepCalls = 0;
+      const inst = loadVariantInstrumentedClassic({
+        onEphemeral(url, headers) {
+          if (variantPhase && failOnce) {
+            failOnce = false;
+            failedPrepCalls += 1;
+            throw failErr;
+          }
+        },
+      });
+      const fx = makeEffects();
+      let variantTokenCalls = 0;
+      const ctrl = inst.api.createBackgroundAdapters(
+        fx.options({
+          randomToken(ns) {
+            fx.counts.randomToken += 1;
+            if (ns === "variant") variantTokenCalls += 1;
+            return "det-tok";
+          },
+        })
+      );
+      assert.equal(inst.registryHits.create, 1);
+      assertRegistryDormant(inst.registryHits, "privfail pre");
+      const docId = "doc-ba05-privfail";
+      const tabId = 250;
+      const mediaId = openOwnedMedia(ctrl, fx, { docId, tabId });
+      const tokenBefore = fx.counts.randomToken;
+      const variantTokensBefore = variantTokenCalls;
+      const ephBefore = inst.privacyCalls.length;
+      const handlesBefore = inst.ephemeralHandles.length;
+      const materialBefore = snapshotEffectBaseline(fx);
+      const popBefore = ctrl.popupMedia(tabId).find((r) => r.id === mediaId);
+      assert.equal(popBefore.variants.length, 0);
+      variantPhase = true;
+      let threw = null;
+      try {
+        ctrl.registerVariants(mediaId, [
+          { url: "https://cdn.example/pf1.mp4", label: "a" },
+          { url: "https://cdn.example/pf2.mp4", label: "b" },
+        ]);
+      } catch (e) {
+        threw = e;
+      }
+      assert.equal(threw, failErr, "preserve Privacy failure identity");
+      assert.equal(failedPrepCalls, 1, "exactly one failed preparation call");
+      // No committed variant set / issued public IDs after failure.
+      assert.equal(
+        ctrl.popupMedia(tabId).find((r) => r.id === mediaId).variants.length,
+        0
+      );
+      assert.equal(
+        fx.counts.publishDetection,
+        materialBefore.publishDetection,
+        "privfail publishDetection"
+      );
+      assert.equal(
+        fx.counts.reportDiagnostic,
+        materialBefore.reportDiagnostic,
+        "privfail reportDiagnostic"
+      );
+      assert.equal(
+        fx.counts.isPopupSender,
+        materialBefore.isPopupSender,
+        "privfail isPopupSender"
+      );
+      assert.equal(
+        fx.counts.getEffectiveDestinationDirectory,
+        materialBefore.getEffectiveDestinationDirectory,
+        "privfail getEffectiveDestinationDirectory"
+      );
+      assert.equal(
+        fx.counts.publishJobs,
+        materialBefore.publishJobs,
+        "privfail publishJobs"
+      );
+      assert.equal(
+        fx.counts.persistHistory,
+        materialBefore.persistHistory,
+        "privfail persistHistory"
+      );
+      assert.equal(
+        fx.counts.postNative,
+        materialBefore.postNative,
+        "privfail postNative"
+      );
+      assertRegistryDormant(inst.registryHits, "privfail after fail");
+      // Failed prep recorded the attempted URL with null headers and no handle commit.
+      const failedSlice = inst.privacyCalls.slice(ephBefore);
+      assert.ok(failedSlice.length >= 1);
+      assert.equal(failedSlice[0].mediaUrl, "https://cdn.example/pf1.mp4");
+      assert.equal(failedSlice[0].requestHeaders, null);
+      assert.equal(
+        inst.ephemeralHandles.length,
+        handlesBefore,
+        "no committed ephemeral handle after Privacy failure"
+      );
+      // Token may have been requested during prep — but no public ID issued.
+      // Capture token delta for comparison; retry must still mint :1/:2.
+      const tokenAfterFail = fx.counts.randomToken;
+      assert.ok(tokenAfterFail >= tokenBefore);
+      assert.ok(variantTokenCalls >= variantTokensBefore);
+
+      // Retry: contiguous :1 and :2 with exact-URL Privacy calls and null headers.
+      const ephRetryBefore = inst.privacyCalls.length;
+      const handlesRetryBefore = inst.ephemeralHandles.length;
+      const rows = ctrl.registerVariants(mediaId, [
+        { url: "https://cdn.example/pf1.mp4", label: "a" },
+        { url: "https://cdn.example/pf2.mp4", label: "b" },
+      ]);
+      assert.equal(rows.length, 2);
+      assert.match(rows[0].id, /:1$/);
+      assert.match(rows[1].id, /:2$/);
+      assert.equal(rows[0].id.includes(":3"), false);
+      assert.equal(rows[1].id.includes(":3"), false);
+      const retryCalls = inst.privacyCalls.slice(ephRetryBefore);
+      assert.equal(retryCalls.length, 2);
+      assert.equal(retryCalls[0].mediaUrl, "https://cdn.example/pf1.mp4");
+      assert.equal(retryCalls[1].mediaUrl, "https://cdn.example/pf2.mp4");
+      for (const c of retryCalls) {
+        assert.equal(c.requestHeaders, null);
+      }
+      const retryHandles = inst.ephemeralHandles.slice(handlesRetryBefore);
+      assert.equal(retryHandles.length, 2);
+      assert.notEqual(retryHandles[0], retryHandles[1]);
+      assertPrivateEphemeralHandle(
+        retryHandles[0],
+        "https://cdn.example/pf1.mp4",
+        "privfail retry0"
+      );
+      assertPrivateEphemeralHandle(
+        retryHandles[1],
+        "https://cdn.example/pf2.mp4",
+        "privfail retry1"
+      );
+      assertRegistryDormant(inst.registryHits, "privfail post");
+    }
+  );
+
+  await t.test(
+    "full-string label safety omits embedded credential/header sentinels",
+    async () => {
+      const fx = makeEffects();
+      const api = loadAdapters();
+      const ctrl = api.createBackgroundAdapters(fx.options());
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-label",
+        tabId: 260,
+      });
+      const unsafeLabels = [
+        "xCookie: SECRET_UNSAFE_LABEL",
+        "xAuthorization: SECRET_UNSAFE_LABEL",
+        "prefix Cookie: SECRET_UNSAFE_LABEL",
+        "Set-Cookie: SECRET_UNSAFE_LABEL",
+        "Authorization: SECRET_UNSAFE_LABEL",
+        "Proxy-Authorization: SECRET_UNSAFE_LABEL",
+        "Bearer SECRET_UNSAFE_LABEL",
+        "see cookie in text",
+        "has token value",
+        "sig present here",
+        "https://evil.example/SECRET_UNSAFE_LABEL",
+        "//evil.example/x",
+        "ok\u0001control",
+        "a".repeat(200) + "Cookie: SECRET_UNSAFE_LABEL",
+      ];
+      const entries = unsafeLabels.map((label, i) => ({
+        url: "https://cdn.example/lab" + i + ".mp4",
+        label: label,
+      }));
+      const rows = ctrl.registerVariants(mediaId, entries);
+      assert.equal(rows.length, unsafeLabels.length);
+      for (const r of rows) {
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(r, "label"),
+          false,
+          "unsafe label must be omitted"
+        );
+      }
+      assertNoVariantSentinels(rows, "unsafe labels");
+      assertNoVariantSentinels(ctrl.popupMedia(260), "popup unsafe labels");
+      // Safe label still kept (trimmed, truncated after full-string checks).
+      const media2 = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-label-ok",
+        tabId: 261,
+      });
+      const longSafe = "  " + "safe-label-" + "x".repeat(140) + "  ";
+      const ok = ctrl.registerVariants(media2, [
+        { url: "https://cdn.example/ok-lab.mp4", label: longSafe },
+      ]);
+      assert.equal(ok[0].label.length, 128);
+      assert.equal(ok[0].label.startsWith("safe-label-"), true);
+    }
+  );
+
+  await t.test(
+    "futureTransport.variants snapshot is not auto-registered; enqueue stays stub",
+    async () => {
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      const docId = "doc-ba05-ft";
+      const tabId = 270;
+      const retainedUrl =
+        "https://retained.example/v.mp4?token=SECRET_VARIANT_QUERY";
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId,
+        tabId,
+        captureOverrides: {
+          transport: {
+            mediaKind: "direct",
+            requestHeaders: null,
+            variants: [{ url: retainedUrl, label: "retained" }],
+          },
+        },
+      });
+      // Capture alone: no variant IDs / popup variants / variant ephemerals for retained.
+      const pop0 = ctrl.popupMedia(tabId);
+      assert.equal(pop0.length, 1);
+      assert.equal(pop0[0].variants.length, 0);
+      const ephUrls = inst.privacyCalls.map((c) => c.mediaUrl);
+      assert.equal(ephUrls.includes(retainedUrl), false);
+
+      const explicit = "https://explicit.example/e.mp4?token=SECRET_VARIANT_QUERY";
+      const rows = ctrl.registerVariants(mediaId, [
+        { url: explicit, label: "explicit" },
+      ]);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].label, "explicit");
+      assert.equal(
+        inst.privacyCalls.some((c) => c.mediaUrl === explicit),
+        true
+      );
+      assert.equal(
+        inst.privacyCalls.some((c) => c.mediaUrl === retainedUrl),
+        false
+      );
+
+      // enqueueDownload remains Lease-1 stub; no reads / effects.
+      let itemHits = 0;
+      const item = {};
+      Object.defineProperty(item, "url", {
+        get() {
+          itemHits += 1;
+          return "https://override.example/SECRET_OVERRIDE_URL.mp4";
+        },
+      });
+      Object.defineProperty(item, "providerKey", {
+        get() {
+          itemHits += 1;
+          return "SECRET_CALLER_PROVIDER";
+        },
+      });
+      Object.defineProperty(item, "variantUrl", {
+        get() {
+          itemHits += 1;
+          return "https://override.example/SECRET_OVERRIDE_URL.mp4";
+        },
+      });
+      Object.defineProperty(item, "variantId", {
+        get() {
+          itemHits += 1;
+          return rows[0].id;
+        },
+      });
+      const baseline = snapshotEffectBaseline(fx);
+      const p = ctrl.enqueueDownload(
+        { item: item, mediaId: mediaId, variantId: rows[0].id },
+        { tab: { id: tabId } }
+      );
+      assert.ok(p && typeof p.then === "function");
+      let rejected = null;
+      await p.then(
+        () => {
+          throw new Error("expected reject");
+        },
+        (err) => {
+          rejected = err;
+        }
+      );
+      assert.ok(rejected instanceof Error);
+      assert.equal(rejected.message, LEASE1_MSG);
+      assert.equal(itemHits, 0);
+      assertEffectBaseline(fx, baseline, "enqueueDownload stub");
+      assert.deepEqual(
+        ctrl.popupMedia(tabId)[0].variants.map((v) => v.id),
+        rows.map((r) => r.id)
+      );
+    }
+  );
+
+  await t.test(
+    "structural: no selection resolver or private export/effect branch",
+    async () => {
+      // Narrow source structural inspection — harness-green on Lease-1.
+      // Maps alone do not prove control flow; this is the source half of the proof.
+      const src = productionSource();
+      assert.equal(
+        /\bresolveSelection\b|\bresolveDownloadSource\b|\bresolveVariantSource\b|\bresolveTransportBinding\b/.test(
+          src
+        ),
+        false,
+        "no selection/resolver branch"
+      );
+      assert.equal(
+        /\bselectSource\b|\bgetOwnedVariants\b|\btestOnly\b/.test(src),
+        false,
+        "no private export/test hook"
+      );
+      assert.equal(
+        /module\.exports\.debug|exports\.getVariant|exports\.selectSource/.test(src),
+        false
+      );
+      assert.equal(
+        /\bmodule\.exports\s*=\s*\{[^}]*resolve/.test(src),
+        false
+      );
+      assert.equal(
+        /\bgetVariantSource\b|\bselectDownloadSource\b|\benqueueVariant\b/.test(src),
+        false,
+        "no selection/enqueue-variant effect branch names"
+      );
+      assert.match(src, /registerVariants\s*[:(]/);
+
+      // Registry dormancy + TrackingMap allocation are concrete, not dead.
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      assert.equal(inst.registryHits.create, 1);
+      assertRegistryDormant(inst.registryHits, "structural source");
+      const tabId = 290;
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-struct-src",
+        tabId,
+        filename: "struct-src.mp4",
+      });
+      assert.ok(inst.trackedMaps.length >= 1, "finalizer maps allocated");
+      assert.ok(isSafeOpaqueId(mediaId));
+      assert.ok(Array.isArray(ctrl.popupMedia(tabId)));
+      assertRegistryDormant(inst.registryHits, "structural source post");
+    }
+  );
+
+  await t.test(
+    "structural maps: private ownership identities after successful bind",
+    async () => {
+      // Concrete Map instrumentation half — RED until Lease-2 bind exists.
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      assert.equal(inst.registryHits.create, 1);
+      assertRegistryDormant(inst.registryHits, "structural maps pre");
+      const tabId = 291;
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-struct-map",
+        tabId,
+        filename: "struct-map.mp4",
+      });
+      const mapsBeforeBind = inst.trackedMaps.length;
+      // Independent original-URL sequence for ownership proof (not from outputs).
+      const expectedStructUrls = [
+        "https://cdn.example/struct-a.mp4?sig=SECRET_VARIANT_QUERY",
+        "https://cdn.example/struct-b.mp4",
+      ];
+      let err = null;
+      let rows = null;
+      try {
+        rows = ctrl.registerVariants(mediaId, [
+          {
+            url: "https://cdn.example/struct-a.mp4?sig=SECRET_VARIANT_QUERY",
+            label: "s",
+          },
+          { url: "https://cdn.example/struct-b.mp4", width: 1 },
+        ]);
+      } catch (e) {
+        err = e;
+      }
+      assertRegistryDormant(inst.registryHits, "structural maps attempt");
+      assert.equal(
+        JSON.stringify(ctrl.popupMedia(tabId)).includes("SECRET_VARIANT_QUERY"),
+        false
+      );
+      // Deliberately RED missing Lease-2 bind; GREEN completes map proof.
+      assert.equal(err, null, "structural map bind");
+      assert.equal(rows.length, 2);
+      assert.ok(inst.trackedMaps.length >= mapsBeforeBind);
+      assertVariantOwnershipMaps(
+        inst,
+        mediaId,
+        rows,
+        expectedStructUrls,
+        ctrl.popupMedia(tabId),
+        "structural maps"
+      );
+      assertNoVariantSentinels(rows, "structural rows");
+      assertRegistryDormant(inst.registryHits, "structural maps post");
+    }
+  );
+
+  await t.test(
+    "stealth null-root custom prototype rejects generically and retry starts :1",
+    async () => {
+      // Mutation caught: accepting a non-direct null-root custom prototype whose
+      // sole own key is a non-enumerable hasOwnProperty (stealth Object.prototype
+      // lookalike), or calling that hasOwnProperty during classification.
+      // Capture both isolated cases fully before any assertion can throw.
+      function runStealthCase(label, makeEntryAndCounter) {
+        const inst = loadVariantInstrumentedClassic();
+        const fx = makeEffects();
+        let variantTokenCalls = 0;
+        const ctrl = inst.api.createBackgroundAdapters(
+          fx.options({
+            randomToken(ns) {
+              fx.counts.randomToken += 1;
+              if (ns === "variant") variantTokenCalls += 1;
+              return "tok-stealth-" + label;
+            },
+          })
+        );
+        const registryCreate = inst.registryHits.create;
+        const registryPre = {
+          observe: inst.registryHits.observe,
+          lookup: inst.registryHits.lookup,
+          clear: inst.registryHits.clear,
+          snapshot: inst.registryHits.snapshot,
+        };
+        const tabId = label === "local" ? 293 : 294;
+        const mediaId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba05-stealth-" + label,
+          tabId,
+          filename: "stealth-" + label + ".mp4",
+        });
+        const stealthUrl =
+          "https://cdn.example/stealth-" +
+          label +
+          ".mp4?sig=SECRET_VARIANT_QUERY";
+        const built = makeEntryAndCounter(stealthUrl);
+        const entry = built.entry;
+        const getHits = built.getHits;
+        const entryProto = Object.getPrototypeOf(entry);
+        const entryGrandProto =
+          entryProto == null ? undefined : Object.getPrototypeOf(entryProto);
+        const proto = entryProto;
+        const hopDesc =
+          proto == null
+            ? undefined
+            : Object.getOwnPropertyDescriptor(proto, "hasOwnProperty");
+        const protoOwnNames =
+          proto == null ? [] : Object.getOwnPropertyNames(proto).slice();
+        const protoSymbolCount =
+          proto == null ? -1 : Object.getOwnPropertySymbols(proto).length;
+        const protoEnumKeyCount = proto == null ? -1 : Object.keys(proto).length;
+
+        const tokenBefore = fx.counts.randomToken;
+        const variantTokensBefore = variantTokenCalls;
+        const ephBefore = inst.privacyCalls.length;
+        const handlesBefore = inst.ephemeralHandles.length;
+        const materialBefore = snapshotEffectBaseline(fx);
+        const popBefore = ctrl.popupMedia(tabId).find((r) => r.id === mediaId);
+        const mapsBefore = inst.trackedMaps.map((m) => m._sets.length);
+
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entry]);
+        } catch (e) {
+          err = e;
+        }
+
+        const hopHits = getHits();
+        const tokenAfter = fx.counts.randomToken;
+        const variantTokensAfter = variantTokenCalls;
+        const ephAfter = inst.privacyCalls.length;
+        const handlesAfter = inst.ephemeralHandles.length;
+        const materialAfter = snapshotEffectBaseline(fx);
+        const registryAfterStealth = {
+          observe: inst.registryHits.observe,
+          lookup: inst.registryHits.lookup,
+          clear: inst.registryHits.clear,
+          snapshot: inst.registryHits.snapshot,
+        };
+        const popAfter = ctrl.popupMedia(tabId).find((r) => r.id === mediaId);
+        const mapsAfter = inst.trackedMaps.map((m) => m._sets.length);
+        const trackedMapsLengthAfter = inst.trackedMaps.length;
+
+        // Open-set retry: ordinary valid entry starts at first namespace suffix :1.
+        const recoverUrl =
+          "https://cdn.example/stealth-recover-" + label + ".mp4";
+        const ephRetryBefore = inst.privacyCalls.length;
+        const handlesRetryBefore = inst.ephemeralHandles.length;
+        let retryErr = null;
+        let rows = null;
+        try {
+          rows = ctrl.registerVariants(mediaId, [
+            { url: recoverUrl, label: "recover-" + label },
+          ]);
+        } catch (e) {
+          retryErr = e;
+        }
+        const retryCalls = inst.privacyCalls.slice(ephRetryBefore);
+        const retryHandles = inst.ephemeralHandles.slice(handlesRetryBefore);
+        const registryAfterRetry = {
+          observe: inst.registryHits.observe,
+          lookup: inst.registryHits.lookup,
+          clear: inst.registryHits.clear,
+          snapshot: inst.registryHits.snapshot,
+        };
+
+        return Object.freeze({
+          label,
+          registryCreate,
+          registryPre: Object.freeze(registryPre),
+          foreignObject: built.foreignObject,
+          entryProtoIsNull: entryProto === null,
+          entryGrandProtoIsNull: entryGrandProto === null,
+          protoOwnNames: Object.freeze(protoOwnNames),
+          protoSymbolCount,
+          protoEnumKeyCount,
+          hopDescPresent: hopDesc != null,
+          hopEnumerable: hopDesc ? hopDesc.enumerable : undefined,
+          hopWritable: hopDesc ? hopDesc.writable : undefined,
+          hopConfigurable: hopDesc ? hopDesc.configurable : undefined,
+          hopValueType: hopDesc ? typeof hopDesc.value : undefined,
+          hopHasGet: hopDesc
+            ? Object.prototype.hasOwnProperty.call(hopDesc, "get")
+            : undefined,
+          popBeforeVariants: popBefore ? popBefore.variants.length : -1,
+          hopHits,
+          tokenBefore,
+          tokenAfter,
+          variantTokensBefore,
+          variantTokensAfter,
+          ephBefore,
+          ephAfter,
+          handlesBefore,
+          handlesAfter,
+          materialBefore: Object.freeze(materialBefore),
+          materialAfter: Object.freeze(materialAfter),
+          registryAfterStealth: Object.freeze(registryAfterStealth),
+          popAfterVariants: popAfter ? popAfter.variants.length : -1,
+          mapsBefore: Object.freeze(mapsBefore.slice()),
+          mapsAfter: Object.freeze(mapsAfter.slice()),
+          trackedMapsLengthAfter,
+          err,
+          recoverUrl,
+          retryErr,
+          rows,
+          retryCalls: Object.freeze(retryCalls.slice()),
+          retryHandles: Object.freeze(retryHandles.slice()),
+          registryAfterRetry: Object.freeze(registryAfterRetry),
+        });
+      }
+
+      // Local stealth proto: Object.create(null) + non-enum hasOwnProperty only.
+      const localObs = runStealthCase("local", (url) => {
+        let hits = 0;
+        const proto = Object.create(null);
+        Object.defineProperty(proto, "hasOwnProperty", {
+          enumerable: false,
+          writable: true,
+          configurable: true,
+          value: function hasOwnProperty() {
+            hits += 1;
+            return Object.prototype.hasOwnProperty.apply(this, arguments);
+          },
+        });
+        const entry = Object.create(proto);
+        Object.defineProperty(entry, "url", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: url,
+        });
+        return {
+          entry: entry,
+          getHits() {
+            return hits;
+          },
+        };
+      });
+
+      // Genuinely foreign-realm stealth proto with independent Object intrinsic.
+      const foreignObs = runStealthCase("foreign", (url) => {
+        const foreign = vm.runInNewContext(
+          [
+            "(function () {",
+            "  var hits = 0;",
+            "  var proto = Object.create(null);",
+            "  Object.defineProperty(proto, 'hasOwnProperty', {",
+            "    enumerable: false,",
+            "    writable: true,",
+            "    configurable: true,",
+            "    value: function hasOwnProperty() {",
+            "      hits += 1;",
+            "      return false;",
+            "    }",
+            "  });",
+            "  return {",
+            "    Object: Object,",
+            "    makeEntry: function (u) {",
+            "      var e = Object.create(proto);",
+            "      Object.defineProperty(e, 'url', {",
+            "        enumerable: true,",
+            "        configurable: true,",
+            "        writable: true,",
+            "        value: u",
+            "      });",
+            "      return e;",
+            "    },",
+            "    getHits: function () { return hits; }",
+            "  };",
+            "})()",
+          ].join("\n"),
+          Object.create(null)
+        );
+        return {
+          entry: foreign.makeEntry(url),
+          foreignObject: foreign.Object,
+          getHits() {
+            return foreign.getHits();
+          },
+        };
+      });
+
+      // Both isolated cases fully exercised — assert each observation now.
+      for (const obs of [localObs, foreignObs]) {
+        const label = obs.label;
+        assert.equal(obs.registryCreate, 1, label + " registry create");
+        assertRegistryDormant(obs.registryPre, label + " pre");
+        if (label === "foreign") {
+          assert.notEqual(obs.foreignObject, Object, "foreign Object intrinsic");
+        }
+        assert.equal(obs.entryProtoIsNull, false, label + " entry not direct null-proto");
+        assert.equal(obs.entryGrandProtoIsNull, true, label + " proto is null-root");
+        assert.deepEqual(
+          obs.protoOwnNames,
+          ["hasOwnProperty"],
+          label + " sole own key hasOwnProperty"
+        );
+        assert.equal(obs.protoSymbolCount, 0, label + " no symbol own keys on proto");
+        assert.ok(obs.hopDescPresent, label + " hop descriptor");
+        assert.equal(obs.hopEnumerable, false, label + " hop non-enumerable");
+        assert.equal(obs.hopWritable, true, label + " hop writable");
+        assert.equal(obs.hopConfigurable, true, label + " hop configurable");
+        assert.equal(obs.hopValueType, "function", label + " hop own-data function");
+        assert.equal(obs.hopHasGet, false, label + " hop not accessor");
+        assert.equal(obs.protoEnumKeyCount, 0, label + " no enum keys on proto");
+        assert.equal(obs.popBeforeVariants, 0, label + " open set pre");
+
+        // Zero-hit / zero-effect evidence first — causal RED if stealth binds.
+        assert.equal(obs.hopHits, 0, label + " hasOwnProperty must not run");
+        assert.equal(
+          obs.tokenAfter,
+          obs.tokenBefore,
+          label + " zero token delta"
+        );
+        assert.equal(
+          obs.variantTokensAfter,
+          obs.variantTokensBefore,
+          label + " zero variant token"
+        );
+        assert.equal(
+          obs.ephAfter,
+          obs.ephBefore,
+          label + " zero Privacy delta"
+        );
+        assert.equal(
+          obs.handlesAfter,
+          obs.handlesBefore,
+          label + " zero ephemeral handle delta"
+        );
+        assert.equal(
+          obs.materialAfter.publishDetection,
+          obs.materialBefore.publishDetection,
+          label + " zero publishDetection"
+        );
+        assert.equal(
+          obs.materialAfter.publishJobs,
+          obs.materialBefore.publishJobs,
+          label + " zero publishJobs"
+        );
+        assert.equal(
+          obs.materialAfter.persistHistory,
+          obs.materialBefore.persistHistory,
+          label + " zero persistHistory"
+        );
+        assert.equal(
+          obs.materialAfter.reportDiagnostic,
+          obs.materialBefore.reportDiagnostic,
+          label + " zero reportDiagnostic"
+        );
+        assert.equal(
+          obs.materialAfter.postNative,
+          obs.materialBefore.postNative,
+          label + " zero postNative"
+        );
+        assert.equal(
+          obs.materialAfter.isPopupSender,
+          obs.materialBefore.isPopupSender,
+          label + " zero isPopupSender"
+        );
+        assert.equal(
+          obs.materialAfter.getEffectiveDestinationDirectory,
+          obs.materialBefore.getEffectiveDestinationDirectory,
+          label + " zero getEffectiveDestinationDirectory"
+        );
+        assertRegistryDormant(
+          obs.registryAfterStealth,
+          label + " after stealth attempt"
+        );
+        assert.equal(
+          obs.popAfterVariants,
+          0,
+          label + " popup ownership unchanged"
+        );
+        assert.equal(
+          obs.trackedMapsLengthAfter,
+          obs.mapsBefore.length,
+          label + " ownership map count stable"
+        );
+        for (let i = 0; i < obs.mapsBefore.length; i++) {
+          assert.equal(
+            obs.mapsAfter[i],
+            obs.mapsBefore[i],
+            label + " ownership map delta " + i
+          );
+        }
+
+        // Deliberately RED: fresh generic TypeError (stealth must not bind).
+        assert.ok(obs.err, label + " stealth must reject");
+        assertVariantRegError(obs.err);
+
+        assert.equal(obs.retryErr, null, label + " retry must not throw");
+        assert.ok(obs.rows, label + " retry rows present");
+        assert.equal(obs.rows.length, 1, label + " retry length");
+        assert.match(obs.rows[0].id, /:1$/, label + " retry starts :1");
+        assert.equal(obs.rows[0].label, "recover-" + label);
+        assert.equal(obs.retryCalls.length, 1, label + " retry Privacy once");
+        assert.equal(
+          obs.retryCalls[0].mediaUrl,
+          obs.recoverUrl,
+          label + " exact private URL"
+        );
+        assert.equal(
+          obs.retryCalls[0].requestHeaders,
+          null,
+          label + " null headers"
+        );
+        assert.equal(obs.retryHandles.length, 1, label + " retry handle once");
+        assertPrivateEphemeralHandle(
+          obs.retryHandles[0],
+          obs.recoverUrl,
+          label + " retry handle"
+        );
+        assertRegistryDormant(obs.registryAfterRetry, label + " post retry");
+        assertNoVariantSentinels(obs.rows, label + " retry rows");
+      }
+    }
+  );
+
+  await t.test(
+    "validation-time same-media reentry preserves first completed set",
+    async () => {
+      // Mutation caught: reflection-time same-media reentry during getPrototypeOf
+      // (before the in-flight marker) must keep the first completed set and
+      // complete-replay the outer call — never mint outer IDs, Privacy, or overwrite.
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      let variantTokenCalls = 0;
+      const ctrl = inst.api.createBackgroundAdapters(
+        fx.options({
+          randomToken(ns) {
+            fx.counts.randomToken += 1;
+            if (ns === "variant") variantTokenCalls += 1;
+            return "tok-val-reentry";
+          },
+        })
+      );
+      assert.equal(inst.registryHits.create, 1);
+      assertRegistryDormant(inst.registryHits, "val-reentry pre");
+      const tabId = 295;
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba05-val-reentry",
+        tabId,
+        filename: "val-reentry.mp4",
+      });
+
+      const outerUrl =
+        "https://cdn.example/outer-reentry.mp4?sig=SECRET_VARIANT_QUERY";
+      const innerUrl =
+        "https://cdn.example/inner-first.mp4?sig=SECRET_VARIANT_QUERY";
+
+      let getProtoHits = 0;
+      let innerRows = null;
+      let innerCallCount = 0;
+      let unexpectedGetHits = 0;
+      let valueOfHits = 0;
+      let toStringHits = 0;
+      let gopdHits = 0;
+      let ownKeysHits = 0;
+
+      const target = {};
+      Object.defineProperty(target, "url", {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: outerUrl,
+      });
+      Object.defineProperty(target, "label", {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: "outer-label",
+      });
+      Object.defineProperty(target, "valueOf", {
+        enumerable: false,
+        configurable: true,
+        get() {
+          valueOfHits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG valueOf");
+        },
+      });
+      Object.defineProperty(target, "toString", {
+        enumerable: false,
+        configurable: true,
+        get() {
+          toStringHits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG toString");
+        },
+      });
+
+      const entryProxy = new Proxy(target, {
+        getPrototypeOf() {
+          getProtoHits += 1;
+          // Reflection-time reentry before outer in-flight marker.
+          innerCallCount += 1;
+          innerRows = ctrl.registerVariants(mediaId, [
+            { url: innerUrl, label: "inner-first" },
+          ]);
+          return Object.prototype;
+        },
+        get(t, p, r) {
+          unexpectedGetHits += 1;
+          return Reflect.get(t, p, r);
+        },
+        getOwnPropertyDescriptor(t, p) {
+          gopdHits += 1;
+          return Reflect.getOwnPropertyDescriptor(t, p);
+        },
+        ownKeys(t) {
+          ownKeysHits += 1;
+          return Reflect.ownKeys(t);
+        },
+      });
+
+      const tokenBefore = fx.counts.randomToken;
+      const variantTokensBefore = variantTokenCalls;
+      const ephBefore = inst.privacyCalls.length;
+      const handlesBefore = inst.ephemeralHandles.length;
+      const materialBefore = snapshotEffectBaseline(fx);
+      const popBefore = ctrl.popupMedia(tabId).find((r) => r.id === mediaId);
+      assert.equal(popBefore.variants.length, 0);
+
+      let outerErr = null;
+      let outerRows = null;
+      try {
+        outerRows = ctrl.registerVariants(mediaId, [entryProxy]);
+      } catch (e) {
+        outerErr = e;
+      }
+
+      // Inner registration is the sole successful bind.
+      assert.equal(innerCallCount, 1, "inner registerVariants exactly once");
+      assert.equal(getProtoHits, 1, "getPrototypeOf trap exactly once");
+      assert.equal(valueOfHits, 0, "valueOf must not run");
+      assert.equal(toStringHits, 0, "toString must not run");
+      assert.ok(innerRows, "inner rows present");
+      assert.equal(innerRows.length, 1, "inner sole row");
+      assert.equal(innerRows[0].label, "inner-first");
+      assert.match(innerRows[0].id, /:1$/, "inner id first suffix");
+      assert.ok(isSafeOpaqueId(innerRows[0].id));
+
+      // Exactly one variant token + Privacy for the inner URL; outer absent.
+      assert.equal(
+        variantTokenCalls,
+        variantTokensBefore + 1,
+        "sole variant token is inner"
+      );
+      assert.equal(
+        fx.counts.randomToken,
+        tokenBefore + 1,
+        "sole randomToken is inner"
+      );
+      const ephDelta = inst.privacyCalls.slice(ephBefore);
+      assert.equal(ephDelta.length, 1, "sole Privacy binding");
+      assert.equal(ephDelta[0].mediaUrl, innerUrl, "Privacy binds inner URL");
+      assert.equal(ephDelta[0].requestHeaders, null);
+      assert.equal(
+        ephDelta.some((c) => c.mediaUrl === outerUrl),
+        false,
+        "outer URL absent from Privacy"
+      );
+      const handleDelta = inst.ephemeralHandles.slice(handlesBefore);
+      assert.equal(handleDelta.length, 1, "sole ephemeral handle");
+      assertPrivateEphemeralHandle(handleDelta[0], innerUrl, "inner handle");
+
+      // Outer must not throw; it complete-replays the already-completed inner set.
+      assert.equal(outerErr, null, "outer must not throw after inner completed");
+      assert.ok(outerRows, "outer return present");
+      assert.equal(outerRows.length, 1, "outer return sole row");
+      assert.equal(outerRows[0].id, innerRows[0].id, "outer retains inner id");
+      assert.equal(outerRows[0].label, "inner-first", "outer retains inner label");
+      assertFreshFrozenCopy(innerRows, outerRows, "outer complete-replay");
+      assertDeepFrozen(outerRows, "outer return frozen");
+
+      // No duplicate publication / material effects beyond media finalize baseline.
+      assert.equal(
+        fx.counts.publishDetection,
+        materialBefore.publishDetection,
+        "no duplicate publishDetection"
+      );
+      assert.equal(
+        fx.counts.publishJobs,
+        materialBefore.publishJobs,
+        "no publishJobs"
+      );
+      assert.equal(
+        fx.counts.persistHistory,
+        materialBefore.persistHistory,
+        "no persistHistory"
+      );
+      assert.equal(
+        fx.counts.reportDiagnostic,
+        materialBefore.reportDiagnostic,
+        "no reportDiagnostic"
+      );
+      assert.equal(
+        fx.counts.postNative,
+        materialBefore.postNative,
+        "no postNative"
+      );
+      assertRegistryDormant(inst.registryHits, "val-reentry post");
+
+      // Popup + completed replay retain the same inner id/label; outer URL absent.
+      const pop = ctrl.popupMedia(tabId);
+      const popRow = pop.find((r) => r.id === mediaId);
+      assert.ok(popRow);
+      assert.equal(popRow.variants.length, 1);
+      assert.equal(popRow.variants[0].id, innerRows[0].id);
+      assert.equal(popRow.variants[0].label, "inner-first");
+      assert.equal(
+        JSON.stringify(pop).includes(outerUrl),
+        false,
+        "popup omits outer URL"
+      );
+      assert.equal(
+        JSON.stringify(outerRows).includes(outerUrl),
+        false,
+        "outer return omits outer URL"
+      );
+      assert.equal(
+        JSON.stringify(innerRows).includes(outerUrl),
+        false,
+        "inner rows omit outer URL"
+      );
+      assertVariantOwnershipMaps(
+        inst,
+        mediaId,
+        innerRows,
+        [innerUrl],
+        pop,
+        "validation reentry maps"
+      );
+
+      const replay = ctrl.registerVariants(mediaId, [
+        { url: "https://cdn.example/should-not-read.mp4" },
+      ]);
+      assert.equal(replay.length, 1);
+      assert.equal(replay[0].id, innerRows[0].id);
+      assert.equal(replay[0].label, "inner-first");
+      assertFreshFrozenCopy(innerRows, replay, "post replay");
+      assert.equal(
+        fx.counts.randomToken,
+        tokenBefore + 1,
+        "replay mints no further token"
+      );
+      assert.equal(
+        inst.privacyCalls.length,
+        ephBefore + 1,
+        "replay creates no further Privacy"
+      );
+      assertRegistryDormant(inst.registryHits, "val-reentry replay");
+      assertNoVariantSentinels(outerRows, "outer rows");
+      assertNoVariantSentinels(pop, "popup val-reentry");
+      // getPrototypeOf may run once; ownKeys/caller getters/coercions execute zero times.
+      assert.equal(unexpectedGetHits, 0, "no Proxy get trap during validation");
+      assert.ok(gopdHits >= 1, "own descriptors consulted");
+      assert.equal(ownKeysHits, 0, "ownKeys must not run");
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// BA06 — public outputs and callbacks exclude every private sentinel
+// ---------------------------------------------------------------------------
+
+test("BA06 — public outputs and callbacks exclude every private URL/header/override sentinel", async (t) => {
+  // Mutation caught: spreading private records, serializing sourceContext or
+  // ephemerals, copying cookies into metadata, echoing validation/trap errors,
+  // or leaking ignored overrides.
+
+  await t.test(
+    "network + DOM finalized media, variants, popup, callbacks stay sentinel-free",
+    async () => {
+      const inst = loadVariantInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+      assert.equal(inst.registryHits.create, 1);
+      assertRegistryDormant(inst.registryHits, "BA06 pre");
+
+      const netDoc = "doc-ba06-net";
+      const domDoc = "doc-ba06-dom";
+      const tabId = 301;
+
+      const netId = openOwnedMedia(ctrl, fx, {
+        docId: netDoc,
+        tabId,
+        filename: "ba06-net.mp4",
+      });
+      const domId = openOwnedMedia(ctrl, fx, {
+        docId: domDoc,
+        tabId,
+        kind: "dom",
+      });
+      assert.equal(
+        fx.publishDetections.filter((p) => p.id === netId || p.id === domId)
+          .length,
+        2
+      );
+
+      const vUrlNet =
+        "https://SECRET_VARIANT_USERINFO:x@cdn.example/n.mp4?token=SECRET_VARIANT_QUERY#SECRET_VARIANT_FRAGMENT";
+      const vUrlDom =
+        "https://cdn.example/d.mp4?sig=SECRET_VARIANT_QUERY&e=SECRET_VARIANT_FRAGMENT";
+      // Independent original-URL sequence for ownership proof (not from outputs).
+      const expectedNetUrls = [vUrlNet, "  https://x.example/a.mp4"];
+
+      // Counter-backed ignored caller authority on network entry.
+      const authorityHits = {
+        id: 0,
+        variantId: 0,
+        variantUrl: 0,
+        mediaId: 0,
+        providerKey: 0,
+        item: 0,
+        pageUrl: 0,
+        sourceContext: 0,
+        headers: 0,
+        Cookie: 0,
+        Authorization: 0,
+      };
+      const netEntry0 = {
+        url: vUrlNet,
+        label: "net-safe",
+        width: 1280,
+        height: 720,
+      };
+      for (const name of Object.keys(authorityHits)) {
+        Object.defineProperty(netEntry0, name, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            authorityHits[name] += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG ba06-auth-" + name);
+          },
+        });
+      }
+      const ephBefore = inst.privacyCalls.length;
+      const handlesBefore = inst.ephemeralHandles.length;
+      let netErr = null;
+      let netRows = null;
+      try {
+        netRows = ctrl.registerVariants(netId, [
+          netEntry0,
+          {
+            url: "  https://x.example/a.mp4",
+            label: "xCookie: SECRET_UNSAFE_LABEL",
+            mime: "video/mp4",
+          },
+        ]);
+      } catch (e) {
+        netErr = e;
+      }
+      for (const name of Object.keys(authorityHits)) {
+        assert.equal(authorityHits[name], 0, "BA06 authority " + name);
+      }
+      assertRegistryDormant(inst.registryHits, "BA06 net attempt");
+      assert.equal(netErr, null, "BA06 network bind");
+      assert.equal(netRows.length, 2);
+      assert.equal(Object.prototype.hasOwnProperty.call(netRows[1], "label"), false);
+      const netHandles = inst.ephemeralHandles.slice(handlesBefore);
+      assert.equal(netHandles.length, 2);
+      assert.notEqual(netHandles[0], netHandles[1]);
+      assertPrivateEphemeralHandle(netHandles[0], vUrlNet, "BA06 net handle0");
+      assertPrivateEphemeralHandle(
+        netHandles[1],
+        "  https://x.example/a.mp4",
+        "BA06 net handle1"
+      );
+      assert.equal(
+        inst.privacyCalls.slice(ephBefore).every((c) => c.requestHeaders === null),
+        true
+      );
+
+      let domErr = null;
+      let domRows = null;
+      try {
+        domRows = ctrl.registerVariants(domId, [
+          {
+            url: vUrlDom,
+            label: "dom-safe",
+            bandwidth: 1000,
+            mime: "video/mp4",
+          },
+        ]);
+      } catch (e) {
+        domErr = e;
+      }
+      assert.equal(domErr, null, "BA06 DOM bind");
+      assert.equal(domRows.length, 1);
+
+      // Replay completed sets: no inspection.
+      {
+        let hits = 0;
+        const hostile = new Proxy([], {
+          get() {
+            hits += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG ba06-replay");
+          },
+          getOwnPropertyDescriptor() {
+            hits += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG ba06-replay-d");
+          },
+        });
+        const r1 = ctrl.registerVariants(netId, hostile);
+        const r2 = ctrl.registerVariants(domId, hostile);
+        assert.equal(hits, 0);
+        assert.deepEqual(
+          r1.map((x) => x.id),
+          netRows.map((x) => x.id)
+        );
+        assert.deepEqual(
+          r2.map((x) => x.id),
+          domRows.map((x) => x.id)
+        );
+      }
+
+      const pop = ctrl.popupMedia(tabId);
+      const pop2 = ctrl.popupMedia(tabId);
+      assertFreshFrozenCopy(pop, pop2, "BA06 popup");
+      assert.equal(pop.length, 2);
+      for (const row of pop) {
+        assert.deepEqual(Object.keys(row).sort(), [
+          "id",
+          "kind",
+          "proposedFilename",
+          "variants",
+        ].sort());
+        assert.ok(Array.isArray(row.variants));
+        for (const v of row.variants) {
+          assert.equal(Object.prototype.hasOwnProperty.call(v, "url"), false);
+          assert.equal(Object.prototype.hasOwnProperty.call(v, "providerKey"), false);
+        }
+      }
+      const netPop = pop.find((r) => r.id === netId);
+      const domPop = pop.find((r) => r.id === domId);
+      assert.equal(netPop.variants.length, 2);
+      assert.equal(domPop.variants.length, 1);
+
+      for (const pub of fx.publishDetections) {
+        assert.deepEqual(Object.keys(pub).sort(), [
+          "id",
+          "kind",
+          "proposedFilename",
+          "providerKey",
+        ].sort());
+      }
+
+      const jobs = ctrl.popupJobs();
+      assert.equal(jobs.length, 0);
+      assertDeepFrozen(jobs, "popupJobs");
+
+      // Invalid registration on fresh open media: generic error, no sentinel echo.
+      {
+        const openId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba06-inv",
+          tabId: 303,
+        });
+        const baseline = snapshotEffectBaseline(fx);
+        const ephInv = inst.privacyCalls.length;
+        let err = null;
+        try {
+          ctrl.registerVariants(openId, [
+            { url: "https://cdn.example/\u0001SECRET_HOSTILE_TRAP_MSG.mp4" },
+          ]);
+        } catch (e) {
+          err = e;
+        }
+        assert.equal(inst.privacyCalls.length, ephInv);
+        assert.equal(fx.counts.randomToken, baseline.randomToken);
+        assert.equal(fx.counts.reportDiagnostic, baseline.reportDiagnostic);
+        assert.equal(fx.counts.isPopupSender, baseline.isPopupSender);
+        assert.equal(
+          fx.counts.getEffectiveDestinationDirectory,
+          baseline.getEffectiveDestinationDirectory
+        );
+        assertRegistryDormant(inst.registryHits, "BA06 inv");
+        assertVariantRegError(err);
+      }
+
+      // Representative future stubs — await all rejections.
+      const stubCalls = [
+        () =>
+          ctrl.enqueueDownload(
+            {
+              url: "https://override.example/SECRET_OVERRIDE_URL.mp4",
+              providerKey: "SECRET_CALLER_PROVIDER",
+              variantUrl: vUrlNet,
+              variantId: netRows[0].id,
+            },
+            {}
+          ),
+        () => ctrl.handleNativeMessage({ cookie: "SECRET_COOKIE_ABC" }),
+        () => ctrl.requestFirefoxHandoff({ url: vUrlNet }, {}),
+        () => ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"),
+        () => ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"),
+        () => ctrl.helperDisconnected(),
+        () => ctrl.setMaxConcurrent(9),
+        () => ctrl.pump(),
+      ];
+      const materialBefore = snapshotEffectBaseline(fx);
+      for (const call of stubCalls) {
+        const p = call();
+        assert.ok(p && typeof p.then === "function");
+        let rejected = null;
+        await p.then(
+          () => {
+            throw new Error("expected rejection");
+          },
+          (err) => {
+            rejected = err;
+          }
+        );
+        assert.ok(rejected instanceof Error);
+        assert.equal(rejected.message, LEASE1_MSG);
+        assert.equal(
+          String(rejected.message).includes("SECRET_"),
+          false
+        );
+      }
+      assert.equal(fx.counts.publishJobs, materialBefore.publishJobs);
+      assert.equal(fx.counts.persistHistory, materialBefore.persistHistory);
+      assert.equal(fx.counts.postNative, materialBefore.postNative);
+      assert.equal(fx.counts.downloadsDownload, materialBefore.downloadsDownload);
+      assert.equal(fx.counts.fetchArrayBuffer, materialBefore.fetchArrayBuffer);
+      assert.equal(fx.counts.assembleMedia, materialBefore.assembleMedia);
+      assert.equal(fx.counts.createObjectURL, materialBefore.createObjectURL);
+      assert.equal(fx.counts.revokeObjectURL, materialBefore.revokeObjectURL);
+      assert.equal(fx.counts.reportDiagnostic, materialBefore.reportDiagnostic);
+      assert.equal(fx.counts.isPopupSender, materialBefore.isPopupSender);
+      assert.equal(
+        fx.counts.getEffectiveDestinationDirectory,
+        materialBefore.getEffectiveDestinationDirectory
+      );
+
+      const surfaces = [
+        netRows,
+        domRows,
+        pop,
+        pop2,
+        jobs,
+        fx.publishDetections,
+        fx.diagnostics,
+      ];
+      for (let i = 0; i < surfaces.length; i++) {
+        assertNoVariantSentinels(surfaces[i], "BA06 surface " + i);
+        assertNoSentinels(surfaces[i], "BA06 surface " + i);
+      }
+      // Privacy instrumentation may see raw URLs; production projections must not.
+      assert.equal(
+        inst.privacyCalls.some((c) => c.mediaUrl === vUrlNet),
+        true
+      );
+      assert.equal(
+        JSON.stringify(netRows).includes("SECRET_VARIANT_QUERY"),
+        false
+      );
+      assertVariantOwnershipMaps(
+        inst,
+        netId,
+        netRows,
+        expectedNetUrls,
+        pop,
+        "BA06 net maps"
+      );
+      assertRegistryDormant(inst.registryHits, "BA06 post");
+    }
+  );
+
+  // BA06 independent known-field accessors (network path) — no combined masking.
+  for (const field of ["url", "label", "width", "height", "bandwidth", "mime"]) {
+    await t.test(
+      "BA06 independent known-field accessor (network): " + field,
+      async () => {
+        const inst = loadVariantInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const tabId =
+          320 +
+          ["url", "label", "width", "height", "bandwidth", "mime"].indexOf(field);
+        const mediaId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba06-acc-net-" + field,
+          tabId,
+          filename: "ba06-acc-" + field + ".mp4",
+        });
+        const hits = { [field]: 0 };
+        const entry = {};
+        if (field !== "url") {
+          Object.defineProperty(entry, "url", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: "https://cdn.example/ba06-acc-" + field + ".mp4",
+          });
+        }
+        Object.defineProperty(entry, field, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits[field] += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG ba06-" + field);
+          },
+        });
+        const baseline = snapshotEffectBaseline(fx);
+        const ephBefore = inst.privacyCalls.length;
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entry]);
+        } catch (e) {
+          err = e;
+        }
+        assert.equal(hits[field], 0, "BA06 " + field + " getter");
+        assert.equal(inst.privacyCalls.length, ephBefore);
+        assert.equal(fx.counts.randomToken, baseline.randomToken);
+        assert.equal(fx.counts.reportDiagnostic, baseline.reportDiagnostic);
+        assert.equal(fx.counts.isPopupSender, baseline.isPopupSender);
+        assert.equal(
+          fx.counts.getEffectiveDestinationDirectory,
+          baseline.getEffectiveDestinationDirectory
+        );
+        assertRegistryDormant(inst.registryHits, "BA06 acc " + field);
+        assert.equal(
+          ctrl.popupMedia(tabId).find((r) => r.id === mediaId).variants.length,
+          0
+        );
+        assert.ok(err);
+        assertVariantRegError(err);
+        const recovered = ctrl.registerVariants(mediaId, [
+          { url: "https://cdn.example/ba06-recover-" + field + ".mp4" },
+        ]);
+        assert.equal(recovered.length, 1);
+        assert.match(recovered[0].id, /:1$/);
+        assertNoVariantSentinels(recovered, "BA06 recover " + field);
+        assertNoVariantSentinels(ctrl.popupMedia(tabId), "BA06 popup recover " + field);
+      }
+    );
+  }
+
+  // BA06 independent optional-field accessor on DOM media (public-sentinel path).
+  for (const field of ["label", "mime"]) {
+    await t.test(
+      "BA06 independent known-field accessor (DOM): " + field,
+      async () => {
+        const inst = loadVariantInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const tabId = 340 + (field === "label" ? 0 : 1);
+        const mediaId = openOwnedMedia(ctrl, fx, {
+          docId: "doc-ba06-acc-dom-" + field,
+          tabId,
+          kind: "dom",
+        });
+        const hits = { [field]: 0 };
+        const entry = {
+          url: "https://cdn.example/ba06-dom-acc-" + field + ".mp4",
+        };
+        Object.defineProperty(entry, field, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits[field] += 1;
+            throw new Error("SECRET_HOSTILE_TRAP_MSG ba06-dom-" + field);
+          },
+        });
+        const ephBefore = inst.privacyCalls.length;
+        let err = null;
+        try {
+          ctrl.registerVariants(mediaId, [entry]);
+        } catch (e) {
+          err = e;
+        }
+        assert.equal(hits[field], 0);
+        assert.equal(inst.privacyCalls.length, ephBefore);
+        assertRegistryDormant(inst.registryHits, "BA06 dom acc " + field);
+        assert.ok(err);
+        assertVariantRegError(err);
+        const recovered = ctrl.registerVariants(mediaId, [
+          { url: "https://cdn.example/ba06-dom-recover-" + field + ".mp4" },
+        ]);
+        assert.equal(recovered.length, 1);
+        assert.match(recovered[0].id, /:1$/);
+      }
+    );
+  }
+
+  await t.test(
+    "unknown media and completed replay never inspect variants argument",
+    async () => {
+      const fx = makeEffects();
+      const api = loadAdapters();
+      const ctrl = api.createBackgroundAdapters(fx.options());
+      let hits = 0;
+      const trap = {
+        getOwnPropertyDescriptor() {
+          hits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG inspect");
+        },
+        ownKeys() {
+          hits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG keys");
+        },
+        get() {
+          hits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG get");
+        },
+        getPrototypeOf() {
+          hits += 1;
+          throw new Error("SECRET_HOSTILE_TRAP_MSG proto");
+        },
+      };
+      const hostile = new Proxy([], trap);
+      assert.throws(
+        () => ctrl.registerVariants("media-unknown-ba06", hostile),
+        (e) => {
+          assertVariantRegError(e);
+          return true;
+        }
+      );
+      assert.equal(hits, 0);
+
+      const mediaId = openOwnedMedia(ctrl, fx, {
+        docId: "doc-ba06-noread",
+        tabId: 310,
+      });
+      const bound = ctrl.registerVariants(mediaId, [
+        { url: "https://cdn.example/bound.mp4", label: "b" },
+      ]);
+      hits = 0;
+      const again = ctrl.registerVariants(mediaId, hostile);
+      assert.equal(hits, 0);
+      assert.deepEqual(
+        again.map((r) => r.id),
+        bound.map((r) => r.id)
+      );
+      assert.notEqual(again, bound);
+      assertDeepFrozen(again, "ba06 replay");
     }
   );
 });
