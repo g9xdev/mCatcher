@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import stat as _stat
 import subprocess
 import sys
 import threading
@@ -1054,13 +1055,108 @@ def _ytdl_paths_same(a, b):
         return False
 
 
+def _ytdl_file_identity(st):
+    """Stable (dev, ino) identity from a stat_result, or None if unusable."""
+    try:
+        dev = st.st_dev
+        ino = st.st_ino
+        if type(dev) is not int or type(ino) is not int:
+            return None
+        # ino 0 is not a reliable unique identity on some platforms.
+        if ino == 0:
+            return None
+        return (dev, ino)
+    except Exception:
+        return None
+
+
+def _ytdl_snapshot_path_identity(path):
+    """lstat identity for path, or None."""
+    try:
+        return _ytdl_file_identity(os.lstat(path))
+    except Exception:
+        return None
+
+
+def _ytdl_unlink_if_identity(path, identity):
+    """Unlink path only when its current lstat identity still matches.
+
+    Used after ownership of a just-created final is established (promote) so
+    verify/claim failures clean only the operation-created file, never a
+    replacement/competitor that later occupied the same pathname.
+    """
+    if not path or type(path) is not str or not identity:
+        return False
+    try:
+        cur = _ytdl_file_identity(os.lstat(path))
+        if cur is None or cur != identity:
+            return False
+        os.unlink(path)
+        return True
+    except Exception:
+        return False
+
+
+def _ytdl_cleanup_exclusive_fd(fd, path):
+    """Remove only the file object this exclusive fd created.
+
+    Snapshot identity from the still-open fd, close (required on Windows before
+    a path unlink can succeed), then unlink the path only if lstat identity
+    still matches. A replacement planted after close is left untouched.
+    """
+    if fd is None:
+        return
+    ident = None
+    try:
+        ident = _ytdl_file_identity(os.fstat(fd))
+    except Exception:
+        ident = None
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    if ident is None or not path or type(path) is not str:
+        return
+    try:
+        cur = _ytdl_file_identity(os.lstat(path))
+        if cur is None or cur != ident:
+            return
+        os.unlink(path)
+    except Exception:
+        pass
+
+
+def _ytdl_write_all(fd, data):
+    """Write every byte of data to fd. Raises OSError on incomplete/hostile counts."""
+    if data is None:
+        raise OSError("write requires bytes")
+    # memoryview handles bytes/bytearray and supports offset slicing without copy.
+    view = memoryview(data)
+    total = len(view)
+    offset = 0
+    while offset < total:
+        try:
+            n = os.write(fd, view[offset:])
+        except Exception:
+            raise
+        # Reject bool (int subclass), non-int, zero, negative, and overlarge.
+        if type(n) is not int or n <= 0 or n > (total - offset):
+            raise OSError("incomplete or invalid write count")
+        offset += n
+    return total
+
+
 def _ytdl_try_exclusive_place(src, target):
     """Place src at target only when target is absent (atomic no-clobber).
 
     Prefers same-filesystem hardlink (create-if-absent), then exclusive-create
-    + copy. Never uses exists-then-replace. Returns target on success, else None.
+    + full copy with short-write looping. Never uses exists-then-replace.
+    Unlinks the staging source only after a verified full place. On copy
+    failure, cleans only the exclusive file this operation created (identity
+    fenced). Returns target on success, else None. Staging source is preserved
+    on failure for owned-stage cleanup.
     """
-    if not src or not target:
+    if not src or not target or type(src) is not str or type(target) is not str:
         return None
     try:
         parent = os.path.dirname(target)
@@ -1069,9 +1165,27 @@ def _ytdl_try_exclusive_place(src, target):
     except Exception:
         return None
 
+    try:
+        src_size = os.path.getsize(src)
+        if type(src_size) is not int or src_size < 0:
+            return None
+    except Exception:
+        return None
+
     # Hardlink: atomic create-if-absent on the same filesystem.
     try:
         os.link(src, target)
+        try:
+            dst_size = os.path.getsize(target)
+            if dst_size != src_size:
+                raise OSError("hardlink size mismatch")
+        except Exception:
+            try:
+                if os.path.isfile(target):
+                    os.unlink(target)
+            except Exception:
+                pass
+            return None
         try:
             os.unlink(src)
         except Exception:
@@ -1089,14 +1203,26 @@ def _ytdl_try_exclusive_place(src, target):
     fd = None
     try:
         fd = os.open(target, flags, 0o644)
+        written = 0
         with open(src, "rb") as rf:
             while True:
                 chunk = rf.read(1024 * 1024)
                 if not chunk:
                     break
-                os.write(fd, chunk)
+                written += _ytdl_write_all(fd, chunk)
+        # Verify full copy via fd size before releasing the exclusive handle.
+        st_fd = os.fstat(fd)
+        if type(st_fd.st_size) is not int or st_fd.st_size != src_size or written != src_size:
+            raise OSError("copied size mismatch")
+        # Path must still name the file we hold open.
+        st_path = os.lstat(target)
+        if _ytdl_file_identity(st_fd) != _ytdl_file_identity(st_path):
+            raise OSError("exclusive target identity mismatch")
+        if st_path.st_size != src_size:
+            raise OSError("path size mismatch")
         os.close(fd)
         fd = None
+        # Only now is it safe to drop the complete staging source.
         try:
             os.unlink(src)
         except Exception:
@@ -1106,15 +1232,8 @@ def _ytdl_try_exclusive_place(src, target):
         return None
     except Exception:
         if fd is not None:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-        try:
-            if os.path.isfile(target):
-                os.unlink(target)
-        except Exception:
-            pass
+            _ytdl_cleanup_exclusive_fd(fd, target)
+            fd = None
         return None
 
 
@@ -1124,7 +1243,7 @@ def _ytdl_promote_to_target(src, target, max_attempts=32):
     Never overwrites a pre-existing final (including symlink/junction paths).
     Returns the actual path on success, or None when promotion/validation fails.
     """
-    if not src or not target:
+    if not src or not target or type(src) is not str or type(target) is not str:
         return None
     try:
         if not os.path.isfile(src):
@@ -1144,6 +1263,64 @@ def _ytdl_promote_to_target(src, target, max_attempts=32):
         if placed:
             return placed
     return None
+
+
+def _ytdl_owned_stage_source(filepath, stage_dir):
+    """Accept only an exact built-in nonblank path wholly inside stage_dir.
+
+    Policy: the @@FILE@@ path must be a real regular non-symlink file that is a
+    strict descendant of this operation's unique stage directory (canonical
+    commonpath containment with component boundaries). The intended stage
+    output basename is preferred, but a legitimate yt-dlp merge/remux
+    descendant inside the same stage dir is also accepted. Rejects traversal,
+    sibling-prefix dirs, relative escape, symlink/junction/reparse escape,
+    the stage directory itself, blank paths, and non-str hostile shapes.
+    Returns the canonical source path on success, else None. Never coerces.
+    """
+    if type(filepath) is not str or not filepath.strip():
+        return None
+    if type(stage_dir) is not str or not stage_dir.strip():
+        return None
+    try:
+        if not os.path.isdir(stage_dir):
+            return None
+        stage_real = os.path.realpath(stage_dir)
+        stage_abs = os.path.abspath(stage_dir)
+        if not stage_real or not os.path.isdir(stage_real):
+            return None
+
+        # Reject before following links: source must be a regular non-symlink file.
+        if not os.path.lexists(filepath):
+            return None
+        st = os.lstat(filepath)
+        if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+            return None
+
+        src_real = os.path.realpath(filepath)
+        src_abs = os.path.abspath(filepath)
+
+        # Stage directory itself is never a source.
+        if os.path.normcase(src_real) == os.path.normcase(stage_real):
+            return None
+        if os.path.normcase(src_abs) == os.path.normcase(stage_abs):
+            return None
+
+        # Canonical containment with path-component boundaries (not prefix match).
+        try:
+            common = os.path.commonpath([stage_real, src_real])
+        except ValueError:
+            return None
+        if os.path.normcase(common) != os.path.normcase(stage_real):
+            return None
+
+        # Re-check the resolved path is still a regular non-symlink file inside stage.
+        st2 = os.lstat(src_real)
+        if _stat.S_ISLNK(st2.st_mode) or not _stat.S_ISREG(st2.st_mode):
+            return None
+        # commonpath equality already requires strict descendant after rejecting equality.
+        return src_real
+    except Exception:
+        return None
 
 
 def _ytdl_cleanup_stage_dir(stage_dir):
@@ -1173,6 +1350,19 @@ def _ytdl_terminal_file_bytes(path):
         return path, size
     except Exception:
         return None, None
+
+
+def _ytdl_terminal_file_bytes_for_identity(path, identity):
+    """Like _ytdl_terminal_file_bytes but only if path still has the given identity."""
+    if not identity:
+        return None, None
+    try:
+        cur = _ytdl_snapshot_path_identity(path)
+        if cur is None or cur != identity:
+            return None, None
+    except Exception:
+        return None, None
+    return _ytdl_terminal_file_bytes(path)
 
 
 def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
@@ -1490,35 +1680,64 @@ def _handle_ytdl_structured(req):
                     emit_error("cancelled", "Cancelled.")
                     return
 
-                if p.returncode == 0 and filepath:
-                    # Exclusive no-clobber promote (may pick a dedup sibling).
-                    final_path = _ytdl_promote_to_target(filepath, preferred)
-                    path, size = _ytdl_terminal_file_bytes(final_path)
-                    # Linearization: cancel vs commit under the op-local lock.
+                if p.returncode == 0:
+                    # Zero-exit without a usable owned stage source is local_io
+                    # (blank marker, missing path, or escape) — never a success.
+                    # Never trust stdout path without stage-ownership validation.
+                    # Reject before any stat/link/copy/unlink/promotion on the marker.
+                    owned_src = _ytdl_owned_stage_source(filepath, stage_dir)
+                    if owned_src is None:
+                        # One safe terminal; do not echo the outside/hostile path.
+                        emit_error(
+                            "local_io",
+                            "Download finished but the file could not be verified.",
+                        )
+                        return
+
+                    # Single linearization region: acquire op lock, recheck cancel/
+                    # commit, and when eligible promote + verify + claim before release.
+                    # Holding the op-local lock across bounded local promotion is intended.
+                    outcome = None
+                    done_path = None
+                    done_size = None
                     with op["ytdl_lock"]:
                         if op.get("cancel_requested") or op.get("commit_claimed"):
                             outcome = "cancelled"
-                        elif path is not None and size is not None:
-                            op["commit_claimed"] = True
-                            outcome = "done"
-                            done_path, done_size = path, size
                         else:
-                            outcome = "local_io"
+                            final_path = _ytdl_promote_to_target(owned_src, preferred)
+                            if not final_path:
+                                outcome = "local_io"
+                            else:
+                                # Ownership identity is from the just-created final,
+                                # not from the nullable verification projection.
+                                owned_ident = _ytdl_snapshot_path_identity(final_path)
+                                path, size = _ytdl_terminal_file_bytes_for_identity(
+                                    final_path, owned_ident
+                                )
+                                if path is not None and size is not None:
+                                    op["commit_claimed"] = True
+                                    outcome = "done"
+                                    done_path, done_size = path, size
+                                else:
+                                    # Promoted but unverifiable: clean only if still ours.
+                                    _ytdl_unlink_if_identity(final_path, owned_ident)
+                                    # Cancel may have been set while we held the lock only
+                                    # if we released — we did not. Prefer local_io for
+                                    # verify failure; cancel-before-promote is handled above.
+                                    outcome = "local_io"
+
                     if outcome == "cancelled":
-                        # Do not report a final; drop an unreported exclusive promote.
-                        if path and not _ytdl_paths_same(path, filepath):
-                            try:
-                                if os.path.isfile(path):
-                                    os.unlink(path)
-                            except Exception:
-                                pass
+                        # Cancel won before promotion: no final was created.
                         emit_error("cancelled", "Cancelled.")
                         return
                     if outcome == "done":
                         emit_done(done_path, done_size)
                         _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(done_path))
                         return
-                    emit_error("local_io", "Download finished but the file could not be verified.")
+                    emit_error(
+                        "local_io",
+                        "Download finished but the file could not be verified.",
+                    )
                     return
 
                 reason, msg = _map_yt_error("\n".join(errbuf))
