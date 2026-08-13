@@ -38,6 +38,28 @@ function Say($m, $c = "Gray") { Write-Host $m -ForegroundColor $c }
 function Step($m) { Write-Host ("  " + $m) -ForegroundColor Green }
 function Warn($m) { Write-Host ("  " + $m) -ForegroundColor Yellow }
 
+# Pure recursive copy of the native Python package tree only.
+function Copy-MchostRuntimePackage {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceDir,
+    [Parameter(Mandatory = $true)][string]$InstallDir
+  )
+  $srcRoot = Join-Path $SourceDir "mchost"
+  if (-not (Test-Path -LiteralPath $srcRoot)) { return }
+  $srcResolved = (Resolve-Path -LiteralPath $srcRoot).Path
+  Get-ChildItem -LiteralPath $srcResolved -Recurse -File | Where-Object {
+    $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and $_.Extension -ne '.pyc'
+  } | ForEach-Object {
+    $rel = $_.FullName.Substring($srcResolved.Length).TrimStart('\', '/')
+    $dest = Join-Path (Join-Path $InstallDir "mchost") $rel
+    $parent = Split-Path -Parent $dest
+    if (-not (Test-Path -LiteralPath $parent)) {
+      New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+  }
+}
+
 # ---------- uninstall ----------
 if ($Uninstall) {
   Say "Removing Media Catcher host..." "Cyan"
@@ -100,6 +122,7 @@ if ($srcResolved -ne $dstResolved) {
     $s = Join-Path $SourceDir $f
     if (Test-Path $s) { Copy-Item $s (Join-Path $InstallDir $f) -Force }
   }
+  Copy-MchostRuntimePackage -SourceDir $SourceDir -InstallDir $InstallDir
   # seed an empty config only if one is not already installed (preserve user settings)
   $cfg = Join-Path $InstallDir "mc_config.json"
   if (-not (Test-Path $cfg)) { Set-Content -Path $cfg -Value "{}" -Encoding UTF8 }

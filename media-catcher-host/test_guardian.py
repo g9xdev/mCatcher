@@ -48,7 +48,9 @@ def ext_zip(path, version, valid=True):
 
 def host_zip(path, body):
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("media-catcher-host/mc_host.py", body)
+        z.writestr("mc_host.py", body)
+        z.writestr("mchost/__init__.py", "# pkg\n")
+        z.writestr("mchost/cast/backend.py", "# backend\n")
 
 
 def pythonw():
@@ -93,6 +95,9 @@ def test_guardian_apply_verify_revert_prune(guardian_ws):
     # 3) good host update
     hostdir = os.path.join(work, "host"); os.makedirs(hostdir)
     open(os.path.join(hostdir, "mc_host.py"), "w").write('VERSION = "1.0.0"\n')
+    os.makedirs(os.path.join(hostdir, "mchost", "cast"), exist_ok=True)
+    open(os.path.join(hostdir, "mchost", "__init__.py"), "w").write("# old pkg\n")
+    open(os.path.join(hostdir, "mchost", "cast", "backend.py"), "w").write("# old backend\n")
     hg = os.path.join(zdir, "media-catcher-host-good.zip"); host_zip(hg, 'VERSION = "1.1.0"\nx = 1\n')
     c3 = dict(base, applyExt=False, applyHost=True, hostZip=hg, hostDir=hostdir,
               expectHostVersion="1.1.0")
@@ -120,6 +125,9 @@ def test_guardian_detached_spawn(guardian_ws):
     work, extdir, zdir, base = guardian_ws
     hdir6 = os.path.join(work, "host6"); os.makedirs(hdir6)
     open(os.path.join(hdir6, "mc_host.py"), "w").write('VERSION = "1.0.0"\n')
+    os.makedirs(os.path.join(hdir6, "mchost", "cast"), exist_ok=True)
+    open(os.path.join(hdir6, "mchost", "__init__.py"), "w").write("# old pkg\n")
+    open(os.path.join(hdir6, "mchost", "cast", "backend.py"), "w").write("# old backend\n")
     hg6 = os.path.join(zdir, "media-catcher-host-detached.zip")
     host_zip(hg6, 'VERSION = "1.1.0"\ny = 2\n')
     braw = os.path.join(work, "backups6")
