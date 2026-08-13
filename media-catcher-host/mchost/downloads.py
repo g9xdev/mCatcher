@@ -2194,31 +2194,53 @@ def _ytdl_adopt_committed_pin(source_handle):
         will attempt one later close via dispose)
       - original, when no pin could be created
     """
-    if not source_handle:
+    # Exact-handle validation (no truthiness traps: 0 / INVALID are not owned).
+    if source_handle is None:
         return None
-    pin = _ytdl_duplicate_readonly_pin(source_handle)
-    raised = False
-    ok = False
     try:
-        ok = bool(_ytdl_close_handle(source_handle))
+        source_hv = int(source_handle)
+    except (TypeError, ValueError):
+        return None
+    if source_hv == 0 or source_hv == int(_YTDL_INVALID_HANDLE_VALUE):
+        return None
+
+    pin = None
+    try:
+        pin = _ytdl_duplicate_readonly_pin(source_handle)
+    except Exception:
+        # Duplication fault: retain the original committed handle; never close it here.
+        return source_handle
+
+    pin_hv = None
+    if pin is not None:
+        try:
+            pin_hv = int(pin)
+        except (TypeError, ValueError):
+            pin_hv = None
+    if (
+        pin_hv is None
+        or pin_hv == 0
+        or pin_hv == int(_YTDL_INVALID_HANDLE_VALUE)
+    ):
+        # No valid replacement pin: keep original ownership through terminal.
+        return source_handle
+
+    # Only with a valid replacement may we attempt the single original close.
+    raised = False
+    try:
+        _ytdl_close_handle(source_handle)
     except Exception:
         raised = True
-        ok = False
-    if ok:
-        return pin if pin is not None else None
     if raised:
         # Close accounting raised before a confirmed release: keep original for
-        # exactly one later worker-level dispose; drop the unused pin.
-        if pin is not None:
-            try:
-                _ytdl_close_handle(pin)
-            except Exception:
-                pass
+        # exactly one later worker-level dispose; drop the unused pin once.
+        try:
+            _ytdl_close_handle(pin_hv)
+        except Exception:
+            pass
         return source_handle
-    # BOOL FALSE: treat original as consumed (exact-once); hold pin if any.
-    if pin is not None:
-        return pin
-    return None
+    # TRUE or FALSE: one close attempt consumed on original; hold the pin.
+    return pin_hv
 
 
 def _ytdl_dispose_handle(handle, delete=False):
