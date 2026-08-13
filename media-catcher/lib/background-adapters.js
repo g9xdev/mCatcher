@@ -270,6 +270,20 @@
       );
     }
 
+    /**
+     * tabId/frameId identity preserved by downstream `| 0`: primitive integers
+     * in inclusive range [0, 0x7fffffff]. Rejects values that would truncate.
+     */
+    function isSignedInt32Identity(value) {
+      return (
+        typeof value === "number" &&
+        Number.isFinite(value) &&
+        Number.isInteger(value) &&
+        value >= 0 &&
+        value <= 0x7fffffff
+      );
+    }
+
     function requireControlFreeString(s) {
       if (typeof s !== "string" || hasControlChars(s)) throw genericTypeError();
       return s;
@@ -611,11 +625,8 @@
     function snapshotNetworkDetails(details) {
       if (details == null || typeof details !== "object") throw genericTypeError();
       var out = {};
-      var url = readOptionalOwnString(details, "url");
-      if (url !== undefined && url !== null) {
-        if (hasControlChars(url)) throw genericTypeError();
-        out.url = url;
-      }
+      // Required absolute HTTP(S) media URL — exact spelling retained; no coercion.
+      out.url = requireAbsoluteHttpUrl(readRequiredOwnString(details, "url"));
       var documentUrl = readOptionalOwnString(details, "documentUrl");
       if (documentUrl !== undefined && documentUrl !== null) {
         if (hasControlChars(documentUrl)) throw genericTypeError();
@@ -633,12 +644,12 @@
       }
       var tabId = readOptionalOwnNumber(details, "tabId");
       if (tabId !== undefined) {
-        if (!isNonnegSafeInt(tabId)) throw genericTypeError();
+        if (!isSignedInt32Identity(tabId)) throw genericTypeError();
         out.tabId = tabId;
       }
       var frameId = readOptionalOwnNumber(details, "frameId");
       if (frameId !== undefined) {
-        if (!isNonnegSafeInt(frameId)) throw genericTypeError();
+        if (!isSignedInt32Identity(frameId)) throw genericTypeError();
         out.frameId = frameId;
       }
       var timeStamp = readOptionalOwnNumber(details, "timeStamp");
@@ -659,16 +670,23 @@
     function snapshotNetworkHints(hints) {
       if (hints == null || typeof hints !== "object") throw genericTypeError();
       var out = {};
-      // Primitive strings only; reject C0/DEL/C1 before any dependency boundary.
-      var top = readOptionalOwnString(hints, "topLevelUrlHint");
-      if (top !== undefined && top !== null) {
-        if (hasControlChars(top)) throw genericTypeError();
-        out.topLevelUrlHint = top;
+      // Absent keys may default; present keys require own-data primitive strings
+      // (present undefined/null are invalid — not treated as absence).
+      var topState = ownKeyState(hints, "topLevelUrlHint");
+      if (topState.present) {
+        if (!topState.data || typeof topState.value !== "string") {
+          throw genericTypeError();
+        }
+        if (hasControlChars(topState.value)) throw genericTypeError();
+        out.topLevelUrlHint = topState.value;
       }
-      var frameOrigin = readOptionalOwnString(hints, "frameOrigin");
-      if (frameOrigin !== undefined && frameOrigin !== null) {
-        if (hasControlChars(frameOrigin)) throw genericTypeError();
-        out.frameOrigin = frameOrigin;
+      var frameOriginState = ownKeyState(hints, "frameOrigin");
+      if (frameOriginState.present) {
+        if (!frameOriginState.data || typeof frameOriginState.value !== "string") {
+          throw genericTypeError();
+        }
+        if (hasControlChars(frameOriginState.value)) throw genericTypeError();
+        out.frameOrigin = frameOriginState.value;
       }
       return out;
     }
@@ -687,12 +705,12 @@
       }
       var tabId = readOptionalOwnNumber(snapshot, "tabId");
       if (tabId !== undefined) {
-        if (!isNonnegSafeInt(tabId)) throw genericTypeError();
+        if (!isSignedInt32Identity(tabId)) throw genericTypeError();
         out.tabId = tabId;
       }
       var frameId = readOptionalOwnNumber(snapshot, "frameId");
       if (frameId !== undefined) {
-        if (!isNonnegSafeInt(frameId)) throw genericTypeError();
+        if (!isSignedInt32Identity(frameId)) throw genericTypeError();
         out.frameId = frameId;
       }
       var pageUrl = readOptionalOwnString(snapshot, "pageUrl");
