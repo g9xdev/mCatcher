@@ -105,6 +105,11 @@ def test_plan_apply_and_content_hash(workspace, tmp_path, monkeypatch):
     host_dir = os.path.join(str(tmp_path), "host"); os.makedirs(host_dir)
     with open(os.path.join(host_dir, "mc_host.py"), "w") as f:
         f.write('VERSION = "1.0.0"\n')
+    os.makedirs(os.path.join(host_dir, "mchost", "cast"), exist_ok=True)
+    with open(os.path.join(host_dir, "mchost", "__init__.py"), "w") as f:
+        f.write("# old pkg\n")
+    with open(os.path.join(host_dir, "mchost", "cast", "backend.py"), "w") as f:
+        f.write("# old backend\n")
     with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
         json.dump({"version": "1.3.0"}, f)   # so the extension is a real upgrade
 
@@ -118,7 +123,9 @@ def test_plan_apply_and_content_hash(workspace, tmp_path, monkeypatch):
 
     # ---- the THIRD scenario: only the host package is newer ----
     with zipfile.ZipFile(os.path.join(zip_dir, "media-catcher-host-1.1.0.zip"), "w") as z:
-        z.writestr("media-catcher-host/mc_host.py", 'VERSION = "1.1.0"\nprint("newer host")\n')
+        z.writestr("mc_host.py", 'VERSION = "1.1.0"\nprint("newer host")\n')
+        z.writestr("mchost/__init__.py", "# pkg\n")
+        z.writestr("mchost/cast/backend.py", "# backend\n")
     p2 = mc.plan_update(ext_dir, host_dir, zip_dir)
     assert not p2["ext_newer"], "host-only: extension NOT flagged newer"
     assert p2["host_newer"] and p2["host_to"] == "1.1.0", \
@@ -136,8 +143,10 @@ def test_plan_apply_and_content_hash(workspace, tmp_path, monkeypatch):
     # ---- content-hash fallback: SAME host version, DIFFERENT code ----
     # host_dir is at 1.1.0 (content "newer host"); drop a 1.1.0 zip with different code.
     with zipfile.ZipFile(os.path.join(zip_dir, "media-catcher-host-1.1.0b.zip"), "w") as z:
-        z.writestr("media-catcher-host/mc_host.py",
+        z.writestr("mc_host.py",
                    'VERSION = "1.1.0"\nprint("DIFFERENT code, same version")\n')
+        z.writestr("mchost/__init__.py", "# pkg\n")
+        z.writestr("mchost/cast/backend.py", "# backend\n")
     p4 = mc.plan_update(ext_dir, host_dir, zip_dir)
     assert not p4["host_newer"], "content-hash: host not flagged 'newer' (same version)"
     assert p4["host_same_ver_changed"] is True, "content-hash: same-version-changed IS detected"
@@ -145,7 +154,9 @@ def test_plan_apply_and_content_hash(workspace, tmp_path, monkeypatch):
     with open(os.path.join(host_dir, "mc_host.py")) as f:
         same_body = f.read()
     with zipfile.ZipFile(os.path.join(zip_dir, "media-catcher-host-1.1.0same.zip"), "w") as z:
-        z.writestr("media-catcher-host/mc_host.py", same_body)   # identical content
+        z.writestr("mc_host.py", same_body)   # identical content
+        z.writestr("mchost/__init__.py", "# pkg\n")
+        z.writestr("mchost/cast/backend.py", "# backend\n")
     # newest 1.1.0 host zip is now ambiguous between the two 1.1.0s; verify the
     # detector only fires when the chosen newest differs from installed:
     hz = mc._newest_zip(zip_dir, "media-catcher-host*.zip")

@@ -36,6 +36,8 @@ Source: "{#HostSrc}mc_host.py";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostSrc}guardian.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostSrc}README.md";    DestDir: "{app}"; Flags: ignoreversion
 Source: "bootstrap.ps1";          DestDir: "{app}"; Flags: ignoreversion
+; Recursive native package under {app}\mchost (never {app}\mchost\mchost).
+Source: "{#HostSrc}mchost\*"; DestDir: "{app}\mchost"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__\*,*.pyc"
 
 [Run]
 ; After files are copied, run the bootstrap in place: ensure Python + ffmpeg,

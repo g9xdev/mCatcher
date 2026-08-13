@@ -86,8 +86,16 @@ function Apply-Update {
   if ($cfg.applyHost) {
     $tmp = Join-Path $env:TEMP ("mc-host-" + $stamp)
     Expand-Archive -LiteralPath $cfg.hostZip -DestinationPath $tmp -Force
-    Get-ChildItem -Recurse -File $tmp | ForEach-Object {
-      Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $cfg.hostDir $_.Name) -Force
+    # Preserve archive-relative trees into hostDir (no basename flattening).
+    $tmpRoot = (Resolve-Path -LiteralPath $tmp).Path
+    Get-ChildItem -LiteralPath $tmpRoot -Recurse -File | ForEach-Object {
+      $rel = $_.FullName.Substring($tmpRoot.Length).TrimStart('\', '/')
+      $dest = Join-Path $cfg.hostDir $rel
+      $parent = Split-Path -Parent $dest
+      if (-not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+      }
+      Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
     }
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
@@ -111,6 +119,8 @@ function Verify-Update {
   }
   if ($cfg.applyHost) {
     $mh = Join-Path $cfg.hostDir "mc_host.py"
+    $pkgInit = Join-Path $cfg.hostDir "mchost\__init__.py"
+    if (-not (Test-Path -LiteralPath $pkgInit)) { $errs += "mchost/__init__.py is missing" }
     if (-not (Test-Path -LiteralPath $mh)) { $errs += "mc_host.py is missing" }
     else {
       if ($cfg.python) {

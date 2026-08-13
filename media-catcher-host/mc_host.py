@@ -217,6 +217,51 @@ def plan_summary(plan):
     return " · ".join(parts)
 
 
+def _validate_host_archive_member(name):
+    """Validate one host-zip member name before any write.
+
+    Returns (relative_path, is_directory). A single terminal separator may mark
+    a directory member; those are skipped only after the rest of the name
+    passes validation. Rejects absolute, drive-qualified, UNC, '.'/'..',
+    empty-name or interior-empty-component, NUL, mixed/backslash traversal,
+    and otherwise escaping names.
+    """
+    if name is None or name == "":
+        raise ValueError("host archive member name is empty")
+    if "\x00" in name:
+        raise ValueError("host archive member name contains NUL")
+    is_dir = name.endswith("/") or name.endswith("\\")
+    core = name[:-1] if is_dir else name
+    if core == "":
+        raise ValueError("host archive member name is empty")
+    # Absolute / UNC / drive-qualified (before separator normalization).
+    if core[0] in "/\\" or core.startswith("//") or core.startswith("\\\\"):
+        raise ValueError("host archive member is absolute or UNC: %r" % name)
+    if len(core) >= 2 and core[1] == ":":
+        raise ValueError("host archive member is drive-qualified: %r" % name)
+    # Component checks on a unified separator view; empty segments catch
+    # interior empties (mchost//x) and reject '.' / '..' traversal.
+    unified = core.replace("\\", "/")
+    if unified.startswith("/") or unified.startswith("//"):
+        raise ValueError("host archive member is absolute or UNC: %r" % name)
+    parts = unified.split("/")
+    if any(p == "" for p in parts):
+        raise ValueError("host archive member has empty path component: %r" % name)
+    if any(p in (".", "..") for p in parts):
+        raise ValueError("host archive member has dot path component: %r" % name)
+    rel = os.path.join(*parts)
+    return rel, is_dir
+
+
+def _host_member_destination(host_dir, rel):
+    """Resolve rel under host_dir; raise if it escapes the destination root."""
+    host_abs = os.path.abspath(host_dir)
+    dest_abs = os.path.abspath(os.path.join(host_dir, rel))
+    if dest_abs != host_abs and not dest_abs.startswith(host_abs + os.sep):
+        raise ValueError("host archive member escapes destination: %r" % rel)
+    return dest_abs
+
+
 def apply_update(plan, ext_dir, host_dir):
     """Apply only the parts that are newer. Returns {staged: bool}."""
     staged = False
@@ -238,10 +283,20 @@ def apply_update(plan, ext_dir, host_dir):
                 staged = False
     if plan["host_newer"] and _await_zip(plan["host_zip"]):
         with zipfile.ZipFile(plan["host_zip"]) as z:
+            # Validate every member before the first directory creation or write.
+            accepted = []
             for n in z.namelist():
-                if n.endswith("/"):
+                rel, is_dir = _validate_host_archive_member(n)
+                _host_member_destination(host_dir, rel)
+                if is_dir:
                     continue
-                with z.open(n) as src, open(os.path.join(host_dir, os.path.basename(n)), "wb") as dst:
+                accepted.append((n, rel))
+            for n, rel in accepted:
+                dest = _host_member_destination(host_dir, rel)
+                parent = os.path.dirname(dest)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with z.open(n) as src, open(dest, "wb") as dst:
                     shutil.copyfileobj(src, dst)
     return {"staged": staged}
 
