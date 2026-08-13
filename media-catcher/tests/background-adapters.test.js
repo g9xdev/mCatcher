@@ -261,9 +261,16 @@ function productionSource() {
   );
 }
 
+/**
+ * Extract enumerable pending object literals that production installs via:
+ *   var pending = { detectionId, ephemeral, mediaKind, tabId };
+ *   installFutureTransport(pending, futureTransport);
+ *   pendingByMediaId.set(mediaId, pending);
+ * (not the old inline `.set(mediaId, { ... })` shape).
+ */
 function extractPendingSetBlocks(src) {
   const blocks = [];
-  const re = /pendingByMediaId\.set\s*\(\s*mediaId\s*,\s*\{/g;
+  const re = /var\s+pending\s*=\s*\{/g;
   let m;
   while ((m = re.exec(src)) !== null) {
     const start = m.index + m[0].length - 1; // at '{'
@@ -281,7 +288,21 @@ function extractPendingSetBlocks(src) {
       }
     }
     assert.ok(end > start, "pending object literal must be balanced");
-    blocks.push(src.slice(start, end + 1));
+    const block = src.slice(start, end + 1);
+    // Require the non-enumerable future-transport install + set(mediaId, pending)
+    // immediately after this literal (network + DOM capture sites).
+    const after = src.slice(end + 1, end + 1 + 500);
+    if (
+      !/installFutureTransport\s*\(\s*pending\s*,\s*futureTransport\s*\)/.test(
+        after
+      )
+    ) {
+      continue;
+    }
+    if (!/pendingByMediaId\.set\s*\(\s*mediaId\s*,\s*pending\s*\)/.test(after)) {
+      continue;
+    }
+    blocks.push(block);
   }
   return blocks;
 }
@@ -337,6 +358,189 @@ function loadClassicDependencies(sandbox, root) {
   assert.equal(typeof root.McProviderRegistry, "object");
   assert.equal(typeof root.McPrivacy, "object");
   assert.equal(typeof root.McFirefoxGuard, "object");
+}
+
+const GENERIC_ADAPTER_MSG = "invalid background adapter input";
+const DATE_RANGE_MS = 8.64e15;
+
+/**
+ * Classic-script load with test-private Map + finalizer instrumentation.
+ * Delegates all real dependency methods/results unchanged; retains instances
+ * only for listFinalized / pending-record inspection. No production hooks.
+ */
+function loadInstrumentedClassic() {
+  const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const root = Object.create(null);
+  const sandbox = classicVmBuiltins(root);
+
+  const trackedMaps = [];
+  class TrackingMap extends Map {
+    constructor() {
+      super();
+      this._sets = [];
+      trackedMaps.push(this);
+    }
+    set(key, value) {
+      this._sets.push({ key: key, value: value });
+      return super.set(key, value);
+    }
+  }
+  sandbox.Map = TrackingMap;
+
+  loadClassicDependencies(sandbox, root);
+
+  const finalizers = [];
+  const RealDF = root.McDetectionFinalizer;
+  const realCreate = RealDF.createDetectionFinalizer;
+  root.McDetectionFinalizer = {
+    CONTEXT_WAIT_MS: RealDF.CONTEXT_WAIT_MS,
+    mapWebRequestDetails: RealDF.mapWebRequestDetails,
+    createDetectionFinalizer(deps) {
+      const instance = realCreate.call(RealDF, deps);
+      finalizers.push(instance);
+      return instance;
+    },
+  };
+
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  assert.equal(typeof root.McBackgroundAdapters, "object");
+
+  return {
+    api: root.McBackgroundAdapters,
+    trackedMaps,
+    finalizers,
+    sessionFinalizer() {
+      return finalizers[0] || null;
+    },
+    pendingRecords() {
+      const out = [];
+      for (const m of trackedMaps) {
+        for (const entry of m._sets) {
+          const v = entry.value;
+          if (!v || typeof v !== "object") continue;
+          const keys = Object.keys(v).slice().sort();
+          if (
+            keys.length === 4 &&
+            keys[0] === "detectionId" &&
+            keys[1] === "ephemeral" &&
+            keys[2] === "mediaKind" &&
+            keys[3] === "tabId"
+          ) {
+            out.push(v);
+          }
+        }
+      }
+      return out;
+    },
+    sourceRecords() {
+      const out = [];
+      for (const m of trackedMaps) {
+        for (const entry of m._sets) {
+          const v = entry.value;
+          if (!v || typeof v !== "object") continue;
+          const keys = Object.keys(v);
+          if (
+            keys.includes("mediaId") &&
+            keys.includes("proposedFilename") &&
+            keys.includes("mediaKind")
+          ) {
+            out.push(v);
+          }
+        }
+      }
+      return out;
+    },
+  };
+}
+
+/**
+ * Prove a fresh adapter-authored TypeError: exact generic message, no wrapped
+ * cause/identity, and no concrete engine/trap/hostile phrases.
+ * Do not ban bare "IsArray" — adapter stack frames legitimately name safeIsArray.
+ */
+function assertGenericTypeError(err, opts) {
+  assert.ok(err instanceof TypeError, "expected TypeError, got " + err);
+  assert.equal(err.name, "TypeError");
+  assert.equal(err.message, GENERIC_ADAPTER_MSG);
+  // Fresh adapter-authored — must not retain a native/hostile cause chain.
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(err, "cause") ? err.cause : undefined,
+    undefined,
+    "generic TypeError must not retain a cause"
+  );
+  if (opts && opts.notSameAs != null) {
+    assert.notEqual(
+      err,
+      opts.notSameAs,
+      "must not rethrow hostile/native exception identity"
+    );
+  }
+  // Message is already exact; scan message+stack only for concrete engine/trap
+  // phrases and hostile sentinels (not helper names like safeIsArray).
+  const blob = String(err.message) + "\n" + String(err.stack || "");
+  const leak =
+    /Cannot perform|revoked proxy|Proxy\s*handler|getOwnPropertyDescriptor|hostilesecret|HOSTILE_SECRET|which is no longer usable|is not iterable|Illegal invocation/i.test(
+      blob
+    );
+  assert.equal(
+    leak,
+    false,
+    "adapter error must not leak engine/trap text: " + err.message
+  );
+}
+
+function assertNoMaterialEffects(fx, baseline) {
+  const b = baseline || {};
+  assert.equal(fx.counts.postNative, b.postNative || 0);
+  assert.equal(fx.counts.downloadsDownload, b.downloadsDownload || 0);
+  assert.equal(fx.counts.fetchArrayBuffer, b.fetchArrayBuffer || 0);
+  assert.equal(fx.counts.assembleMedia, b.assembleMedia || 0);
+  assert.equal(fx.counts.createObjectURL, b.createObjectURL || 0);
+  assert.equal(fx.counts.revokeObjectURL, b.revokeObjectURL || 0);
+  assert.equal(fx.counts.publishDetection, b.publishDetection || 0);
+  assert.equal(fx.counts.publishJobs, b.publishJobs || 0);
+  assert.equal(fx.counts.persistHistory, b.persistHistory || 0);
+}
+
+function assertNoFinalizerResidue(finalizer, mediaCtrl, tabId) {
+  assert.ok(finalizer, "session finalizer must be captured");
+  assert.equal(finalizer.listFinalized().length, 0);
+  // Length check only — classic-VM arrays are cross-realm vs assert helpers.
+  assert.equal(mediaCtrl.popupMedia(tabId).length, 0);
+}
+
+function validNetworkCapture(overrides) {
+  return florenNetworkInput(overrides);
+}
+
+function validDomCapture(overrides) {
+  const base = {
+    mediaUrl: "https://cdn.example/dom-valid.mp4",
+    mediaOrigin: "https://cdn.example",
+    contentDisposition: null,
+    referrerUrl: "https://site.example/watch",
+    frameOrigin: "https://site.example",
+    ts: 1_000_000,
+    snapshot: {
+      documentId: "doc-dom-valid",
+      tabId: 70,
+      frameId: 0,
+      pageUrl: "https://site.example/watch",
+      topLevelPageUrl: "https://site.example/watch",
+      documentNonce: "n-dom-valid",
+      candidates: [{ kind: "visible-filename", value: "dom-valid.mp4" }],
+      capturedAt: "2026-08-12T12:00:00.000Z",
+    },
+    transport: { mediaKind: "direct", requestHeaders: null },
+  };
+  return Object.assign(base, overrides || {});
+}
+
+function assertFirstObservableIds(mediaId, pendingRec) {
+  assert.ok(isSafeOpaqueId(mediaId));
+  assert.match(mediaId, /:1$/);
+  assert.equal(pendingRec.detectionId, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,6 +2100,1409 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
       assertNoSentinels(diag, "diagnostic");
       assertNoSentinels(committed, "reenter popup");
       assertNoSentinels(fxR.publishDetections, "reenter publish");
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Repair subtests A–E — failure atomicity, private transport, generic errors
+  // -------------------------------------------------------------------------
+
+  await t.test(
+    "BA04 network invalid/throwing capture is failure-atomic",
+    async () => {
+      function freshNetHarness(optionOverrides) {
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(
+          fx.options(optionOverrides || {})
+        );
+        return { inst, fx, ctrl };
+      }
+
+      async function assertNetworkRejectedAtomic(runCapture, opts) {
+        const { inst, fx, ctrl } = freshNetHarness(opts && opts.optionOverrides);
+        const finalizer = inst.sessionFinalizer();
+        let threw = null;
+        try {
+          runCapture(ctrl, fx);
+        } catch (err) {
+          threw = err;
+        }
+        assert.ok(threw, "capture must reject");
+        if (opts && opts.expectTokenIdentity) {
+          assert.equal(threw, opts.expectTokenIdentity);
+        } else {
+          assertGenericTypeError(threw);
+        }
+        if (opts && opts.hits) {
+          for (const k of Object.keys(opts.hits)) {
+            assert.equal(opts.hits[k], 0, "hostile " + k + " must not run");
+          }
+        }
+        assertNoMaterialEffects(fx);
+        if (!(opts && opts.skipTokenCount)) {
+          assert.equal(
+            fx.counts.randomToken,
+            opts && opts.tokenCalls != null ? opts.tokenCalls : 0
+          );
+        }
+        assertNoFinalizerResidue(finalizer, ctrl, 42);
+
+        // Matching snapshot / tick must not surface orphan finalizer work.
+        ctrl.acceptPageSnapshot(florenSnapshot());
+        await ctrl.tick(1_000_750);
+        assert.equal(finalizer.listFinalized().length, 0);
+        assert.equal(fx.counts.publishDetection, 0);
+        assert.equal(ctrl.popupMedia(42).length, 0);
+
+        // Restore one-shot failure (if any), then first valid capture is :1 / det 1.
+        // Note: the orphan-proof snapshot above is a matching floren snapshot, so a
+        // later valid floren capture may finalize/publish immediately on reconcile.
+        if (opts && opts.restore) opts.restore(fx);
+        const okId = ctrl.captureNetwork(validNetworkCapture());
+        const pendings = inst.pendingRecords();
+        assert.ok(pendings.length >= 1);
+        const lastPending = pendings[pendings.length - 1];
+        assertFirstObservableIds(okId, lastPending);
+        assert.equal(lastPending.detectionId, 1);
+        if (finalizer.listFinalized().length === 0) {
+          assert.equal(fx.counts.publishDetection, 0);
+          ctrl.acceptPageSnapshot(florenSnapshot());
+        }
+        // Exactly-once publication/finalizer result after valid recovery.
+        assert.equal(fx.counts.publishDetection, 1);
+        assert.equal(fx.publishDetections[0].id, okId);
+        assert.equal(finalizer.listFinalized().length, 1);
+        assert.equal(finalizer.listFinalized()[0].detectionId, 1);
+        ctrl.acceptPageSnapshot(florenSnapshot());
+        await ctrl.tick(1_000_900);
+        assert.equal(fx.counts.publishDetection, 1);
+        assert.equal(ctrl.popupMedia(42).length, 1);
+        assert.equal(ctrl.popupMedia(42)[0].id, okId);
+      }
+
+      // randomToken throws once
+      {
+        const tokenErr = new Error("TOKEN_INJECTED_BOOM");
+        let thrown = false;
+        let tokenInvocations = 0;
+        await assertNetworkRejectedAtomic(
+          (ctrl) => {
+            ctrl.captureNetwork(validNetworkCapture());
+          },
+          {
+            optionOverrides: {
+              randomToken() {
+                tokenInvocations += 1;
+                if (!thrown) {
+                  thrown = true;
+                  throw tokenErr;
+                }
+                return "tok-ok";
+              },
+            },
+            expectTokenIdentity: tokenErr,
+            skipTokenCount: true,
+            restore() {
+              /* one-shot already consumed */
+            },
+          }
+        );
+        // One failing invocation + one successful recovery capture.
+        assert.equal(tokenInvocations, 2);
+      }
+
+      // requestHeaders own accessor
+      {
+        const hits = { headerGetter: 0 };
+        const headers = {};
+        Object.defineProperty(headers, "Cookie", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.headerGetter += 1;
+            throw new Error("HOSTILE_SECRET_HEADER_GETTER");
+          },
+        });
+        await assertNetworkRejectedAtomic(
+          (ctrl) => {
+            ctrl.captureNetwork(
+              validNetworkCapture({
+                transport: {
+                  mediaKind: "direct",
+                  requestHeaders: headers,
+                },
+              })
+            );
+          },
+          { hits }
+        );
+      }
+
+      // requestHeaders symbol key
+      {
+        const headers = { Cookie: "session=ok" };
+        headers[Symbol("secret")] = "HOSTILE_SYMBOL";
+        await assertNetworkRejectedAtomic((ctrl) => {
+          ctrl.captureNetwork(
+            validNetworkCapture({
+              transport: { mediaKind: "direct", requestHeaders: headers },
+            })
+          );
+        });
+      }
+
+      // requestHeaders non-string value
+      {
+        await assertNetworkRejectedAtomic((ctrl) => {
+          ctrl.captureNetwork(
+            validNetworkCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: { Cookie: 123 },
+              },
+            })
+          );
+        });
+      }
+
+      // requestHeaders revoked Proxy
+      {
+        const rev = Proxy.revocable(
+          { Cookie: "session=ok" },
+          {}
+        );
+        rev.revoke();
+        await assertNetworkRejectedAtomic((ctrl) => {
+          ctrl.captureNetwork(
+            validNetworkCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: rev.proxy,
+              },
+            })
+          );
+        });
+      }
+
+      // invalid / C1 response-header name
+      {
+        await assertNetworkRejectedAtomic((ctrl) => {
+          ctrl.captureNetwork(
+            validNetworkCapture({
+              details: Object.assign({}, florenNetworkInput().details, {
+                responseHeaders: [
+                  { name: "Content-Type\u0085", value: "video/mp4" },
+                ],
+              }),
+            })
+          );
+        });
+      }
+
+      // invalid / C1 response-header value
+      {
+        await assertNetworkRejectedAtomic((ctrl) => {
+          ctrl.captureNetwork(
+            validNetworkCapture({
+              details: Object.assign({}, florenNetworkInput().details, {
+                responseHeaders: [
+                  { name: "Content-Type", value: "video/\u0081mp4" },
+                ],
+              }),
+            })
+          );
+        });
+      }
+
+      // invalid now() NaN on pending network capture
+      {
+        let nowMode = "nan";
+        await assertNetworkRejectedAtomic(
+          (ctrl) => {
+            ctrl.captureNetwork(validNetworkCapture());
+          },
+          {
+            optionOverrides: {
+              now() {
+                if (nowMode === "nan") return Number.NaN;
+                if (nowMode === "range") return DATE_RANGE_MS + 1;
+                return 1_000_000;
+              },
+            },
+            restore() {
+              nowMode = "ok";
+            },
+          }
+        );
+      }
+
+      // invalid now() out-of-Date-range on pending network capture
+      {
+        let bad = true;
+        await assertNetworkRejectedAtomic(
+          (ctrl) => {
+            ctrl.captureNetwork(validNetworkCapture());
+          },
+          {
+            optionOverrides: {
+              now() {
+                return bad ? DATE_RANGE_MS + 100 : 1_000_000;
+              },
+            },
+            restore() {
+              bad = false;
+            },
+          }
+        );
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 DOM invalid/throwing capture is failure-atomic",
+    async () => {
+      function freshDomHarness(optionOverrides) {
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(
+          fx.options(optionOverrides || {})
+        );
+        return { inst, fx, ctrl };
+      }
+
+      async function assertDomRejectedAtomic(runCapture, opts) {
+        const { inst, fx, ctrl } = freshDomHarness(opts && opts.optionOverrides);
+        const finalizer = inst.sessionFinalizer();
+        let threw = null;
+        try {
+          runCapture(ctrl, fx);
+        } catch (err) {
+          threw = err;
+        }
+        assert.ok(threw, "DOM capture must reject");
+        if (opts && opts.expectTokenIdentity) {
+          assert.equal(threw, opts.expectTokenIdentity);
+        } else {
+          assertGenericTypeError(threw);
+        }
+        if (opts && opts.hits) {
+          for (const k of Object.keys(opts.hits)) {
+            assert.equal(opts.hits[k], 0, "hostile " + k + " must not run");
+          }
+        }
+        assertNoMaterialEffects(fx);
+        assert.equal(
+          fx.counts.randomToken,
+          opts && opts.tokenCalls != null ? opts.tokenCalls : 0
+        );
+        assertNoFinalizerResidue(finalizer, ctrl, 70);
+        assert.equal(inst.pendingRecords().length, 0);
+        assert.equal(inst.sourceRecords().length, 0);
+
+        if (opts && opts.restore) opts.restore();
+        const okId = ctrl.captureDomMedia(validDomCapture());
+        const pendings = inst.pendingRecords();
+        assert.ok(pendings.length >= 1);
+        assertFirstObservableIds(okId, pendings[pendings.length - 1]);
+        assert.equal(fx.counts.publishDetection, 1);
+        assert.equal(fx.publishDetections[0].id, okId);
+        assert.equal(finalizer.listFinalized().length, 1);
+        assert.equal(finalizer.listFinalized()[0].detectionId, 1);
+      }
+
+      // empty mediaUrl
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(validDomCapture({ mediaUrl: "" }));
+      });
+
+      // blank mediaUrl
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(validDomCapture({ mediaUrl: "   " }));
+      });
+
+      // control mediaUrl (C0)
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ mediaUrl: "https://cdn.example/\u0001x.mp4" })
+        );
+      });
+
+      // C1 mediaUrl
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ mediaUrl: "https://cdn.example/\u0085x.mp4" })
+        );
+      });
+
+      // requestHeaders invalid forms
+      {
+        const hits = { h: 0 };
+        const headers = {};
+        Object.defineProperty(headers, "Authorization", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.h += 1;
+            return "Bearer x";
+          },
+        });
+        await assertDomRejectedAtomic(
+          (ctrl) => {
+            ctrl.captureDomMedia(
+              validDomCapture({
+                transport: { mediaKind: "direct", requestHeaders: headers },
+              })
+            );
+          },
+          { hits }
+        );
+      }
+      await assertDomRejectedAtomic((ctrl) => {
+        const h = { a: "1" };
+        h[Symbol("s")] = "x";
+        ctrl.captureDomMedia(
+          validDomCapture({
+            transport: { mediaKind: "direct", requestHeaders: h },
+          })
+        );
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({
+            transport: {
+              mediaKind: "direct",
+              requestHeaders: { Cookie: false },
+            },
+          })
+        );
+      });
+      {
+        const rev = Proxy.revocable({ Cookie: "x" }, {});
+        rev.revoke();
+        await assertDomRejectedAtomic((ctrl) => {
+          ctrl.captureDomMedia(
+            validDomCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: rev.proxy,
+              },
+            })
+          );
+        });
+      }
+
+      // ts outside Date range / non-safe / non-finite
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(validDomCapture({ ts: DATE_RANGE_MS + 1 }));
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(validDomCapture({ ts: Number.NaN }));
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(validDomCapture({ ts: Number.POSITIVE_INFINITY }));
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ ts: Number.MAX_SAFE_INTEGER + 1 })
+        );
+      });
+
+      // invalid now() when DOM snapshot has no usable captured time
+      {
+        let bad = true;
+        await assertDomRejectedAtomic(
+          (ctrl) => {
+            ctrl.captureDomMedia(
+              validDomCapture({
+                snapshot: {
+                  documentId: "doc-dom-nocap",
+                  tabId: 70,
+                  frameId: 0,
+                  pageUrl: "https://site.example/watch",
+                  topLevelPageUrl: "https://site.example/watch",
+                  documentNonce: "n-nocap",
+                  candidates: [
+                    { kind: "visible-filename", value: "dom-valid.mp4" },
+                  ],
+                  // capturedAt absent → finalizer may sample now()
+                },
+              })
+            );
+          },
+          {
+            optionOverrides: {
+              now() {
+                return bad ? Number.NaN : 1_000_000;
+              },
+            },
+            restore() {
+              bad = false;
+            },
+          }
+        );
+      }
+
+      // revoked snapshot Proxy
+      {
+        const rev = Proxy.revocable(
+          {
+            documentId: "doc-dom-valid",
+            tabId: 70,
+            frameId: 0,
+            pageUrl: "https://site.example/watch",
+            topLevelPageUrl: "https://site.example/watch",
+            documentNonce: "n",
+            candidates: [{ kind: "visible-filename", value: "x.mp4" }],
+            capturedAt: "2026-08-12T12:00:00.000Z",
+          },
+          {}
+        );
+        rev.revoke();
+        await assertDomRejectedAtomic((ctrl) => {
+          ctrl.captureDomMedia(validDomCapture({ snapshot: rev.proxy }));
+        });
+      }
+
+      // revoked candidates Proxy
+      {
+        const rev = Proxy.revocable(
+          [{ kind: "visible-filename", value: "x.mp4" }],
+          {}
+        );
+        rev.revoke();
+        await assertDomRejectedAtomic((ctrl) => {
+          ctrl.captureDomMedia(
+            validDomCapture({
+              snapshot: {
+                documentId: "doc-dom-valid",
+                tabId: 70,
+                frameId: 0,
+                pageUrl: "https://site.example/watch",
+                topLevelPageUrl: "https://site.example/watch",
+                documentNonce: "n",
+                candidates: rev.proxy,
+                capturedAt: "2026-08-12T12:00:00.000Z",
+              },
+            })
+          );
+        });
+      }
+
+      // Ordinary Floren/DOM still succeed after the above patterns on a fresh ctrl
+      {
+        const { fx, ctrl } = freshDomHarness();
+        const florenId = ctrl.captureNetwork(florenNetworkInput());
+        ctrl.acceptPageSnapshot(florenSnapshot());
+        assert.equal(fx.publishDetections[0].proposedFilename, "11238-makemebi.net.mp4");
+        const domId = ctrl.captureDomMedia(validDomCapture());
+        assert.ok(isSafeOpaqueId(florenId));
+        assert.ok(isSafeOpaqueId(domId));
+        assert.notEqual(florenId, domId);
+        assert.equal(fx.counts.publishDetection, 2);
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 future transport is privately retained, copied, and frozen",
+    async () => {
+      const inst = loadInstrumentedClassic();
+      const fx = makeEffects();
+      const ctrl = inst.api.createBackgroundAdapters(fx.options());
+
+      const mirrorA =
+        "https://m1.example-cdn.invalid/a.mp4?token=SECRET_SIGNED_QUERY_XYZ&exp=1";
+      const mirrorB =
+        "https://m2.example-cdn.invalid/b.mp4?token=SECRET_SIGNED_QUERY_XYZ&exp=2";
+      const refererExact =
+        "https://site.example/SECRET_REFERER_PATH/ref?auth=SECRET_AUTH_BEARER_TOKEN";
+      const uaExact = "Lease1TestAgent/2.5 SECRET_AUTH_BEARER_TOKEN";
+      const variantUrl =
+        "https://v.example-cdn.invalid/v.mp4?token=SECRET_SIGNED_QUERY_XYZ";
+      const mirrorsArr = [mirrorA, mirrorB];
+      const variantsArr = [
+        {
+          url: variantUrl,
+          label: "1080p",
+          bandwidth: 5000000,
+        },
+      ];
+      const transportObj = {
+        mediaKind: "direct",
+        requestHeaders: {
+          Cookie: "session=SECRET_COOKIE_ABC",
+          Authorization: "Bearer SECRET_AUTH_BEARER_TOKEN",
+        },
+        mirrors: mirrorsArr,
+        referer: refererExact,
+        userAgent: uaExact,
+        variants: variantsArr,
+      };
+
+      const mediaId = ctrl.captureNetwork(
+        validNetworkCapture({ transport: transportObj })
+      );
+      const pendings = inst.pendingRecords();
+      assert.equal(pendings.length, 1);
+      const pending = pendings[0];
+      assert.deepEqual(Object.keys(pending).sort(), [
+        "detectionId",
+        "ephemeral",
+        "mediaKind",
+        "tabId",
+      ]);
+
+      const ftDesc = Object.getOwnPropertyDescriptor(pending, "futureTransport");
+      assert.ok(ftDesc, "futureTransport must exist on pending");
+      assert.equal(ftDesc.enumerable, false);
+      assert.equal(ftDesc.writable, false);
+      assert.equal(ftDesc.configurable, false);
+      const ft = ftDesc.value;
+      assert.ok(ft && typeof ft === "object");
+      assert.ok(Object.isFrozen(ft), "futureTransport handle frozen");
+      assert.notEqual(ft.mirrors, mirrorsArr, "mirrors must be a fresh copy");
+      assert.notEqual(ft.variants, variantsArr, "variants must be a fresh copy");
+      assert.ok(Object.isFrozen(ft.mirrors));
+      assert.ok(Object.isFrozen(ft.variants));
+      assert.ok(Object.isFrozen(ft.variants[0]));
+      assert.equal(ft.mirrors[0], mirrorA);
+      assert.equal(ft.mirrors[1], mirrorB);
+      assert.equal(ft.referer, refererExact);
+      assert.equal(ft.userAgent, uaExact);
+      assert.equal(ft.variants[0].url, variantUrl);
+      assert.equal(ft.variants[0].label, "1080p");
+      assert.equal(ft.variants[0].bandwidth, 5000000);
+      // requestHeaders owned only by Privacy.createEphemeral — absent here.
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(ft, "requestHeaders"),
+        false
+      );
+      assert.equal("requestHeaders" in ft, false);
+
+      // Mutate caller after capture — retained values unchanged.
+      mirrorsArr[0] = "mutated-mirror";
+      variantsArr[0].url = "mutated-variant";
+      transportObj.referer = "mutated-referer";
+      transportObj.userAgent = "mutated-ua";
+      transportObj.mirrors = [];
+      transportObj.variants = [];
+      assert.equal(ft.mirrors[0], mirrorA);
+      assert.equal(ft.variants[0].url, variantUrl);
+      assert.equal(ft.referer, refererExact);
+      assert.equal(ft.userAgent, uaExact);
+
+      // Public surfaces must not project secrets.
+      assert.equal(ctrl.popupMedia(42).length, 0);
+      assert.equal(fx.counts.publishDetection, 0);
+      assert.equal(JSON.stringify(pending), JSON.stringify({
+        detectionId: pending.detectionId,
+        ephemeral: pending.ephemeral,
+        mediaKind: pending.mediaKind,
+        tabId: pending.tabId,
+      }));
+      assertNoSentinels(
+        {
+          keys: Object.keys(pending),
+          json: JSON.stringify(pending),
+        },
+        "enumerable pending"
+      );
+
+      ctrl.acceptPageSnapshot(florenSnapshot());
+      assert.equal(fx.counts.publishDetection, 1);
+      const sources = inst.sourceRecords();
+      assert.ok(sources.length >= 1);
+      const source = sources[sources.length - 1];
+      const srcFtDesc = Object.getOwnPropertyDescriptor(source, "futureTransport");
+      assert.ok(srcFtDesc, "futureTransport on finalized source");
+      assert.equal(srcFtDesc.enumerable, false);
+      assert.equal(srcFtDesc.writable, false);
+      assert.equal(srcFtDesc.configurable, false);
+      const srcFt = srcFtDesc.value;
+      assert.ok(Object.isFrozen(srcFt));
+      assert.equal(srcFt.mirrors[0], mirrorA);
+      assert.equal(srcFt.referer, refererExact);
+      assert.equal(srcFt.userAgent, uaExact);
+      assert.equal(srcFt.variants[0].url, variantUrl);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(srcFt, "requestHeaders"),
+        false
+      );
+
+      const pop = ctrl.popupMedia(42);
+      assert.equal(pop[0].id, mediaId);
+      assertNoSentinels(pop, "transport popup");
+      assertNoSentinels(fx.publishDetections, "transport publish");
+      assertNoSentinels(fx.diagnostics, "transport diagnostics");
+      const publicBlob = [
+        JSON.stringify(pop),
+        JSON.stringify(fx.publishDetections),
+        JSON.stringify(Object.keys(source)),
+        JSON.stringify(Object.keys(pending)),
+      ].join("\n");
+      for (const s of SECRET_SENTINELS) {
+        assert.equal(publicBlob.includes(s), false, "public must not contain " + s);
+      }
+      // Direct private reads still retain secrets for later leases.
+      assert.equal(srcFt.mirrors[0].includes("SECRET_SIGNED_QUERY_XYZ"), true);
+
+      // Reject invalid transport graphs before IDs / finalizer / effects.
+      function assertTransportReject(transportPatch, label, hits) {
+        const h = loadInstrumentedClassic();
+        const fx2 = makeEffects();
+        const c2 = h.api.createBackgroundAdapters(fx2.options());
+        let err = null;
+        try {
+          c2.captureNetwork(
+            validNetworkCapture({
+              transport: Object.assign(
+                { mediaKind: "direct", requestHeaders: null },
+                transportPatch
+              ),
+            })
+          );
+        } catch (e) {
+          err = e;
+        }
+        assert.ok(err, label + " must reject");
+        assertGenericTypeError(err);
+        assert.equal(fx2.counts.randomToken, 0, label + " no token");
+        assert.equal(fx2.counts.publishDetection, 0, label + " no publish");
+        assertNoMaterialEffects(fx2);
+        assert.equal(h.sessionFinalizer().listFinalized().length, 0, label);
+        assert.equal(h.pendingRecords().length, 0, label + " no pending");
+        assert.equal(h.sourceRecords().length, 0, label + " no source");
+        if (hits) {
+          for (const k of Object.keys(hits)) {
+            assert.equal(hits[k], 0, label + " hostile " + k + " must not run");
+          }
+        }
+      }
+
+      // accessor on mirrors index via non-data descriptor entry.
+      // Build a real Array (length is non-configurable — never redefine it).
+      // Defining index "0" on [] advances length to 1 automatically.
+      {
+        const hits = { mirrorGet: 0 };
+        const hostileMirrors = [];
+        Object.defineProperty(hostileMirrors, "0", {
+          configurable: true,
+          enumerable: true,
+          get() {
+            hits.mirrorGet += 1;
+            throw new Error("HOSTILE_MIRROR_GET");
+          },
+        });
+        assert.equal(hostileMirrors.length, 1);
+        assertTransportReject(
+          { mirrors: hostileMirrors },
+          "accessor mirrors",
+          hits
+        );
+      }
+      // accessor on variants index
+      {
+        const hits = { variantGet: 0 };
+        const hostileVariants = [];
+        Object.defineProperty(hostileVariants, "0", {
+          configurable: true,
+          enumerable: true,
+          get() {
+            hits.variantGet += 1;
+            throw new Error("HOSTILE_VARIANT_GET");
+          },
+        });
+        assert.equal(hostileVariants.length, 1);
+        assertTransportReject(
+          { variants: hostileVariants },
+          "accessor variants",
+          hits
+        );
+      }
+      assertTransportReject(
+        {
+          mirrors: (() => {
+            const a = ["https://ok.example/a.mp4"];
+            a[2] = "https://ok.example/sparse.mp4";
+            return a;
+          })(),
+        },
+        "sparse mirrors"
+      );
+      assertTransportReject(
+        {
+          variants: (() => {
+            const a = [{ url: "https://ok.example/v.mp4" }];
+            a[2] = { url: "https://ok.example/sparse.mp4" };
+            return a;
+          })(),
+        },
+        "sparse variants"
+      );
+      // Symbol own keys on mirrors / variants arrays must reject descriptor-safely.
+      {
+        const mirrors = ["https://ok.example/a.mp4"];
+        mirrors[Symbol("mirror-secret")] = "HOSTILE_SYMBOL_MIRROR";
+        assertTransportReject({ mirrors: mirrors }, "symbol on mirrors array");
+      }
+      {
+        const variants = [{ url: "https://ok.example/v.mp4" }];
+        variants[Symbol("variant-secret")] = "HOSTILE_SYMBOL_VARIANT";
+        assertTransportReject(
+          { variants: variants },
+          "symbol on variants array"
+        );
+      }
+      // Unexpected non-index own data properties on array shells.
+      {
+        const mirrors = ["https://ok.example/a.mp4"];
+        mirrors.extra = "unexpected";
+        assertTransportReject(
+          { mirrors: mirrors },
+          "unexpected own property on mirrors"
+        );
+      }
+      {
+        const variants = [{ url: "https://ok.example/v.mp4" }];
+        variants.extra = "unexpected";
+        assertTransportReject(
+          { variants: variants },
+          "unexpected own property on variants"
+        );
+      }
+      {
+        const rev = Proxy.revocable(["https://ok.example/a.mp4"], {});
+        rev.revoke();
+        assertTransportReject({ mirrors: rev.proxy }, "revoked mirrors");
+      }
+      {
+        const rev = Proxy.revocable(
+          [{ url: "https://ok.example/v.mp4", label: "x" }],
+          {}
+        );
+        rev.revoke();
+        assertTransportReject({ variants: rev.proxy }, "revoked variants");
+      }
+      assertTransportReject(
+        { mirrors: new Array(65).fill("https://ok.example/x.mp4") },
+        "excessive mirrors"
+      );
+      assertTransportReject(
+        { variants: new Array(65).fill({ url: "https://ok.example/x.mp4" }) },
+        "excessive variants"
+      );
+      assertTransportReject(
+        { variants: [{ url: "https://ok.example/x.mp4", nested: { a: 1 } }] },
+        "nested non-primitive variant field"
+      );
+      assertTransportReject(
+        { referer: "https://x.example/\u0001" },
+        "control referer"
+      );
+      assertTransportReject(
+        { userAgent: "agent\u0085" },
+        "C1 userAgent"
+      );
+      assertTransportReject(
+        { mirrors: ["https://ok.example/\u009F.mp4"] },
+        "C1 mirror"
+      );
+      assertTransportReject({ mirrors: [12] }, "non-string mirror");
+
+      // Every variant entry requires an own-data primitive, nonblank,
+      // C0/DEL/C1-free absolute HTTP(S) url — reject before any allocation.
+      assertTransportReject(
+        { variants: [{ label: "no-url" }] },
+        "variant missing url"
+      );
+      assertTransportReject(
+        { variants: [{ url: 99 }] },
+        "numeric variant url"
+      );
+      assertTransportReject(
+        { variants: [{ url: { href: "https://ok.example/x.mp4" } }] },
+        "object variant url"
+      );
+      assertTransportReject(
+        { variants: [{ url: Object("https://ok.example/x.mp4") }] },
+        "boxed String variant url"
+      );
+      {
+        const hits = { variantUrlGet: 0, toString: 0 };
+        const entry = {};
+        Object.defineProperty(entry, "url", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.variantUrlGet += 1;
+            throw new Error("HOSTILE_VARIANT_URL_GET");
+          },
+        });
+        assertTransportReject(
+          { variants: [entry] },
+          "accessor variant url",
+          hits
+        );
+      }
+      {
+        const hits = { toString: 0 };
+        const hostileUrl = {
+          toString() {
+            hits.toString += 1;
+            return "https://HOSTILE_SECRET_toString.example/x.mp4";
+          },
+        };
+        assertTransportReject(
+          { variants: [{ url: hostileUrl }] },
+          "toString-trap variant url",
+          hits
+        );
+      }
+      assertTransportReject(
+        { variants: [{ url: "   " }] },
+        "whitespace variant url"
+      );
+      assertTransportReject(
+        { variants: [{ url: "" }] },
+        "blank variant url"
+      );
+      assertTransportReject(
+        { variants: [{ url: "ftp://ok.example/x.mp4" }] },
+        "non-HTTP variant url (ftp)"
+      );
+      assertTransportReject(
+        { variants: [{ url: "/relative/path.mp4" }] },
+        "non-HTTP variant url (relative)"
+      );
+      assertTransportReject(
+        { variants: [{ url: "javascript:alert(1)" }] },
+        "non-HTTP variant url (javascript)"
+      );
+      assertTransportReject(
+        { variants: [{ url: "https://ok.example/\u0085x.mp4" }] },
+        "C1 variant url"
+      );
+      assertTransportReject(
+        { variants: [{ url: "https://ok.example/\u0001x.mp4" }] },
+        "C0 variant url"
+      );
+      assertTransportReject(
+        { variants: [{ url: "https://ok.example/\u007fx.mp4" }] },
+        "DEL variant url"
+      );
+      {
+        const v = [{ url: "https://ok.example/x.mp4" }];
+        v[Symbol("s")] = 1;
+        // symbol on array may be ignored by length walk — use symbol on record
+        assertTransportReject(
+          {
+            variants: [
+              Object.defineProperty(
+                { url: "https://ok.example/x.mp4" },
+                Symbol("s"),
+                { enumerable: true, value: "x" }
+              ),
+            ],
+          },
+          "symbol on variant record"
+        );
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 revoked proxies, generic errors, and C1 controls",
+    async () => {
+      const api = loadAdapters();
+
+      function assertRevokedReject(buildInput, method) {
+        const fx = makeEffects();
+        const c = api.createBackgroundAdapters(fx.options());
+        let err = null;
+        try {
+          if (method === "network") c.captureNetwork(buildInput());
+          else c.captureDomMedia(buildInput());
+        } catch (e) {
+          err = e;
+        }
+        assertGenericTypeError(err);
+        assert.equal(fx.counts.randomToken, 0);
+        assert.equal(fx.counts.publishDetection, 0);
+        assert.deepEqual(c.popupMedia(42), []);
+        assert.deepEqual(c.popupMedia(70), []);
+      }
+
+      // requestHeaders revoked
+      {
+        const rev = Proxy.revocable({ Cookie: "x" }, {});
+        rev.revoke();
+        assertRevokedReject(
+          () =>
+            validNetworkCapture({
+              transport: { mediaKind: "direct", requestHeaders: rev.proxy },
+            }),
+          "network"
+        );
+      }
+      // responseHeaders revoked
+      {
+        const rev = Proxy.revocable(
+          [{ name: "Content-Type", value: "video/mp4" }],
+          {}
+        );
+        rev.revoke();
+        assertRevokedReject(
+          () =>
+            validNetworkCapture({
+              details: Object.assign({}, florenNetworkInput().details, {
+                responseHeaders: rev.proxy,
+              }),
+            }),
+          "network"
+        );
+      }
+      // candidates revoked
+      {
+        const rev = Proxy.revocable(
+          [{ kind: "visible-filename", value: "x.mp4" }],
+          {}
+        );
+        rev.revoke();
+        assertRevokedReject(
+          () =>
+            validDomCapture({
+              snapshot: {
+                documentId: "doc-dom-valid",
+                tabId: 70,
+                frameId: 0,
+                pageUrl: "https://site.example/watch",
+                topLevelPageUrl: "https://site.example/watch",
+                documentNonce: "n",
+                candidates: rev.proxy,
+                capturedAt: "2026-08-12T12:00:00.000Z",
+              },
+            }),
+          "dom"
+        );
+      }
+      // mirrors revoked
+      {
+        const rev = Proxy.revocable(["https://ok.example/a.mp4"], {});
+        rev.revoke();
+        assertRevokedReject(
+          () =>
+            validNetworkCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: null,
+                mirrors: rev.proxy,
+              },
+            }),
+          "network"
+        );
+      }
+      // variants revoked
+      {
+        const rev = Proxy.revocable(
+          [{ url: "https://ok.example/v.mp4" }],
+          {}
+        );
+        rev.revoke();
+        assertRevokedReject(
+          () =>
+            validNetworkCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: null,
+                variants: rev.proxy,
+              },
+            }),
+          "network"
+        );
+      }
+
+      // C1 / C0 / DEL never reach proposed filename or publish
+      {
+        const fx = makeEffects();
+        const c = api.createBackgroundAdapters(fx.options());
+        const c1Name = "evil\u0085name.mp4";
+        let err = null;
+        try {
+          c.captureDomMedia(
+            validDomCapture({
+              snapshot: {
+                documentId: "doc-c1",
+                tabId: 70,
+                frameId: 0,
+                pageUrl: "https://site.example/watch",
+                topLevelPageUrl: "https://site.example/watch",
+                documentNonce: "n-c1",
+                candidates: [{ kind: "visible-filename", value: c1Name }],
+                capturedAt: "2026-08-12T12:00:00.000Z",
+              },
+            })
+          );
+        } catch (e) {
+          err = e;
+        }
+        assertGenericTypeError(err);
+        assert.equal(fx.counts.publishDetection, 0);
+        assert.equal(fx.counts.randomToken, 0);
+        assert.deepEqual(c.popupMedia(70), []);
+
+        // C0 in header name
+        err = null;
+        try {
+          c.captureNetwork(
+            validNetworkCapture({
+              details: Object.assign({}, florenNetworkInput().details, {
+                responseHeaders: [{ name: "X\u0001Header", value: "v" }],
+              }),
+            })
+          );
+        } catch (e) {
+          err = e;
+        }
+        assertGenericTypeError(err);
+        assert.equal(fx.counts.randomToken, 0);
+        assert.equal(fx.counts.publishDetection, 0);
+
+        // DEL in header value
+        err = null;
+        try {
+          c.captureNetwork(
+            validNetworkCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: { Cookie: "x\u007f" },
+              },
+            })
+          );
+        } catch (e) {
+          err = e;
+        }
+        assertGenericTypeError(err);
+        assert.equal(fx.counts.randomToken, 0);
+
+        // C1 in referer / userAgent
+        err = null;
+        try {
+          c.captureNetwork(
+            validNetworkCapture({
+              transport: {
+                mediaKind: "direct",
+                requestHeaders: null,
+                referer: "https://x.example/\u0080",
+              },
+            })
+          );
+        } catch (e) {
+          err = e;
+        }
+        assertGenericTypeError(err);
+        assert.equal(fx.counts.randomToken, 0);
+
+        // C0 / DEL / C1 in hints.topLevelUrlHint and hints.frameOrigin reject
+        // before token allocation, finalizer work, or publication.
+        const hintControlCases = [
+          {
+            label: "C0 topLevelUrlHint",
+            hints: {
+              topLevelUrlHint: "https://site.example/\u0001path",
+              frameOrigin: "https://site.example",
+            },
+          },
+          {
+            label: "DEL topLevelUrlHint",
+            hints: {
+              topLevelUrlHint: "https://site.example/\u007fpath",
+              frameOrigin: "https://site.example",
+            },
+          },
+          {
+            label: "C1 topLevelUrlHint",
+            hints: {
+              topLevelUrlHint: "https://site.example/\u0085path",
+              frameOrigin: "https://site.example",
+            },
+          },
+          {
+            label: "C0 frameOrigin",
+            hints: {
+              topLevelUrlHint: "https://site.example/watch",
+              frameOrigin: "https://site.example\u0001",
+            },
+          },
+          {
+            label: "DEL frameOrigin",
+            hints: {
+              topLevelUrlHint: "https://site.example/watch",
+              frameOrigin: "https://site.example\u007f",
+            },
+          },
+          {
+            label: "C1 frameOrigin",
+            hints: {
+              topLevelUrlHint: "https://site.example/watch",
+              frameOrigin: "https://site.example\u009f",
+            },
+          },
+        ];
+        for (const hc of hintControlCases) {
+          const tokenBefore = fx.counts.randomToken;
+          const pubBefore = fx.counts.publishDetection;
+          err = null;
+          try {
+            c.captureNetwork(
+              validNetworkCapture({ hints: hc.hints })
+            );
+          } catch (e) {
+            err = e;
+          }
+          assert.ok(err, hc.label + " must reject");
+          assertGenericTypeError(err);
+          assert.equal(
+            fx.counts.randomToken,
+            tokenBefore,
+            hc.label + " no token"
+          );
+          assert.equal(
+            fx.counts.publishDetection,
+            pubBefore,
+            hc.label + " no publish"
+          );
+          assert.deepEqual(c.popupMedia(42), []);
+        }
+
+        // Object toString traps on hints/scalars must never execute or leak.
+        {
+          const hits = { toString: 0 };
+          const hostileHint = {
+            toString() {
+              hits.toString += 1;
+              throw new Error("HOSTILE_SECRET_HINT_toString");
+            },
+          };
+          err = null;
+          try {
+            c.captureNetwork(
+              validNetworkCapture({
+                hints: {
+                  topLevelUrlHint: hostileHint,
+                  frameOrigin: "https://site.example",
+                },
+              })
+            );
+          } catch (e) {
+            err = e;
+          }
+          assertGenericTypeError(err);
+          assert.equal(hits.toString, 0, "hint toString must not run");
+          assert.equal(fx.counts.randomToken, 0);
+          assert.equal(fx.counts.publishDetection, 0);
+        }
+        {
+          const hits = { toString: 0 };
+          const hostileOrigin = {
+            toString() {
+              hits.toString += 1;
+              return "https://HOSTILE_SECRET_frameOrigin.example";
+            },
+          };
+          err = null;
+          try {
+            c.captureNetwork(
+              validNetworkCapture({
+                hints: {
+                  topLevelUrlHint: "https://site.example/watch",
+                  frameOrigin: hostileOrigin,
+                },
+              })
+            );
+          } catch (e) {
+            err = e;
+          }
+          assertGenericTypeError(err);
+          assert.equal(hits.toString, 0, "frameOrigin toString must not run");
+          assert.equal(fx.counts.randomToken, 0);
+        }
+
+        // Revoked proxy as entire transport / details / hints — generic only.
+        {
+          const rev = Proxy.revocable(
+            { mediaKind: "direct", requestHeaders: null },
+            {}
+          );
+          rev.revoke();
+          err = null;
+          try {
+            c.captureNetwork(
+              validNetworkCapture({ transport: rev.proxy })
+            );
+          } catch (e) {
+            err = e;
+          }
+          assertGenericTypeError(err);
+          assert.equal(
+            String(err.message + (err.stack || "")).includes("HOSTILE_SECRET"),
+            false
+          );
+          assert.equal(fx.counts.randomToken, 0);
+          assert.equal(fx.counts.publishDetection, 0);
+        }
+        {
+          const rev = Proxy.revocable(
+            { topLevelUrlHint: "https://site.example/watch", frameOrigin: "https://site.example" },
+            {}
+          );
+          rev.revoke();
+          err = null;
+          try {
+            c.captureNetwork(validNetworkCapture({ hints: rev.proxy }));
+          } catch (e) {
+            err = e;
+          }
+          assertGenericTypeError(err);
+          assert.equal(fx.counts.randomToken, 0);
+          assert.equal(fx.counts.publishDetection, 0);
+        }
+
+        // Valid Unicode including non-BMP still accepted as filename candidate
+        const nonBmp = "clip-\u{1F3AC}end.mp4";
+        const id = c.captureDomMedia(
+          validDomCapture({
+            snapshot: {
+              documentId: "doc-unicode",
+              tabId: 71,
+              frameId: 0,
+              pageUrl: "https://site.example/watch",
+              topLevelPageUrl: "https://site.example/watch",
+              documentNonce: "n-u",
+              candidates: [{ kind: "visible-filename", value: nonBmp }],
+              capturedAt: "2026-08-12T12:00:00.000Z",
+            },
+          })
+        );
+        assert.ok(isSafeOpaqueId(id));
+        assert.equal(fx.counts.publishDetection, 1);
+        assert.equal(fx.publishDetections[0].proposedFilename, nonBmp);
+        assert.equal(c.popupMedia(71)[0].proposedFilename, nonBmp);
+        assert.equal(
+          JSON.stringify(fx.publishDetections[0]).includes("\u0085"),
+          false
+        );
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 randomToken reentrancy and reservation control",
+    async () => {
+      const inst = loadInstrumentedClassic();
+      const fx = makeEffects();
+      let ctrl;
+      let reentered = false;
+      let reenterId = null;
+      ctrl = inst.api.createBackgroundAdapters(
+        fx.options({
+          randomToken(namespace) {
+            fx.counts.randomToken += 1;
+            if (!reentered) {
+              reentered = true;
+              // Reenter one valid capture before returning the outer token.
+              reenterId = ctrl.captureNetwork(
+                validNetworkCapture({
+                  details: Object.assign({}, florenNetworkInput().details, {
+                    documentId: "doc-reenter-token",
+                    url: "https://cdn.example/reenter-token.mp4",
+                  }),
+                })
+              );
+            }
+            return "tok-reenter";
+          },
+        })
+      );
+
+      const outerId = ctrl.captureNetwork(
+        validNetworkCapture({
+          details: Object.assign({}, florenNetworkInput().details, {
+            documentId: "doc-outer-token",
+            url: "https://cdn.example/outer-token.mp4",
+          }),
+        })
+      );
+
+      assert.ok(isSafeOpaqueId(outerId));
+      assert.ok(isSafeOpaqueId(reenterId));
+      assert.notEqual(outerId, reenterId);
+      assert.match(reenterId, /:1$/);
+      assert.match(outerId, /:2$/);
+
+      const pendings = inst.pendingRecords();
+      assert.equal(pendings.length, 2);
+      const detIds = pendings.map((p) => p.detectionId).sort((a, b) => a - b);
+      assert.deepEqual(detIds, [1, 2]);
+      assert.equal(new Set(detIds).size, 2);
+
+      // Finalize both — each publishes exactly once.
+      ctrl.acceptPageSnapshot({
+        documentId: "doc-reenter-token",
+        tabId: 42,
+        frameId: 0,
+        pageUrl: florenPageUrl(),
+        topLevelPageUrl: florenPageUrl(),
+        documentNonce: "n-rt",
+        candidates: [{ kind: "visible-filename", value: "reenter-token.mp4" }],
+        capturedAt: "2026-08-12T12:00:00.000Z",
+      });
+      ctrl.acceptPageSnapshot({
+        documentId: "doc-outer-token",
+        tabId: 42,
+        frameId: 0,
+        pageUrl: florenPageUrl(),
+        topLevelPageUrl: florenPageUrl(),
+        documentNonce: "n-ot",
+        candidates: [{ kind: "visible-filename", value: "outer-token.mp4" }],
+        capturedAt: "2026-08-12T12:00:01.000Z",
+      });
+      assert.equal(fx.counts.publishDetection, 2);
+      const pubIds = fx.publishDetections.map((p) => p.id).sort();
+      assert.deepEqual(pubIds, [outerId, reenterId].sort());
+      assert.equal(ctrl.popupMedia(42).length, 2);
+
+      // Token throw after prevalidation commits no suffix.
+      {
+        const inst2 = loadInstrumentedClassic();
+        const fx2 = makeEffects();
+        const tokenErr = new Error("TOKEN_THROW_AFTER_PREVALIDATION");
+        let shouldThrow = true;
+        const c2 = inst2.api.createBackgroundAdapters(
+          fx2.options({
+            randomToken() {
+              fx2.counts.randomToken += 1;
+              if (shouldThrow) throw tokenErr;
+              return "tok-after";
+            },
+          })
+        );
+        let threw = null;
+        try {
+          c2.captureNetwork(validNetworkCapture());
+        } catch (e) {
+          threw = e;
+        }
+        assert.equal(threw, tokenErr);
+        assert.equal(inst2.sessionFinalizer().listFinalized().length, 0);
+        assert.equal(inst2.pendingRecords().length, 0);
+        assert.equal(fx2.counts.publishDetection, 0);
+        shouldThrow = false;
+        const okId = c2.captureNetwork(validNetworkCapture());
+        assert.match(okId, /:1$/);
+        const p = inst2.pendingRecords();
+        assert.equal(p[p.length - 1].detectionId, 1);
+      }
     }
   );
 });

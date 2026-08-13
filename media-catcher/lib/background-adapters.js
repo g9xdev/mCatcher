@@ -81,7 +81,7 @@
 
     function deepClone(value) {
       if (value == null || typeof value !== "object") return value;
-      if (Array.isArray(value)) return value.map(deepClone);
+      if (safeIsArray(value)) return value.map(deepClone);
       var out = {};
       Object.keys(value).forEach(function (k) {
         out[k] = deepClone(value[k]);
@@ -107,9 +107,45 @@
     var GENERIC_INPUT_MSG = "invalid background adapter input";
     var MAX_HEADER_ENTRIES = 64;
     var MAX_CANDIDATE_ENTRIES = 64;
+    var MAX_TRANSPORT_ENTRIES = 64;
+    var MAX_TRANSPORT_FIELDS = 16;
+    var DATE_RANGE_ABS_MS = 8.64e15;
 
     function genericTypeError() {
       return new TypeError(GENERIC_INPUT_MSG);
+    }
+
+    /** Array.isArray behind a genericizing boundary (revoked Proxy safe). */
+    function safeIsArray(v) {
+      try {
+        return Array.isArray(v);
+      } catch (e) {
+        throw genericTypeError();
+      }
+    }
+
+    function safeGetPrototypeOf(v) {
+      try {
+        return Object.getPrototypeOf(v);
+      } catch (e) {
+        throw genericTypeError();
+      }
+    }
+
+    function safeOwnPropertyNames(v) {
+      try {
+        return Object.getOwnPropertyNames(v);
+      } catch (e) {
+        throw genericTypeError();
+      }
+    }
+
+    function safeOwnPropertySymbols(v) {
+      try {
+        return Object.getOwnPropertySymbols(v);
+      } catch (e) {
+        throw genericTypeError();
+      }
     }
 
     /** Named own data property only — never enumerates, never invokes accessors. */
@@ -148,9 +184,9 @@
 
     function isPlainRecord(v) {
       if (v === null || typeof v !== "object") return false;
-      if (Array.isArray(v)) return false;
+      if (safeIsArray(v)) return false;
       try {
-        var proto = Object.getPrototypeOf(v);
+        var proto = safeGetPrototypeOf(v);
         return proto === Object.prototype || proto === null;
       } catch (e) {
         throw genericTypeError();
@@ -212,7 +248,38 @@
     }
 
     function hasControlChars(s) {
-      return /[\u0000-\u001f\u007f]/.test(s);
+      // C0, DEL, and C1 (U+0080–U+009F).
+      return /[\u0000-\u001f\u007f-\u009f]/.test(s);
+    }
+
+    function isValidDateMs(value) {
+      return (
+        typeof value === "number" &&
+        Number.isFinite(value) &&
+        Number.isSafeInteger(value) &&
+        Math.abs(value) <= DATE_RANGE_ABS_MS
+      );
+    }
+
+    function isNonnegSafeInt(value) {
+      return (
+        typeof value === "number" &&
+        Number.isFinite(value) &&
+        Number.isSafeInteger(value) &&
+        value >= 0
+      );
+    }
+
+    function requireControlFreeString(s) {
+      if (typeof s !== "string" || hasControlChars(s)) throw genericTypeError();
+      return s;
+    }
+
+    function requireNonblankControlFreeString(s) {
+      if (typeof s !== "string" || s.trim().length === 0 || hasControlChars(s)) {
+        throw genericTypeError();
+      }
+      return s;
     }
 
     function isSafeTokenString(v) {
@@ -243,8 +310,218 @@
     }
 
     /**
-     * Descriptor-safe transport validation for ephemeral creation only.
-     * Does not retain raw caller transport/header graphs in pending state.
+     * Snapshot requestHeaders into a fresh frozen null-prototype own-data string
+     * record. Rejects symbols, accessors, non-enumerable/non-string entries,
+     * controls (C0/DEL/C1), excessive entries, and revoked proxies.
+     */
+    function snapshotRequestHeaders(raw) {
+      if (raw === undefined || raw === null) return null;
+      if (!isPlainRecord(raw)) throw genericTypeError();
+      var symbols = safeOwnPropertySymbols(raw);
+      if (symbols.length > 0) throw genericTypeError();
+      var names = safeOwnPropertyNames(raw);
+      if (names.length > MAX_HEADER_ENTRIES) throw genericTypeError();
+      var out = Object.create(null);
+      for (var i = 0; i < names.length; i++) {
+        var k = names[i];
+        if (typeof k !== "string" || hasControlChars(k)) throw genericTypeError();
+        var st = ownKeyState(raw, k);
+        if (!st.present || !st.data) throw genericTypeError();
+        // Must be enumerable own data (Privacy contract).
+        var desc;
+        try {
+          desc = Object.getOwnPropertyDescriptor(raw, k);
+        } catch (e) {
+          throw genericTypeError();
+        }
+        if (!desc || !desc.enumerable || desc.get || desc.set || !("value" in desc)) {
+          throw genericTypeError();
+        }
+        if (typeof st.value !== "string" || hasControlChars(st.value)) {
+          throw genericTypeError();
+        }
+        out[k] = st.value;
+      }
+      return Object.freeze(out);
+    }
+
+    /**
+     * Own-data primitive string that is nonblank, trim-stable, C0/DEL/C1-free,
+     * and an absolute HTTP(S) URL. Preserves exact accepted spelling (no
+     * toString/valueOf coercion, no normalization of the retained value).
+     */
+    function requireAbsoluteHttpUrl(value) {
+      if (typeof value !== "string") throw genericTypeError();
+      if (value.length === 0 || value.trim() !== value) throw genericTypeError();
+      if (hasControlChars(value)) throw genericTypeError();
+      var parsed;
+      try {
+        parsed = new URL(value);
+      } catch (e) {
+        throw genericTypeError();
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw genericTypeError();
+      }
+      return value;
+    }
+
+    /**
+     * Dense real-Array shell: same/cross-realm Arrays only; no Symbols,
+     * no unexpected own keys, no accessor/non-data/sparse indices.
+     * Inspects only via guarded own-key/descriptor ops. Returns length.
+     * Accepts ordinary and frozen dense arrays (writable/configurable not required).
+     */
+    function denseArrayLength(raw, maxLen) {
+      if (!safeIsArray(raw)) throw genericTypeError();
+      var symbols = safeOwnPropertySymbols(raw);
+      if (symbols.length > 0) throw genericTypeError();
+      var names = safeOwnPropertyNames(raw);
+      var lenState = ownKeyState(raw, "length");
+      if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
+        throw genericTypeError();
+      }
+      var len = lenState.value;
+      if (len > maxLen) throw genericTypeError();
+      var allowed = Object.create(null);
+      allowed.length = true;
+      for (var i = 0; i < len; i++) {
+        allowed[String(i)] = true;
+      }
+      for (var n = 0; n < names.length; n++) {
+        if (allowed[names[n]] !== true) throw genericTypeError();
+      }
+      for (var j = 0; j < len; j++) {
+        var eState = ownKeyState(raw, String(j));
+        if (!eState.present || !eState.data) throw genericTypeError();
+      }
+      return len;
+    }
+
+    /**
+     * Descriptor-safe snapshot of optional future-transport evidence.
+     * Bounded plain own-data only; primitive leaves; recursively frozen.
+     * Never retains requestHeaders or raw caller graph identity.
+     */
+    function snapshotFutureTransport(transport) {
+      var handle = {};
+
+      var mirrorsState = ownKeyState(transport, "mirrors");
+      if (mirrorsState.present) {
+        if (!mirrorsState.data) throw genericTypeError();
+        handle.mirrors = snapshotMirrorArray(mirrorsState.value);
+      }
+
+      var refererState = ownKeyState(transport, "referer");
+      if (refererState.present) {
+        if (!refererState.data) throw genericTypeError();
+        if (refererState.value !== undefined && refererState.value !== null) {
+          handle.referer = requireControlFreeString(refererState.value);
+        }
+      }
+
+      var uaState = ownKeyState(transport, "userAgent");
+      if (uaState.present) {
+        if (!uaState.data) throw genericTypeError();
+        if (uaState.value !== undefined && uaState.value !== null) {
+          handle.userAgent = requireControlFreeString(uaState.value);
+        }
+      }
+
+      var variantsState = ownKeyState(transport, "variants");
+      if (variantsState.present) {
+        if (!variantsState.data) throw genericTypeError();
+        handle.variants = snapshotVariantArray(variantsState.value);
+      }
+
+      return deepFreeze(handle);
+    }
+
+    /** Fresh dense copy of mirror URL strings (absolute HTTP(S), exact spelling). */
+    function snapshotMirrorArray(raw) {
+      var len = denseArrayLength(raw, MAX_TRANSPORT_ENTRIES);
+      var out = [];
+      for (var i = 0; i < len; i++) {
+        var eState = ownKeyState(raw, String(i));
+        // denseArrayLength already proved present own-data indices.
+        out.push(requireAbsoluteHttpUrl(eState.value));
+      }
+      return out;
+    }
+
+    /**
+     * Fresh dense copy of variant plain records. Each entry requires an own-data
+     * primitive absolute HTTP(S) `url` (exact spelling retained privately).
+     * Other own fields are bounded primitive leaves only.
+     */
+    function snapshotVariantArray(raw) {
+      var len = denseArrayLength(raw, MAX_TRANSPORT_ENTRIES);
+      var out = [];
+      for (var i = 0; i < len; i++) {
+        var eState = ownKeyState(raw, String(i));
+        var entry = eState.value;
+        if (entry == null || typeof entry !== "object" || safeIsArray(entry)) {
+          throw genericTypeError();
+        }
+        if (!isPlainRecord(entry)) throw genericTypeError();
+        var symbols = safeOwnPropertySymbols(entry);
+        if (symbols.length > 0) throw genericTypeError();
+        var names = safeOwnPropertyNames(entry);
+        if (names.length > MAX_TRANSPORT_FIELDS) throw genericTypeError();
+        var urlState = ownKeyState(entry, "url");
+        if (!urlState.present || !urlState.data) throw genericTypeError();
+        var rec = {};
+        var sawUrl = false;
+        for (var n = 0; n < names.length; n++) {
+          var key = names[n];
+          if (typeof key !== "string" || hasControlChars(key)) throw genericTypeError();
+          var fState = ownKeyState(entry, key);
+          if (!fState.present || !fState.data) throw genericTypeError();
+          var fDesc;
+          try {
+            fDesc = Object.getOwnPropertyDescriptor(entry, key);
+          } catch (e) {
+            throw genericTypeError();
+          }
+          if (!fDesc || !fDesc.enumerable || fDesc.get || fDesc.set || !("value" in fDesc)) {
+            throw genericTypeError();
+          }
+          var val = fState.value;
+          if (key === "url") {
+            rec.url = requireAbsoluteHttpUrl(val);
+            sawUrl = true;
+          } else if (val === null) {
+            rec[key] = null;
+          } else if (typeof val === "string") {
+            if (hasControlChars(val)) throw genericTypeError();
+            rec[key] = val;
+          } else if (typeof val === "number") {
+            if (!Number.isFinite(val)) throw genericTypeError();
+            rec[key] = val;
+          } else if (typeof val === "boolean") {
+            rec[key] = val;
+          } else {
+            throw genericTypeError();
+          }
+        }
+        if (!sawUrl) throw genericTypeError();
+        out.push(rec);
+      }
+      return out;
+    }
+
+    function installFutureTransport(record, futureTransport) {
+      Object.defineProperty(record, "futureTransport", {
+        value: futureTransport,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+    }
+
+    /**
+     * Descriptor-safe transport validation for ephemeral + future evidence.
+     * Returns frozen header copy + future handle; never retains raw caller graphs.
      */
     function validateTransport(transport) {
       if (!transport || typeof transport !== "object") {
@@ -260,19 +537,17 @@
       var requestHeaders = null;
       if (headersState.present) {
         if (!headersState.data) throw genericTypeError();
-        requestHeaders = headersState.value;
-        if (requestHeaders === undefined) requestHeaders = null;
-        if (requestHeaders !== null) {
-          if (!isPlainRecord(requestHeaders)) {
-            throw new TypeError("transport.requestHeaders must be a plain record or null");
-          }
+        if (headersState.value !== undefined) {
+          requestHeaders = snapshotRequestHeaders(headersState.value);
         }
       }
-      // Only mediaKind + headers needed for Lease 1 ephemeral handle.
-      // Optional mirrors/referer/userAgent/variants are not retained on pending.
+
+      var futureTransport = snapshotFutureTransport(transport);
+
       return {
         mediaKind: mediaKind,
         requestHeaders: requestHeaders,
+        futureTransport: futureTransport,
       };
     }
 
@@ -305,7 +580,7 @@
      */
     function snapshotResponseHeaders(raw) {
       if (raw === undefined || raw === null) return [];
-      if (!Array.isArray(raw)) throw genericTypeError();
+      if (!safeIsArray(raw)) throw genericTypeError();
       var lenState = ownKeyState(raw, "length");
       if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
         throw genericTypeError();
@@ -323,6 +598,7 @@
         if (typeof name !== "string" || typeof value !== "string") {
           throw genericTypeError();
         }
+        if (hasControlChars(name) || hasControlChars(value)) throw genericTypeError();
         out.push({ name: name, value: value });
       }
       return out;
@@ -336,25 +612,40 @@
       if (details == null || typeof details !== "object") throw genericTypeError();
       var out = {};
       var url = readOptionalOwnString(details, "url");
-      if (url !== undefined && url !== null) out.url = url;
+      if (url !== undefined && url !== null) {
+        if (hasControlChars(url)) throw genericTypeError();
+        out.url = url;
+      }
       var documentUrl = readOptionalOwnString(details, "documentUrl");
-      if (documentUrl !== undefined && documentUrl !== null) out.documentUrl = documentUrl;
+      if (documentUrl !== undefined && documentUrl !== null) {
+        if (hasControlChars(documentUrl)) throw genericTypeError();
+        out.documentUrl = documentUrl;
+      }
       var originUrl = readOptionalOwnString(details, "originUrl");
-      if (originUrl !== undefined && originUrl !== null) out.originUrl = originUrl;
+      if (originUrl !== undefined && originUrl !== null) {
+        if (hasControlChars(originUrl)) throw genericTypeError();
+        out.originUrl = originUrl;
+      }
       var documentId = readOptionalOwnString(details, "documentId");
-      if (documentId !== undefined) out.documentId = documentId;
+      if (documentId !== undefined) {
+        if (documentId !== null && hasControlChars(documentId)) throw genericTypeError();
+        out.documentId = documentId;
+      }
       var tabId = readOptionalOwnNumber(details, "tabId");
       if (tabId !== undefined) {
-        if (!Number.isInteger(tabId)) throw genericTypeError();
+        if (!isNonnegSafeInt(tabId)) throw genericTypeError();
         out.tabId = tabId;
       }
       var frameId = readOptionalOwnNumber(details, "frameId");
       if (frameId !== undefined) {
-        if (!Number.isInteger(frameId)) throw genericTypeError();
+        if (!isNonnegSafeInt(frameId)) throw genericTypeError();
         out.frameId = frameId;
       }
       var timeStamp = readOptionalOwnNumber(details, "timeStamp");
-      if (timeStamp !== undefined) out.timeStamp = timeStamp;
+      if (timeStamp !== undefined) {
+        if (!isValidDateMs(timeStamp)) throw genericTypeError();
+        out.timeStamp = timeStamp;
+      }
       var rhState = ownKeyState(details, "responseHeaders");
       if (rhState.present) {
         if (!rhState.data) throw genericTypeError();
@@ -368,10 +659,17 @@
     function snapshotNetworkHints(hints) {
       if (hints == null || typeof hints !== "object") throw genericTypeError();
       var out = {};
+      // Primitive strings only; reject C0/DEL/C1 before any dependency boundary.
       var top = readOptionalOwnString(hints, "topLevelUrlHint");
-      if (top !== undefined && top !== null) out.topLevelUrlHint = top;
+      if (top !== undefined && top !== null) {
+        if (hasControlChars(top)) throw genericTypeError();
+        out.topLevelUrlHint = top;
+      }
       var frameOrigin = readOptionalOwnString(hints, "frameOrigin");
-      if (frameOrigin !== undefined && frameOrigin !== null) out.frameOrigin = frameOrigin;
+      if (frameOrigin !== undefined && frameOrigin !== null) {
+        if (hasControlChars(frameOrigin)) throw genericTypeError();
+        out.frameOrigin = frameOrigin;
+      }
       return out;
     }
 
@@ -383,29 +681,41 @@
       if (snapshot == null || typeof snapshot !== "object") throw genericTypeError();
       var out = {};
       var documentId = readOptionalOwnString(snapshot, "documentId");
-      if (documentId !== undefined) out.documentId = documentId;
+      if (documentId !== undefined) {
+        if (documentId !== null && hasControlChars(documentId)) throw genericTypeError();
+        out.documentId = documentId;
+      }
       var tabId = readOptionalOwnNumber(snapshot, "tabId");
       if (tabId !== undefined) {
-        if (!Number.isInteger(tabId)) throw genericTypeError();
+        if (!isNonnegSafeInt(tabId)) throw genericTypeError();
         out.tabId = tabId;
       }
       var frameId = readOptionalOwnNumber(snapshot, "frameId");
       if (frameId !== undefined) {
-        if (!Number.isInteger(frameId)) throw genericTypeError();
+        if (!isNonnegSafeInt(frameId)) throw genericTypeError();
         out.frameId = frameId;
       }
       var pageUrl = readOptionalOwnString(snapshot, "pageUrl");
-      if (pageUrl !== undefined && pageUrl !== null) out.pageUrl = pageUrl;
+      if (pageUrl !== undefined && pageUrl !== null) {
+        if (hasControlChars(pageUrl)) throw genericTypeError();
+        out.pageUrl = pageUrl;
+      }
       var topLevelPageUrl = readOptionalOwnString(snapshot, "topLevelPageUrl");
       if (topLevelPageUrl !== undefined && topLevelPageUrl !== null) {
+        if (hasControlChars(topLevelPageUrl)) throw genericTypeError();
         out.topLevelPageUrl = topLevelPageUrl;
       }
       var documentNonce = readOptionalOwnString(snapshot, "documentNonce");
       if (documentNonce !== undefined && documentNonce !== null) {
+        if (hasControlChars(documentNonce)) throw genericTypeError();
         out.documentNonce = documentNonce;
       }
       var capturedAt = readOptionalOwnString(snapshot, "capturedAt");
-      if (capturedAt !== undefined && capturedAt !== null) out.capturedAt = capturedAt;
+      if (capturedAt !== undefined && capturedAt !== null) {
+        // Primitive string only — reject controls; do not coerce.
+        if (hasControlChars(capturedAt)) throw genericTypeError();
+        out.capturedAt = capturedAt;
+      }
 
       var candState = ownKeyState(snapshot, "candidates");
       if (!candState.present) {
@@ -416,7 +726,7 @@
         if (rawCands == null) {
           out.candidates = [];
         } else {
-          if (!Array.isArray(rawCands)) throw genericTypeError();
+          if (!safeIsArray(rawCands)) throw genericTypeError();
           var lenState = ownKeyState(rawCands, "length");
           if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
             throw genericTypeError();
@@ -434,6 +744,7 @@
             if (typeof kind !== "string" || typeof value !== "string") {
               throw genericTypeError();
             }
+            if (hasControlChars(kind) || hasControlChars(value)) throw genericTypeError();
             cands.push({ kind: kind, value: value });
           }
           out.candidates = cands;
@@ -527,10 +838,29 @@
       void publishJobs;
       void persistHistory;
 
+      /** Transactional now sample used during a capture finalizer call. */
+      var transactionalNowSample = null;
+
+      function sampleAndValidateNow() {
+        var t = nowFn();
+        if (!isValidDateMs(t)) {
+          throw genericTypeError();
+        }
+        return t;
+      }
+
       function safeNow() {
+        if (transactionalNowSample !== null) {
+          return transactionalNowSample;
+        }
         var t = nowFn();
         if (typeof t !== "number" || !Number.isFinite(t)) {
           throw new TypeError("now must return a finite number");
+        }
+        // Outside a capture transaction, still reject out-of-range samples that
+        // would make Date#toISOString throw inside the real finalizer.
+        if (!Number.isSafeInteger(t) || Math.abs(t) > DATE_RANGE_ABS_MS) {
+          throw genericTypeError();
         }
         return t;
       }
@@ -559,6 +889,14 @@
 
       var providerRegistry = ProviderRegistryApi.createProviderRegistry();
       void providerRegistry;
+
+      function createDisposableFinalizer() {
+        return DetectionFinalizer.createDetectionFinalizer({
+          now: safeNow,
+          rank: FilenameRanker.rank,
+          buildSourceContext: SourceContext.buildSourceContext,
+        });
+      }
 
       // --- Private session state (never exposed) ---
       /** @type {Map<string, object>} opaque media ID → finalized private source record */
@@ -593,7 +931,12 @@
       void proofTokens;
       void historyEntries;
 
-      function mintPublicId(namespace) {
+      /**
+       * Prepare public ID: invoke randomToken and validate base only.
+       * Does not commit namespace counter or issued set (failure-atomic).
+       * Reentrant captures may commit other IDs before this prepare commits.
+       */
+      function preparePublicId(namespace) {
         var raw = randomTokenFn(namespace);
         var base;
         if (isSafeTokenNumber(raw)) {
@@ -603,6 +946,16 @@
         } else {
           throw new TypeError("randomToken must return a safe identifier");
         }
+        return { namespace: namespace, base: base };
+      }
+
+      /**
+       * Commit a prepared public ID using the next still-free monotonic suffix.
+       * Does not re-invoke randomToken (reentrancy-safe).
+       */
+      function commitPublicId(prep) {
+        var namespace = prep.namespace;
+        var base = prep.base;
         var counter = namespaceCounters.has(namespace)
           ? namespaceCounters.get(namespace)
           : 0;
@@ -614,6 +967,10 @@
         namespaceCounters.set(namespace, counter);
         issuedPublicIds.add(id);
         return id;
+      }
+
+      function discardPublicReservation(/* prep */) {
+        // Prepare holds no committed counter/issued entry — nothing to roll back.
       }
 
       function deriveProviderKey(sourceContext) {
@@ -700,6 +1057,8 @@
           var mediaKind =
             pending && pending.mediaKind ? pending.mediaKind : "direct";
           var ephemeral = pending && pending.ephemeral ? pending.ephemeral : null;
+          var futureTransport =
+            pending && pending.futureTransport ? pending.futureTransport : null;
           var tabId =
             item.sourceContext && typeof item.sourceContext.tabId === "number"
               ? item.sourceContext.tabId
@@ -737,6 +1096,10 @@
             writable: false,
             configurable: false,
           });
+          // Private future-transport evidence — non-enumerable.
+          if (futureTransport) {
+            installFutureTransport(record, futureTransport);
+          }
           Object.freeze(record);
 
           sourcesByMediaId.set(mediaId, record);
@@ -786,34 +1149,68 @@
         var transport = validateTransport(transportState.value);
 
         var mapped = DetectionFinalizer.mapWebRequestDetails(safeDetails, safeHints);
-        // Finalizer is the sole allocator — never force mapped.detectionId.
-        var detectionId = finalizer.beginNetworkDetection(mapped);
+        var mediaKind = transport.mediaKind;
+        var requestHeaders = transport.requestHeaders;
+        var futureTransport = transport.futureTransport;
+
+        var mediaUrlForEph =
+          typeof mapped.mediaUrl === "string" && mapped.mediaUrl
+            ? mapped.mediaUrl
+            : "about:blank";
+        // Privacy on the prevalidated header copy before any shared allocator work.
+        var ephemeral = Privacy.createEphemeral(mediaUrlForEph, requestHeaders);
+
+        // Sample/validate now before token or shared finalizer mutation.
+        var nowSample = sampleAndValidateNow();
+        var prevNowSample = transactionalNowSample;
+        transactionalNowSample = nowSample;
+        var prep;
+        var detectionId;
+        try {
+          // Disposable preflight for deterministic finalizer failures.
+          try {
+            var preflight = createDisposableFinalizer();
+            preflight.beginNetworkDetection(mapped);
+          } catch (preErr) {
+            throw genericTypeError();
+          }
+
+          // Prepare opaque reservation only after Privacy/time/preflight succeed.
+          prep = preparePublicId("media");
+
+          try {
+            detectionId = finalizer.beginNetworkDetection(mapped);
+          } catch (finErr) {
+            discardPublicReservation(prep);
+            throw genericTypeError();
+          }
+        } finally {
+          transactionalNowSample = prevNowSample;
+        }
+
         if (!isPositiveSafeInteger(detectionId)) {
+          discardPublicReservation(prep);
           throw new TypeError("detection id must be a positive safe integer");
         }
         if (detectionIdToMediaId.has(detectionId)) {
+          discardPublicReservation(prep);
           throw new TypeError("detection id collision");
         }
 
-        var mediaId = mintPublicId("media");
-        var mediaKind = transport.mediaKind;
-        var requestHeaders = transport.requestHeaders;
-        var ephemeral = Privacy.createEphemeral(
-          typeof mapped.mediaUrl === "string" && mapped.mediaUrl
-            ? mapped.mediaUrl
-            : "about:blank",
-          requestHeaders
-        );
+        // Commit public ID only after real finalizer returns a positive safe integer.
+        var mediaId = commitPublicId(prep);
         var pendingTabId = typeof mapped.tabId === "number" ? mapped.tabId : 0;
 
         // Enumerable pending metadata is exactly these four fields.
-        pendingByMediaId.set(mediaId, {
+        var pending = {
           detectionId: detectionId,
           ephemeral: ephemeral,
           mediaKind: mediaKind,
           tabId: pendingTabId,
-        });
+        };
+        installFutureTransport(pending, futureTransport);
         // Install mapping/pending before reconcile (finalizer may already be finalized).
+        pendingByMediaId.set(mediaId, pending);
         detectionIdToMediaId.set(detectionId, mediaId);
 
         reconcile();
@@ -844,27 +1241,40 @@
         var transport = validateTransport(transportState.value);
         var mediaKind = transport.mediaKind;
         var requestHeaders = transport.requestHeaders;
+        var futureTransport = transport.futureTransport;
 
-        var mediaUrl = readRequiredOwnString(input, "mediaUrl");
+        var mediaUrl = requireNonblankControlFreeString(
+          readRequiredOwnString(input, "mediaUrl")
+        );
         var mediaOrigin = readOwnStringOrNull(input, "mediaOrigin");
         if (mediaOrigin === undefined) mediaOrigin = "";
+        if (mediaOrigin != null && hasControlChars(mediaOrigin)) throw genericTypeError();
         var contentDisposition = readOwnStringOrNull(input, "contentDisposition");
         if (contentDisposition === undefined) contentDisposition = null;
+        if (contentDisposition != null && hasControlChars(contentDisposition)) {
+          throw genericTypeError();
+        }
         var referrerUrl = readOwnStringOrNull(input, "referrerUrl");
         if (referrerUrl === undefined) referrerUrl = "";
+        if (referrerUrl != null && hasControlChars(referrerUrl)) throw genericTypeError();
         var frameOrigin = readOwnStringOrNull(input, "frameOrigin");
         if (frameOrigin === undefined) frameOrigin = "";
+        if (frameOrigin != null && hasControlChars(frameOrigin)) throw genericTypeError();
         var ts = readOptionalOwnNumber(input, "ts");
         if (ts === undefined) ts = 0;
+        if (!isValidDateMs(ts)) throw genericTypeError();
 
         var snapState = ownKeyState(input, "snapshot");
         if (!snapState.present || !snapState.data) throw genericTypeError();
         var safeSnapshot = snapshotDocumentSnapshot(snapState.value);
 
-        var mediaId = mintPublicId("media");
+        // Privacy before any shared ID / finalizer mutation.
         var ephemeral = Privacy.createEphemeral(mediaUrl, requestHeaders);
 
-        var item = finalizer.finalizeFromDom({
+        // Sample/validate now before token/finalizer (needed when capturedAt absent).
+        var nowSample = sampleAndValidateNow();
+
+        var domInput = {
           snapshot: safeSnapshot,
           mediaUrl: mediaUrl,
           mediaOrigin: mediaOrigin == null ? "" : mediaOrigin,
@@ -872,20 +1282,57 @@
           referrerUrl: referrerUrl == null ? "" : referrerUrl,
           frameOrigin: frameOrigin == null ? "" : frameOrigin,
           ts: ts,
-        });
+        };
+
+        var prevNowSample = transactionalNowSample;
+        transactionalNowSample = nowSample;
+        var prep;
+        var item;
+        try {
+          // Disposable preflight so deterministic date/rank/source failures run first.
+          try {
+            var preflight = createDisposableFinalizer();
+            preflight.finalizeFromDom(domInput);
+          } catch (preErr) {
+            throw genericTypeError();
+          }
+
+          prep = preparePublicId("media");
+
+          try {
+            item = finalizer.finalizeFromDom(domInput);
+          } catch (finErr) {
+            discardPublicReservation(prep);
+            throw genericTypeError();
+          }
+        } finally {
+          transactionalNowSample = prevNowSample;
+        }
 
         var detectionId = item && item.detectionId;
+        if (!isPositiveSafeInteger(detectionId)) {
+          discardPublicReservation(prep);
+          throw new TypeError("detection id must be a positive safe integer");
+        }
+        if (detectionIdToMediaId.has(detectionId)) {
+          discardPublicReservation(prep);
+          throw new TypeError("detection id collision");
+        }
+
+        var mediaId = commitPublicId(prep);
         bindDetectionId(detectionId, mediaId);
         var pendingTabId =
           item.sourceContext && typeof item.sourceContext.tabId === "number"
             ? item.sourceContext.tabId
             : 0;
-        pendingByMediaId.set(mediaId, {
+        var pending = {
           detectionId: detectionId,
           ephemeral: ephemeral,
           mediaKind: mediaKind,
           tabId: pendingTabId,
-        });
+        };
+        installFutureTransport(pending, futureTransport);
+        pendingByMediaId.set(mediaId, pending);
 
         reconcile();
         return mediaId;
