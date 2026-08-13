@@ -2202,6 +2202,7 @@
           var input = deepClone(jobs[i]);
           var binding = jobBindings.get(jobs[i].id);
           if (binding && binding.progress) input.progress = binding.progress;
+          if (binding && binding.mediaId) input.mediaId = binding.mediaId;
           out.push(freezeClone(Privacy.projectPopupJob(input)));
         }
         return deepFreeze(out);
@@ -2218,7 +2219,10 @@
       }
 
       function projectReturnedJob(jobId) {
-        return freezeClone(Privacy.projectPopupJob(getScheduler().getJob(jobId)));
+        var input = deepClone(getScheduler().getJob(jobId));
+        var binding = jobBindings.get(jobId);
+        if (binding && binding.mediaId) input.mediaId = binding.mediaId;
+        return freezeClone(Privacy.projectPopupJob(input));
       }
 
       function requirePopupSender(sender) {
