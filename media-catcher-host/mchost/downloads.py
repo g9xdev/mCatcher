@@ -23,6 +23,8 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
+import uuid
 
 
 def _h():
@@ -1017,12 +1019,14 @@ def _ytdl_exact_nonblank_str(val):
 
 
 def _ytdl_control_free_str(val):
-    """True when val is a built-in str with no C0/C1 control characters."""
+    """True when val is a built-in str with no Unicode control characters (Cc).
+
+    Rejects C0 (U+0000–001F), DEL (U+007F), and C1 (U+0080–009F) among others.
+    """
     if type(val) is not str:
         return False
     for ch in val:
-        o = ord(ch)
-        if o < 32 or o == 127:
+        if unicodedata.category(ch) == "Cc":
             return False
     return True
 
@@ -1050,11 +1054,75 @@ def _ytdl_paths_same(a, b):
         return False
 
 
-def _ytdl_promote_to_target(src, target):
-    """Move src onto the preselected target when they differ.
+def _ytdl_try_exclusive_place(src, target):
+    """Place src at target only when target is absent (atomic no-clobber).
 
-    Never overwrites an unrelated existing final. Returns the path that should
-    be reported on success, or None when promotion/validation fails.
+    Prefers same-filesystem hardlink (create-if-absent), then exclusive-create
+    + copy. Never uses exists-then-replace. Returns target on success, else None.
+    """
+    if not src or not target:
+        return None
+    try:
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        return None
+
+    # Hardlink: atomic create-if-absent on the same filesystem.
+    try:
+        os.link(src, target)
+        try:
+            os.unlink(src)
+        except Exception:
+            pass
+        return target if os.path.isfile(target) else None
+    except FileExistsError:
+        return None
+    except OSError:
+        pass  # unsupported / cross-device — fall through
+
+    # Exclusive create + copy fallback (never truncates an existing path).
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = None
+    try:
+        fd = os.open(target, flags, 0o644)
+        with open(src, "rb") as rf:
+            while True:
+                chunk = rf.read(1024 * 1024)
+                if not chunk:
+                    break
+                os.write(fd, chunk)
+        os.close(fd)
+        fd = None
+        try:
+            os.unlink(src)
+        except Exception:
+            pass
+        return target if os.path.isfile(target) else None
+    except FileExistsError:
+        return None
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        try:
+            if os.path.isfile(target):
+                os.unlink(target)
+        except Exception:
+            pass
+        return None
+
+
+def _ytdl_promote_to_target(src, target, max_attempts=32):
+    """Promote staging src onto target or a bounded dedup sibling without clobber.
+
+    Never overwrites a pre-existing final (including symlink/junction paths).
+    Returns the actual path on success, or None when promotion/validation fails.
     """
     if not src or not target:
         return None
@@ -1063,16 +1131,33 @@ def _ytdl_promote_to_target(src, target):
             return None
         if _ytdl_paths_same(src, target):
             return target if os.path.isfile(target) else src
-        if os.path.exists(target) and not _ytdl_paths_same(src, target):
-            # Do not clobber an unrelated final path.
-            return None
-        parent = os.path.dirname(target)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        os.replace(src, target)
-        return target if os.path.isfile(target) else None
     except Exception:
         return None
+
+    root, ext = os.path.splitext(target)
+    candidates = [target]
+    for n in range(1, max(1, int(max_attempts))):
+        candidates.append("%s (%d)%s" % (root, n, ext))
+
+    for cand in candidates:
+        placed = _ytdl_try_exclusive_place(src, cand)
+        if placed:
+            return placed
+    return None
+
+
+def _ytdl_cleanup_stage_dir(stage_dir):
+    """Remove only an operation-owned staging directory tree."""
+    if not stage_dir or type(stage_dir) is not str:
+        return
+    try:
+        base = os.path.basename(stage_dir.rstrip("\\/"))
+        if not base.startswith(".mc-ytdl-"):
+            return
+        if os.path.isdir(stage_dir):
+            shutil.rmtree(stage_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _ytdl_terminal_file_bytes(path):
@@ -1208,6 +1293,8 @@ def _handle_ytdl_structured(req):
         "kind": "ytdl",
         "attemptToken": token,
         "cancel_requested": False,
+        "ytdl_lock": threading.Lock(),  # cancel vs final-commit linearization
+        "commit_claimed": False,
     }
     if not _pget_register(jid, op):
         _h().send({
@@ -1263,149 +1350,191 @@ def _handle_ytdl_structured(req):
         return bool(op.get("cancel_requested"))
 
     def worker():
-        target = None
+        stage_dir = None
+        preferred = None
         try:
-            if cancelled():
-                emit_error("cancelled", "Cancelled.")
-                return
-
-            ytdlp = ensure_ytdlp()
-            if cancelled():
-                emit_error("cancelled", "Cancelled.")
-                return
-            if not ytdlp:
-                emit_error(
-                    "noytdlp",
-                    "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer.",
-                )
-                return
-
-            deno = ensure_deno()
-            if cancelled():
-                emit_error("cancelled", "Cancelled.")
-                return
-
-            if not explicit_dir:
-                try:
-                    out = _ytdl_default_outdir()
-                except Exception:
-                    emit_error("local_io", "Couldn't access the save folder.")
+            try:
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
                     return
-            else:
-                out = outdir
 
-            try:
-                os.makedirs(out, exist_ok=True)
-                if not os.path.isdir(out):
-                    raise OSError("not a directory")
-            except Exception:
-                # Explicit destination failure never silently falls back.
-                emit_error("local_io", "Couldn't create the save folder.")
-                return
+                ytdlp = ensure_ytdlp()
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                    return
+                if not ytdlp:
+                    emit_error(
+                        "noytdlp",
+                        "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer.",
+                    )
+                    return
 
-            if cancelled():
-                emit_error("cancelled", "Cancelled.")
-                return
+                deno = ensure_deno()
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                    return
 
-            try:
-                target = _dedup(os.path.join(out, safe_name))
-            except Exception:
-                emit_error("local_io", "Couldn't prepare the save path.")
-                return
+                if not explicit_dir:
+                    try:
+                        out = _ytdl_default_outdir()
+                    except Exception:
+                        emit_error("local_io", "Couldn't access the save folder.")
+                        return
+                else:
+                    out = outdir
 
-            pot = start_pot_provider()
-            if cancelled():
-                emit_error("cancelled", "Cancelled.")
-                return
+                try:
+                    os.makedirs(out, exist_ok=True)
+                    if not os.path.isdir(out):
+                        raise OSError("not a directory")
+                except Exception:
+                    # Explicit destination failure never silently falls back.
+                    emit_error("local_io", "Couldn't create the save folder.")
+                    return
 
-            outtmpl = _ytdl_escape_outtmpl(target)
-            cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
-            _h()._hlog("info", "yt-dlp: downloading (structured, pot=%s)" % ("on" if pot else "off"))
-            progress_msg(pct=0, stage="resolving", note="Preparing")
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                    return
 
-            cf, si = _no_window()
-            try:
-                p = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                try:
+                    preferred = _dedup(os.path.join(out, safe_name))
+                except Exception:
+                    emit_error("local_io", "Couldn't prepare the save path.")
+                    return
+
+                # Unique op-owned staging on the selected destination filesystem.
+                # yt-dlp --force-overwrites may only hit this tree, never the final.
+                # Basename matches the pre-deduped preferred name; the unique dir
+                # is what prevents cross-job staging collisions.
+                try:
+                    stage_dir = os.path.join(out, ".mc-ytdl-%s" % uuid.uuid4().hex)
+                    os.makedirs(stage_dir)
+                    stage_file = os.path.join(stage_dir, os.path.basename(preferred))
+                except Exception:
+                    emit_error("local_io", "Couldn't prepare the save path.")
+                    return
+
+                pot = start_pot_provider()
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                    return
+
+                outtmpl = _ytdl_escape_outtmpl(stage_file)
+                cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
+                _h()._hlog("info", "yt-dlp: downloading (structured, pot=%s)" % ("on" if pot else "off"))
+                progress_msg(pct=0, stage="resolving", note="Preparing")
+
+                cf, si = _no_window()
+                try:
+                    p = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                    )
+                except Exception:
+                    if cancelled():
+                        emit_error("cancelled", "Cancelled.")
+                    else:
+                        emit_error("spawn", "Couldn't start the download.")
+                    return
+
+                op["proc"] = p
+                if cancelled():
+                    _safe_kill(p)
+                    emit_error("cancelled", "Cancelled.")
+                    return
+
+                errbuf = []
+                filepath = None
+                last_pct = -1.0
+                last_note = ""
+                last_note_ts = 0.0
+                try:
+                    for line in p.stdout:
+                        if cancelled():
+                            break
+                        s = line.strip() if isinstance(line, str) else str(line).strip()
+                        if not s:
+                            continue
+                        if s.startswith("@@FILE@@"):
+                            filepath = s[len("@@FILE@@"):].strip()
+                            continue
+                        if s.startswith("[download]"):
+                            prog = _parse_yt_progress(s)
+                            if prog:
+                                pct = prog.get("pct", 0.0)
+                                if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
+                                    last_pct = pct
+                                    progress_msg(**prog)
+                                continue
+                        errbuf.append(s)
+                        if "Merging formats" in s or s.startswith("[Merger]"):
+                            progress_msg(pct=99, stage="merging")
+                            continue
+                        if last_pct < 0:
+                            note = _yt_stage_note(s)
+                            now = time.time()
+                            if note and (note != last_note or now - last_note_ts > 0.5):
+                                last_note = note
+                                last_note_ts = now
+                                progress_msg(pct=0, stage="resolving", note=note)
+                    p.wait()
+                except Exception:
+                    if cancelled():
+                        emit_error("cancelled", "Cancelled.")
+                        return
+                    emit_error("permanent", "Download failed.")
+                    return
+
+                # Fast cancel path after subprocess exit (still rechecked under lock).
+                if cancelled():
+                    emit_error("cancelled", "Cancelled.")
+                    return
+
+                if p.returncode == 0 and filepath:
+                    # Exclusive no-clobber promote (may pick a dedup sibling).
+                    final_path = _ytdl_promote_to_target(filepath, preferred)
+                    path, size = _ytdl_terminal_file_bytes(final_path)
+                    # Linearization: cancel vs commit under the op-local lock.
+                    with op["ytdl_lock"]:
+                        if op.get("cancel_requested") or op.get("commit_claimed"):
+                            outcome = "cancelled"
+                        elif path is not None and size is not None:
+                            op["commit_claimed"] = True
+                            outcome = "done"
+                            done_path, done_size = path, size
+                        else:
+                            outcome = "local_io"
+                    if outcome == "cancelled":
+                        # Do not report a final; drop an unreported exclusive promote.
+                        if path and not _ytdl_paths_same(path, filepath):
+                            try:
+                                if os.path.isfile(path):
+                                    os.unlink(path)
+                            except Exception:
+                                pass
+                        emit_error("cancelled", "Cancelled.")
+                        return
+                    if outcome == "done":
+                        emit_done(done_path, done_size)
+                        _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(done_path))
+                        return
+                    emit_error("local_io", "Download finished but the file could not be verified.")
+                    return
+
+                reason, msg = _map_yt_error("\n".join(errbuf))
+                _h()._hlog(
+                    "error",
+                    "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]),
                 )
+                emit_error(reason, msg)
             except Exception:
+                # Outer safety net for prep/setup surprises: exactly one safe terminal.
                 if cancelled():
                     emit_error("cancelled", "Cancelled.")
                 else:
-                    emit_error("spawn", "Couldn't start the download.")
-                return
-
-            op["proc"] = p
-            if cancelled():
-                _safe_kill(p)
-                emit_error("cancelled", "Cancelled.")
-                return
-
-            errbuf = []
-            filepath = None
-            last_pct = -1.0
-            last_note = ""
-            last_note_ts = 0.0
-            try:
-                for line in p.stdout:
-                    if cancelled():
-                        break
-                    s = line.strip() if isinstance(line, str) else str(line).strip()
-                    if not s:
-                        continue
-                    if s.startswith("@@FILE@@"):
-                        filepath = s[len("@@FILE@@"):].strip()
-                        continue
-                    if s.startswith("[download]"):
-                        prog = _parse_yt_progress(s)
-                        if prog:
-                            pct = prog.get("pct", 0.0)
-                            if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
-                                last_pct = pct
-                                progress_msg(**prog)
-                            continue
-                    errbuf.append(s)
-                    if "Merging formats" in s or s.startswith("[Merger]"):
-                        progress_msg(pct=99, stage="merging")
-                        continue
-                    if last_pct < 0:
-                        note = _yt_stage_note(s)
-                        now = time.time()
-                        if note and (note != last_note or now - last_note_ts > 0.5):
-                            last_note = note
-                            last_note_ts = now
-                            progress_msg(pct=0, stage="resolving", note=note)
-                p.wait()
-            except Exception:
-                if cancelled():
-                    emit_error("cancelled", "Cancelled.")
-                    return
-                emit_error("permanent", "Download failed.")
-                return
-
-            # Matching cancel always wins over a late successful subprocess exit.
-            if cancelled():
-                emit_error("cancelled", "Cancelled.")
-                return
-
-            if p.returncode == 0 and filepath:
-                final_path = _ytdl_promote_to_target(filepath, target)
-                path, size = _ytdl_terminal_file_bytes(final_path)
-                if path is not None and size is not None:
-                    emit_done(path, size)
-                    _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(path))
-                    return
-                emit_error("local_io", "Download finished but the file could not be verified.")
-                return
-
-            reason, msg = _map_yt_error("\n".join(errbuf))
-            _h()._hlog(
-                "error",
-                "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]),
-            )
-            emit_error(reason, msg)
+                    emit_error("permanent", "Download failed.")
         finally:
+            _ytdl_cleanup_stage_dir(stage_dir)
             # CAS identity cleanup — no-op when emit already unregistered.
             _pget_unregister(jid, op)
 
@@ -2115,6 +2244,27 @@ def _pget_cancel(req):
     # Omitted property preserves legacy id-only cancel; present null does not.
     if not _pget_attempt_token_allows(req, j):
         return
+
+    # Structured yt-dl ops carry ytdl_lock so cancel and final commit share one
+    # linearization point. Do not hold _PGET_LOCK here (already released).
+    ytdl_lock = j.get("ytdl_lock") if isinstance(j, dict) else None
+    if ytdl_lock is not None:
+        with ytdl_lock:
+            if j.get("commit_claimed"):
+                return  # success already linearized — cancel is inert
+            j["cancel_requested"] = True
+            proc = j.get("proc")
+        # Kill / wake outside the op lock (never hold it across process ops).
+        if j.get("stop"):
+            j["stop"].set()
+        if proc:
+            _safe_kill(proc)
+        cv = j.get("lease_cv")
+        if cv is not None:
+            with cv:
+                cv.notify_all()
+        return
+
     j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
