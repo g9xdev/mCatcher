@@ -22,6 +22,8 @@
 - Ranker runs once at finalization; retries/engine changes reuse frozen `proposedFilename` / `requestedFilename`.
 - Keep existing settings keys (`maxConcurrentDownloads`, `concurrency`, `retries`, `filenameTemplate`, `saveFolder`); no settings migration.
 - PowerShell is the shell. Prefer `Set-Location` + `python -m pytest` / `node --test` forms that work from the repo root.
+- Project containment is absolute: all mCatcher worktrees, prompts, briefs, reports, test artifacts, packages, and installation inputs must live under `C:\Code\mCatcher`. `C:\Code\GrokOrchestration` was never a valid mCatcher project root and must not be used as a source, destination, recovery input, or verification path.
+- Quarantined BA07/BA08 and native-host harness attempts are outside this goal. They are not requirements, source material, test evidence, or completion criteria; only accepted code and behavior-focused tests in the contained mCatcher worktree count.
 - Do not rewrite unrelated cast/update/recording code. Touch only the files listed per task.
 - Commits are required at the end of each task. Do not amend published history.
 
@@ -371,7 +373,8 @@ module.exports = { loadLib, mediaCatcherRoot };
 - [ ] **Step 2: Run test to verify it fails**
 
 ```powershell
-Set-Location C:\Code\GrokOrchestration\mcatcher-plan-d16e0b9
+$RepoRoot = git rev-parse --show-toplevel
+Set-Location $RepoRoot
 node --test media-catcher/tests/smoke.test.js
 ```
 
@@ -2119,7 +2122,8 @@ def test_http_429_is_not_range_unsupported(tmp_path, monkeypatch):
 - [ ] **Step 2: Run FAIL**
 
 ```powershell
-Set-Location C:\Code\GrokOrchestration\mcatcher-plan-d16e0b9\media-catcher-host
+$RepoRoot = git rev-parse --show-toplevel
+Set-Location (Join-Path $RepoRoot 'media-catcher-host')
 python -m pytest test_pget.py -q
 ```
 
@@ -3290,7 +3294,8 @@ Expected: FAIL — module missing. Implement dual-export `McDownloadMessageRoute
 - [ ] **Step 4: Run all automated suites**
 
 ```powershell
-Set-Location C:\Code\GrokOrchestration\mcatcher-plan-d16e0b9
+$RepoRoot = git rev-parse --show-toplevel
+Set-Location $RepoRoot
 node --test media-catcher/tests
 Set-Location media-catcher-host
 python -m pytest test_pget.py test_file_sink.py test_host.py -q
@@ -3455,7 +3460,8 @@ test("manifest background scripts include download-message-router before backgro
 - [ ] **Step 3: Run full suite**
 
 ```powershell
-Set-Location C:\Code\GrokOrchestration\mcatcher-plan-d16e0b9
+$RepoRoot = git rev-parse --show-toplevel
+Set-Location $RepoRoot
 node --test media-catcher/tests
 Set-Location media-catcher-host
 python -m pytest -q
@@ -3482,7 +3488,8 @@ git commit -m "test: complete regression matrix for save-as, ranker, and provide
 - [ ] **Step 1: Stamp versions**
 
 ```powershell
-Set-Location C:\Code\GrokOrchestration\mcatcher-plan-d16e0b9
+$RepoRoot = git rev-parse --show-toplevel
+Set-Location $RepoRoot
 (Get-Content media-catcher/manifest.json -Raw) -replace '"version"\s*:\s*"[0-9.]+"', '"version": "1.10.0"' | Set-Content media-catcher/manifest.json -NoNewline -Encoding utf8
 (Get-Content media-catcher-host/mc_host.py -Raw) -replace 'VERSION\s*=\s*"[0-9.]+"', 'VERSION = "1.10.0"' | Set-Content media-catcher-host/mc_host.py -NoNewline -Encoding utf8
 (Get-Content media-catcher-host/installer/media-catcher-host.iss -Raw) -replace '#define AppVersion "[0-9.]+"', '#define AppVersion "1.10.0"' | Set-Content media-catcher-host/installer/media-catcher-host.iss -NoNewline -Encoding utf8
@@ -3598,7 +3605,8 @@ Write a short verification note (for the PR) with date, Firefox version, helper 
 ## Final verification commands (copy/paste)
 
 ```powershell
-Set-Location C:\Code\GrokOrchestration\mcatcher-plan-d16e0b9
+$RepoRoot = git rev-parse --show-toplevel
+Set-Location $RepoRoot
 node --test media-catcher/tests
 Set-Location media-catcher-host
 python -m pytest -q
