@@ -104,6 +104,14 @@
       return deepFreeze(deepClone(value));
     }
 
+    var GENERIC_INPUT_MSG = "invalid background adapter input";
+    var MAX_HEADER_ENTRIES = 64;
+    var MAX_CANDIDATE_ENTRIES = 64;
+
+    function genericTypeError() {
+      return new TypeError(GENERIC_INPUT_MSG);
+    }
+
     /** Named own data property only — never enumerates, never invokes accessors. */
     function ownData(obj, key) {
       if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
@@ -118,6 +126,26 @@
       }
     }
 
+    /**
+     * Own-key presence without invoking accessors.
+     * Reflection faults → generic TypeError (never leak trap identity/text).
+     */
+    function ownKeyState(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { present: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc) return { present: false };
+        if (desc.get || desc.set || !("value" in desc)) {
+          return { present: true, data: false };
+        }
+        return { present: true, data: true, value: desc.value };
+      } catch (e) {
+        throw genericTypeError();
+      }
+    }
+
     function isPlainRecord(v) {
       if (v === null || typeof v !== "object") return false;
       if (Array.isArray(v)) return false;
@@ -125,8 +153,17 @@
         var proto = Object.getPrototypeOf(v);
         return proto === Object.prototype || proto === null;
       } catch (e) {
-        return false;
+        throw genericTypeError();
       }
+    }
+
+    function isPositiveSafeInteger(value) {
+      return (
+        typeof value === "number" &&
+        Number.isFinite(value) &&
+        Number.isSafeInteger(value) &&
+        value >= 1
+      );
     }
 
     function requirePositiveInt(value, label) {
@@ -205,27 +242,223 @@
       return value;
     }
 
+    /**
+     * Descriptor-safe transport validation for ephemeral creation only.
+     * Does not retain raw caller transport/header graphs in pending state.
+     */
     function validateTransport(transport) {
       if (!transport || typeof transport !== "object") {
         throw new TypeError("transport must be an object");
       }
-      var mediaKind = validateMediaKind(ownData(transport, "mediaKind"));
-      var requestHeaders = ownData(transport, "requestHeaders");
-      if (requestHeaders === undefined) requestHeaders = null;
-      if (requestHeaders !== null) {
-        if (!isPlainRecord(requestHeaders)) {
-          throw new TypeError("transport.requestHeaders must be a plain record or null");
+      var mediaKindState = ownKeyState(transport, "mediaKind");
+      if (!mediaKindState.present || !mediaKindState.data) {
+        throw new TypeError("transport.mediaKind is invalid");
+      }
+      var mediaKind = validateMediaKind(mediaKindState.value);
+
+      var headersState = ownKeyState(transport, "requestHeaders");
+      var requestHeaders = null;
+      if (headersState.present) {
+        if (!headersState.data) throw genericTypeError();
+        requestHeaders = headersState.value;
+        if (requestHeaders === undefined) requestHeaders = null;
+        if (requestHeaders !== null) {
+          if (!isPlainRecord(requestHeaders)) {
+            throw new TypeError("transport.requestHeaders must be a plain record or null");
+          }
         }
       }
-      // Retain optional future fields privately; do not execute or publish them.
+      // Only mediaKind + headers needed for Lease 1 ephemeral handle.
+      // Optional mirrors/referer/userAgent/variants are not retained on pending.
       return {
         mediaKind: mediaKind,
         requestHeaders: requestHeaders,
-        mirrors: ownData(transport, "mirrors"),
-        referer: ownData(transport, "referer"),
-        userAgent: ownData(transport, "userAgent"),
-        variants: ownData(transport, "variants"),
       };
+    }
+
+    /** Optional own-data primitive string (absent → undefined; accessor/non-string → TypeError). */
+    function readOptionalOwnString(obj, key) {
+      var st = ownKeyState(obj, key);
+      if (!st.present) return undefined;
+      if (!st.data) throw genericTypeError();
+      if (st.value === undefined) return undefined;
+      if (st.value === null) return null;
+      if (typeof st.value !== "string") throw genericTypeError();
+      return st.value;
+    }
+
+    /** Optional own-data finite number. */
+    function readOptionalOwnNumber(obj, key) {
+      var st = ownKeyState(obj, key);
+      if (!st.present) return undefined;
+      if (!st.data) throw genericTypeError();
+      if (st.value === undefined) return undefined;
+      if (typeof st.value !== "number" || !Number.isFinite(st.value)) {
+        throw genericTypeError();
+      }
+      return st.value;
+    }
+
+    /**
+     * Snapshot responseHeaders as a bounded ordinary array of fresh {name,value}
+     * own-data records. Never invokes index/length accessors or entry getters.
+     */
+    function snapshotResponseHeaders(raw) {
+      if (raw === undefined || raw === null) return [];
+      if (!Array.isArray(raw)) throw genericTypeError();
+      var lenState = ownKeyState(raw, "length");
+      if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
+        throw genericTypeError();
+      }
+      var len = lenState.value;
+      if (len > MAX_HEADER_ENTRIES) throw genericTypeError();
+      var out = [];
+      for (var i = 0; i < len; i++) {
+        var entryState = ownKeyState(raw, String(i));
+        if (!entryState.present || !entryState.data) throw genericTypeError();
+        var entry = entryState.value;
+        if (entry == null || typeof entry !== "object") throw genericTypeError();
+        var name = readOptionalOwnString(entry, "name");
+        var value = readOptionalOwnString(entry, "value");
+        if (typeof name !== "string" || typeof value !== "string") {
+          throw genericTypeError();
+        }
+        out.push({ name: name, value: value });
+      }
+      return out;
+    }
+
+    /**
+     * Fresh plain details/hints records for mapWebRequestDetails.
+     * Only validated primitive own-data values; never pass caller graphs.
+     */
+    function snapshotNetworkDetails(details) {
+      if (details == null || typeof details !== "object") throw genericTypeError();
+      var out = {};
+      var url = readOptionalOwnString(details, "url");
+      if (url !== undefined && url !== null) out.url = url;
+      var documentUrl = readOptionalOwnString(details, "documentUrl");
+      if (documentUrl !== undefined && documentUrl !== null) out.documentUrl = documentUrl;
+      var originUrl = readOptionalOwnString(details, "originUrl");
+      if (originUrl !== undefined && originUrl !== null) out.originUrl = originUrl;
+      var documentId = readOptionalOwnString(details, "documentId");
+      if (documentId !== undefined) out.documentId = documentId;
+      var tabId = readOptionalOwnNumber(details, "tabId");
+      if (tabId !== undefined) {
+        if (!Number.isInteger(tabId)) throw genericTypeError();
+        out.tabId = tabId;
+      }
+      var frameId = readOptionalOwnNumber(details, "frameId");
+      if (frameId !== undefined) {
+        if (!Number.isInteger(frameId)) throw genericTypeError();
+        out.frameId = frameId;
+      }
+      var timeStamp = readOptionalOwnNumber(details, "timeStamp");
+      if (timeStamp !== undefined) out.timeStamp = timeStamp;
+      var rhState = ownKeyState(details, "responseHeaders");
+      if (rhState.present) {
+        if (!rhState.data) throw genericTypeError();
+        out.responseHeaders = snapshotResponseHeaders(rhState.value);
+      } else {
+        out.responseHeaders = [];
+      }
+      return out;
+    }
+
+    function snapshotNetworkHints(hints) {
+      if (hints == null || typeof hints !== "object") throw genericTypeError();
+      var out = {};
+      var top = readOptionalOwnString(hints, "topLevelUrlHint");
+      if (top !== undefined && top !== null) out.topLevelUrlHint = top;
+      var frameOrigin = readOptionalOwnString(hints, "frameOrigin");
+      if (frameOrigin !== undefined && frameOrigin !== null) out.frameOrigin = frameOrigin;
+      return out;
+    }
+
+    /**
+     * Fresh document snapshot for provideDocumentSnapshot / finalizeFromDom.
+     * Never passes the caller's snapshot/candidate graph to the finalizer.
+     */
+    function snapshotDocumentSnapshot(snapshot) {
+      if (snapshot == null || typeof snapshot !== "object") throw genericTypeError();
+      var out = {};
+      var documentId = readOptionalOwnString(snapshot, "documentId");
+      if (documentId !== undefined) out.documentId = documentId;
+      var tabId = readOptionalOwnNumber(snapshot, "tabId");
+      if (tabId !== undefined) {
+        if (!Number.isInteger(tabId)) throw genericTypeError();
+        out.tabId = tabId;
+      }
+      var frameId = readOptionalOwnNumber(snapshot, "frameId");
+      if (frameId !== undefined) {
+        if (!Number.isInteger(frameId)) throw genericTypeError();
+        out.frameId = frameId;
+      }
+      var pageUrl = readOptionalOwnString(snapshot, "pageUrl");
+      if (pageUrl !== undefined && pageUrl !== null) out.pageUrl = pageUrl;
+      var topLevelPageUrl = readOptionalOwnString(snapshot, "topLevelPageUrl");
+      if (topLevelPageUrl !== undefined && topLevelPageUrl !== null) {
+        out.topLevelPageUrl = topLevelPageUrl;
+      }
+      var documentNonce = readOptionalOwnString(snapshot, "documentNonce");
+      if (documentNonce !== undefined && documentNonce !== null) {
+        out.documentNonce = documentNonce;
+      }
+      var capturedAt = readOptionalOwnString(snapshot, "capturedAt");
+      if (capturedAt !== undefined && capturedAt !== null) out.capturedAt = capturedAt;
+
+      var candState = ownKeyState(snapshot, "candidates");
+      if (!candState.present) {
+        out.candidates = [];
+      } else {
+        if (!candState.data) throw genericTypeError();
+        var rawCands = candState.value;
+        if (rawCands == null) {
+          out.candidates = [];
+        } else {
+          if (!Array.isArray(rawCands)) throw genericTypeError();
+          var lenState = ownKeyState(rawCands, "length");
+          if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
+            throw genericTypeError();
+          }
+          var len = lenState.value;
+          if (len > MAX_CANDIDATE_ENTRIES) throw genericTypeError();
+          var cands = [];
+          for (var i = 0; i < len; i++) {
+            var eState = ownKeyState(rawCands, String(i));
+            if (!eState.present || !eState.data) throw genericTypeError();
+            var entry = eState.value;
+            if (entry == null || typeof entry !== "object") throw genericTypeError();
+            var kind = readOptionalOwnString(entry, "kind");
+            var value = readOptionalOwnString(entry, "value");
+            if (typeof kind !== "string" || typeof value !== "string") {
+              throw genericTypeError();
+            }
+            cands.push({ kind: kind, value: value });
+          }
+          out.candidates = cands;
+        }
+      }
+      return out;
+    }
+
+    /** Required primitive string own-data field (no coercion / toString). */
+    function readRequiredOwnString(obj, key) {
+      var st = ownKeyState(obj, key);
+      if (!st.present || !st.data || typeof st.value !== "string") {
+        throw genericTypeError();
+      }
+      return st.value;
+    }
+
+    /** Optional primitive string or null for DOM fields. */
+    function readOwnStringOrNull(obj, key) {
+      var st = ownKeyState(obj, key);
+      if (!st.present) return undefined;
+      if (!st.data) throw genericTypeError();
+      if (st.value === null) return null;
+      if (typeof st.value !== "string") throw genericTypeError();
+      return st.value;
     }
 
     function createBackgroundAdapters(options) {
@@ -349,7 +582,6 @@
       var sessionPageIdentity = new Map();
       var sessionDocCounter = 0;
       var sessionPageCounter = 0;
-      var nextPrivateDetectionId = 0;
 
       // Empty holders for later leases (no behavior yet).
       var jobsById = new Map();
@@ -441,12 +673,24 @@
         });
       }
 
+      function bindDetectionId(detectionId, mediaId) {
+        if (!isPositiveSafeInteger(detectionId)) {
+          throw new TypeError("detection id must be a positive safe integer");
+        }
+        if (detectionIdToMediaId.has(detectionId)) {
+          throw new TypeError("detection id collision");
+        }
+        detectionIdToMediaId.set(detectionId, mediaId);
+      }
+
       function reconcile() {
         var items = finalizer.listFinalized();
         for (var i = 0; i < items.length; i++) {
           var item = items[i];
           if (!item) continue;
-          var detId = item.detectionId | 0;
+          // Exact finalizer numeric ID — never bitwise-coerce.
+          var detId = item.detectionId;
+          if (!isPositiveSafeInteger(detId)) continue;
           if (reconciledDetectionIds.has(detId)) continue;
 
           var mediaId = detectionIdToMediaId.get(detId);
@@ -468,14 +712,8 @@
           var proposedFilename = item.proposedFilename;
           var providerKey = deriveProviderKey(sourceContext);
 
-          // Session registry observation for later leases (CDN origin + site key).
-          try {
-            if (sourceContext && sourceContext.mediaOrigin) {
-              providerRegistry.observe(sourceContext.mediaOrigin, providerKey);
-            }
-          } catch (observeErr) {
-            // Registry observe is best-effort scaffolding.
-          }
+          // ProviderRegistry is reserved for Lease 2 — no observe/lookup in Lease 1.
+          void providerRegistry;
 
           var record = {
             mediaId: mediaId,
@@ -533,37 +771,63 @@
         if (!input || typeof input !== "object") {
           throw new TypeError("captureNetwork input must be an object");
         }
-        var details = ownData(input, "details");
-        var hints = ownData(input, "hints");
-        var transport = validateTransport(ownData(input, "transport"));
+        // Snapshot/validate named own-data fields before any dependency boundary.
+        var detailsState = ownKeyState(input, "details");
+        if (!detailsState.present || !detailsState.data) throw genericTypeError();
+        var hintsState = ownKeyState(input, "hints");
+        if (!hintsState.present || !hintsState.data) throw genericTypeError();
+        var transportState = ownKeyState(input, "transport");
+        if (!transportState.present || !transportState.data) {
+          throw new TypeError("transport must be an object");
+        }
 
-        var mapped = DetectionFinalizer.mapWebRequestDetails(details || {}, hints || {});
-        nextPrivateDetectionId += 1;
-        var detectionId = nextPrivateDetectionId;
-        mapped.detectionId = detectionId;
+        var safeDetails = snapshotNetworkDetails(detailsState.value);
+        var safeHints = snapshotNetworkHints(hintsState.value);
+        var transport = validateTransport(transportState.value);
+
+        var mapped = DetectionFinalizer.mapWebRequestDetails(safeDetails, safeHints);
+        // Finalizer is the sole allocator — never force mapped.detectionId.
+        var detectionId = finalizer.beginNetworkDetection(mapped);
+        if (!isPositiveSafeInteger(detectionId)) {
+          throw new TypeError("detection id must be a positive safe integer");
+        }
+        if (detectionIdToMediaId.has(detectionId)) {
+          throw new TypeError("detection id collision");
+        }
 
         var mediaId = mintPublicId("media");
+        var mediaKind = transport.mediaKind;
+        var requestHeaders = transport.requestHeaders;
         var ephemeral = Privacy.createEphemeral(
-          String(mapped.mediaUrl || "about:blank"),
-          transport.requestHeaders
+          typeof mapped.mediaUrl === "string" && mapped.mediaUrl
+            ? mapped.mediaUrl
+            : "about:blank",
+          requestHeaders
         );
+        var pendingTabId = typeof mapped.tabId === "number" ? mapped.tabId : 0;
 
+        // Enumerable pending metadata is exactly these four fields.
         pendingByMediaId.set(mediaId, {
           detectionId: detectionId,
-          transport: transport,
           ephemeral: ephemeral,
-          mediaKind: transport.mediaKind,
-          tabId: mapped.tabId | 0,
+          mediaKind: mediaKind,
+          tabId: pendingTabId,
         });
+        // Install mapping/pending before reconcile (finalizer may already be finalized).
         detectionIdToMediaId.set(detectionId, mediaId);
 
-        finalizer.beginNetworkDetection(mapped);
         reconcile();
         return mediaId;
       }
 
       function acceptPageSnapshot(snapshot) {
-        finalizer.provideDocumentSnapshot(snapshot);
+        if (snapshot == null) {
+          finalizer.provideDocumentSnapshot(snapshot);
+          reconcile();
+          return undefined;
+        }
+        var safe = snapshotDocumentSnapshot(snapshot);
+        finalizer.provideDocumentSnapshot(safe);
         reconcile();
         return undefined;
       }
@@ -572,32 +836,55 @@
         if (!input || typeof input !== "object") {
           throw new TypeError("captureDomMedia input must be an object");
         }
-        var transport = validateTransport(ownData(input, "transport"));
+        // Validate/snapshot all inputs before minting opaque IDs or binding state.
+        var transportState = ownKeyState(input, "transport");
+        if (!transportState.present || !transportState.data) {
+          throw new TypeError("transport must be an object");
+        }
+        var transport = validateTransport(transportState.value);
+        var mediaKind = transport.mediaKind;
+        var requestHeaders = transport.requestHeaders;
+
+        var mediaUrl = readRequiredOwnString(input, "mediaUrl");
+        var mediaOrigin = readOwnStringOrNull(input, "mediaOrigin");
+        if (mediaOrigin === undefined) mediaOrigin = "";
+        var contentDisposition = readOwnStringOrNull(input, "contentDisposition");
+        if (contentDisposition === undefined) contentDisposition = null;
+        var referrerUrl = readOwnStringOrNull(input, "referrerUrl");
+        if (referrerUrl === undefined) referrerUrl = "";
+        var frameOrigin = readOwnStringOrNull(input, "frameOrigin");
+        if (frameOrigin === undefined) frameOrigin = "";
+        var ts = readOptionalOwnNumber(input, "ts");
+        if (ts === undefined) ts = 0;
+
+        var snapState = ownKeyState(input, "snapshot");
+        if (!snapState.present || !snapState.data) throw genericTypeError();
+        var safeSnapshot = snapshotDocumentSnapshot(snapState.value);
+
         var mediaId = mintPublicId("media");
-        var mediaUrl = ownData(input, "mediaUrl");
-        var ephemeral = Privacy.createEphemeral(
-          String(mediaUrl == null ? "about:blank" : mediaUrl),
-          transport.requestHeaders
-        );
+        var ephemeral = Privacy.createEphemeral(mediaUrl, requestHeaders);
 
         var item = finalizer.finalizeFromDom({
-          snapshot: ownData(input, "snapshot"),
+          snapshot: safeSnapshot,
           mediaUrl: mediaUrl,
-          mediaOrigin: ownData(input, "mediaOrigin"),
-          contentDisposition: ownData(input, "contentDisposition"),
-          referrerUrl: ownData(input, "referrerUrl"),
-          frameOrigin: ownData(input, "frameOrigin"),
-          ts: ownData(input, "ts"),
+          mediaOrigin: mediaOrigin == null ? "" : mediaOrigin,
+          contentDisposition: contentDisposition,
+          referrerUrl: referrerUrl == null ? "" : referrerUrl,
+          frameOrigin: frameOrigin == null ? "" : frameOrigin,
+          ts: ts,
         });
 
-        var detectionId = item.detectionId | 0;
-        detectionIdToMediaId.set(detectionId, mediaId);
+        var detectionId = item && item.detectionId;
+        bindDetectionId(detectionId, mediaId);
+        var pendingTabId =
+          item.sourceContext && typeof item.sourceContext.tabId === "number"
+            ? item.sourceContext.tabId
+            : 0;
         pendingByMediaId.set(mediaId, {
           detectionId: detectionId,
-          transport: transport,
           ephemeral: ephemeral,
-          mediaKind: transport.mediaKind,
-          tabId: item.sourceContext ? item.sourceContext.tabId | 0 : 0,
+          mediaKind: mediaKind,
+          tabId: pendingTabId,
         });
 
         reconcile();

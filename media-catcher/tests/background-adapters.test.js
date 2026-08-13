@@ -254,30 +254,40 @@ function florenNetworkInput(overrides) {
   return Object.assign(base, overrides || {});
 }
 
-// ---------------------------------------------------------------------------
-// BA01 — dual export and permanent controller surface
-// ---------------------------------------------------------------------------
+function productionSource() {
+  return fs.readFileSync(
+    path.join(mediaCatcherRoot, "lib", "background-adapters.js"),
+    "utf8"
+  );
+}
 
-test("BA01 — dual export assigns McBackgroundAdapters and exports only createBackgroundAdapters", async () => {
-  // Mutation caught: export/API drift, unfrozen controller, eager material
-  // effects, or a later writer changing Promise conventions.
+function extractPendingSetBlocks(src) {
+  const blocks = [];
+  const re = /pendingByMediaId\.set\s*\(\s*mediaId\s*,\s*\{/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const start = m.index + m[0].length - 1; // at '{'
+    let depth = 0;
+    let end = -1;
+    for (let i = start; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    assert.ok(end > start, "pending object literal must be balanced");
+    blocks.push(src.slice(start, end + 1));
+  }
+  return blocks;
+}
 
-  const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
-  assert.ok(fs.existsSync(abs), "production module must exist for dual-export load");
-
-  // --- CommonJS load ---
-  const api = loadAdapters();
-  assert.ok(Object.isFrozen(api), "CommonJS export must be frozen");
-  assert.deepEqual(Object.keys(api), ["createBackgroundAdapters"]);
-  assert.equal(typeof api.createBackgroundAdapters, "function");
-
-  // --- classic-script VM load ---
-  const code = fs.readFileSync(abs, "utf8");
-  const root = Object.create(null);
-  const sandbox = {
-    module: { exports: {} },
-    exports: {},
-    require,
+function classicVmBuiltins(root) {
+  return {
     console,
     self: root,
     Object,
@@ -296,30 +306,157 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
     URL,
     isFinite,
     parseInt,
+    parseFloat,
+    Boolean,
+    RegExp,
+    Function,
+    Symbol,
+    Reflect,
+    Proxy,
+    undefined,
   };
-  sandbox.module.exports = sandbox.exports;
-  const beforeKeys = Object.keys(root).slice().sort();
-  vm.runInNewContext(code, sandbox, { filename: abs });
-  assert.equal(typeof root.McBackgroundAdapters, "object");
-  assert.ok(Object.isFrozen(root.McBackgroundAdapters));
-  assert.deepEqual(Object.keys(root.McBackgroundAdapters), ["createBackgroundAdapters"]);
-  assert.equal(root.McBackgroundAdapters, sandbox.module.exports);
-  const afterKeys = Object.keys(root).slice().sort();
-  assert.deepEqual(
-    afterKeys.filter((k) => k !== "McBackgroundAdapters"),
-    beforeKeys,
-    "loading must create only McBackgroundAdapters global"
-  );
-  assert.equal(
-    Object.prototype.hasOwnProperty.call(sandbox, "browser"),
-    false
-  );
-  assert.equal(
-    Object.prototype.hasOwnProperty.call(sandbox, "chrome"),
-    false
+}
+
+function loadClassicDependencies(sandbox, root) {
+  const depFiles = [
+    "detection-finalizer.js",
+    "source-context.js",
+    "filename-ranker.js",
+    "provider-registry.js",
+    "privacy.js",
+    "firefox-guard.js",
+  ];
+  for (const name of depFiles) {
+    const abs = path.join(mediaCatcherRoot, "lib", name);
+    const code = fs.readFileSync(abs, "utf8");
+    vm.runInNewContext(code, sandbox, { filename: abs });
+  }
+  assert.equal(typeof root.McDetectionFinalizer, "object");
+  assert.equal(typeof root.McSourceContext, "object");
+  assert.equal(typeof root.McFilenameRanker, "object");
+  assert.equal(typeof root.McProviderRegistry, "object");
+  assert.equal(typeof root.McPrivacy, "object");
+  assert.equal(typeof root.McFirefoxGuard, "object");
+}
+
+// ---------------------------------------------------------------------------
+// BA01 — dual export and permanent controller surface
+// ---------------------------------------------------------------------------
+
+test("BA01 — dual export assigns McBackgroundAdapters and exports only createBackgroundAdapters", async (t) => {
+  // Mutation caught: export/API drift, unfrozen controller, eager material
+  // effects, or a later writer changing Promise conventions.
+
+  const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
+  assert.ok(fs.existsSync(abs), "production module must exist for dual-export load");
+
+  // --- CommonJS load ---
+  const api = loadAdapters();
+  assert.ok(Object.isFrozen(api), "CommonJS export must be frozen");
+  assert.deepEqual(Object.keys(api), ["createBackgroundAdapters"]);
+  assert.equal(typeof api.createBackgroundAdapters, "function");
+
+  // --- classic-script VM load (genuine classic: no CommonJS globals) ---
+  await t.test(
+    "BA01 classic-script load has no CommonJS globals and adds only McBackgroundAdapters",
+    async () => {
+      const code = fs.readFileSync(abs, "utf8");
+      const root = Object.create(null);
+      const sandbox = classicVmBuiltins(root);
+      // Explicitly prove no CommonJS resolution surface.
+      assert.equal(Object.prototype.hasOwnProperty.call(sandbox, "module"), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(sandbox, "exports"), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(sandbox, "require"), false);
+
+      let browserHits = 0;
+      let chromeHits = 0;
+      Object.defineProperty(sandbox, "browser", {
+        configurable: true,
+        enumerable: false,
+        get() {
+          browserHits += 1;
+          throw new Error("browser global must not be touched");
+        },
+      });
+      Object.defineProperty(sandbox, "chrome", {
+        configurable: true,
+        enumerable: false,
+        get() {
+          chromeHits += 1;
+          throw new Error("chrome global must not be touched");
+        },
+      });
+
+      // Real Mc* dependencies supplied only on the classic-script root.
+      loadClassicDependencies(sandbox, root);
+      const beforeKeys = Object.keys(root).slice().sort();
+
+      vm.runInNewContext(code, sandbox, { filename: abs });
+      assert.equal(typeof root.McBackgroundAdapters, "object");
+      assert.ok(Object.isFrozen(root.McBackgroundAdapters));
+      assert.deepEqual(Object.keys(root.McBackgroundAdapters), [
+        "createBackgroundAdapters",
+      ]);
+      const afterKeys = Object.keys(root).slice().sort();
+      assert.deepEqual(
+        afterKeys.filter((k) => k !== "McBackgroundAdapters"),
+        beforeKeys,
+        "loading must create only McBackgroundAdapters global"
+      );
+      assert.equal(browserHits, 0, "browser getter must not run");
+      assert.equal(chromeHits, 0, "chrome getter must not run");
+
+      const fx = makeEffects();
+      let effectHits = 0;
+      const classicCtrl = root.McBackgroundAdapters.createBackgroundAdapters(
+        fx.options({
+          postNative() {
+            effectHits += 1;
+          },
+          downloadsDownload() {
+            effectHits += 1;
+          },
+          createObjectURL() {
+            effectHits += 1;
+            return "blob:x";
+          },
+          revokeObjectURL() {
+            effectHits += 1;
+          },
+          fetchArrayBuffer() {
+            effectHits += 1;
+            return Promise.resolve(new ArrayBuffer(0));
+          },
+          assembleMedia() {
+            effectHits += 1;
+            return Promise.resolve(null);
+          },
+          publishDetection() {
+            effectHits += 1;
+          },
+          publishJobs() {
+            effectHits += 1;
+          },
+          persistHistory() {
+            effectHits += 1;
+          },
+          reportDiagnostic() {
+            effectHits += 1;
+          },
+        })
+      );
+      assert.ok(Object.isFrozen(classicCtrl));
+      assert.deepEqual(Object.keys(classicCtrl), CONTROLLER_KEYS.slice());
+      for (const k of CONTROLLER_KEYS) {
+        assert.equal(typeof classicCtrl[k], "function", k + " must be a function");
+      }
+      assert.equal(effectHits, 0);
+      assert.equal(browserHits, 0);
+      assert.equal(chromeHits, 0);
+    }
   );
 
-  // --- factory controller surface ---
+  // --- factory controller surface (CommonJS) ---
   const fx = makeEffects();
   let effectHits = 0;
   const opts = fx.options({
@@ -485,7 +622,7 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 // BA02 — pending detection invisible until finalization
 // ---------------------------------------------------------------------------
 
-test("BA02 — pending detection is invisible until finalization", async () => {
+test("BA02 — pending detection is invisible until finalization", async (t) => {
   // Mutation caught: exposing pending records, correlating by mutable tab alone,
   // or reconciling the same finalizer ID twice.
 
@@ -579,6 +716,248 @@ test("BA02 — pending detection is invisible until finalization", async () => {
   assert.equal(fx.counts.publishDetection, 1);
   assert.equal(ctrl.popupMedia(7).length, 1);
   assert.equal(ctrl.popupMedia(7)[0].id, mediaId);
+
+  await t.test(
+    "DOM then network never reuses a finalizer ID and both publish",
+    async () => {
+      const api2 = loadAdapters();
+      const fx2 = makeEffects();
+      const c = api2.createBackgroundAdapters(fx2.options());
+
+      const domId = c.captureDomMedia({
+        mediaUrl: "https://cdn.example/dom-a.mp4",
+        mediaOrigin: "https://cdn.example",
+        contentDisposition: null,
+        referrerUrl: "https://site-a.example/watch",
+        frameOrigin: "https://site-a.example",
+        ts: 1_000_000,
+        snapshot: {
+          documentId: "doc-dom-tabA",
+          tabId: 11,
+          frameId: 0,
+          pageUrl: "https://site-a.example/watch",
+          topLevelPageUrl: "https://site-a.example/watch",
+          documentNonce: "n-dom-a",
+          candidates: [{ kind: "visible-filename", value: "dom-item.mp4" }],
+          capturedAt: "2026-08-12T12:00:00.000Z",
+        },
+        transport: { mediaKind: "direct", requestHeaders: null },
+      });
+      assert.ok(isSafeOpaqueId(domId));
+      assert.equal(fx2.counts.publishDetection, 1);
+      assert.equal(fx2.publishDetections[0].id, domId);
+      assert.equal(fx2.publishDetections[0].proposedFilename, "dom-item.mp4");
+      const rowsA = c.popupMedia(11);
+      assert.equal(rowsA.length, 1);
+      assert.equal(rowsA[0].id, domId);
+      assert.equal(rowsA[0].proposedFilename, "dom-item.mp4");
+      assert.equal(rowsA[0].kind, "direct");
+      assert.deepEqual(c.popupMedia(22), []);
+
+      const netId = c.captureNetwork({
+        details: {
+          url: "https://cdn.example/net-b.mp4",
+          documentUrl: "https://site-b.example/page",
+          originUrl: "https://site-b.example/page",
+          tabId: 22,
+          frameId: 0,
+          documentId: "doc-net-tabB",
+          timeStamp: 1_000_100,
+          responseHeaders: [],
+        },
+        hints: {
+          topLevelUrlHint: "https://site-b.example/page",
+          frameOrigin: "https://site-b.example",
+        },
+        transport: { mediaKind: "hls", requestHeaders: null },
+      });
+      assert.ok(isSafeOpaqueId(netId));
+      assert.notEqual(netId, domId);
+      assert.deepEqual(c.popupMedia(22), []);
+      assert.equal(fx2.counts.publishDetection, 1);
+
+      c.acceptPageSnapshot({
+        documentId: "doc-net-tabB",
+        tabId: 22,
+        frameId: 0,
+        pageUrl: "https://site-b.example/page",
+        topLevelPageUrl: "https://site-b.example/page",
+        documentNonce: "n-net-b",
+        candidates: [{ kind: "visible-filename", value: "net-item.mp4" }],
+        capturedAt: "2026-08-12T12:00:01.000Z",
+      });
+
+      assert.equal(fx2.counts.publishDetection, 2);
+      assert.equal(fx2.publishDetections[0].id, domId);
+      assert.equal(fx2.publishDetections[1].id, netId);
+      assert.equal(fx2.publishDetections[1].proposedFilename, "net-item.mp4");
+      assert.equal(fx2.publishDetections[1].kind, "hls");
+
+      const popA = c.popupMedia(11);
+      const popB = c.popupMedia(22);
+      assert.equal(popA.length, 1);
+      assert.equal(popA[0].id, domId);
+      assert.equal(popA[0].proposedFilename, "dom-item.mp4");
+      assert.equal(popA[0].kind, "direct");
+      assert.equal(popB.length, 1);
+      assert.equal(popB[0].id, netId);
+      assert.equal(popB[0].proposedFilename, "net-item.mp4");
+      assert.equal(popB[0].kind, "hls");
+
+      c.acceptPageSnapshot({
+        documentId: "doc-net-tabB",
+        tabId: 22,
+        frameId: 0,
+        pageUrl: "https://site-b.example/page",
+        topLevelPageUrl: "https://site-b.example/page",
+        documentNonce: "n-net-b-2",
+        candidates: [{ kind: "visible-filename", value: "net-item.mp4" }],
+        capturedAt: "2026-08-12T12:00:02.000Z",
+      });
+      await c.tick(1_000_900);
+      assert.equal(fx2.counts.publishDetection, 2);
+      assert.equal(c.popupMedia(11).length, 1);
+      assert.equal(c.popupMedia(22).length, 1);
+      assert.equal(c.popupMedia(11)[0].id, domId);
+      assert.equal(c.popupMedia(22)[0].id, netId);
+    }
+  );
+
+  await t.test(
+    "network then DOM then network remains one-to-one with three publications",
+    async () => {
+      const api3 = loadAdapters();
+      const fx3 = makeEffects();
+      const c = api3.createBackgroundAdapters(fx3.options());
+
+      const netA = c.captureNetwork({
+        details: {
+          url: "https://cdn.example/a.mp4",
+          documentUrl: "https://a.example/p",
+          originUrl: "https://a.example/p",
+          tabId: 31,
+          frameId: 0,
+          documentId: "doc-seq-A",
+          timeStamp: 1_000_000,
+          responseHeaders: [],
+        },
+        hints: {
+          topLevelUrlHint: "https://a.example/p",
+          frameOrigin: "https://a.example",
+        },
+        transport: { mediaKind: "direct", requestHeaders: null },
+      });
+      assert.deepEqual(c.popupMedia(31), []);
+      c.acceptPageSnapshot({
+        documentId: "doc-seq-A",
+        tabId: 31,
+        frameId: 0,
+        pageUrl: "https://a.example/p",
+        topLevelPageUrl: "https://a.example/p",
+        documentNonce: "n-a",
+        candidates: [{ kind: "visible-filename", value: "seq-a.mp4" }],
+        capturedAt: "2026-08-12T12:00:00.000Z",
+      });
+      assert.equal(fx3.counts.publishDetection, 1);
+      assert.equal(fx3.publishDetections[0].id, netA);
+      assert.equal(fx3.publishDetections[0].proposedFilename, "seq-a.mp4");
+
+      const domB = c.captureDomMedia({
+        mediaUrl: "https://cdn.example/b.mp4",
+        mediaOrigin: "https://cdn.example",
+        contentDisposition: null,
+        referrerUrl: "https://b.example/p",
+        frameOrigin: "https://b.example",
+        ts: 1_000_050,
+        snapshot: {
+          documentId: "doc-seq-B",
+          tabId: 32,
+          frameId: 0,
+          pageUrl: "https://b.example/p",
+          topLevelPageUrl: "https://b.example/p",
+          documentNonce: "n-b",
+          candidates: [{ kind: "visible-filename", value: "seq-b.mp4" }],
+          capturedAt: "2026-08-12T12:00:01.000Z",
+        },
+        transport: { mediaKind: "dash", requestHeaders: null },
+      });
+      assert.equal(fx3.counts.publishDetection, 2);
+      assert.equal(fx3.publishDetections[1].id, domB);
+      assert.equal(fx3.publishDetections[1].proposedFilename, "seq-b.mp4");
+      assert.equal(fx3.publishDetections[1].kind, "dash");
+
+      const netC = c.captureNetwork({
+        details: {
+          url: "https://cdn.example/c.mp4",
+          documentUrl: "https://c.example/p",
+          originUrl: "https://c.example/p",
+          tabId: 33,
+          frameId: 0,
+          documentId: "doc-seq-C",
+          timeStamp: 1_000_100,
+          responseHeaders: [],
+        },
+        hints: {
+          topLevelUrlHint: "https://c.example/p",
+          frameOrigin: "https://c.example",
+        },
+        transport: { mediaKind: "hls", requestHeaders: null },
+      });
+      assert.ok(isSafeOpaqueId(netA));
+      assert.ok(isSafeOpaqueId(domB));
+      assert.ok(isSafeOpaqueId(netC));
+      assert.equal(new Set([netA, domB, netC]).size, 3);
+      assert.deepEqual(c.popupMedia(33), []);
+      assert.equal(fx3.counts.publishDetection, 2);
+
+      c.acceptPageSnapshot({
+        documentId: "doc-seq-C",
+        tabId: 33,
+        frameId: 0,
+        pageUrl: "https://c.example/p",
+        topLevelPageUrl: "https://c.example/p",
+        documentNonce: "n-c",
+        candidates: [{ kind: "visible-filename", value: "seq-c.mp4" }],
+        capturedAt: "2026-08-12T12:00:02.000Z",
+      });
+
+      assert.equal(fx3.counts.publishDetection, 3);
+      assert.deepEqual(
+        fx3.publishDetections.map((p) => p.id),
+        [netA, domB, netC]
+      );
+      assert.deepEqual(
+        fx3.publishDetections.map((p) => p.proposedFilename),
+        ["seq-a.mp4", "seq-b.mp4", "seq-c.mp4"]
+      );
+      assert.equal(c.popupMedia(31).length, 1);
+      assert.equal(c.popupMedia(31)[0].id, netA);
+      assert.equal(c.popupMedia(31)[0].proposedFilename, "seq-a.mp4");
+      assert.equal(c.popupMedia(32).length, 1);
+      assert.equal(c.popupMedia(32)[0].id, domB);
+      assert.equal(c.popupMedia(32)[0].proposedFilename, "seq-b.mp4");
+      assert.equal(c.popupMedia(33).length, 1);
+      assert.equal(c.popupMedia(33)[0].id, netC);
+      assert.equal(c.popupMedia(33)[0].proposedFilename, "seq-c.mp4");
+      assert.equal(c.popupMedia(33)[0].kind, "hls");
+
+      c.acceptPageSnapshot({
+        documentId: "doc-seq-C",
+        tabId: 33,
+        frameId: 0,
+        pageUrl: "https://c.example/p",
+        topLevelPageUrl: "https://c.example/p",
+        documentNonce: "n-c-2",
+        candidates: [{ kind: "visible-filename", value: "seq-c.mp4" }],
+        capturedAt: "2026-08-12T12:00:03.000Z",
+      });
+      await c.tick(1_001_000);
+      assert.equal(fx3.counts.publishDetection, 3);
+      assert.equal(c.popupMedia(31).length, 1);
+      assert.equal(c.popupMedia(32).length, 1);
+      assert.equal(c.popupMedia(33).length, 1);
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -660,7 +1039,7 @@ test("BA03 — finalized source context and proposed filename survive later snap
 // BA04 — popup media exposes opaque IDs and no raw secrets
 // ---------------------------------------------------------------------------
 
-test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fields", async () => {
+test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fields", async (t) => {
   // Mutation caught: spreading the finalizer/private source record, leaking
   // numeric detection authority, or serializing ephemeral request material.
 
@@ -842,4 +1221,681 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
   for (const s of SECRET_SENTINELS) {
     assert.equal(inspection.includes(s), false, "inspection must not contain " + s);
   }
+
+  await t.test(
+    "pending records do not retain raw transport or header objects",
+    async () => {
+      const src = productionSource();
+      const setSites = src.match(/pendingByMediaId\.set\s*\(/g) || [];
+      assert.equal(
+        setSites.length,
+        2,
+        "exactly two pendingByMediaId.set sites (network + DOM)"
+      );
+      const blocks = extractPendingSetBlocks(src);
+      assert.equal(blocks.length, 2);
+      const forbiddenPending = [
+        /\btransport\b/,
+        /\brequestHeaders\b/,
+        /\burl\b/i,
+        /\breferrer\b/i,
+        /\breferer\b/i,
+        /\buserAgent\b/,
+        /\bmirrors\b/,
+        /\bvariants\b/,
+      ];
+      for (let i = 0; i < blocks.length; i++) {
+        const block = blocks[i];
+        // Enumerable pending metadata is only detectionId/ephemeral/mediaKind/tabId.
+        assert.match(block, /\bdetectionId\b/);
+        assert.match(block, /\bephemeral\b/);
+        assert.match(block, /\bmediaKind\b/);
+        assert.match(block, /\btabId\b/);
+        for (const re of forbiddenPending) {
+          assert.equal(
+            re.test(block),
+            false,
+            "pending block " + i + " must not contain " + re
+          );
+        }
+      }
+      // Fail closed on the known old-production retention shape.
+      assert.equal(
+        /transport\s*:\s*transport/.test(src),
+        false,
+        "must not assign transport: transport into pending"
+      );
+
+      // Primary media URL / request headers have no second long-lived adapter owner
+      // outside createEphemeral (no adapter-level header/url maps or pending URL fields).
+      assert.equal(
+        /new Map\(\)\s*;\s*\/\/.*headers|headersByMediaId|urlByMediaId|pendingUrls/.test(
+          src
+        ),
+        false
+      );
+      const createEph = (src.match(/Privacy\.createEphemeral\s*\(/g) || []).length;
+      assert.equal(createEph, 2, "ephemeral created once per capture path");
+
+      const apiP = loadAdapters();
+      const fxP = makeEffects();
+      const c = apiP.createBackgroundAdapters(fxP.options());
+      const secretHeaders = {
+        Cookie: "session=SECRET_COOKIE_ABC",
+        Authorization: "Bearer SECRET_AUTH_BEARER_TOKEN",
+        "X-Custom": "SECRET_SIGNED_QUERY_XYZ",
+      };
+      const transportObj = {
+        mediaKind: "direct",
+        requestHeaders: secretHeaders,
+        referer: "https://site.example/SECRET_REFERER_PATH",
+        userAgent: "Agent SECRET_AUTH_BEARER_TOKEN",
+        mirrors: ["https://mirror/SECRET_SIGNED_QUERY_XYZ"],
+        variants: [{ id: "v1", url: "https://v/SECRET_PAGE_PATH" }],
+      };
+      const mediaId = c.captureNetwork({
+        details: {
+          url:
+            "https://SECRET_MEDIA_ORIGIN_HOST.example/v.mp4?token=SECRET_SIGNED_QUERY_XYZ",
+          documentUrl:
+            "https://site.example/SECRET_PAGE_PATH/watch",
+          originUrl: "https://site.example/SECRET_REFERER_PATH",
+          tabId: 77,
+          frameId: 0,
+          documentId: "doc-pending-privacy",
+          timeStamp: 1_000_000,
+          responseHeaders: [
+            { name: "Content-Type", value: "video/mp4" },
+          ],
+        },
+        hints: {
+          topLevelUrlHint: "https://site.example/SECRET_PAGE_PATH/watch",
+          frameOrigin: "https://site.example",
+        },
+        transport: transportObj,
+      });
+      // Mutate/revoke caller-owned raw objects after capture.
+      secretHeaders.Cookie = "MUTATED_AFTER_CAPTURE";
+      secretHeaders.Authorization = "MUTATED_AUTH";
+      transportObj.requestHeaders = null;
+      transportObj.referer = "mutated";
+      transportObj.mirrors = [];
+      transportObj.variants = [];
+
+      assert.deepEqual(c.popupMedia(77), []);
+      assert.equal(fxP.counts.publishDetection, 0);
+
+      c.acceptPageSnapshot({
+        documentId: "doc-pending-privacy",
+        tabId: 77,
+        frameId: 0,
+        pageUrl: "https://site.example/SECRET_PAGE_PATH/watch",
+        topLevelPageUrl: "https://site.example/SECRET_PAGE_PATH/watch",
+        documentNonce: "n-priv",
+        candidates: [{ kind: "visible-filename", value: "priv-safe.mp4" }],
+        capturedAt: "2026-08-12T12:00:00.000Z",
+      });
+      assert.equal(fxP.counts.publishDetection, 1);
+      assert.equal(fxP.publishDetections[0].id, mediaId);
+      assert.equal(fxP.publishDetections[0].proposedFilename, "priv-safe.mp4");
+      const pop = c.popupMedia(77);
+      assert.equal(pop.length, 1);
+      assert.equal(pop[0].id, mediaId);
+      assertDeepFrozen(pop, "privacy popup");
+      assertDeepFrozen(fxP.publishDetections[0], "privacy publish");
+      assertNoSentinels(pop, "privacy popup");
+      assertNoSentinels(fxP.publishDetections, "privacy publish");
+      assertNoSentinels(fxP.diagnostics, "privacy diagnostics");
+      const blob = [
+        JSON.stringify(pop),
+        JSON.stringify(fxP.publishDetections),
+        JSON.stringify(fxP.diagnostics),
+        String(mediaId),
+      ].join("\n");
+      for (const s of SECRET_SENTINELS) {
+        assert.equal(blob.includes(s), false, "projection must not contain " + s);
+      }
+    }
+  );
+
+  await t.test(
+    "ProviderRegistry is constructed once but never observed in Lease 1",
+    async () => {
+      const src = productionSource();
+      const creates = src.match(/createProviderRegistry\s*\(/g) || [];
+      assert.equal(creates.length, 1, "createProviderRegistry exactly once");
+      assert.equal(
+        (src.match(/\.observe\s*\(/g) || []).length,
+        0,
+        "Lease 1 must not call .observe("
+      );
+      assert.equal(
+        (src.match(/\.lookup\s*\(/g) || []).length,
+        0,
+        "Lease 1 must not call .lookup("
+      );
+      assert.equal(
+        (src.match(/providerRegistry\.clear\s*\(/g) || []).length,
+        0,
+        "Lease 1 must not call providerRegistry.clear("
+      );
+      assert.equal(
+        (src.match(/providerRegistry\.snapshot\s*\(/g) || []).length,
+        0,
+        "Lease 1 must not call providerRegistry.snapshot("
+      );
+    }
+  );
+
+  await t.test(
+    "hostile input accessors never execute or leak across dependency boundaries",
+    async () => {
+      const apiH = loadAdapters();
+      const fxH = makeEffects();
+      const c = apiH.createBackgroundAdapters(fxH.options());
+
+      const hits = Object.create(null);
+      function track(name) {
+        hits[name] = 0;
+        return function hostileGetter() {
+          hits[name] += 1;
+          throw new Error("HOSTILE_SECRET_" + name + "_TOKEN_XYZ");
+        };
+      }
+
+      // --- captureNetwork: hostile details/hints/headers ---
+      const details = {};
+      Object.defineProperty(details, "url", {
+        enumerable: true,
+        configurable: true,
+        get: track("details.url"),
+      });
+      Object.defineProperty(details, "documentUrl", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example/page",
+        writable: true,
+      });
+      Object.defineProperty(details, "originUrl", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example/page",
+        writable: true,
+      });
+      Object.defineProperty(details, "tabId", {
+        enumerable: true,
+        configurable: true,
+        value: 50,
+        writable: true,
+      });
+      Object.defineProperty(details, "frameId", {
+        enumerable: true,
+        configurable: true,
+        value: 0,
+        writable: true,
+      });
+      Object.defineProperty(details, "documentId", {
+        enumerable: true,
+        configurable: true,
+        value: "doc-hostile-net",
+        writable: true,
+      });
+      Object.defineProperty(details, "timeStamp", {
+        enumerable: true,
+        configurable: true,
+        value: 1_000_000,
+        writable: true,
+      });
+      const respHeaders = [{}];
+      Object.defineProperty(respHeaders[0], "name", {
+        enumerable: true,
+        configurable: true,
+        get: track("responseHeaders.name"),
+      });
+      Object.defineProperty(respHeaders[0], "value", {
+        enumerable: true,
+        configurable: true,
+        get: track("responseHeaders.value"),
+      });
+      Object.defineProperty(details, "responseHeaders", {
+        enumerable: true,
+        configurable: true,
+        value: respHeaders,
+        writable: true,
+      });
+
+      const hints = {};
+      Object.defineProperty(hints, "topLevelUrlHint", {
+        enumerable: true,
+        configurable: true,
+        get: track("hints.topLevelUrlHint"),
+      });
+      Object.defineProperty(hints, "frameOrigin", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example",
+        writable: true,
+      });
+
+      const hostileToString = {
+        toString() {
+          hits["toString"] = (hits["toString"] || 0) + 1;
+          return "https://HOSTILE_SECRET_toString.example/x";
+        },
+      };
+      hits["toString"] = 0;
+
+      let netThrew = null;
+      try {
+        c.captureNetwork({
+          details: details,
+          hints: hints,
+          transport: { mediaKind: "direct", requestHeaders: null },
+        });
+      } catch (err) {
+        netThrew = err;
+      }
+      assert.ok(netThrew instanceof TypeError, "hostile network must TypeError");
+      assert.equal(
+        String(netThrew.message).includes("HOSTILE_SECRET"),
+        false,
+        "network error must not leak hostile text: " + netThrew.message
+      );
+      assert.equal(
+        String(netThrew.stack || "").includes("HOSTILE_SECRET"),
+        false
+      );
+      for (const k of Object.keys(hits)) {
+        assert.equal(hits[k], 0, "getter " + k + " must not execute on network path");
+      }
+      assert.equal(fxH.counts.publishDetection, 0);
+      assert.equal(fxH.counts.randomToken, 0, "must not mint opaque ID on hostile network");
+      assert.deepEqual(c.popupMedia(50), []);
+
+      // Proxy reflection trap: may consult classification, but exception text is generic.
+      const proxyDetails = new Proxy(
+        {
+          url: "https://ok.example/v.mp4",
+          documentUrl: "https://ok.example/p",
+          originUrl: "https://ok.example/p",
+          tabId: 50,
+          frameId: 0,
+          documentId: "doc-proxy",
+          timeStamp: 1_000_000,
+          responseHeaders: [],
+        },
+        {
+          getOwnPropertyDescriptor() {
+            throw new Error("HOSTILE_SECRET_PROXY_GOPD_DETAILS");
+          },
+          get() {
+            throw new Error("HOSTILE_SECRET_PROXY_GET_DETAILS");
+          },
+        }
+      );
+      assert.throws(
+        () =>
+          c.captureNetwork({
+            details: proxyDetails,
+            hints: { topLevelUrlHint: "https://ok.example/p", frameOrigin: "https://ok.example" },
+            transport: { mediaKind: "direct", requestHeaders: null },
+          }),
+        (err) => {
+          assert.ok(err instanceof TypeError);
+          assert.equal(String(err.message).includes("HOSTILE_SECRET"), false);
+          assert.equal(String(err.stack || "").includes("HOSTILE_SECRET"), false);
+          return true;
+        }
+      );
+      assert.equal(fxH.counts.randomToken, 0);
+      assert.equal(fxH.counts.publishDetection, 0);
+
+      // --- acceptPageSnapshot: hostile snapshot fields ---
+      const snapHits = Object.create(null);
+      function trackSnap(name) {
+        snapHits[name] = 0;
+        return function () {
+          snapHits[name] += 1;
+          throw new Error("HOSTILE_SECRET_SNAP_" + name);
+        };
+      }
+      const hostileSnap = {};
+      Object.defineProperty(hostileSnap, "documentId", {
+        enumerable: true,
+        configurable: true,
+        get: trackSnap("documentId"),
+      });
+      Object.defineProperty(hostileSnap, "tabId", {
+        enumerable: true,
+        configurable: true,
+        value: 50,
+        writable: true,
+      });
+      Object.defineProperty(hostileSnap, "frameId", {
+        enumerable: true,
+        configurable: true,
+        value: 0,
+        writable: true,
+      });
+      Object.defineProperty(hostileSnap, "pageUrl", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example/p",
+        writable: true,
+      });
+      Object.defineProperty(hostileSnap, "topLevelPageUrl", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example/p",
+        writable: true,
+      });
+      Object.defineProperty(hostileSnap, "documentNonce", {
+        enumerable: true,
+        configurable: true,
+        value: "n",
+        writable: true,
+      });
+      Object.defineProperty(hostileSnap, "capturedAt", {
+        enumerable: true,
+        configurable: true,
+        value: "2026-08-12T12:00:00.000Z",
+        writable: true,
+      });
+      const hostileCand = {};
+      Object.defineProperty(hostileCand, "kind", {
+        enumerable: true,
+        configurable: true,
+        get: trackSnap("candidates.kind"),
+      });
+      Object.defineProperty(hostileCand, "value", {
+        enumerable: true,
+        configurable: true,
+        get: trackSnap("candidates.value"),
+      });
+      Object.defineProperty(hostileSnap, "candidates", {
+        enumerable: true,
+        configurable: true,
+        value: [hostileCand],
+        writable: true,
+      });
+
+      let snapThrew = null;
+      try {
+        c.acceptPageSnapshot(hostileSnap);
+      } catch (err) {
+        snapThrew = err;
+      }
+      // Must either accept descriptor-safe own-data snapshot or reject generically.
+      if (snapThrew) {
+        assert.ok(snapThrew instanceof TypeError);
+        assert.equal(String(snapThrew.message).includes("HOSTILE_SECRET"), false);
+        assert.equal(String(snapThrew.stack || "").includes("HOSTILE_SECRET"), false);
+      }
+      for (const k of Object.keys(snapHits)) {
+        assert.equal(snapHits[k], 0, "snapshot getter " + k + " must not run");
+      }
+      assert.equal(fxH.counts.publishDetection, 0);
+
+      // --- captureDomMedia: hostile snapshot + DOM scalars ---
+      const domHits = Object.create(null);
+      function trackDom(name) {
+        domHits[name] = 0;
+        return function () {
+          domHits[name] += 1;
+          throw new Error("HOSTILE_SECRET_DOM_" + name);
+        };
+      }
+      const domSnap = {};
+      Object.defineProperty(domSnap, "documentId", {
+        enumerable: true,
+        configurable: true,
+        get: trackDom("snapshot.documentId"),
+      });
+      Object.defineProperty(domSnap, "tabId", {
+        enumerable: true,
+        configurable: true,
+        value: 51,
+        writable: true,
+      });
+      Object.defineProperty(domSnap, "frameId", {
+        enumerable: true,
+        configurable: true,
+        value: 0,
+        writable: true,
+      });
+      Object.defineProperty(domSnap, "pageUrl", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example/dom",
+        writable: true,
+      });
+      Object.defineProperty(domSnap, "topLevelPageUrl", {
+        enumerable: true,
+        configurable: true,
+        value: "https://ok.example/dom",
+        writable: true,
+      });
+      Object.defineProperty(domSnap, "documentNonce", {
+        enumerable: true,
+        configurable: true,
+        value: "nd",
+        writable: true,
+      });
+      Object.defineProperty(domSnap, "capturedAt", {
+        enumerable: true,
+        configurable: true,
+        value: "2026-08-12T12:00:00.000Z",
+        writable: true,
+      });
+      Object.defineProperty(domSnap, "candidates", {
+        enumerable: true,
+        configurable: true,
+        value: [{ kind: "visible-filename", value: "x.mp4" }],
+        writable: true,
+      });
+
+      let domThrew = null;
+      try {
+        c.captureDomMedia({
+          mediaUrl: "https://cdn.example/dom.mp4",
+          mediaOrigin: "https://cdn.example",
+          contentDisposition: null,
+          referrerUrl: "https://ok.example/dom",
+          frameOrigin: "https://ok.example",
+          ts: 1_000_000,
+          snapshot: domSnap,
+          transport: { mediaKind: "direct", requestHeaders: null },
+        });
+      } catch (err) {
+        domThrew = err;
+      }
+      assert.ok(domThrew instanceof TypeError);
+      assert.equal(String(domThrew.message).includes("HOSTILE_SECRET"), false);
+      for (const k of Object.keys(domHits)) {
+        assert.equal(domHits[k], 0, "dom getter " + k + " must not run");
+      }
+      assert.equal(fxH.counts.publishDetection, 0);
+      assert.equal(
+        fxH.counts.randomToken,
+        0,
+        "hostile DOM must fail before minting opaque ID"
+      );
+      assert.deepEqual(c.popupMedia(51), []);
+
+      // Hostile toString on a scalar field must not be coerced.
+      assert.throws(
+        () =>
+          c.captureDomMedia({
+            mediaUrl: hostileToString,
+            mediaOrigin: "https://cdn.example",
+            contentDisposition: null,
+            referrerUrl: "https://ok.example/dom",
+            frameOrigin: "https://ok.example",
+            ts: 1_000_000,
+            snapshot: {
+              documentId: "doc-tostring",
+              tabId: 52,
+              frameId: 0,
+              pageUrl: "https://ok.example/dom",
+              topLevelPageUrl: "https://ok.example/dom",
+              documentNonce: "nt",
+              candidates: [{ kind: "visible-filename", value: "t.mp4" }],
+              capturedAt: "2026-08-12T12:00:00.000Z",
+            },
+            transport: { mediaKind: "direct", requestHeaders: null },
+          }),
+        TypeError
+      );
+      assert.equal(hits["toString"], 0, "hostile toString must not run");
+      assert.equal(fxH.counts.randomToken, 0);
+      assert.equal(fxH.counts.publishDetection, 0);
+
+      // Ordinary own-data control: same fields still flow; Floren proposal correct.
+      const florenId = c.captureNetwork(florenNetworkInput());
+      c.acceptPageSnapshot(florenSnapshot());
+      assert.equal(fxH.counts.publishDetection, 1);
+      assert.equal(fxH.publishDetections[0].id, florenId);
+      assert.equal(
+        fxH.publishDetections[0].proposedFilename,
+        "11238-makemebi.net.mp4"
+      );
+      assert.equal(fxH.publishDetections[0].providerKey, "florenfile.com");
+      assert.equal(c.popupMedia(42).length, 1);
+      assert.equal(c.popupMedia(42)[0].id, florenId);
+
+      // Next valid capture after hostile failures behaves as first capture for order.
+      // (Floren above is the first successful capture; second succeeds with distinct ID.)
+      const secondId = c.captureDomMedia({
+        mediaUrl: "https://cdn.example/after-hostile.mp4",
+        mediaOrigin: "https://cdn.example",
+        contentDisposition: null,
+        referrerUrl: "https://ok.example/after",
+        frameOrigin: "https://ok.example",
+        ts: 1_000_200,
+        snapshot: {
+          documentId: "doc-after-hostile",
+          tabId: 60,
+          frameId: 0,
+          pageUrl: "https://ok.example/after",
+          topLevelPageUrl: "https://ok.example/after",
+          documentNonce: "na",
+          candidates: [{ kind: "visible-filename", value: "after.mp4" }],
+          capturedAt: "2026-08-12T12:00:02.000Z",
+        },
+        transport: { mediaKind: "direct", requestHeaders: null },
+      });
+      assert.ok(isSafeOpaqueId(secondId));
+      assert.notEqual(secondId, florenId);
+      assert.equal(fxH.counts.publishDetection, 2);
+      assert.equal(fxH.publishDetections[1].id, secondId);
+      assert.equal(fxH.publishDetections[1].proposedFilename, "after.mp4");
+      assert.equal(c.popupMedia(60).length, 1);
+      assertNoSentinels(fxH.publishDetections, "hostile-path publications");
+      assertNoSentinels(fxH.diagnostics, "hostile-path diagnostics");
+    }
+  );
+
+  await t.test(
+    "publication reentrancy and throw remains exactly once with safe diagnostics",
+    async () => {
+      const apiR = loadAdapters();
+      const fxR = makeEffects();
+      let publishCalls = 0;
+      let diagCalls = 0;
+      const SECRET_PUB = "SECRET_PUBLISH_THROW_TOKEN";
+      const SECRET_DIAG = "SECRET_DIAG_THROW_TOKEN";
+      let ctrlR;
+      ctrlR = apiR.createBackgroundAdapters(
+        fxR.options({
+          publishDetection(safe) {
+            publishCalls += 1;
+            fxR.counts.publishDetection += 1;
+            fxR.publishDetections.push(safe);
+            // Re-enter popup projection mid-publish, then throw secret-bearing error.
+            const rows = ctrlR.popupMedia(88);
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].id, safe.id);
+            throw new Error(SECRET_PUB + " boom");
+          },
+          reportDiagnostic(safeDiagnostic) {
+            diagCalls += 1;
+            fxR.counts.reportDiagnostic += 1;
+            fxR.diagnostics.push(safeDiagnostic);
+            throw new Error(SECRET_DIAG + " diag");
+          },
+        })
+      );
+
+      const mediaId = ctrlR.captureNetwork({
+        details: {
+          url: "https://cdn.example/reenter.mp4",
+          documentUrl: "https://site.example/re",
+          originUrl: "https://site.example/re",
+          tabId: 88,
+          frameId: 0,
+          documentId: "doc-reenter",
+          timeStamp: 1_000_000,
+          responseHeaders: [],
+        },
+        hints: {
+          topLevelUrlHint: "https://site.example/re",
+          frameOrigin: "https://site.example",
+        },
+        transport: { mediaKind: "direct", requestHeaders: null },
+      });
+      // Must not escape publish/diagnostic exceptions to the caller.
+      assert.doesNotThrow(() => {
+        ctrlR.acceptPageSnapshot({
+          documentId: "doc-reenter",
+          tabId: 88,
+          frameId: 0,
+          pageUrl: "https://site.example/re",
+          topLevelPageUrl: "https://site.example/re",
+          documentNonce: "nr",
+          candidates: [{ kind: "visible-filename", value: "reenter.mp4" }],
+          capturedAt: "2026-08-12T12:00:00.000Z",
+        });
+      });
+
+      assert.equal(publishCalls, 1, "exactly one publication attempt");
+      assert.equal(fxR.publishDetections.length, 1);
+      assert.equal(fxR.publishDetections[0].id, mediaId);
+      assert.equal(fxR.publishDetections[0].proposedFilename, "reenter.mp4");
+
+      const committed = ctrlR.popupMedia(88);
+      assert.equal(committed.length, 1);
+      assert.equal(committed[0].id, mediaId);
+      assert.equal(committed[0].proposedFilename, "reenter.mp4");
+
+      // Later snapshot/tick must not duplicate.
+      ctrlR.acceptPageSnapshot({
+        documentId: "doc-reenter",
+        tabId: 88,
+        frameId: 0,
+        pageUrl: "https://site.example/re",
+        topLevelPageUrl: "https://site.example/re",
+        documentNonce: "nr-2",
+        candidates: [{ kind: "visible-filename", value: "reenter.mp4" }],
+        capturedAt: "2026-08-12T12:00:01.000Z",
+      });
+      await ctrlR.tick(1_000_900);
+      assert.equal(publishCalls, 1);
+      assert.equal(ctrlR.popupMedia(88).length, 1);
+
+      // reportDiagnostic receives exact deeply frozen safe own-data projection.
+      assert.equal(diagCalls, 1);
+      assert.equal(fxR.diagnostics.length, 1);
+      const diag = fxR.diagnostics[0];
+      assert.deepEqual(Object.keys(diag).sort(), ["code", "id", "scope"].sort());
+      assert.equal(diag.code, "publish-detection-failed");
+      assert.equal(diag.scope, "background-adapters");
+      assert.equal(diag.id, mediaId);
+      assertDeepFrozen(diag, "reportDiagnostic payload");
+      assert.equal(JSON.stringify(diag).includes(SECRET_PUB), false);
+      assert.equal(JSON.stringify(diag).includes(SECRET_DIAG), false);
+      assertNoSentinels(diag, "diagnostic");
+      assertNoSentinels(committed, "reenter popup");
+      assertNoSentinels(fxR.publishDetections, "reenter publish");
+    }
+  );
 });
