@@ -2273,6 +2273,16 @@
             delete terminalBinding.progress;
             delete terminalBinding.limitAck;
           }
+          var settledDirect = getScheduler().getJob(decision.jobId);
+          if (
+            settledDirect &&
+            settledDirect.mediaKind === "direct" &&
+            (settledDirect.state === "completed" ||
+              settledDirect.state === "failed" ||
+              settledDirect.state === "cancelled")
+          ) {
+            popupTokenStore.delete(decision.jobId);
+          }
           return Promise.all(switchEffects).then(function () { return pump(); }).then(function () {
             publishJobsIfChanged(beforeSig);
             return true;

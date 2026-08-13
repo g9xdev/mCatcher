@@ -128,6 +128,44 @@ test("forged, malformed, non-popup, and concurrent handoffs are inert", async ()
   assert.equal(pair.filter((row) => row.status === "fulfilled" && row.value === false).length, 1);
 });
 
+test("false flag and cross-job proof leave the target and publications unchanged", async () => {
+  const env = makeEnv();
+  const first = await needsUser(env, "first");
+  const second = await needsUser(env, "second");
+  const beforeJobs = JSON.stringify(env.ctrl.popupJobs());
+  const beforePublications = JSON.stringify(env.publications);
+
+  const falseFlag = handoffMessage(first.job, "proof-first");
+  falseFlag.intent.userSelectedFirefox = false;
+  assert.equal(await env.ctrl.requestFirefoxHandoff(falseFlag, "popup"), false);
+  assert.equal(
+    await env.ctrl.requestFirefoxHandoff(handoffMessage(second.job, "proof-first"), "popup"),
+    false
+  );
+
+  assert.equal(env.downloads.length, 0);
+  assert.equal(JSON.stringify(env.ctrl.popupJobs()), beforeJobs);
+  assert.equal(JSON.stringify(env.publications), beforePublications);
+});
+
+test("Firefox API rejection consumes proof and returns the safe needs_user job", async () => {
+  const rejection = new Error("browser rejected PRIVATE_BROWSER_ERROR");
+  const env = makeEnv({ downloadsDownload(input) { env.downloads.push(input); return Promise.reject(rejection); } });
+  const { job, secretUrl } = await needsUser(env, "reject");
+  const message = handoffMessage(job, "proof-reject");
+
+  const result = await env.ctrl.requestFirefoxHandoff(message, "popup");
+
+  assert.equal(result.state, "needs_user");
+  assert.equal(env.ctrl.popupJobs().find((row) => row.id === job.id).holdsGlobalSlot, undefined);
+  assert.equal(env.downloads.length, 1);
+  assert.equal(await env.ctrl.requestFirefoxHandoff(message, "popup"), false);
+  const safeJson = JSON.stringify({ result, jobs: env.ctrl.popupJobs(), publications: env.publications });
+  assert.equal(safeJson.includes(secretUrl), false);
+  assert.equal(safeJson.includes("proof-reject"), false);
+  assert.equal(safeJson.includes("SECRET_COOKIE"), false);
+});
+
 test("running direct job preserves its proof until a real result reaches needs_user", async () => {
   const env = makeEnv();
   const secretUrl = "https://cdn.example/running.mp4?sig=PRIVATE_RUNNING";
