@@ -675,7 +675,10 @@
           return true;
         }
         if (snap.state === "normal") {
-          authorizeWake(job);
+          // Same FIFO head as recovering-no-owner: never wake an arbitrary
+          // pending-obligation job ahead of an older same-provider waiter.
+          var nextNormal = oldestEligibleWaiter(job.providerKey);
+          if (nextNormal) authorizeWake(nextNormal);
           return true;
         }
         // saturated with drain owner, or recovering with active owner: remain parked.
