@@ -3415,3 +3415,656 @@ def test_commit_prebuild_and_immediate_claim_contract(tmp_path, monkeypatch):
     assert open(path, "rb").read() == b"Z"
     d._ytdl_cleanup_stage_tree(stage_h)
     d._ytdl_release_dest_lease(lease)
+
+
+# ---------------------------------------------------------------------------
+# 43. Post-claim return-transfer fault still emits exactly one done
+# ---------------------------------------------------------------------------
+
+def test_post_claim_return_transfer_fault_emits_done(tmp_path, monkeypatch):
+    """Real NT claim then wrapper raise before helper return: one done, final survives."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "xfer"
+    dest.mkdir()
+    sent = []
+    payload = b"XFER-CLAIM-BYTES"
+    final = dest / "xfer.mp4"
+    real_commit = d._ytdl_commit_with_candidates
+
+    def boom_after_real_commit(source_handle, candidates, op=None, **kwargs):
+        # Perform the real rename + commit_claimed mutation, then fault on the
+        # helper return-transfer path so done_path never materializes in the worker.
+        path = real_commit(source_handle, candidates, op=op, **kwargs)
+        if path:
+            raise RuntimeError("return-transfer fault after claim")
+        return path
+
+    monkeypatch.setattr(d, "_ytdl_commit_with_candidates", boom_after_real_commit)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobXfer", "attemptToken": "atk-xfer",
+        "url": "https://example.test/v", "name": "xfer.mp4", "dir": str(dest),
+    })
+    # Wait for worker teardown (not terminal): claim may leave a final with no frame.
+    assert wait_for(lambda: d._PGET.get("jobXfer") is None, timeout=5), (
+        "jobXfer still registered after post-claim transfer fault"
+    )
+    assert final.is_file(), "committed final must survive post-claim transfer fault"
+    assert final.read_bytes() == payload
+    terminals = [
+        m for m in sent
+        if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == "jobXfer"
+    ]
+    # Production defect: commit_claimed without done_path yields no terminal.
+    assert len(terminals) == 1, "expected exactly one terminal, got %r" % (terminals,)
+    term = terminals[0]
+    assert term["type"] == "ytdl-done"
+    assert term["file"] == str(final)
+    assert term["bytes"] == len(payload)
+    key = d._ytdl_canon_path_key(str(dest))
+    assert d._YTDL_DEST_LEASES.get(key) is None
+
+
+# ---------------------------------------------------------------------------
+# 44. Raw destination grammar: reject .. before abspath erases it
+# ---------------------------------------------------------------------------
+
+def test_raw_dest_traversal_rejected_explicit_and_default(tmp_path, monkeypatch):
+    """Raw `.`/`..` destination components rejected before abspath; no outside create."""
+    import mchost.downloads as d
+
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "escaped"
+    assert not outside.exists()
+    # Primitive path contains `..`; abspath would erase it to tmp_path/escaped.
+    raw_escape = str(root) + r"\..\escaped"
+    assert ".." in raw_escape.replace("/", "\\")
+    assert os.path.normcase(os.path.abspath(raw_escape)) == os.path.normcase(str(outside))
+
+    # Explicit dir traversal.
+    sent = []
+    spawned = []
+
+    def fake_popen(*a, **k):
+        spawned.append(1)
+        path = _materialize_stage_from_cmd(a, b"X")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobTrav", "attemptToken": "atk-trav",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": raw_escape,
+    })
+    term = _wait_terminal(sent, "jobTrav")
+    assert term["type"] == "ytdl-error"
+    assert term["reason"] in ("local_io", "permanent")
+    assert spawned == []
+    assert not outside.exists()
+    assert not (root / "escaped").exists()
+    stages = [p for p in root.iterdir() if p.name.startswith(".mc-ytdl-")]
+    assert stages == []
+    assert d._PGET.get("jobTrav") is None
+
+    # Configured default dir traversal (no explicit dir).
+    sent2 = []
+    spawned2 = []
+
+    def fake_popen2(*a, **k):
+        spawned2.append(1)
+        path = _materialize_stage_from_cmd(a, b"Y")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent2, popen=fake_popen2)
+    monkeypatch.setattr(d, "_ytdl_default_outdir", lambda: raw_escape)
+    d.handle_ytdl({
+        "id": "jobTravDef", "attemptToken": "atk-trav-def",
+        "url": "https://example.test/v", "name": "clip.mp4",
+    })
+    term2 = _wait_terminal(sent2, "jobTravDef")
+    assert term2["type"] == "ytdl-error"
+    assert term2["reason"] in ("local_io", "permanent")
+    assert spawned2 == []
+    assert not outside.exists()
+    assert d._PGET.get("jobTravDef") is None
+
+    # Raw single-dot component: abspath would erase `.` but grammar must reject first.
+    raw_dot = str(root) + r"\.\inside"
+    assert "\\." in raw_dot.replace("/", "\\") or "/." in raw_dot
+    assert os.path.normcase(os.path.abspath(raw_dot)) == os.path.normcase(
+        str(root / "inside")
+    )
+    sent3 = []
+    spawned3 = []
+
+    def fake_popen3(*a, **k):
+        spawned3.append(1)
+        path = _materialize_stage_from_cmd(a, b"Z")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent3, popen=fake_popen3)
+    d.handle_ytdl({
+        "id": "jobTravDot", "attemptToken": "atk-trav-dot",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": raw_dot,
+    })
+    term3 = _wait_terminal(sent3, "jobTravDot")
+    assert term3["type"] == "ytdl-error"
+    assert term3["reason"] in ("local_io", "permanent")
+    assert spawned3 == []
+    assert not (root / "inside").exists()
+    stages_dot = [p for p in root.iterdir() if p.name.startswith(".mc-ytdl-")]
+    assert stages_dot == []
+    assert not (root / "clip.mp4").exists()
+    assert d._PGET.get("jobTravDot") is None
+
+
+# ---------------------------------------------------------------------------
+# 45. Root/component acquisition never retries without OPEN_REPARSE_POINT
+# ---------------------------------------------------------------------------
+
+def test_root_and_component_open_always_reparse_aware(tmp_path, monkeypatch):
+    """Root CreateFileW and component NtCreateFile always use reparse-aware flags."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "reparse-acq"
+    dest.mkdir()
+    api = d._ytdl_winapi()
+    real_cf = api.k32.CreateFileW
+    real_nt = d._ytdl_nt_create_relative
+    real_status = d._ytdl_nt_create_relative_status
+    real_open_root = d._ytdl_open_path_root
+    root_calls = []
+    child_opts = []
+
+    def open_root_spy(root_display):
+        """Record CreateFileW flags; always restore the real ctypes binding."""
+        calls = []
+
+        def cf_spy(path, access, share, sec, disp, flags, template):
+            calls.append(int(flags))
+            return real_cf(path, access, share, sec, disp, flags, template)
+
+        prev = api.k32.CreateFileW
+        api.k32.CreateFileW = cf_spy
+        try:
+            return real_open_root(root_display)
+        finally:
+            api.k32.CreateFileW = prev
+            root_calls.extend(calls)
+
+    def nt_spy(root_handle, leaf, desired_access, share_access, create_disposition,
+               create_options, file_attributes=0):
+        child_opts.append(int(create_options))
+        return real_nt(
+            root_handle, leaf, desired_access, share_access, create_disposition,
+            create_options, file_attributes=file_attributes,
+        )
+
+    lease = None
+    lease2 = None
+    try:
+        monkeypatch.setattr(d, "_ytdl_open_path_root", open_root_spy)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", nt_spy)
+        lease = d._ytdl_acquire_dest_lease(str(dest / "nested"))
+        assert lease is not None
+        assert root_calls, "expected root CreateFileW"
+        reparse_flag = d._YTDL_FILE_FLAG_OPEN_REPARSE_POINT
+        for fl in root_calls:
+            assert fl & reparse_flag, "root open missing OPEN_REPARSE_POINT: %r" % fl
+        assert child_opts, "expected component NtCreateFile"
+        for opt in child_opts:
+            assert opt & d._YTDL_FILE_OPEN_REPARSE_POINT, (
+                "component open missing OPEN_REPARSE_POINT: %r" % opt
+            )
+        d._ytdl_release_dest_lease(lease)
+        lease = None
+        monkeypatch.setattr(d, "_ytdl_open_path_root", real_open_root)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", real_nt)
+
+        # When reparse-aware open fails, never retry plain open or accept a handle.
+        insecure = []
+        accepted = []
+
+        def nt_fail_reparse(root_handle, leaf, desired_access, share_access,
+                            create_disposition, create_options, file_attributes=0):
+            opt = int(create_options)
+            if opt & d._YTDL_FILE_OPEN_REPARSE_POINT:
+                return None
+            insecure.append(opt)
+            accepted.append(4242)
+            return 4242
+
+        def status_fail_reparse(root_handle, leaf, desired_access, share_access,
+                                create_disposition, create_options, file_attributes=0):
+            opt = int(create_options)
+            if opt & d._YTDL_FILE_OPEN_REPARSE_POINT:
+                return None, 0xC0000034
+            insecure.append(opt)
+            accepted.append(4242)
+            return 4242, 0
+
+        lease2 = d._ytdl_acquire_dest_lease(str(dest))
+        assert lease2 is not None
+        parent_h = lease2["handle"]
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", nt_fail_reparse)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative_status", status_fail_reparse)
+        try:
+            h = d._ytdl_open_or_create_component(parent_h, "nope-child")
+            assert h is None
+            assert insecure == []
+            assert accepted == []
+        finally:
+            monkeypatch.setattr(d, "_ytdl_nt_create_relative", real_nt)
+            monkeypatch.setattr(d, "_ytdl_nt_create_relative_status", real_status)
+            d._ytdl_release_dest_lease(lease2)
+            lease2 = None
+
+        # Root: reparse-aware failure must not fall back to plain CreateFileW.
+        root_plain = []
+
+        def open_root_fail_reparse(root_display):
+            def cf_fail_reparse(path, access, share, sec, disp, flags, template):
+                fl = int(flags)
+                if fl & d._YTDL_FILE_FLAG_OPEN_REPARSE_POINT:
+                    return d._YTDL_INVALID_HANDLE_VALUE
+                root_plain.append(fl)
+                return real_cf(path, access, share, sec, disp, flags, template)
+
+            prev = api.k32.CreateFileW
+            api.k32.CreateFileW = cf_fail_reparse
+            try:
+                return real_open_root(root_display)
+            finally:
+                api.k32.CreateFileW = prev
+
+        monkeypatch.setattr(d, "_ytdl_open_path_root", open_root_fail_reparse)
+        rh = None
+        try:
+            split = d._ytdl_split_dest_path(str(dest))
+            assert split is not None
+            rh = d._ytdl_open_path_root(split[0])
+            assert rh is None
+            assert root_plain == []
+        finally:
+            monkeypatch.setattr(d, "_ytdl_open_path_root", real_open_root)
+            # Partial impl may return a real handle from plain fallback; close once.
+            if rh is not None and rh != d._YTDL_INVALID_HANDLE_VALUE:
+                try:
+                    d._ytdl_close_handle(rh)
+                except Exception:
+                    pass
+                rh = None
+    finally:
+        # Always restore shared bindings and release any held lease.
+        api.k32.CreateFileW = real_cf
+        monkeypatch.setattr(d, "_ytdl_open_path_root", real_open_root)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", real_nt)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative_status", real_status)
+        if lease is not None:
+            d._ytdl_release_dest_lease(lease)
+        if lease2 is not None:
+            d._ytdl_release_dest_lease(lease2)
+        # Prove the next real lease still opens after spies/restores.
+        probe = d._ytdl_acquire_dest_lease(str(dest / "after-probe"))
+        assert probe is not None, "CreateFileW/open_root left unusable after reparse test"
+        d._ytdl_release_dest_lease(probe)
+
+
+# ---------------------------------------------------------------------------
+# 46. UNC server/share must pass safe-component validation
+# ---------------------------------------------------------------------------
+
+def test_unc_server_share_component_validation(monkeypatch):
+    """UNC server and share validated as exact Windows components; invalid = no handles."""
+    import mchost.downloads as d
+
+    accept = [
+        r"\\server\share",
+        r"\\server\share\folder",
+        r"\\server.domain\share.name\a",
+        r"\\服务器\共享\folder",
+        r"\\srv-1\share_2",
+    ]
+    reject = [
+        r"\\server\share.\folder",
+        r"\\server\CON\folder",
+        r"\\server \share\folder",
+        r"\\server\share \folder",
+        r"\\.\share\folder",
+        r"\\..\share\folder",
+        r"\\server\..\folder",
+        r"\\server\.\folder",
+        r"\\server\PRN\x",
+        r"\\server\COM1\x",
+        r"\\server\NUL",
+        r"\\server\share:ads\x",
+        r"\\server:ads\share\x",
+        r"\\server\share.",
+        r"\\server \share",
+        r"\\ \share\x",
+        r"\\server\\folder",
+        r"\\server\share\..\x",
+        # Malformed UNC server: reserved name, trailing-dot, trailing-space.
+        r"\\CON\share\x",
+        r"\\server.\share\x",
+        r"\\server \share\x",
+    ]
+    for p in accept:
+        assert d._ytdl_split_dest_path(p) is not None, "expected accept: %r" % p
+        assert d._ytdl_is_allowed_dest_path(p) is True, p
+    for p in reject:
+        assert d._ytdl_split_dest_path(p) is None, "expected reject: %r" % p
+        assert d._ytdl_is_allowed_dest_path(p) is False, p
+
+    # Invalid UNC roots must not call CreateFileW / NtCreateFile.
+    calls = []
+    real_open_root = d._ytdl_open_path_root
+    real_nt = d._ytdl_nt_create_relative
+
+    def open_root_ban(root_display):
+        calls.append(("root", root_display))
+        raise AssertionError("root open must not run for invalid UNC")
+
+    def nt_ban(*a, **k):
+        calls.append(("nt", a[1] if len(a) > 1 else None))
+        raise AssertionError("NtCreateFile must not run for invalid UNC")
+
+    monkeypatch.setattr(d, "_ytdl_open_path_root", open_root_ban)
+    monkeypatch.setattr(d, "_ytdl_nt_create_relative", nt_ban)
+    try:
+        for p in (
+            r"\\server\share.\folder",
+            r"\\server\CON\folder",
+            r"\\server \share\folder",
+            r"\\CON\share\x",
+            r"\\server.\share\x",
+            r"\\server \share\x",
+        ):
+            assert d._ytdl_acquire_dest_lease(p) is None
+        assert calls == []
+    finally:
+        monkeypatch.setattr(d, "_ytdl_open_path_root", real_open_root)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", real_nt)
+
+
+# ---------------------------------------------------------------------------
+# 47. Nonterminated FileDirectoryInformation frames fail closed
+# ---------------------------------------------------------------------------
+
+def test_dir_info_nonterminated_frame_fail_closed(tmp_path, monkeypatch):
+    """NextEntryOffset landing at Information end without zero terminator is rejected."""
+    import ctypes
+    import shutil
+    import mchost.downloads as d
+
+    dest = tmp_path / "nonterm"
+    dest.mkdir()
+    api = d._ytdl_winapi()
+    real_ntc = d._ytdl_nt_create_relative
+    real_query = api.ntdll.NtQueryDirectoryFile
+    # header(64) + UTF-16 `.`(2) → pad to 8-aligned Information end at 72.
+    info_len = 72
+    assert info_len % 8 == 0
+    assert info_len >= d._YTDL_DIR_INFO_HEADER + 2
+
+    def build_dot_nonterm(buf_len, declared_info):
+        """Single `.` record: NextEntryOffset == Information, no zero-term final."""
+        raw = bytearray(buf_len)
+        name = ".".encode("utf-16-le")
+        assert len(name) == 2
+        raw[0:4] = int(declared_info).to_bytes(4, "little")
+        raw[60:64] = len(name).to_bytes(4, "little")
+        raw[64:64 + len(name)] = name
+        return bytes(raw), declared_info
+
+    def _iosb_obj(iosb):
+        # Python-replaced ctypes funcs receive byref as CArgObject with _obj.
+        if hasattr(iosb, "contents"):
+            return iosb.contents
+        return iosb._obj
+
+    lease = None
+    sh = None
+    sh2 = None
+    sd2 = None
+    try:
+        lease = d._ytdl_acquire_dest_lease(str(dest))
+        assert lease is not None
+
+        sh, _, sd = d._ytdl_create_stage_dir(lease)
+        assert sh and sd
+        with open(os.path.join(sd, "keep.mp4"), "wb") as f:
+            f.write(b"K")
+
+        def fake_query_empty(handle, evt, apc, apc_ctx, iosb, buf, length,
+                             info_class, single, name, restart):
+            raw, info = build_dot_nonterm(int(length), info_len)
+            ctypes.memmove(buf, raw, min(len(raw), int(length)))
+            obj = _iosb_obj(iosb)
+            obj.Status = 0
+            obj.Information = info
+            return 0
+
+        monkeypatch.setattr(api.ntdll, "NtQueryDirectoryFile", fake_query_empty)
+        empty = d._ytdl_dir_is_empty(sh, api)
+        # Current production accepts the nonterminated `.` frame as empty=True.
+        assert empty is not True, "nonterminated FileDirectoryInformation must fail closed"
+        d._ytdl_close_handle(sh)
+        sh = None
+
+        # Cleanup path: one nonterm page then NO_MORE_FILES so acceptance would
+        # wrongly succeed rather than only trip the query-budget limit.
+        opens = []
+
+        def no_open(*a, **k):
+            opens.append(a[1] if len(a) > 1 else None)
+            raise AssertionError("must not open on nonterminated frame: %r" % (opens[-1],))
+
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", real_ntc)
+        sh2, _, sd2 = d._ytdl_create_stage_dir(lease)
+        assert sh2 and sd2
+        with open(os.path.join(sd2, "keep.mp4"), "wb") as f:
+            f.write(b"K")
+
+        qstate = {"n": 0}
+
+        def fake_query_cleanup(handle, evt, apc, apc_ctx, iosb, buf, length,
+                               info_class, single, name, restart):
+            qstate["n"] += 1
+            obj = _iosb_obj(iosb)
+            if qstate["n"] > 1:
+                obj.Status = d._YTDL_STATUS_NO_MORE_FILES
+                obj.Information = 0
+                return d._YTDL_STATUS_NO_MORE_FILES
+            raw, info = build_dot_nonterm(int(length), info_len)
+            ctypes.memmove(buf, raw, min(len(raw), int(length)))
+            obj.Status = 0
+            obj.Information = info
+            return 0
+
+        monkeypatch.setattr(api.ntdll, "NtQueryDirectoryFile", fake_query_cleanup)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", no_open)
+        ok = d._ytdl_cleanup_stage_tree(sh2)
+        sh2 = None  # cleanup always consumes the stage handle
+        assert ok is False
+        # Parser must reject on the first malformed page; later queries mean
+        # acceptance of the nonterminated frame (or budget/disposition paths).
+        assert qstate["n"] == 1, (
+            "cleanup must stop after one malformed query, got n=%r" % qstate["n"]
+        )
+        assert opens == []
+        assert os.path.isfile(os.path.join(sd2, "keep.mp4"))
+    finally:
+        monkeypatch.setattr(api.ntdll, "NtQueryDirectoryFile", real_query)
+        monkeypatch.setattr(d, "_ytdl_nt_create_relative", real_ntc)
+        if sh is not None:
+            try:
+                d._ytdl_close_handle(sh)
+            except Exception:
+                pass
+        if sh2 is not None:
+            try:
+                d._ytdl_close_handle(sh2)
+            except Exception:
+                pass
+        if sd2 and os.path.isdir(sd2):
+            shutil.rmtree(sd2, ignore_errors=True)
+        if lease is not None:
+            d._ytdl_release_dest_lease(lease)
+
+
+# ---------------------------------------------------------------------------
+# 48. CloseHandle BOOL + exact-once; no double close on exception
+# ---------------------------------------------------------------------------
+
+def test_close_handle_bool_once_no_double_close(tmp_path, monkeypatch):
+    """CloseHandle FALSE/exception: cleanup false, one attempt; committed still done."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "closeonce"
+    dest.mkdir()
+    real_close = d._ytdl_close_handle
+    real_api = d._ytdl_winapi()
+    assert real_api is not None
+
+    # Unit: CloseHandle BOOL FALSE => helper reports False.
+    # Patch the Python winapi accessor only — never replace the shared k32 binding.
+    bool_calls = []
+
+    class _K32CloseFalse(object):
+        def CloseHandle(self, handle):
+            bool_calls.append(int(handle) if handle else None)
+            return 0  # BOOL FALSE
+
+        def __getattr__(self, name):
+            return getattr(real_api.k32, name)
+
+    class _ApiCloseFalse(object):
+        def __init__(self):
+            self.k32 = _K32CloseFalse()
+            self.ntdll = real_api.ntdll
+
+    monkeypatch.setattr(d, "_ytdl_winapi", lambda: _ApiCloseFalse())
+    try:
+        assert d._ytdl_close_handle(4242) is False
+        assert bool_calls == [4242]
+    finally:
+        monkeypatch.setattr(d, "_ytdl_winapi", lambda: real_api)
+
+    # Prove real handle open/close still works after the BOOL unit section.
+    probe = d._ytdl_acquire_dest_lease(str(dest))
+    assert probe is not None, "winapi left unusable after CloseHandle BOOL unit"
+    d._ytdl_release_dest_lease(probe)
+
+    # Stage cleanup: close helper reports False => cleanup must not claim success.
+    # Still perform the real OS close so the suite does not leak handles.
+    lease = None
+    sd = None
+    try:
+        lease = d._ytdl_acquire_dest_lease(str(dest))
+        assert lease is not None
+        sh, _, sd = d._ytdl_create_stage_dir(lease)
+        assert sh and sd
+        with open(os.path.join(sd, "x.mp4"), "wb") as f:
+            f.write(b"X")
+
+        close_calls = []
+
+        def close_report_false(handle):
+            if handle:
+                close_calls.append(int(handle))
+                real_close(handle)
+                return False
+            return True
+
+        monkeypatch.setattr(d, "_ytdl_close_handle", close_report_false)
+        try:
+            ok = d._ytdl_cleanup_stage_tree(sh)
+            assert ok is False
+            assert close_calls, "expected at least one close"
+            assert len(close_calls) == len(set(close_calls)), close_calls
+        finally:
+            monkeypatch.setattr(d, "_ytdl_close_handle", real_close)
+    finally:
+        if sd and os.path.isdir(sd):
+            try:
+                import shutil
+                shutil.rmtree(sd, ignore_errors=True)
+            except Exception:
+                pass
+        if lease is not None:
+            d._ytdl_release_dest_lease(lease)
+
+    # dispose_handle: injected exception must not retry the same raw handle.
+    dispose_calls = []
+
+    def close_raise_once(handle):
+        dispose_calls.append(int(handle) if handle is not None else None)
+        raise RuntimeError("close inject")
+
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_raise_once)
+    try:
+        d._ytdl_dispose_handle(77, delete=False)
+        assert dispose_calls == [77]
+    finally:
+        monkeypatch.setattr(d, "_ytdl_close_handle", real_close)
+
+    # Committed final: close failure after claim still yields done, no second close.
+    sent = []
+    payload = b"CLOSE-FINAL"
+    close_final_calls = []
+    armed = {"v": False}
+    real_commit = d._ytdl_commit_with_candidates
+
+    def commit_arm(source_handle, candidates, op=None, **kwargs):
+        path = real_commit(source_handle, candidates, op=op, **kwargs)
+        if path:
+            armed["v"] = True
+        return path
+
+    def close_post_claim(handle):
+        if not handle:
+            return True
+        hv = int(handle)
+        if armed["v"]:
+            close_final_calls.append(hv)
+            if close_final_calls.count(hv) > 1:
+                raise AssertionError("double close on %r" % (hv,))
+            # Best-effort fail: still release OS handle, report False once.
+            real_close(handle)
+            return False
+        return real_close(handle)
+
+    monkeypatch.setattr(d, "_ytdl_commit_with_candidates", commit_arm)
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_post_claim)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobCloseFinal", "attemptToken": "atk-cf",
+        "url": "https://example.test/v", "name": "final.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobCloseFinal")
+    assert term["type"] == "ytdl-done"
+    assert term["bytes"] == len(payload)
+    assert open(term["file"], "rb").read() == payload
+    assert not any(
+        m.get("type") == "ytdl-error" and m.get("id") == "jobCloseFinal" for m in sent
+    )
+    terminals = [
+        m for m in sent
+        if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == "jobCloseFinal"
+    ]
+    assert len(terminals) == 1
+    assert close_final_calls, "expected at least one post-claim final-handle close"
+    assert len(close_final_calls) == len(set(close_final_calls)), close_final_calls
+    assert d._PGET.get("jobCloseFinal") is None
