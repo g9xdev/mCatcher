@@ -803,6 +803,31 @@ function directGroupKey(url) {
   }
 }
 
+function hasLiveMediaKey(tabId, key) {
+  const keys = livePromotedKeys.get(tabId);
+  return !!keys && keys.has(key);
+}
+
+// Network and DOM are independent evidence producers for the same direct file.
+// Claim their shared tab-scoped identity at ingress so the controller receives
+// one source, while different directGroupKey values remain separate media.
+function claimLiveMediaKey(tabId, key, mediaId) {
+  liveControllerTabs.add(tabId);
+  const ids = liveControllerMediaIds.get(tabId) || new Set();
+  ids.add(mediaId);
+  liveControllerMediaIds.set(tabId, ids);
+  const keys = livePromotedKeys.get(tabId) || new Set();
+  keys.add(key);
+  livePromotedKeys.set(tabId, keys);
+
+  const map = mediaByTab.get(tabId);
+  const legacy = map && map.get(key);
+  if (legacy) {
+    map.delete(key);
+    liveNetworkEvidence.delete(legacy);
+  }
+}
+
 function addMedia(tabId, item, networkEvidence) {
   if (tabId < 0) return;
   // De-dup key collapses Low-Latency HLS reloads of one playlist (differing only
@@ -811,8 +836,7 @@ function addMedia(tabId, item, networkEvidence) {
   const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url)
             : item.kind === "direct" ? directGroupKey(item.url) : item.url;
   item.key = key;
-  const promoted = livePromotedKeys.get(tabId);
-  if (promoted && promoted.has(key)) return;
+  if (hasLiveMediaKey(tabId, key)) return;
   // Stash any audio-track playlist URL (even one we're about to suppress) so the
   // recorder can pair it with the video by directory.
   if (item.kind === "hls" && isAudioUrl(item.url)) rememberAudioTrack(tabId, item.url);
@@ -907,6 +931,9 @@ async function promoteLiveNetworkItem(tabId, key, item, variants) {
   const controller = liveController;
   const evidence = liveNetworkEvidence.get(item);
   if (!controller || !evidence) return false;
+  // A matching DOM report may have claimed this file while the network probe
+  // awaited I/O. Recheck after the await and before minting a second media ID.
+  if (hasLiveMediaKey(tabId, key)) return false;
   if (item.kind === "direct" && Array.isArray(item.mirrors)) {
     evidence.transport.mirrors = item.mirrors.slice();
   }
@@ -923,15 +950,7 @@ async function promoteLiveNetworkItem(tabId, key, item, variants) {
     catch (e) { dlog("live variant registration rejected", item.kind, e && e.message); }
   }
 
-  liveControllerTabs.add(tabId);
-  const ids = liveControllerMediaIds.get(tabId) || new Set();
-  ids.add(mediaId);
-  liveControllerMediaIds.set(tabId, ids);
-  const keys = livePromotedKeys.get(tabId) || new Set();
-  keys.add(key);
-  livePromotedKeys.set(tabId, keys);
-  const map = mediaByTab.get(tabId);
-  if (map && map.get(key) === item) map.delete(key);
+  claimLiveMediaKey(tabId, key, mediaId);
   liveNetworkEvidence.delete(item);
   return true;
 }
@@ -2654,22 +2673,22 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           if (item && item.kind === "direct" && msg.snapshot && liveController) {
             const mediaUrl = item.url;
-            let mediaOrigin = "";
-            try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
-            const mediaId = liveController.captureDomMedia({
-              mediaUrl,
-              mediaOrigin,
-              contentDisposition: null,
-              referrerUrl: typeof msg.referrerUrl === "string" ? msg.referrerUrl : "",
-              frameOrigin: typeof msg.frameOrigin === "string" ? msg.frameOrigin : "",
-              ts: Number.isFinite(item.ts) ? item.ts : 0,
-              snapshot: msg.snapshot,
-              transport: { mediaKind: "direct", requestHeaders: null },
-            });
-            liveControllerTabs.add(sender.tab.id);
-            const ids = liveControllerMediaIds.get(sender.tab.id) || new Set();
-            ids.add(mediaId);
-            liveControllerMediaIds.set(sender.tab.id, ids);
+            const key = directGroupKey(mediaUrl);
+            if (!hasLiveMediaKey(sender.tab.id, key)) {
+              let mediaOrigin = "";
+              try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
+              const mediaId = liveController.captureDomMedia({
+                mediaUrl,
+                mediaOrigin,
+                contentDisposition: null,
+                referrerUrl: typeof msg.referrerUrl === "string" ? msg.referrerUrl : "",
+                frameOrigin: typeof msg.frameOrigin === "string" ? msg.frameOrigin : "",
+                ts: Number.isFinite(item.ts) ? item.ts : 0,
+                snapshot: msg.snapshot,
+                transport: { mediaKind: "direct", requestHeaders: null },
+              });
+              claimLiveMediaKey(sender.tab.id, key, mediaId);
+            }
           } else {
             item.name = item.name || shortName(item.url);
             addMedia(sender.tab.id, item);

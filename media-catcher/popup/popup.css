@@ -975,15 +975,15 @@ html.rail .pane-title {
 .pane-title .linkish:hover { color: var(--accent); }
 .pane-title.sub { padding: 8px 4px 0; }
 
-.rail {
+.rail-scroll {
   overflow-y: auto;
   padding: 10px 12px 14px;
   display: flex; flex-direction: column; gap: 10px;
   scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
   scrollbar-width: thin;
 }
-.rail::-webkit-scrollbar { width: 7px; }
-.rail::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(255, 255, 255, 0.2); }
+.rail-scroll::-webkit-scrollbar { width: 7px; }
+.rail-scroll::-webkit-scrollbar-thumb { border-radius: 99px; background: rgba(255, 255, 255, 0.2); }
 
 /* An item currently being cast gets a cyan halo + a Casting chip. */
 .item.casting {

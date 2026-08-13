@@ -308,6 +308,50 @@ test("promotes a probed network direct item and merges opaque frozen controller 
   assert.equal(Object.isFrozen(h.popupRows.get(7)[0]), true, "background must copy, not mutate controller rows");
 });
 
+test("matching network and DOM direct detections reach the controller once in either order", async () => {
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const sender = {
+    tab: { id: 7, url: "https://site.example/watch", title: "Movie Night" },
+    frameId: 2,
+    documentId: "doc-7",
+    url: "https://frame.example/player",
+  };
+  const domMessage = {
+    type: "content-media",
+    item: { url: mediaUrl, kind: "direct", name: "movie.mp4", source: "dom" },
+    referrerUrl: sender.url,
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  };
+
+  const networkFirst = createHarness();
+  await settle();
+  emitNetwork(networkFirst, 7, mediaUrl, "video/mp4", "doc-7");
+  await eventually(() => networkFirst.captureNetwork.length === 1, "network direct promotion");
+  await networkFirst.send(domMessage, sender);
+  assert.equal(networkFirst.captureNetwork.length, 1);
+  assert.equal(networkFirst.captureDomMedia.length, 0, "matching DOM report must reuse network ownership");
+
+  const domFirst = createHarness();
+  await settle();
+  await domFirst.send(domMessage, sender);
+  assert.equal(domFirst.captureDomMedia.length, 1);
+  emitNetwork(domFirst, 7, mediaUrl, "video/mp4", "doc-7");
+  await settle();
+  await settle();
+  assert.equal(domFirst.captureNetwork.length, 0, "matching network report must reuse DOM ownership");
+
+  await domFirst.send(Object.assign({}, domMessage, {
+    item: {
+      url: "https://cdn.example/other/movie.mp4",
+      kind: "direct",
+      name: "movie.mp4",
+      source: "dom",
+    },
+  }), sender);
+  assert.equal(domFirst.captureDomMedia.length, 2, "different media URL remains a distinct row");
+});
+
 test("promotes only static non-DRM HLS and DASH and binds private quality sources", async () => {
   const h = createHarness();
   await settle();

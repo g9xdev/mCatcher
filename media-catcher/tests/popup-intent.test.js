@@ -495,6 +495,54 @@ function extractNamedFunction(source, name) {
   throw new Error("unbalanced braces for " + name);
 }
 
+function fakeClassList() {
+  const values = new Set();
+  return {
+    toggle(name, on) {
+      if (on) values.add(name);
+      else values.delete(name);
+    },
+    add(name) { values.add(name); },
+    contains(name) { return values.has(name); },
+    values() { return Array.from(values); },
+  };
+}
+
+test("popup layout mode never shares a class with the inner scroll container", () => {
+  const root = { classList: fakeClassList(), style: { width: "" } };
+  const sandbox = {
+    document: { documentElement: root },
+    localStorage: {
+      getItem(key) {
+        assert.equal(key, "mc-layout");
+        return JSON.stringify({ rail: true, w: 640, cast: false });
+      },
+    },
+    JSON,
+  };
+  const source = readPopupSource();
+  vm.runInNewContext(
+    extractNamedFunction(source, "primeLayout") + "\nthis.primeLayout = primeLayout;",
+    sandbox
+  );
+
+  sandbox.primeLayout();
+
+  const popupHtml = fs.readFileSync(path.join(mediaCatcherRoot, "popup", "popup.html"), "utf8");
+  const scrollTag = popupHtml.match(/<[^>]*\bid=["']rail["'][^>]*>/i);
+  assert.ok(scrollTag, "inner rail element exists");
+  const classAttr = scrollTag[0].match(/\bclass=["']([^"']*)["']/i);
+  assert.ok(classAttr, "inner rail element has a class");
+  const scrollClasses = new Set(classAttr[1].trim().split(/\s+/).filter(Boolean));
+  for (const modeClass of root.classList.values()) {
+    assert.equal(
+      scrollClasses.has(modeClass),
+      false,
+      "root layout mode must not turn the document into the inner scroll container"
+    );
+  }
+});
+
 function loadPopupRenderHarness() {
   const source = readPopupSource();
   const starts = [];
