@@ -48,7 +48,7 @@ if _m is not None:
 
 import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 # ---- stdio framing: moved to mchost/nm.py (Task C1) ----------------------
 # The IN/OUT globals stay OWNED by nm (init_io rebinds them there; a shim copy
