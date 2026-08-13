@@ -670,6 +670,58 @@ test("controller media progress binds by mediaId identity", () => {
   assert.equal(h.progress[0].el, h.listEl.children[0]);
 });
 
+test("live-jobs-updated refreshes opaque queue and row progress while ignoring malformed jobs", () => {
+  const source = readPopupSource();
+  const row = { id: "url-free-row" };
+  const progress = [];
+  let queueRenders = 0;
+  const sandbox = {
+    downloadState: new Map([
+      ["job:old:1", { id: "job:old:1", mediaId: "media:old:1", state: "running" }],
+      [77, { id: 77, url: "https://cdn.example/legacy.mp4", status: "downloading" }],
+    ]),
+    itemDownloadId: new Map([["id:media:old:1", "job:old:1"]]),
+    itemElements: new Map([["id:media:m5:1", row]]),
+    renderProgress: (el, download) => progress.push({ el, download }),
+    renderQueue: () => { queueRenders += 1; },
+  };
+  const pieces = ["isSafeOpaqueId", "applyLiveJobsUpdate"]
+    .map((name) => extractNamedFunction(source, name));
+  vm.runInNewContext(
+    pieces.join("\n") + "\nthis.applyLiveJobsUpdate = applyLiveJobsUpdate;",
+    sandbox
+  );
+  const hostile = {};
+  Object.defineProperty(hostile, "id", { get() { throw new Error("hostile getter"); } });
+  const liveJob = {
+    id: "job:j5:1",
+    mediaId: "media:m5:1",
+    state: "running",
+    requestedFilename: "episode.mp4",
+  };
+
+  assert.doesNotThrow(() => sandbox.applyLiveJobsUpdate({
+    type: "live-jobs-updated",
+    jobs: [
+      null,
+      42,
+      {},
+      { id: "https://unsafe.example/job", mediaId: "media:m5:1" },
+      { id: "job:missing-media:1" },
+      hostile,
+      liveJob,
+    ],
+  }));
+
+  assert.equal(sandbox.downloadState.has("job:old:1"), false);
+  assert.equal(sandbox.downloadState.get(77).status, "downloading", "legacy queue entry stays intact");
+  assert.equal(sandbox.downloadState.get(liveJob.id), liveJob);
+  assert.equal(sandbox.itemDownloadId.has("id:media:old:1"), false);
+  assert.equal(sandbox.itemDownloadId.get("id:media:m5:1"), liveJob.id);
+  assert.deepEqual(progress, [{ el: row, download: liveJob }]);
+  assert.equal(queueRenders, 1);
+});
+
 function loadStartDownload(deps) {
   const src = extractNamedFunction(readPopupSource(), "startDownload");
   const sandbox = Object.assign(

@@ -26,6 +26,41 @@ function downloadItemIdentity(download) {
   return null;
 }
 
+function applyLiveJobsUpdate(msg) {
+  if (!msg || !Array.isArray(msg.jobs)) return;
+
+  const valid = [];
+  for (const job of msg.jobs) {
+    try {
+      if (!job || typeof job !== "object" ||
+          !isSafeOpaqueId(job.id) || !isSafeOpaqueId(job.mediaId)) continue;
+      valid.push({ job, id: job.id, identity: "id:" + job.mediaId });
+    } catch (e) {
+      // Ignore malformed/hostile entries without disturbing the valid snapshot.
+    }
+  }
+
+  // This message is a full controller snapshot. Remove only controller jobs;
+  // legacy URL-backed downloads continue to be owned by download-update.
+  for (const [id, existing] of downloadState) {
+    let identity = null;
+    try {
+      if (existing && isSafeOpaqueId(existing.mediaId)) identity = "id:" + existing.mediaId;
+    } catch (e) {}
+    if (!identity) continue;
+    downloadState.delete(id);
+    if (itemDownloadId.get(identity) === id) itemDownloadId.delete(identity);
+  }
+
+  for (const entry of valid) {
+    downloadState.set(entry.id, entry.job);
+    itemDownloadId.set(entry.identity, entry.id);
+    const el = itemElements.get(entry.identity);
+    if (el) renderProgress(el, entry.job);
+  }
+  renderQueue();
+}
+
 // Web Crypto user-action token — minted only on Download / Save-As Confirm / Use Firefox click.
 function mintUserActionToken() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -1626,6 +1661,8 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg.type === "helper-status") {
     if (msg.helper) helperStatus = msg.helper;
     renderHelperBadge();
+  } else if (msg.type === "live-jobs-updated") {
+    applyLiveJobsUpdate(msg);
   } else if (msg.type === "download-update") {
     const dl = msg.download;
     downloadState.set(dl.id, dl);
