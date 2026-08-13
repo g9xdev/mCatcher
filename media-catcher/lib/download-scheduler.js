@@ -267,7 +267,7 @@
 
     function projectJob(job) {
       // Safe allowlist — never ephemeral, cookies, headers, signed URLs, mediaOrigin,
-      // drainingAttemptToken, or pendingDrainTerminal.
+      // drainingAttemptToken, pendingDrainTerminal, or drainTransportUnavailable.
       // inFlightPermits is the exact sum of wrapper-owned + observation-adapter counts.
       return deepFreeze({
         id: job.id,
@@ -293,6 +293,7 @@
       if (!job) return;
       job.drainingAttemptToken = null;
       job.pendingDrainTerminal = null;
+      job.drainTransportUnavailable = false;
     }
 
     /**
@@ -602,16 +603,20 @@
     /**
      * Apply a once-accepted private draining terminal after full permit/native
      * quiescence. Pausing jobs are non-owners — never mutates ProviderGate ownership.
+     * Precedence: cancelRequested > completed > drainTransportUnavailable > outcome class.
      */
     function settleDrainingTerminal(job) {
       if (!job || job.state !== "pausing_provider") return false;
       var outcome = job.pendingDrainTerminal;
       if (!outcome || typeof outcome !== "object") return false;
+      // Capture private unavailable-during-drain before clearing private drain state.
+      var transportUnavailable = job.drainTransportUnavailable === true;
       // Consume pending exactly once.
       job.pendingDrainTerminal = null;
       job.drainingAttemptToken = null;
+      job.drainTransportUnavailable = false;
 
-      // User cancel wins over any stored native terminal.
+      // User cancel wins over any stored native terminal (and over unavailable).
       if (job.cancelRequested === true) {
         releaseSlotIfHeld(job);
         removeFromWaitQueue(job);
@@ -628,6 +633,8 @@
       var status = outcome.status;
 
       if (status === "completed") {
+        // Completed/committed is the semantic terminal even if the helper
+        // disconnected while wrapper/observed permits still drained.
         releaseSlotIfHeld(job);
         removeFromWaitQueue(job);
         removeFromQueue(job);
@@ -637,6 +644,14 @@
         job.attemptToken = null;
         job.consumeRetryOnWake = false;
         clearEphemeralOnce(job);
+        drain();
+        return true;
+      }
+
+      // Helper unavailable during drain: non-success pending outcomes park
+      // needs_user once fully quiescent. No wake, no retry charge, no Firefox.
+      if (transportUnavailable) {
+        enterNeedsUser(job);
         drain();
         return true;
       }
@@ -703,6 +718,22 @@
           releaseSlotIfHeld(job);
           appendWaitFifo(job);
           maybeAuthorizeReadyWaiter(job);
+          drain();
+          return true;
+        }
+
+        // failed + failureCategory cancelled: permanent-class terminal failed.
+        // Distinct from status cancelled (pause-control ack → waiting_provider).
+        if (category === "cancelled") {
+          releaseSlotIfHeld(job);
+          removeFromWaitQueue(job);
+          removeFromQueue(job);
+          clearRetryDeadline(job);
+          job.state = "failed";
+          job.stateVersion += 1;
+          job.attemptToken = null;
+          job.consumeRetryOnWake = false;
+          clearEphemeralOnce(job);
           drain();
           return true;
         }
@@ -1560,6 +1591,9 @@
         // while public attemptToken is nulled in pausing_provider. Never projected.
         drainingAttemptToken: null,
         pendingDrainTerminal: null,
+        // Private: helper disconnected after an authenticated pending drain
+        // terminal was accepted. Never projected or echoed in errors.
+        drainTransportUnavailable: false,
       };
       jobs.set(id, job);
       jobOrder.push(id);
@@ -2115,7 +2149,29 @@
         return false;
       }
       job.nativeOpenConnections = 0;
-      // Physical transport is gone: private draining identity is no longer valid.
+
+      // Authenticated pending drain terminal is the one semantic terminal for this
+      // physical attempt. Helper disconnect must not erase or overwrite it.
+      // Record a private unavailable-during-drain condition and settle only after
+      // full physical quiescence (maybeQuiesce → settleDrainingTerminal).
+      if (job.state === "pausing_provider" && job.pendingDrainTerminal != null) {
+        if (job.drainTransportUnavailable === true) {
+          // Duplicate unavailable while already recorded: false no-op.
+          return false;
+        }
+        job.drainTransportUnavailable = true;
+        // Residual private token is no longer needed; pending outcome is authoritative.
+        job.drainingAttemptToken = null;
+        if (!isQuiescent(job)) {
+          // Wrapper/observed permits remain: stay pausing, keep slot, preserve pending.
+          return true;
+        }
+        // Fully quiescent: settle via unified precedence (cancel > completed > unavailable).
+        settleDrainingTerminal(job);
+        return true;
+      }
+
+      // No pending authenticated outcome: private draining identity is invalid.
       clearDrainingState(job);
 
       // Authenticated saturated/recovering owner: confirmed release with no recovery
