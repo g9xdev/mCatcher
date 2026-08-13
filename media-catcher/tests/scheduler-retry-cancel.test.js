@@ -186,6 +186,7 @@ test("Firefox handoff callback receives the consumed immutable true intent", asy
   await s.requestFirefoxHandoff("j", handoffIntent);
 
   assert.equal(adapterInput.intent, handoffIntent);
+  assert.equal(adapterInput.jobId, "j");
   assert.equal(Object.isFrozen(adapterInput.intent), true);
   assert.equal(adapterInput.intent.userSelectedFirefox, true);
   assert.equal(popupTokenStore.has("j"), false);

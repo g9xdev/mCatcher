@@ -3180,6 +3180,7 @@
           sourceHandle = job.ephemeral;
         }
         var adapterInput = Object.freeze({
+          jobId: job.id,
           filename: job.intent.requestedFilename,
           saveAs: true,
           intent: handoffIntent,
