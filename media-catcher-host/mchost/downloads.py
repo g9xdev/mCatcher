@@ -15,6 +15,7 @@ subprocess is the GLOBAL module object, so the test suite's
 setattr(mc_host.subprocess, "Popen", ...) patch is seen here too.
 """
 import concurrent.futures
+import ctypes
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from ctypes import wintypes
 
 
 def _h():
@@ -1048,321 +1050,920 @@ def _ytdl_escape_outtmpl(path):
     return (path or "").replace("%", "%%")
 
 
-def _ytdl_paths_same(a, b):
-    try:
-        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
-    except Exception:
-        return False
+# ---- Structured yt-dlp: Windows handle-owned stage/commit/cleanup ------------
+# Pathname hardlink / O_EXCL-copy / lstat-unlink promotion is intentionally gone.
+# Token-bound structured commits pin destination + stage + source by handle and
+# rename with ntdll NtSetInformationFile(FileRenameInformation) only.
+
+_YTDL_WIN = None
+_YTDL_WIN_LOCK = threading.Lock()
+_YTDL_DEST_LOCK = threading.Lock()
+_YTDL_DEST_LEASES = {}  # canonical path key -> lease dict
+
+# NTSTATUS / Win32 constants used by the structured path.
+_YTDL_STATUS_SUCCESS = 0
+_YTDL_STATUS_NO_MORE_FILES = 0x80000006
+_YTDL_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+_YTDL_STATUS_BUFFER_OVERFLOW = 0x80000005
+_YTDL_STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+
+_YTDL_DELETE = 0x00010000
+_YTDL_SYNCHRONIZE = 0x00100000
+_YTDL_FILE_LIST_DIRECTORY = 0x0001
+_YTDL_FILE_ADD_FILE = 0x0002
+_YTDL_FILE_TRAVERSE = 0x0020
+_YTDL_FILE_READ_ATTRIBUTES = 0x0080
+_YTDL_FILE_READ_DATA = 0x0001
+_YTDL_FILE_SHARE_READ = 0x00000001
+_YTDL_FILE_SHARE_WRITE = 0x00000002
+_YTDL_OPEN_EXISTING = 3
+_YTDL_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_YTDL_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_YTDL_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_YTDL_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_YTDL_FILE_ATTRIBUTE_NORMAL = 0x00000080
+
+_YTDL_FILE_DIRECTORY_FILE = 0x00000001
+_YTDL_FILE_NON_DIRECTORY_FILE = 0x00000040
+_YTDL_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_YTDL_FILE_OPEN_REPARSE_POINT = 0x00200000
+_YTDL_FILE_CREATE = 2
+_YTDL_FILE_OPEN = 1
+_YTDL_OBJ_CASE_INSENSITIVE = 0x00000040
+
+_YTDL_FileStandardInfo = 1
+_YTDL_FileDispositionInfo = 4
+_YTDL_FileAttributeTagInfo = 9
+_YTDL_FileNamesInformation = 12
+_YTDL_FileIdInfo = 18
+_YTDL_FileRenameInformation = 10  # NtSetInformationFile class (not Win32 FileRenameInfo=3)
+_YTDL_INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 
-def _ytdl_file_identity(st):
-    """Stable (dev, ino) identity from a stat_result, or None if unusable."""
-    try:
-        dev = st.st_dev
-        ino = st.st_ino
-        if type(dev) is not int or type(ino) is not int:
-            return None
-        # ino 0 is not a reliable unique identity on some platforms.
-        if ino == 0:
-            return None
-        return (dev, ino)
-    except Exception:
-        return None
+class _YTDL_UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", ctypes.c_void_p),
+    ]
 
 
-def _ytdl_snapshot_path_identity(path):
-    """lstat identity for path, or None."""
-    try:
-        return _ytdl_file_identity(os.lstat(path))
-    except Exception:
-        return None
+class _YTDL_OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.ULONG),
+        ("RootDirectory", wintypes.HANDLE),
+        ("ObjectName", ctypes.POINTER(_YTDL_UNICODE_STRING)),
+        ("Attributes", wintypes.ULONG),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    ]
 
 
-def _ytdl_unlink_if_identity(path, identity):
-    """Unlink path only when its current lstat identity still matches.
+class _YTDL_IO_STATUS_BLOCK(ctypes.Structure):
+    _fields_ = [
+        ("Status", ctypes.c_long),
+        ("Information", ctypes.c_size_t),
+    ]
 
-    Used after ownership of a just-created final is established (promote) so
-    verify/claim failures clean only the operation-created file, never a
-    replacement/competitor that later occupied the same pathname.
+
+class _YTDL_FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+    _fields_ = [
+        ("FileAttributes", wintypes.DWORD),
+        ("ReparseTag", wintypes.DWORD),
+    ]
+
+
+class _YTDL_FILE_STANDARD_INFO(ctypes.Structure):
+    _fields_ = [
+        ("AllocationSize", ctypes.c_longlong),
+        ("EndOfFile", ctypes.c_longlong),
+        ("NumberOfLinks", wintypes.DWORD),
+        ("DeletePending", wintypes.BOOLEAN),
+        ("Directory", wintypes.BOOLEAN),
+    ]
+
+
+class _YTDL_FILE_ID_INFO(ctypes.Structure):
+    _fields_ = [
+        ("VolumeSerialNumber", ctypes.c_ulonglong),
+        ("FileId", ctypes.c_ubyte * 16),
+    ]
+
+
+class _YTDL_FILE_DISPOSITION_INFO(ctypes.Structure):
+    _fields_ = [
+        ("DeleteFile", wintypes.BOOLEAN),
+    ]
+
+
+class _YTDL_FILE_RENAME_INFORMATION(ctypes.Structure):
+    """Prefix layout for Nt FileRenameInformation (class 10).
+
+    On x64: ReplaceIfExists@0, RootDirectory@8, FileNameLength@16, FileName@20.
     """
-    if not path or type(path) is not str or not identity:
+    _fields_ = [
+        ("ReplaceIfExists", ctypes.c_ubyte),
+        ("RootDirectory", wintypes.HANDLE),
+        ("FileNameLength", wintypes.ULONG),
+        ("FileName", wintypes.WCHAR * 1),
+    ]
+
+
+class _YTDL_FILE_NAMES_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("NextEntryOffset", wintypes.ULONG),
+        ("FileIndex", wintypes.ULONG),
+        ("FileNameLength", wintypes.ULONG),
+        ("FileName", wintypes.WCHAR * 1),
+    ]
+
+
+def _ytdl_rename_info_offsets():
+    """Portable FILE_RENAME_INFORMATION field offsets for tests/ABI checks."""
+    return {
+        "ReplaceIfExists": _YTDL_FILE_RENAME_INFORMATION.ReplaceIfExists.offset,
+        "RootDirectory": _YTDL_FILE_RENAME_INFORMATION.RootDirectory.offset,
+        "FileNameLength": _YTDL_FILE_RENAME_INFORMATION.FileNameLength.offset,
+        "FileName": _YTDL_FILE_RENAME_INFORMATION.FileName.offset,
+        "sizeof_prefix": ctypes.sizeof(_YTDL_FILE_RENAME_INFORMATION),
+    }
+
+
+def _ytdl_build_rename_buffer(root_handle, leaf):
+    """Build an Nt FileRenameInformation buffer for a relative leaf rename.
+
+    FileNameLength is the exact UTF-16LE byte count excluding any terminator.
+    ReplaceIfExists is zero (no-replace). RootDirectory is the pinned dest handle.
+    """
+    if type(leaf) is not str:
+        raise TypeError("leaf")
+    enc = leaf.encode("utf-16-le")
+    off = _YTDL_FILE_RENAME_INFORMATION.FileName.offset
+    size = max(ctypes.sizeof(_YTDL_FILE_RENAME_INFORMATION), off + len(enc))
+    buf = ctypes.create_string_buffer(size)
+    # ReplaceIfExists already 0; store RootDirectory + FileNameLength portably.
+    root_v = wintypes.HANDLE(int(root_handle))
+    ctypes.memmove(
+        ctypes.addressof(buf) + _YTDL_FILE_RENAME_INFORMATION.RootDirectory.offset,
+        ctypes.byref(root_v),
+        ctypes.sizeof(wintypes.HANDLE),
+    )
+    flen = wintypes.ULONG(len(enc))
+    ctypes.memmove(
+        ctypes.addressof(buf) + _YTDL_FILE_RENAME_INFORMATION.FileNameLength.offset,
+        ctypes.byref(flen),
+        ctypes.sizeof(wintypes.ULONG),
+    )
+    if enc:
+        ctypes.memmove(ctypes.addressof(buf) + off, enc, len(enc))
+    return buf, size, len(enc), enc
+
+
+def _ytdl_is_safe_relative_leaf(name):
+    """True for a single built-in nonblank control-free path leaf (no ADS/traversal)."""
+    if type(name) is not str or not name or not name.strip():
+        return False
+    if not _ytdl_control_free_str(name):
+        return False
+    if name in (".", ".."):
+        return False
+    if "/" in name or "\\" in name or "\x00" in name:
+        return False
+    if ":" in name:  # ADS / drive-qualified
+        return False
+    if name.rstrip(" .") != name:
+        return False
+    return True
+
+
+def _ytdl_is_local_abs_win_path(path):
+    """Built-in absolute local Windows path; UNC/network shapes fail closed."""
+    if type(path) is not str or not path.strip():
+        return False
+    if not _ytdl_control_free_str(path):
         return False
     try:
-        cur = _ytdl_file_identity(os.lstat(path))
-        if cur is None or cur != identity:
+        if not os.path.isabs(path):
             return False
-        os.unlink(path)
+    except Exception:
+        return False
+    # Reject UNC \\server\share and //server/share (no network path support).
+    if path.startswith("\\\\") or path.startswith("//"):
+        # Allow long-path local \\?\C:\... only.
+        if path.startswith("\\\\?\\") and len(path) > 6 and path[5] == ":" and path[4].isalpha():
+            return True
+        if path.startswith("\\\\.\\"):
+            return False
+        return False
+    # Drive-letter absolute: C:\...
+    if len(path) >= 3 and path[1] == ":" and path[0].isalpha() and path[2] in "\\/":
         return True
+    return False
+
+
+def _ytdl_canon_path_key(path):
+    try:
+        return os.path.normcase(os.path.abspath(path))
+    except Exception:
+        return None
+
+
+class _YtdlWinApi:
+    """Lazy kernel32/ntdll binding. Import of downloads.py must stay non-Windows-safe."""
+
+    def __init__(self):
+        self.k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+        self.k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        self.k32.CreateFileW.restype = wintypes.HANDLE
+
+        self.k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.k32.CloseHandle.restype = wintypes.BOOL
+
+        self.k32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        self.k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+
+        self.k32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        self.k32.SetFileInformationByHandle.restype = wintypes.BOOL
+
+        self.k32.GetFinalPathNameByHandleW.argtypes = [
+            wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        ]
+        self.k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+
+        self.ntdll.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG,
+            ctypes.POINTER(_YTDL_OBJECT_ATTRIBUTES),
+            ctypes.POINTER(_YTDL_IO_STATUS_BLOCK),
+            ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG,
+            wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+        ]
+        self.ntdll.NtCreateFile.restype = ctypes.c_long
+
+        self.ntdll.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_YTDL_IO_STATUS_BLOCK),
+            ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG,
+        ]
+        self.ntdll.NtSetInformationFile.restype = ctypes.c_long
+
+        self.ntdll.NtQueryDirectoryFile.argtypes = [
+            wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(_YTDL_IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
+            wintypes.ULONG, wintypes.BOOLEAN, ctypes.POINTER(_YTDL_UNICODE_STRING),
+            wintypes.BOOLEAN,
+        ]
+        self.ntdll.NtQueryDirectoryFile.restype = ctypes.c_long
+
+        self.ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
+        self.ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+
+
+def _ytdl_winapi():
+    """Return the shared WinAPI wrapper, or None if unavailable on this host."""
+    global _YTDL_WIN
+    if _YTDL_WIN is not None:
+        return _YTDL_WIN if _YTDL_WIN is not False else None
+    with _YTDL_WIN_LOCK:
+        if _YTDL_WIN is not None:
+            return _YTDL_WIN if _YTDL_WIN is not False else None
+        if os.name != "nt":
+            _YTDL_WIN = False
+            return None
+        try:
+            _YTDL_WIN = _YtdlWinApi()
+        except Exception:
+            _YTDL_WIN = False
+            return None
+        return _YTDL_WIN
+
+
+def _ytdl_close_handle(handle):
+    if not handle:
+        return
+    api = _ytdl_winapi()
+    if not api:
+        return
+    try:
+        api.k32.CloseHandle(wintypes.HANDLE(int(handle)))
+    except Exception:
+        pass
+
+
+def _ytdl_set_disposition_delete(handle):
+    """Mark the exact held object for delete-on-close. Never path-based."""
+    if not handle:
+        return False
+    api = _ytdl_winapi()
+    if not api:
+        return False
+    info = _YTDL_FILE_DISPOSITION_INFO()
+    info.DeleteFile = True
+    try:
+        ok = api.k32.SetFileInformationByHandle(
+            wintypes.HANDLE(int(handle)),
+            _YTDL_FileDispositionInfo,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        return bool(ok)
     except Exception:
         return False
 
 
-def _ytdl_cleanup_exclusive_fd(fd, path):
-    """Remove only the file object this exclusive fd created.
-
-    Snapshot identity from the still-open fd, close (required on Windows before
-    a path unlink can succeed), then unlink the path only if lstat identity
-    still matches. A replacement planted after close is left untouched.
-    """
-    if fd is None:
-        return
-    ident = None
-    try:
-        ident = _ytdl_file_identity(os.fstat(fd))
-    except Exception:
-        ident = None
-    try:
-        os.close(fd)
-    except Exception:
-        pass
-    if ident is None or not path or type(path) is not str:
-        return
-    try:
-        cur = _ytdl_file_identity(os.lstat(path))
-        if cur is None or cur != ident:
-            return
-        os.unlink(path)
-    except Exception:
-        pass
-
-
-def _ytdl_write_all(fd, data):
-    """Write every byte of data to fd. Raises OSError on incomplete/hostile counts."""
-    if data is None:
-        raise OSError("write requires bytes")
-    # memoryview handles bytes/bytearray and supports offset slicing without copy.
-    view = memoryview(data)
-    total = len(view)
-    offset = 0
-    while offset < total:
-        try:
-            n = os.write(fd, view[offset:])
-        except Exception:
-            raise
-        # Reject bool (int subclass), non-int, zero, negative, and overlarge.
-        if type(n) is not int or n <= 0 or n > (total - offset):
-            raise OSError("incomplete or invalid write count")
-        offset += n
-    return total
-
-
-def _ytdl_try_exclusive_place(src, target):
-    """Place src at target only when target is absent (atomic no-clobber).
-
-    Prefers same-filesystem hardlink (create-if-absent), then exclusive-create
-    + full copy with short-write looping. Never uses exists-then-replace.
-    Unlinks the staging source only after a verified full place. On copy
-    failure, cleans only the exclusive file this operation created (identity
-    fenced). Returns target on success, else None. Staging source is preserved
-    on failure for owned-stage cleanup.
-    """
-    if not src or not target or type(src) is not str or type(target) is not str:
+def _ytdl_query_tag_std(handle):
+    """Return (attrs, is_dir, delete_pending, is_reparse) or None."""
+    api = _ytdl_winapi()
+    if not api or not handle:
         return None
+    tag = _YTDL_FILE_ATTRIBUTE_TAG_INFO()
+    std = _YTDL_FILE_STANDARD_INFO()
     try:
-        parent = os.path.dirname(target)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-    except Exception:
-        return None
-
-    try:
-        src_size = os.path.getsize(src)
-        if type(src_size) is not int or src_size < 0:
+        if not api.k32.GetFileInformationByHandleEx(
+            wintypes.HANDLE(int(handle)), _YTDL_FileAttributeTagInfo,
+            ctypes.byref(tag), ctypes.sizeof(tag),
+        ):
+            return None
+        if not api.k32.GetFileInformationByHandleEx(
+            wintypes.HANDLE(int(handle)), _YTDL_FileStandardInfo,
+            ctypes.byref(std), ctypes.sizeof(std),
+        ):
             return None
     except Exception:
         return None
+    attrs = int(tag.FileAttributes)
+    is_reparse = bool(attrs & _YTDL_FILE_ATTRIBUTE_REPARSE_POINT)
+    is_dir = bool(std.Directory) or bool(attrs & _YTDL_FILE_ATTRIBUTE_DIRECTORY)
+    delete_pending = bool(std.DeletePending)
+    return attrs, is_dir, delete_pending, is_reparse, std
 
-    # Hardlink: atomic create-if-absent on the same filesystem.
+
+def _ytdl_query_file_id(handle):
+    api = _ytdl_winapi()
+    if not api or not handle:
+        return None
+    info = _YTDL_FILE_ID_INFO()
     try:
-        os.link(src, target)
-        try:
-            dst_size = os.path.getsize(target)
-            if dst_size != src_size:
-                raise OSError("hardlink size mismatch")
-        except Exception:
-            try:
-                if os.path.isfile(target):
-                    os.unlink(target)
-            except Exception:
-                pass
+        if not api.k32.GetFileInformationByHandleEx(
+            wintypes.HANDLE(int(handle)), _YTDL_FileIdInfo,
+            ctypes.byref(info), ctypes.sizeof(info),
+        ):
             return None
-        try:
-            os.unlink(src)
-        except Exception:
-            pass
-        return target if os.path.isfile(target) else None
-    except FileExistsError:
-        return None
-    except OSError:
-        pass  # unsupported / cross-device — fall through
-
-    # Exclusive create + copy fallback (never truncates an existing path).
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    fd = None
-    try:
-        fd = os.open(target, flags, 0o644)
-        written = 0
-        with open(src, "rb") as rf:
-            while True:
-                chunk = rf.read(1024 * 1024)
-                if not chunk:
-                    break
-                written += _ytdl_write_all(fd, chunk)
-        # Verify full copy via fd size before releasing the exclusive handle.
-        st_fd = os.fstat(fd)
-        if type(st_fd.st_size) is not int or st_fd.st_size != src_size or written != src_size:
-            raise OSError("copied size mismatch")
-        # Path must still name the file we hold open.
-        st_path = os.lstat(target)
-        if _ytdl_file_identity(st_fd) != _ytdl_file_identity(st_path):
-            raise OSError("exclusive target identity mismatch")
-        if st_path.st_size != src_size:
-            raise OSError("path size mismatch")
-        os.close(fd)
-        fd = None
-        # Only now is it safe to drop the complete staging source.
-        try:
-            os.unlink(src)
-        except Exception:
-            pass
-        return target if os.path.isfile(target) else None
-    except FileExistsError:
-        return None
-    except Exception:
-        if fd is not None:
-            _ytdl_cleanup_exclusive_fd(fd, target)
-            fd = None
-        return None
-
-
-def _ytdl_promote_to_target(src, target, max_attempts=32):
-    """Promote staging src onto target or a bounded dedup sibling without clobber.
-
-    Never overwrites a pre-existing final (including symlink/junction paths).
-    Returns the actual path on success, or None when promotion/validation fails.
-    """
-    if not src or not target or type(src) is not str or type(target) is not str:
-        return None
-    try:
-        if not os.path.isfile(src):
-            return None
-        if _ytdl_paths_same(src, target):
-            return target if os.path.isfile(target) else src
     except Exception:
         return None
+    serial = int(info.VolumeSerialNumber)
+    fid = bytes(info.FileId)
+    if serial == 0 and fid == b"\x00" * 16:
+        return None
+    return serial, fid
 
-    root, ext = os.path.splitext(target)
-    candidates = [target]
-    for n in range(1, max(1, int(max_attempts))):
-        candidates.append("%s (%d)%s" % (root, n, ext))
 
-    for cand in candidates:
-        placed = _ytdl_try_exclusive_place(src, cand)
-        if placed:
-            return placed
+def _ytdl_final_path(handle):
+    """Optional diagnostic GetFinalPathNameByHandleW; never vetoes a commit."""
+    api = _ytdl_winapi()
+    if not api or not handle:
+        return None
+    try:
+        buflen = 512
+        while buflen <= 32768:
+            buf = ctypes.create_unicode_buffer(buflen)
+            n = api.k32.GetFinalPathNameByHandleW(
+                wintypes.HANDLE(int(handle)), buf, buflen, 0
+            )
+            if n == 0:
+                return None
+            if n < buflen:
+                return buf.value
+            buflen = int(n) + 2
+    except Exception:
+        return None
     return None
 
 
-def _ytdl_owned_stage_source(filepath, stage_dir):
-    """Accept only an exact built-in nonblank path wholly inside stage_dir.
+def _ytdl_paths_compatible(requested_abs, final_path):
+    """Best-effort check that a final path names the same local location."""
+    if type(requested_abs) is not str or type(final_path) is not str:
+        return False
+    try:
+        a = os.path.normcase(os.path.abspath(requested_abs))
+        b = final_path
+        if b.startswith("\\\\?\\"):
+            b = b[4:]
+        if b.startswith("\\\\?\\UNC\\"):
+            return False
+        b = os.path.normcase(os.path.abspath(b))
+        return a == b
+    except Exception:
+        return False
 
-    Policy: the @@FILE@@ path must be a real regular non-symlink file that is a
-    strict descendant of this operation's unique stage directory (canonical
-    commonpath containment with component boundaries). The intended stage
-    output basename is preferred, but a legitimate yt-dlp merge/remux
-    descendant inside the same stage dir is also accepted. Rejects traversal,
-    sibling-prefix dirs, relative escape, symlink/junction/reparse escape,
-    the stage directory itself, blank paths, and non-str hostile shapes.
-    Returns the canonical source path on success, else None. Never coerces.
+
+def _ytdl_make_unicode_string(leaf, keep):
+    """Build UNICODE_STRING for a relative leaf; keep holds the buffer alive."""
+    buf = ctypes.create_unicode_buffer(leaf)
+    us = _YTDL_UNICODE_STRING()
+    us.Length = len(leaf) * 2
+    us.MaximumLength = us.Length + 2
+    us.Buffer = ctypes.addressof(buf)
+    keep.append(buf)
+    return us
+
+
+def _ytdl_nt_create_relative(
+    root_handle, leaf, desired_access, share_access, create_disposition, create_options,
+    file_attributes=0,
+):
+    """NtCreateFile relative to root_handle for a single safe leaf. Returns handle or None."""
+    api = _ytdl_winapi()
+    if not api or not root_handle:
+        return None
+    if not _ytdl_is_safe_relative_leaf(leaf):
+        return None
+    keep = []
+    try:
+        us = _ytdl_make_unicode_string(leaf, keep)
+        oa = _YTDL_OBJECT_ATTRIBUTES()
+        oa.Length = ctypes.sizeof(_YTDL_OBJECT_ATTRIBUTES)
+        oa.RootDirectory = wintypes.HANDLE(int(root_handle))
+        oa.ObjectName = ctypes.pointer(us)
+        oa.Attributes = _YTDL_OBJ_CASE_INSENSITIVE
+        oa.SecurityDescriptor = None
+        oa.SecurityQualityOfService = None
+        iosb = _YTDL_IO_STATUS_BLOCK()
+        handle = wintypes.HANDLE()
+        status = api.ntdll.NtCreateFile(
+            ctypes.byref(handle),
+            int(desired_access),
+            ctypes.byref(oa),
+            ctypes.byref(iosb),
+            None,
+            int(file_attributes),
+            int(share_access),
+            int(create_disposition),
+            int(create_options),
+            None,
+            0,
+        )
+        if (status & 0xFFFFFFFF) != _YTDL_STATUS_SUCCESS:
+            return None
+        return int(handle.value)
+    except Exception:
+        return None
+
+
+def _ytdl_acquire_dest_lease(out_path):
+    """Pin destination directory handle with shared process-local refcount.
+
+    Access: DELETE|LIST|ADD_FILE|TRAVERSE|READ_ATTRIBUTES|SYNCHRONIZE
+    Share: READ|WRITE (no SHARE_DELETE)
+    Flags: BACKUP_SEMANTICS|OPEN_REPARSE_POINT
     """
+    api = _ytdl_winapi()
+    if not api:
+        return None
+    if not _ytdl_is_local_abs_win_path(out_path):
+        return None
+    try:
+        os.makedirs(out_path, exist_ok=True)
+    except Exception:
+        return None
+    key = _ytdl_canon_path_key(out_path)
+    if not key:
+        return None
+    display = os.path.abspath(out_path)
+    if type(display) is not str:
+        return None
+
+    with _YTDL_DEST_LOCK:
+        existing = _YTDL_DEST_LEASES.get(key)
+        if existing and existing.get("handle") and existing.get("refcount", 0) > 0:
+            existing["refcount"] += 1
+            return existing
+
+        access = (
+            _YTDL_DELETE
+            | _YTDL_FILE_LIST_DIRECTORY
+            | _YTDL_FILE_ADD_FILE
+            | _YTDL_FILE_TRAVERSE
+            | _YTDL_FILE_READ_ATTRIBUTES
+            | _YTDL_SYNCHRONIZE
+        )
+        share = _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE
+        flags = _YTDL_FILE_FLAG_BACKUP_SEMANTICS | _YTDL_FILE_FLAG_OPEN_REPARSE_POINT
+        try:
+            h = api.k32.CreateFileW(
+                display, access, share, None, _YTDL_OPEN_EXISTING, flags, None,
+            )
+        except Exception:
+            return None
+        hv = int(h) if h else 0
+        if not hv or hv == int(_YTDL_INVALID_HANDLE_VALUE):
+            return None
+
+        meta = _ytdl_query_tag_std(hv)
+        if meta is None:
+            _ytdl_close_handle(hv)
+            return None
+        _attrs, is_dir, delete_pending, is_reparse, _std = meta
+        if not is_dir or delete_pending or is_reparse:
+            _ytdl_close_handle(hv)
+            return None
+
+        # One optional path consistency check at acquisition only.
+        # Diagnostic failures must not fail closed here — only a concrete
+        # incompatible resolved path rejects the lease.
+        try:
+            final = _ytdl_final_path(hv)
+        except Exception:
+            final = None
+        if final is not None and not _ytdl_paths_compatible(display, final):
+            _ytdl_close_handle(hv)
+            return None
+
+        lease = {
+            "key": key,
+            "handle": hv,
+            "refcount": 1,
+            "display_path": display,
+            "closed": False,
+        }
+        _YTDL_DEST_LEASES[key] = lease
+        return lease
+
+
+def _ytdl_release_dest_lease(lease):
+    if not lease or not isinstance(lease, dict):
+        return
+    with _YTDL_DEST_LOCK:
+        key = lease.get("key")
+        cur = _YTDL_DEST_LEASES.get(key) if key else None
+        if cur is not lease:
+            # Still decrement if we hold a stale view of the same object.
+            if lease.get("closed"):
+                return
+            rc = int(lease.get("refcount") or 0) - 1
+            if rc < 0:
+                rc = 0
+            lease["refcount"] = rc
+            if rc == 0 and not lease.get("closed"):
+                lease["closed"] = True
+                h = lease.get("handle")
+                lease["handle"] = None
+                if h:
+                    _ytdl_close_handle(h)
+            return
+        rc = int(cur.get("refcount") or 0) - 1
+        if rc < 0:
+            rc = 0
+        cur["refcount"] = rc
+        if rc == 0:
+            _YTDL_DEST_LEASES.pop(key, None)
+            cur["closed"] = True
+            h = cur.get("handle")
+            cur["handle"] = None
+            if h:
+                _ytdl_close_handle(h)
+
+
+def _ytdl_create_stage_dir(dest_lease):
+    """Create `.mc-ytdl-<uuid>` relative to the pinned destination handle."""
+    if not dest_lease or not dest_lease.get("handle"):
+        return None, None, None
+    leaf = ".mc-ytdl-%s" % uuid.uuid4().hex
+    if not _ytdl_is_safe_relative_leaf(leaf):
+        return None, None, None
+    desired = (
+        _YTDL_DELETE
+        | _YTDL_FILE_LIST_DIRECTORY
+        | _YTDL_FILE_TRAVERSE
+        | _YTDL_FILE_READ_ATTRIBUTES
+        | _YTDL_SYNCHRONIZE
+    )
+    share = _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE
+    options = (
+        _YTDL_FILE_DIRECTORY_FILE
+        | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+        | _YTDL_FILE_OPEN_REPARSE_POINT
+    )
+    h = _ytdl_nt_create_relative(
+        dest_lease["handle"], leaf, desired, share,
+        _YTDL_FILE_CREATE, options,
+        file_attributes=_YTDL_FILE_ATTRIBUTE_DIRECTORY,
+    )
+    if not h:
+        return None, None, None
+    meta = _ytdl_query_tag_std(h)
+    if meta is None:
+        _ytdl_close_handle(h)
+        return None, None, None
+    _attrs, is_dir, delete_pending, is_reparse, _std = meta
+    if not is_dir or delete_pending or is_reparse:
+        _ytdl_set_disposition_delete(h)
+        _ytdl_close_handle(h)
+        return None, None, None
+    display = os.path.join(dest_lease["display_path"], leaf)
+    return h, leaf, display
+
+
+def _ytdl_open_stage_source(stage_handle, stage_display, filepath):
+    """Open @@FILE@@ as a direct child of the pinned stage handle.
+
+    Returns dict(handle, size, leaf) or None. Handle authority only — no path
+    stat/lstat/realpath/getsize after open.
+    """
+    if not stage_handle or type(stage_display) is not str:
+        return None
     if type(filepath) is not str or not filepath.strip():
         return None
-    if type(stage_dir) is not str or not stage_dir.strip():
+    if not _ytdl_control_free_str(filepath):
         return None
     try:
-        if not os.path.isdir(stage_dir):
+        if not os.path.isabs(filepath):
             return None
-        stage_real = os.path.realpath(stage_dir)
-        stage_abs = os.path.abspath(stage_dir)
-        if not stage_real or not os.path.isdir(stage_real):
-            return None
-
-        # Reject before following links: source must be a regular non-symlink file.
-        if not os.path.lexists(filepath):
-            return None
-        st = os.lstat(filepath)
-        if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
-            return None
-
-        src_real = os.path.realpath(filepath)
-        src_abs = os.path.abspath(filepath)
-
-        # Stage directory itself is never a source.
-        if os.path.normcase(src_real) == os.path.normcase(stage_real):
-            return None
-        if os.path.normcase(src_abs) == os.path.normcase(stage_abs):
-            return None
-
-        # Canonical containment with path-component boundaries (not prefix match).
-        try:
-            common = os.path.commonpath([stage_real, src_real])
-        except ValueError:
-            return None
-        if os.path.normcase(common) != os.path.normcase(stage_real):
-            return None
-
-        # Re-check the resolved path is still a regular non-symlink file inside stage.
-        st2 = os.lstat(src_real)
-        if _stat.S_ISLNK(st2.st_mode) or not _stat.S_ISREG(st2.st_mode):
-            return None
-        # commonpath equality already requires strict descendant after rejecting equality.
-        return src_real
+        filepath_abs = os.path.abspath(filepath)
+        stage_abs = os.path.abspath(stage_display)
     except Exception:
         return None
+    # Lexical parent must equal the pinned stage display path.
+    try:
+        parent = os.path.dirname(filepath_abs)
+        if os.path.normcase(parent) != os.path.normcase(stage_abs):
+            return None
+        leaf = os.path.basename(filepath_abs)
+    except Exception:
+        return None
+    if not _ytdl_is_safe_relative_leaf(leaf):
+        return None
+
+    desired = (
+        _YTDL_FILE_READ_DATA
+        | _YTDL_FILE_READ_ATTRIBUTES
+        | _YTDL_DELETE
+        | _YTDL_SYNCHRONIZE
+    )
+    # Share READ only — deny write/delete sharing after subprocess exit.
+    share = _YTDL_FILE_SHARE_READ
+    options = (
+        _YTDL_FILE_NON_DIRECTORY_FILE
+        | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+        | _YTDL_FILE_OPEN_REPARSE_POINT
+    )
+    h = _ytdl_nt_create_relative(
+        stage_handle, leaf, desired, share, _YTDL_FILE_OPEN, options,
+    )
+    if not h:
+        return None
+    meta = _ytdl_query_tag_std(h)
+    if meta is None:
+        _ytdl_close_handle(h)
+        return None
+    attrs, is_dir, delete_pending, is_reparse, std = meta
+    if is_dir or delete_pending or is_reparse:
+        _ytdl_close_handle(h)
+        return None
+    if bool(attrs & _YTDL_FILE_ATTRIBUTE_REPARSE_POINT):
+        _ytdl_close_handle(h)
+        return None
+    if int(std.NumberOfLinks) != 1:
+        _ytdl_close_handle(h)
+        return None
+    eof = int(std.EndOfFile)
+    if type(eof) is not int or eof < 0:
+        _ytdl_close_handle(h)
+        return None
+    if _ytdl_query_file_id(h) is None:
+        _ytdl_close_handle(h)
+        return None
+    return {"handle": h, "size": eof, "leaf": leaf}
 
 
-def _ytdl_cleanup_stage_dir(stage_dir):
-    """Remove only an operation-owned staging directory tree."""
-    if not stage_dir or type(stage_dir) is not str:
+def _ytdl_candidate_leaves(safe_name, max_attempts=32):
+    """Bounded single-leaf candidates: name, name (1).ext, ... (max 32)."""
+    if not _ytdl_is_safe_relative_leaf(safe_name):
+        return []
+    root, ext = os.path.splitext(safe_name)
+    out = [safe_name]
+    limit = max(1, int(max_attempts))
+    for n in range(1, limit):
+        cand = "%s (%d)%s" % (root, n, ext)
+        if _ytdl_is_safe_relative_leaf(cand):
+            out.append(cand)
+    return out[:limit]
+
+
+def _ytdl_nt_rename_no_replace(source_handle, dest_handle, leaf):
+    """NtSetInformationFile FileRenameInformation=10 relative no-replace rename.
+
+    Returns 'ok', 'collision', or 'error'. Never uses Win32 FileRenameInfo=3.
+    """
+    api = _ytdl_winapi()
+    if not api or not source_handle or not dest_handle:
+        return "error"
+    if not _ytdl_is_safe_relative_leaf(leaf):
+        return "error"
+    try:
+        buf, size, _flen, _enc = _ytdl_build_rename_buffer(dest_handle, leaf)
+        iosb = _YTDL_IO_STATUS_BLOCK()
+        status = api.ntdll.NtSetInformationFile(
+            wintypes.HANDLE(int(source_handle)),
+            ctypes.byref(iosb),
+            buf,
+            int(size),
+            _YTDL_FileRenameInformation,
+        )
+        code = status & 0xFFFFFFFF
+        if code == _YTDL_STATUS_SUCCESS:
+            return "ok"
+        if code == _YTDL_STATUS_OBJECT_NAME_COLLISION:
+            return "collision"
+        return "error"
+    except Exception:
+        return "error"
+
+
+def _ytdl_commit_source(source_handle, dest_lease, safe_name, max_attempts=32):
+    """Atomic bounded no-replace commit under the caller's ytdl_lock.
+
+    On success returns (display_path, size_from_source) and leaves source_handle
+    open on the committed object. On failure returns None (caller disposes source).
+    """
+    if not source_handle or not dest_lease or not dest_lease.get("handle"):
+        return None
+    leaves = _ytdl_candidate_leaves(safe_name, max_attempts=max_attempts)
+    if not leaves:
+        return None
+    dest_h = dest_lease["handle"]
+    base = dest_lease["display_path"]
+    for leaf in leaves:
+        result = _ytdl_nt_rename_no_replace(source_handle, dest_h, leaf)
+        if result == "ok":
+            path = os.path.join(base, leaf)
+            return path
+        if result == "collision":
+            continue
+        return None
+    return None
+
+
+def _ytdl_dispose_handle(handle, delete=False):
+    """Idempotent exact-once close; optional disposition-delete first."""
+    if not handle:
         return
+    if delete:
+        _ytdl_set_disposition_delete(handle)
+    _ytdl_close_handle(handle)
+
+
+def _ytdl_cleanup_stage_tree(stage_handle):
+    """Handle-relative stage cleanup. Safe-leak on any uncertainty.
+
+    Enumerate via NtQueryDirectoryFile, open each child with OPEN_REPARSE_POINT
+    + DELETE, dispose reparse as the reparse object (never traverse), recurse
+    only non-reparse directories, then disposition the stage directory itself.
+    Returns True when the stage handle was fully disposed; False on safe leak.
+    """
+    if not stage_handle:
+        return True
+    api = _ytdl_winapi()
+    if not api:
+        _ytdl_close_handle(stage_handle)
+        return False
+
+    def _enum_and_clean(dir_handle, depth=0):
+        if depth > 64:
+            return False
+        buf_size = 4096
+        buf = ctypes.create_string_buffer(buf_size)
+        restart = True
+        while True:
+            iosb = _YTDL_IO_STATUS_BLOCK()
+            status = api.ntdll.NtQueryDirectoryFile(
+                wintypes.HANDLE(int(dir_handle)),
+                None, None, None,
+                ctypes.byref(iosb),
+                buf, buf_size,
+                _YTDL_FileNamesInformation,
+                False,
+                None,
+                restart,
+            )
+            restart = False
+            code = status & 0xFFFFFFFF
+            if code in (
+                _YTDL_STATUS_NO_MORE_FILES,
+                0x80000006,
+            ):
+                break
+            # STATUS_NO_MORE_FILES as signed long may be negative.
+            if status in (-2147483642,):  # 0x80000006 as INT32
+                break
+            if code != _YTDL_STATUS_SUCCESS and code != _YTDL_STATUS_BUFFER_OVERFLOW:
+                # Treat NT_WARNING NO_MORE_FILES variants.
+                if code & 0xC0000000 == 0x80000000 and (code == _YTDL_STATUS_NO_MORE_FILES):
+                    break
+                # Rtl classification is optional; unknown => safe leak.
+                if code != 0:
+                    # 0x80000006 often arrives as status with high bit; accept both.
+                    if (status & 0xFFFFFFFF) == _YTDL_STATUS_NO_MORE_FILES:
+                        break
+                    return False
+            # Walk entries
+            offset = 0
+            while True:
+                if offset + 12 > buf_size:
+                    return False
+                next_off = int.from_bytes(buf[offset:offset + 4], "little")
+                name_len = int.from_bytes(buf[offset + 8:offset + 12], "little")
+                name_off = offset + 12
+                if name_len <= 0 or name_off + name_len > buf_size:
+                    return False
+                try:
+                    name = bytes(buf[name_off:name_off + name_len]).decode("utf-16-le")
+                except Exception:
+                    return False
+                if name not in (".", ".."):
+                    if not _ytdl_is_safe_relative_leaf(name):
+                        # Hostile name: do not open by string path; leak.
+                        return False
+                    child = _ytdl_nt_create_relative(
+                        dir_handle,
+                        name,
+                        _YTDL_DELETE
+                        | _YTDL_FILE_LIST_DIRECTORY
+                        | _YTDL_FILE_TRAVERSE
+                        | _YTDL_FILE_READ_ATTRIBUTES
+                        | _YTDL_FILE_READ_DATA
+                        | _YTDL_SYNCHRONIZE,
+                        _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE,
+                        _YTDL_FILE_OPEN,
+                        _YTDL_FILE_SYNCHRONOUS_IO_NONALERT | _YTDL_FILE_OPEN_REPARSE_POINT,
+                    )
+                    if not child:
+                        # Retry as non-directory open for files.
+                        child = _ytdl_nt_create_relative(
+                            dir_handle,
+                            name,
+                            _YTDL_DELETE
+                            | _YTDL_FILE_READ_ATTRIBUTES
+                            | _YTDL_FILE_READ_DATA
+                            | _YTDL_SYNCHRONIZE,
+                            _YTDL_FILE_SHARE_READ,
+                            _YTDL_FILE_OPEN,
+                            _YTDL_FILE_NON_DIRECTORY_FILE
+                            | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+                            | _YTDL_FILE_OPEN_REPARSE_POINT,
+                        )
+                    if not child:
+                        return False
+                    meta = _ytdl_query_tag_std(child)
+                    if meta is None:
+                        _ytdl_close_handle(child)
+                        return False
+                    _attrs, is_dir, _dp, is_reparse, _std = meta
+                    if is_reparse:
+                        # Dispose the reparse object itself; never traverse.
+                        _ytdl_set_disposition_delete(child)
+                        _ytdl_close_handle(child)
+                    elif is_dir:
+                        if not _enum_and_clean(child, depth + 1):
+                            _ytdl_close_handle(child)
+                            return False
+                        _ytdl_set_disposition_delete(child)
+                        _ytdl_close_handle(child)
+                    else:
+                        _ytdl_set_disposition_delete(child)
+                        _ytdl_close_handle(child)
+                if next_off == 0:
+                    break
+                offset += next_off
+                if offset >= buf_size:
+                    return False
+        return True
+
     try:
-        base = os.path.basename(stage_dir.rstrip("\\/"))
-        if not base.startswith(".mc-ytdl-"):
-            return
-        if os.path.isdir(stage_dir):
-            shutil.rmtree(stage_dir, ignore_errors=True)
+        if not _enum_and_clean(stage_handle, 0):
+            try:
+                _h()._hlog("info", "yt-dlp: stage cleanup leaked private debris")
+            except Exception:
+                pass
+            _ytdl_close_handle(stage_handle)
+            return False
+        _ytdl_set_disposition_delete(stage_handle)
+        _ytdl_close_handle(stage_handle)
+        return True
     except Exception:
-        pass
-
-
-def _ytdl_terminal_file_bytes(path):
-    """Return (path, size) only for a real file with a nonnegative built-in int size."""
-    if not path or type(path) is not str:
-        return None, None
-    try:
-        if not os.path.isfile(path):
-            return None, None
-        size = _pget_nonneg_int_bytes(os.path.getsize(path))
-        if size is None:
-            return None, None
-        return path, size
-    except Exception:
-        return None, None
-
-
-def _ytdl_terminal_file_bytes_for_identity(path, identity):
-    """Like _ytdl_terminal_file_bytes but only if path still has the given identity."""
-    if not identity:
-        return None, None
-    try:
-        cur = _ytdl_snapshot_path_identity(path)
-        if cur is None or cur != identity:
-            return None, None
-    except Exception:
-        return None, None
-    return _ytdl_terminal_file_bytes(path)
+        try:
+            _h()._hlog("info", "yt-dlp: stage cleanup leaked private debris")
+        except Exception:
+            pass
+        _ytdl_close_handle(stage_handle)
+        return False
 
 
 def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
@@ -1540,12 +2141,57 @@ def _handle_ytdl_structured(req):
         return bool(op.get("cancel_requested"))
 
     def worker():
-        stage_dir = None
-        preferred = None
+        dest_lease = None
+        stage_handle = None
+        stage_display = None
+        source_handle = None
+        committed_handle = None
+        close_counts = op.setdefault("_ytdl_close_counts", {
+            "source": 0, "final": 0, "stage": 0, "dest": 0,
+        })
+
+        def _close_source(delete=False):
+            nonlocal source_handle
+            h = source_handle
+            source_handle = None
+            if h:
+                close_counts["source"] += 1
+                _ytdl_dispose_handle(h, delete=delete)
+
+        def _close_committed():
+            nonlocal committed_handle
+            h = committed_handle
+            committed_handle = None
+            if h:
+                close_counts["final"] += 1
+                _ytdl_dispose_handle(h, delete=False)
+
+        def _close_stage():
+            nonlocal stage_handle
+            h = stage_handle
+            stage_handle = None
+            if h:
+                close_counts["stage"] += 1
+                _ytdl_cleanup_stage_tree(h)
+
+        def _release_dest():
+            nonlocal dest_lease
+            lease = dest_lease
+            dest_lease = None
+            if lease:
+                close_counts["dest"] += 1
+                _ytdl_release_dest_lease(lease)
+
         try:
             try:
                 if cancelled():
                     emit_error("cancelled", "Cancelled.")
+                    return
+
+                # Structured path requires Windows handle APIs; never fall back
+                # to the rejected pathname hardlink/O_EXCL/unlink scheme.
+                if _ytdl_winapi() is None:
+                    emit_error("local_io", "Couldn't prepare the save path.")
                     return
 
                 ytdlp = ensure_ytdlp()
@@ -1573,12 +2219,23 @@ def _handle_ytdl_structured(req):
                 else:
                     out = outdir
 
+                if type(out) is not str or not out.strip():
+                    emit_error("local_io", "Couldn't access the save folder.")
+                    return
                 try:
-                    os.makedirs(out, exist_ok=True)
-                    if not os.path.isdir(out):
+                    out_abs = os.path.abspath(out)
+                except Exception:
+                    emit_error("local_io", "Couldn't create the save folder.")
+                    return
+                if not _ytdl_is_local_abs_win_path(out_abs):
+                    emit_error("local_io", "Couldn't create the save folder.")
+                    return
+
+                try:
+                    os.makedirs(out_abs, exist_ok=True)
+                    if not os.path.isdir(out_abs):
                         raise OSError("not a directory")
                 except Exception:
-                    # Explicit destination failure never silently falls back.
                     emit_error("local_io", "Couldn't create the save folder.")
                     return
 
@@ -1586,23 +2243,22 @@ def _handle_ytdl_structured(req):
                     emit_error("cancelled", "Cancelled.")
                     return
 
-                try:
-                    preferred = _dedup(os.path.join(out, safe_name))
-                except Exception:
+                dest_lease = _ytdl_acquire_dest_lease(out_abs)
+                if dest_lease is None:
                     emit_error("local_io", "Couldn't prepare the save path.")
                     return
 
-                # Unique op-owned staging on the selected destination filesystem.
-                # yt-dlp --force-overwrites may only hit this tree, never the final.
-                # Basename matches the pre-deduped preferred name; the unique dir
-                # is what prevents cross-job staging collisions.
-                try:
-                    stage_dir = os.path.join(out, ".mc-ytdl-%s" % uuid.uuid4().hex)
-                    os.makedirs(stage_dir)
-                    stage_file = os.path.join(stage_dir, os.path.basename(preferred))
-                except Exception:
+                stage_handle, _stage_leaf, stage_display = _ytdl_create_stage_dir(dest_lease)
+                if not stage_handle or not stage_display:
                     emit_error("local_io", "Couldn't prepare the save path.")
                     return
+
+                # Stage file basename is the requested safe name (not pre-deduped).
+                # Final name is chosen atomically at Nt rename time.
+                if not _ytdl_is_safe_relative_leaf(safe_name):
+                    emit_error("local_io", "Couldn't prepare the save path.")
+                    return
+                stage_file = os.path.join(stage_display, safe_name)
 
                 pot = start_pot_provider()
                 if cancelled():
@@ -1675,65 +2331,74 @@ def _handle_ytdl_structured(req):
                     emit_error("permanent", "Download failed.")
                     return
 
-                # Fast cancel path after subprocess exit (still rechecked under lock).
                 if cancelled():
                     emit_error("cancelled", "Cancelled.")
                     return
 
                 if p.returncode == 0:
-                    # Zero-exit without a usable owned stage source is local_io
-                    # (blank marker, missing path, or escape) — never a success.
-                    # Never trust stdout path without stage-ownership validation.
-                    # Reject before any stat/link/copy/unlink/promotion on the marker.
-                    owned_src = _ytdl_owned_stage_source(filepath, stage_dir)
-                    if owned_src is None:
-                        # One safe terminal; do not echo the outside/hostile path.
+                    owned = _ytdl_open_stage_source(stage_handle, stage_display, filepath)
+                    if owned is None:
+                        emit_error(
+                            "local_io",
+                            "Download finished but the file could not be verified.",
+                        )
+                        return
+                    source_handle = owned["handle"]
+                    owned_size = owned["size"]
+                    if type(owned_size) is not int or owned_size < 0:
+                        _close_source(delete=True)
                         emit_error(
                             "local_io",
                             "Download finished but the file could not be verified.",
                         )
                         return
 
-                    # Single linearization region: acquire op lock, recheck cancel/
-                    # commit, and when eligible promote + verify + claim before release.
-                    # Holding the op-local lock across bounded local promotion is intended.
                     outcome = None
                     done_path = None
                     done_size = None
+                    # Holding the op-local lock across bounded Nt rename is intended.
                     with op["ytdl_lock"]:
                         if op.get("cancel_requested") or op.get("commit_claimed"):
                             outcome = "cancelled"
                         else:
-                            final_path = _ytdl_promote_to_target(owned_src, preferred)
+                            final_path = _ytdl_commit_source(
+                                source_handle, dest_lease, safe_name, max_attempts=32,
+                            )
                             if not final_path:
                                 outcome = "local_io"
                             else:
-                                # Ownership identity is from the just-created final,
-                                # not from the nullable verification projection.
-                                owned_ident = _ytdl_snapshot_path_identity(final_path)
-                                path, size = _ytdl_terminal_file_bytes_for_identity(
-                                    final_path, owned_ident
-                                )
-                                if path is not None and size is not None:
-                                    op["commit_claimed"] = True
-                                    outcome = "done"
-                                    done_path, done_size = path, size
-                                else:
-                                    # Promoted but unverifiable: clean only if still ours.
-                                    _ytdl_unlink_if_identity(final_path, owned_ident)
-                                    # Cancel may have been set while we held the lock only
-                                    # if we released — we did not. Prefer local_io for
-                                    # verify failure; cancel-before-promote is handled above.
-                                    outcome = "local_io"
+                                # Successful Nt rename moved the exact held object.
+                                # Precomputed path + prevalidated size are authority;
+                                # no post-rename path/identity lookup may veto.
+                                op["commit_claimed"] = True
+                                outcome = "done"
+                                done_path = final_path
+                                done_size = owned_size
+                                committed_handle = source_handle
+                                source_handle = None
+                                # Optional diagnostic only — failure must not demote.
+                                try:
+                                    _ytdl_final_path(committed_handle)
+                                except Exception:
+                                    pass
 
                     if outcome == "cancelled":
-                        # Cancel won before promotion: no final was created.
+                        _close_source(delete=True)
                         emit_error("cancelled", "Cancelled.")
                         return
                     if outcome == "done":
+                        # Hold committed handle through terminal so replacement is denied.
                         emit_done(done_path, done_size)
-                        _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(done_path))
+                        _close_committed()
+                        try:
+                            _h()._hlog(
+                                "info",
+                                "yt-dlp: saved %s" % os.path.basename(done_path),
+                            )
+                        except Exception:
+                            pass
                         return
+                    _close_source(delete=True)
                     emit_error(
                         "local_io",
                         "Download finished but the file could not be verified.",
@@ -1747,14 +2412,20 @@ def _handle_ytdl_structured(req):
                 )
                 emit_error(reason, msg)
             except Exception:
-                # Outer safety net for prep/setup surprises: exactly one safe terminal.
                 if cancelled():
                     emit_error("cancelled", "Cancelled.")
                 else:
                     emit_error("permanent", "Download failed.")
         finally:
-            _ytdl_cleanup_stage_dir(stage_dir)
-            # CAS identity cleanup — no-op when emit already unregistered.
+            # Never delete a committed final. Dispose only uncommitted source.
+            if source_handle is not None:
+                _close_source(delete=True)
+            if committed_handle is not None:
+                _close_committed()
+            if stage_handle is not None:
+                _close_stage()
+            if dest_lease is not None:
+                _release_dest()
             _pget_unregister(jid, op)
 
     threading.Thread(target=worker, daemon=True).start()

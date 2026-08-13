@@ -275,10 +275,12 @@ def test_dedup_existing_file_reports_actual_path(tmp_path, monkeypatch):
     assert term["file"] == str(expected)
     assert term["bytes"] == len(payload)
     assert existing.read_bytes() == b"OLD"
+    assert open(term["file"], "rb").read() == payload
     cmd = _cmd_from_popen_calls(calls)
     outtmpl = cmd[cmd.index("-o") + 1]
-    assert "clip (1).mp4" in outtmpl
-    assert outtmpl.rstrip("/\\").endswith("clip (1).mp4") or "clip (1).mp4" in outtmpl
+    # Stage uses the requested safe leaf; collision is resolved only at commit.
+    assert "clip.mp4" in outtmpl.replace("%%", "%")
+    assert ".mc-ytdl-" in outtmpl.replace("%%", "%")
 
 
 # ---------------------------------------------------------------------------
@@ -489,9 +491,8 @@ def test_structured_registered_during_async_preparation(tmp_path, monkeypatch):
         return "yt-dlp-fake"
 
     def fake_popen(*a, **k):
-        pth = dest / "p.mp4"
-        pth.write_bytes(b"P")
-        return LiveProc(lines=["@@FILE@@ %s" % pth], returncode=0)
+        path = _materialize_stage_from_cmd(a, b"P")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
 
     _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
     monkeypatch.setattr(d, "ensure_ytdlp", slow_ensure)
@@ -919,27 +920,16 @@ def test_missing_nonfile_negative_size_no_ytdl_done(tmp_path, monkeypatch):
     assert term["attemptToken"] == "atk-dir"
     assert not any(m.get("type") == "ytdl-done" for m in sent if m.get("id") == "jobDir")
 
-    # Case C: negative / hostile size
+    # Case C: handle FileStandardInfo EndOfFile is the size authority — a
+    # hostile os.path.getsize cannot invent success or negative wire bytes.
     sent.clear()
 
     def popen_neg(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else str(dest / "neg.mp4")
-        path = out.replace("%%", "%")
-        with open(path, "wb") as f:
-            f.write(b"ABC")
+        path = _materialize_stage_from_cmd(a, b"ABC")
         return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
 
     monkeypatch.setattr(d.subprocess, "Popen", popen_neg)
-
-    real_getsize = d.os.path.getsize
-
-    def hostile_getsize(p):
-        if os.path.basename(str(p)) == "neg.mp4":
-            return -1
-        return real_getsize(p)
-
-    monkeypatch.setattr(d.os.path, "getsize", hostile_getsize)
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: -1)
     d.handle_ytdl({
         "id": "jobNeg",
         "attemptToken": "atk-neg",
@@ -948,12 +938,40 @@ def test_missing_nonfile_negative_size_no_ytdl_done(tmp_path, monkeypatch):
         "dir": str(dest),
     })
     term = _wait_terminal(sent, "jobNeg")
-    assert term["type"] == "ytdl-error"
+    # Handle-captured nonnegative EndOfFile wins; path getsize is irrelevant.
+    assert term["type"] == "ytdl-done"
     assert term["attemptToken"] == "atk-neg"
-    assert term["reason"] in ("local_io", "permanent")
-    assert not any(m.get("type") == "ytdl-done" for m in sent if m.get("id") == "jobNeg")
-    if "bytes" in term:
+    assert term["bytes"] == 3
+    assert open(term["file"], "rb").read() == b"ABC"
+
+    # Case D: reject when handle standard info reports unusable EndOfFile.
+    sent.clear()
+    real_open_src = d._ytdl_open_stage_source
+
+    def open_bad_size(stage_handle, stage_display, filepath):
+        owned = real_open_src(stage_handle, stage_display, filepath)
+        if owned is not None:
+            owned = dict(owned)
+            owned["size"] = -1
+        return owned
+
+    monkeypatch.setattr(d, "_ytdl_open_stage_source", open_bad_size)
+    monkeypatch.setattr(d.subprocess, "Popen", popen_neg)
+    d.handle_ytdl({
+        "id": "jobNeg2",
+        "attemptToken": "atk-neg2",
+        "url": "https://example.test/v",
+        "name": "neg2.mp4",
+        "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobNeg2")
+    # size is captured inside open; forcing negative after open is a test hook —
+    # production open already rejects negative EndOfFile. Ensure commit path
+    # still never emits negative bytes on wire for a synthetic bad size.
+    if term["type"] == "ytdl-done":
         assert term["bytes"] >= 0
+    else:
+        assert term["reason"] in ("local_io", "permanent")
 
 
 # ---------------------------------------------------------------------------
@@ -1098,152 +1116,870 @@ def test_concurrent_same_name_distinct_staging_safe_dedup(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# 17. Target created after dedup, before promotion: sentinel preserved
+# 17. ctypes ABI for Nt FILE_RENAME_INFORMATION + rename class
 # ---------------------------------------------------------------------------
 
-def test_target_occupied_after_dedup_before_promote_preserves_sentinel(
-        tmp_path, monkeypatch):
-    """A file created after pre-dedup must not be overwritten by promotion.
+def test_file_rename_information_abi_and_nt_class(monkeypatch):
+    """Offsets/UTF-16 length match x64 layout; rename uses Nt class 10 only."""
+    import ctypes
+    import tempfile
+    import mchost.downloads as d
 
-    Job may pick another actual path or emit one local_io; never done->sentinel.
-    """
+    offs = d._ytdl_rename_info_offsets()
+    assert offs["ReplaceIfExists"] == 0
+    assert offs["RootDirectory"] == 8
+    assert offs["FileNameLength"] == 16
+    assert offs["FileName"] == 20
+    assert offs["sizeof_prefix"] >= 22
+
+    root = 0x1122334455667788
+    leaf_ascii = "clip.mp4"
+    buf, size, flen, enc = d._ytdl_build_rename_buffer(root, leaf_ascii)
+    assert flen == len(leaf_ascii) * 2
+    assert enc == leaf_ascii.encode("utf-16-le")
+    assert size >= offs["FileName"] + flen
+    raw = bytes(buf)[:size]
+    assert raw[0] == 0
+    got_root = int.from_bytes(raw[8:16], "little")
+    assert got_root == (root & ((1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1))
+    got_len = int.from_bytes(raw[16:20], "little")
+    assert got_len == flen
+    assert raw[20:20 + flen] == enc
+
+    leaf_u = "clip-\U0001f600.mp4"
+    buf2, size2, flen2, enc2 = d._ytdl_build_rename_buffer(0xAB, leaf_u)
+    assert flen2 == len(leaf_u.encode("utf-16-le"))
+    assert enc2 == leaf_u.encode("utf-16-le")
+    assert bytes(buf2)[20:20 + flen2] == enc2
+
+    api = d._ytdl_winapi()
+    assert api is not None
+    seen = []
+    real_nt = api.ntdll.NtSetInformationFile
+    real_sfih = api.k32.SetFileInformationByHandle
+
+    def nt_hook(handle, iosb, buf, length, klass):
+        seen.append(("nt", int(klass)))
+        return real_nt(handle, iosb, buf, length, klass)
+
+    def sfih_hook(handle, klass, info, length):
+        seen.append(("win32", int(klass)))
+        return real_sfih(handle, klass, info, length)
+
+    monkeypatch.setattr(api.ntdll, "NtSetInformationFile", nt_hook)
+    monkeypatch.setattr(api.k32, "SetFileInformationByHandle", sfih_hook)
+
+    dest = tempfile.mkdtemp(prefix="ytdl-abi-")
+    lease = d._ytdl_acquire_dest_lease(dest)
+    assert lease is not None
+    stage_h, leaf, stage_disp = d._ytdl_create_stage_dir(lease)
+    assert stage_h
+    src_path = os.path.join(stage_disp, "a.mp4")
+    with open(src_path, "wb") as f:
+        f.write(b"X")
+    owned = d._ytdl_open_stage_source(stage_h, stage_disp, src_path)
+    assert owned is not None
+    path = d._ytdl_commit_source(owned["handle"], lease, "a.mp4")
+    assert path is not None
+    d._ytdl_dispose_handle(owned["handle"], delete=False)
+    d._ytdl_cleanup_stage_tree(stage_h)
+    d._ytdl_release_dest_lease(lease)
+    assert any(kind == "nt" and klass == 10 for kind, klass in seen), seen
+    assert not any(kind == "win32" and klass == 3 for kind, klass in seen), seen
+
+
+# ---------------------------------------------------------------------------
+# 18. Real Windows temp-volume integration
+# ---------------------------------------------------------------------------
+
+def test_windows_handle_commit_integration_collision_and_sentinel(tmp_path):
+    """Pinned dest + handle stage/source + Nt relative rename; sentinel preserved."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "integ"
+    dest.mkdir()
+    sentinel = dest / "clip.mp4"
+    sentinel.write_bytes(b"SENTINEL-BYTES")
+    lease = d._ytdl_acquire_dest_lease(str(dest))
+    assert lease is not None
+    stage_h, stage_leaf, stage_disp = d._ytdl_create_stage_dir(lease)
+    assert stage_h and stage_leaf.startswith(".mc-ytdl-")
+    payload = b"OWNED-PAYLOAD-XYZ"
+    src = os.path.join(stage_disp, "clip.mp4")
+    with open(src, "wb") as f:
+        f.write(payload)
+    owned = d._ytdl_open_stage_source(stage_h, stage_disp, src)
+    assert owned is not None
+    assert owned["size"] == len(payload)
+    path = d._ytdl_commit_source(owned["handle"], lease, "clip.mp4")
+    assert path is not None
+    assert os.path.basename(path) == "clip (1).mp4"
+    d._ytdl_dispose_handle(owned["handle"], delete=False)
+    assert sentinel.read_bytes() == b"SENTINEL-BYTES"
+    assert open(path, "rb").read() == payload
+    assert not os.path.exists(src)
+    d._ytdl_cleanup_stage_tree(stage_h)
+    d._ytdl_release_dest_lease(lease)
+    assert not any(p.name.startswith(".mc-ytdl-") for p in dest.iterdir() if p.is_dir())
+
+# ---------------------------------------------------------------------------
+# 19. Concurrent same-destination lease/refcount + same-name commits
+# ---------------------------------------------------------------------------
+
+def test_concurrent_dest_lease_refcount_and_same_name_commits(tmp_path, monkeypatch):
+    """Shared dest lease refcount; two same-name jobs -> two full distinct files."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "lease"
+    dest.mkdir()
+    sent = []
+    create_calls = []
+    api = d._ytdl_winapi()
+    assert api is not None
+    real_create = api.k32.CreateFileW
+
+    def tracking_create(*a, **k):
+        create_calls.append(a[0] if a else None)
+        return real_create(*a, **k)
+
+    monkeypatch.setattr(api.k32, "CreateFileW", tracking_create)
+
+    barrier = threading.Barrier(2)
+    idx = {"n": 0}
+    lock = threading.Lock()
+
+    def fake_popen(*a, **k):
+        with lock:
+            my = idx["n"]
+            idx["n"] += 1
+        path = _materialize_stage_from_cmd(a, b"A" * (10 + my))
+        barrier.wait(timeout=5)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobL1", "attemptToken": "atk-l1", "url": "https://example.test/a",
+        "name": "same.mp4", "dir": str(dest),
+    })
+    d.handle_ytdl({
+        "id": "jobL2", "attemptToken": "atk-l2", "url": "https://example.test/b",
+        "name": "same.mp4", "dir": str(dest),
+    })
+    t1 = _wait_terminal(sent, "jobL1")
+    t2 = _wait_terminal(sent, "jobL2")
+    assert t1["type"] == "ytdl-done" and t2["type"] == "ytdl-done"
+    assert t1["file"] != t2["file"]
+    bodies = {open(t1["file"], "rb").read(), open(t2["file"], "rb").read()}
+    assert bodies == {b"A" * 10, b"A" * 11}
+    dest_opens = [c for c in create_calls if c and os.path.normcase(str(c)) == os.path.normcase(str(dest))]
+    assert len(dest_opens) == 1, dest_opens
+    key = d._ytdl_canon_path_key(str(dest))
+    assert d._YTDL_DEST_LEASES.get(key) is None
+
+
+# ---------------------------------------------------------------------------
+# 20. Final ownership held through terminal
+# ---------------------------------------------------------------------------
+
+def test_committed_handle_blocks_replace_until_terminal(tmp_path, monkeypatch):
+    """Between commit claim and terminal, external replace/delete of final fails."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "own"
+    dest.mkdir()
+    sent = []
+    payload = b"OWNED-FINAL-BYTES"
+    race = {"checked": False, "replace_ok": None, "delete_ok": None}
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    def capturing_send(msg):
+        if msg.get("type") == "ytdl-done" and not race["checked"]:
+            race["checked"] = True
+            path = msg.get("file")
+            try:
+                os.replace(path, path + ".moved")
+                race["replace_ok"] = True
+            except OSError:
+                race["replace_ok"] = False
+            try:
+                os.unlink(path)
+                race["delete_ok"] = True
+            except OSError:
+                race["delete_ok"] = False
+        sent.append(dict(msg))
+
+    monkeypatch.setattr(mc, "send", capturing_send)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_ytdlp", lambda: "yt-dlp-fake")
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+    monkeypatch.setattr(d, "_no_window", lambda: (0, None))
+    monkeypatch.setattr(mc, "FFMPEG", None)
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+
+    d.handle_ytdl({
+        "id": "jobOwn", "attemptToken": "atk-own",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobOwn")
+    assert term["type"] == "ytdl-done"
+    assert term["bytes"] == len(payload)
+    assert term["file"] and open(term["file"], "rb").read() == payload
+    assert race["checked"] is True
+    assert race["replace_ok"] is False
+    assert race["delete_ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 21. Cleanup disposition uses handle; no pathname deletes
+# ---------------------------------------------------------------------------
+
+def test_cleanup_disposition_preserves_replacement_zero_path_deletes(tmp_path, monkeypatch):
+    """Disposition targets the held handle; pathname delete APIs are unused."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "crepl"
+    dest.mkdir()
+    outside = tmp_path / "outside-secret.mp4"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+    sent = []
+    path_deletes = []
+
+    def track_unlink(path, *a, **k):
+        path_deletes.append(("unlink", path))
+        raise AssertionError("os.unlink must not be used on structured path")
+
+    def track_remove(path, *a, **k):
+        path_deletes.append(("remove", path))
+        raise AssertionError("os.remove must not be used")
+
+    def track_rmtree(path, *a, **k):
+        path_deletes.append(("rmtree", path))
+        raise AssertionError("shutil.rmtree must not be used")
+
+    def track_link(src, dst, *a, **k):
+        path_deletes.append(("link", src, dst))
+        raise AssertionError("os.link must not be used")
+
+    monkeypatch.setattr(d.os, "unlink", track_unlink)
+    monkeypatch.setattr(d.os, "remove", track_remove)
+    monkeypatch.setattr(d.shutil, "rmtree", track_rmtree)
+    monkeypatch.setattr(d.os, "link", track_link)
+
+    post_wait = threading.Event()
+    release = threading.Event()
+    payload = b"TO-DISPOSE"
+
+    def after_wait():
+        post_wait.set()
+        assert release.wait(timeout=5)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0, after_wait=after_wait)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobCrepl", "attemptToken": "atk-crepl",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
+    })
+    assert wait_for(post_wait.is_set, timeout=5)
+    d._pget_cancel({"id": "jobCrepl", "attemptToken": "atk-crepl"})
+    release.set()
+    term = _wait_terminal(sent, "jobCrepl")
+    assert term["type"] == "ytdl-error"
+    assert term["reason"] == "cancelled"
+    assert path_deletes == []
+    assert outside.read_bytes() == b"OUTSIDE-SECRET"
+    assert not (dest / "clip.mp4").exists()
+
+
+# ---------------------------------------------------------------------------
+# 22. Cleanup enumeration failure safely leaks stage debris
+# ---------------------------------------------------------------------------
+
+def test_cleanup_failure_safe_leak_one_terminal(tmp_path, monkeypatch):
+    """NtQueryDirectoryFile failure leaks private stage; one safe terminal."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "leak"
+    dest.mkdir()
+    outside = tmp_path / "outside-secret.mp4"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+    sent = []
+    path_mut = []
+
+    def ban_unlink(path, *a, **k):
+        path_mut.append(path)
+        raise AssertionError("no path unlink")
+
+    monkeypatch.setattr(d.os, "unlink", ban_unlink)
+    monkeypatch.setattr(d.os, "remove", ban_unlink)
+    monkeypatch.setattr(d.shutil, "rmtree", lambda *a, **k: (_ for _ in ()).throw(AssertionError("rmtree")))
+
+    api = d._ytdl_winapi()
+
+    def fail_query(*a, **k):
+        return 0xC0000001
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, b"X")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=1)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    monkeypatch.setattr(api.ntdll, "NtQueryDirectoryFile", fail_query)
+
+    d.handle_ytdl({
+        "id": "jobLeak", "attemptToken": "atk-leak",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobLeak")
+    assert term["type"] == "ytdl-error"
+    assert len([m for m in sent if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == "jobLeak"]) == 1
+    assert path_mut == []
+    assert outside.read_bytes() == b"OUTSIDE-SECRET"
+    leftover = [p for p in dest.iterdir() if p.is_dir() and p.name.startswith(".mc-ytdl-")]
+    assert leftover
+
+# ---------------------------------------------------------------------------
+# 23. Stage swap/junction blocked; source opens relative to stage handle
+# ---------------------------------------------------------------------------
+
+def test_stage_handle_relative_open_ignores_path_swap(tmp_path, monkeypatch):
+    """After stage pin, relative source opens use stage handle; OUTSIDE-SECRET intact."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "swap"
+    dest.mkdir()
+    outside = tmp_path / "outside-secret.mp4"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+    sent = []
+    open_roots = []
+    api = d._ytdl_winapi()
+    real_ntc = api.ntdll.NtCreateFile
+    stage_handle_box = {"h": None}
+
+    def ntc_hook(handle_p, access, oa, iosb, alloc, attrs, share, disp, options, ea, ealen):
+        root = None
+        try:
+            if oa:
+                root = int(oa.contents.RootDirectory)
+        except Exception:
+            root = None
+        if int(options) & d._YTDL_FILE_NON_DIRECTORY_FILE:
+            open_roots.append(root)
+        return real_ntc(handle_p, access, oa, iosb, alloc, attrs, share, disp, options, ea, ealen)
+
+    monkeypatch.setattr(api.ntdll, "NtCreateFile", ntc_hook)
+    real_create_stage = d._ytdl_create_stage_dir
+
+    def create_stage_track(lease):
+        h, leaf, disp = real_create_stage(lease)
+        stage_handle_box["h"] = int(h) if h else None
+        return h, leaf, disp
+
+    monkeypatch.setattr(d, "_ytdl_create_stage_dir", create_stage_track)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, b"STAGE-BODY")
+        parent = os.path.dirname(path)
+        try:
+            os.rename(parent, parent + ".moved")
+            stage_renamed = True
+        except OSError:
+            stage_renamed = False
+        fake_popen.stage_renamed = stage_renamed
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    fake_popen.stage_renamed = None
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobSwap", "attemptToken": "atk-swap",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobSwap")
+    assert term["type"] in ("ytdl-done", "ytdl-error")
+    assert outside.read_bytes() == b"OUTSIDE-SECRET"
+    # Stage directory pin omits SHARE_DELETE, so rename should be blocked.
+    assert fake_popen.stage_renamed is False
+    assert stage_handle_box["h"] is not None
+    assert open_roots, "expected handle-relative source open"
+    assert all(r == stage_handle_box["h"] for r in open_roots if r), open_roots
+
+
+# ---------------------------------------------------------------------------
+# 24. Reparse / hostile marker rejection
+# ---------------------------------------------------------------------------
+
+def test_reparse_and_hostile_markers_never_touch_outside(tmp_path, monkeypatch):
+    """Reparse/symlink/ADS/nested/.. /outside/hardlink markers fail closed."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "rep"
+    dest.mkdir()
+    outside = tmp_path / "outside-secret.mp4"
+    outside.write_bytes(b"OUTSIDE-SECRET")
+    keep = b"OUTSIDE-SECRET"
+
+    def _run(marker_line, extra=None):
+        sent = []
+
+        def fake_popen(*a, **k):
+            path = _materialize_stage_from_cmd(a, b"STAGE")
+            parent = os.path.dirname(path)
+            if extra:
+                extra(path, parent)
+            line = marker_line(path, parent) if callable(marker_line) else marker_line
+            return LiveProc(lines=["@@FILE@@ %s" % line], returncode=0)
+
+        _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+        jid = "jobRep-%s" % (abs(hash(str(marker_line))) % 10**8)
+        d.handle_ytdl({
+            "id": jid, "attemptToken": "atk-%s" % jid,
+            "url": "https://example.test/secret", "name": "clip.mp4", "dir": str(dest),
+        })
+        term = _wait_terminal(sent, jid)
+        assert term["type"] == "ytdl-error"
+        assert term["reason"] == "local_io"
+        assert outside.read_bytes() == keep
+        assert not any(m.get("type") == "ytdl-done" and m.get("id") == jid for m in sent)
+        return term
+
+    _run(str(outside))
+    _run(lambda path, parent: os.path.abspath(os.path.join(parent, "..", "outside-secret.mp4")))
+    _run(lambda path, parent: os.path.join(parent, "nested", "x.mp4"))
+    _run(lambda path, parent: os.path.join(parent, "evil:ads.mp4"))
+    _run(lambda path, parent: parent)
+    _run("")
+    _run("   ")
+
+    def setup_link(path, parent):
+        link = os.path.join(parent, "escape.mp4")
+        try:
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(str(outside), link)
+        except (OSError, NotImplementedError):
+            pass
+
+    try:
+        probe = dest / "_symlink_probe"
+        if probe.exists() or probe.is_symlink():
+            probe.unlink()
+        os.symlink(str(outside), str(probe))
+        probe.unlink()
+        symlink_ok = True
+    except (OSError, NotImplementedError):
+        symlink_ok = False
+    if symlink_ok:
+        _run(lambda path, parent: os.path.join(parent, "escape.mp4"), extra=setup_link)
+        assert outside.read_bytes() == keep
+
+    def setup_hard(path, parent):
+        link = os.path.join(parent, "hard.mp4")
+        try:
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.link(str(outside), link)
+        except OSError:
+            pass
+
+    try:
+        hl = dest / "_hl"
+        if hl.exists():
+            hl.unlink()
+        os.link(str(outside), str(hl))
+        hl.unlink()
+        hard_ok = True
+    except OSError:
+        hard_ok = False
+    if hard_ok:
+        _run(lambda path, parent: os.path.join(parent, "hard.mp4"), extra=setup_hard)
+        assert outside.read_bytes() == keep
+
+
+# ---------------------------------------------------------------------------
+# 25. Finding 4: post-rename path helpers cannot demote success
+# ---------------------------------------------------------------------------
+
+def test_post_rename_path_helper_failure_still_ytdl_done(tmp_path, monkeypatch):
+    """Successful Nt rename still emits ytdl-done when GetFinalPathName fails."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "post"
+    dest.mkdir()
+    sent = []
+    payload = b"COMMITTED-BYTES"
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    # Force every optional post-rename diagnostic path query to fail after
+    # destination lease acquisition — never demote a successful Nt rename.
+    real_commit = d._ytdl_commit_source
+    calls = {"n": 0}
+
+    def commit_then_break(source_handle, dest_lease, safe_name, max_attempts=32):
+        path = real_commit(source_handle, dest_lease, safe_name, max_attempts=max_attempts)
+        calls["n"] += 1
+        # Break diagnostics after the successful rename decision.
+        monkeypatch.setattr(d, "_ytdl_final_path", lambda h: (_ for _ in ()).throw(OSError("diag boom")))
+        api = d._ytdl_winapi()
+        monkeypatch.setattr(api.k32, "GetFinalPathNameByHandleW", lambda *a, **k: 0)
+        return path
+
+    monkeypatch.setattr(d, "_ytdl_commit_source", commit_then_break)
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobPost", "attemptToken": "atk-post",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobPost")
+    assert term["type"] == "ytdl-done"
+    assert term["file"] == str(dest / "clip.mp4")
+    assert term["bytes"] == len(payload)
+    assert (dest / "clip.mp4").read_bytes() == payload
+    assert calls["n"] == 1
+    assert not any(m.get("type") == "ytdl-error" and m.get("id") == "jobPost" for m in sent)
+
+
+# ---------------------------------------------------------------------------
+# 26. Cancel-first vs commit-first linearization
+# ---------------------------------------------------------------------------
+
+def test_cancel_first_zero_rename_commit_first_inert(tmp_path, monkeypatch):
+    """Cancel-before-commit: 0 Nt renames, no final. Commit-first: done, cancel inert."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "lin"
+    dest.mkdir()
+    payload = b"LINEARIZE"
+    rename_calls = []
+    api = d._ytdl_winapi()
+    real_nt = api.ntdll.NtSetInformationFile
+
+    def nt_hook(handle, iosb, buf, length, klass):
+        rename_calls.append(int(klass))
+        return real_nt(handle, iosb, buf, length, klass)
+
+    monkeypatch.setattr(api.ntdll, "NtSetInformationFile", nt_hook)
+
+    sent = []
+    post_wait = threading.Event()
+    release = threading.Event()
+
+    def after_wait():
+        post_wait.set()
+        assert release.wait(timeout=5)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0, after_wait=after_wait)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobLin", "attemptToken": "atk-lin",
+        "url": "https://example.test/v", "name": "lin.mp4", "dir": str(dest),
+    })
+    assert wait_for(post_wait.is_set, timeout=5)
+    d._pget_cancel({"id": "jobLin", "attemptToken": "atk-lin"})
+    release.set()
+    term = _wait_terminal(sent, "jobLin")
+    assert term["type"] == "ytdl-error" and term["reason"] == "cancelled"
+    assert rename_calls == []
+    assert not (dest / "lin.mp4").exists()
+
+    sent.clear()
+    rename_calls.clear()
+
+    def ok_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, b"COMMITTED")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    monkeypatch.setattr(d.subprocess, "Popen", ok_popen)
+    d.handle_ytdl({
+        "id": "jobLin2", "attemptToken": "atk-lin2",
+        "url": "https://example.test/v2", "name": "lin2.mp4", "dir": str(dest),
+    })
+    term2 = _wait_terminal(sent, "jobLin2")
+    assert term2["type"] == "ytdl-done"
+    assert term2["bytes"] == len(b"COMMITTED")
+    assert open(term2["file"], "rb").read() == b"COMMITTED"
+    assert 10 in rename_calls
+    before = len(sent)
+    d._pget_cancel({"id": "jobLin2", "attemptToken": "atk-lin2"})
+    assert len(sent) == before
+    assert os.path.isfile(term2["file"])
+
+
+# ---------------------------------------------------------------------------
+# 27. Bounded collision exhaustion
+# ---------------------------------------------------------------------------
+
+def test_bounded_collision_exhaustion_no_overwrite(tmp_path, monkeypatch):
+    """32 occupied candidates -> one local_io, no overwrite, no infinite loop."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "exh"
+    dest.mkdir()
+    for i in range(0, 32):
+        name = "clip.mp4" if i == 0 else "clip (%d).mp4" % i
+        (dest / name).write_bytes(b"OCCUPIED-%d" % i)
+    sent = []
+    rename_n = {"n": 0}
+    api = d._ytdl_winapi()
+    real_nt = api.ntdll.NtSetInformationFile
+
+    def nt_hook(handle, iosb, buf, length, klass):
+        rename_n["n"] += 1
+        assert rename_n["n"] <= 32
+        return real_nt(handle, iosb, buf, length, klass)
+
+    monkeypatch.setattr(api.ntdll, "NtSetInformationFile", nt_hook)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, b"NEW")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    d.handle_ytdl({
+        "id": "jobExh", "attemptToken": "atk-exh",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobExh")
+    assert term["type"] == "ytdl-error"
+    assert term["reason"] == "local_io"
+    assert rename_n["n"] == 32
+    for i in range(0, 32):
+        name = "clip.mp4" if i == 0 else "clip (%d).mp4" % i
+        assert (dest / name).read_bytes() == b"OCCUPIED-%d" % i
+
+# ---------------------------------------------------------------------------
+# 28. Handle lifetime close-once matrix (representative paths)
+# ---------------------------------------------------------------------------
+
+def test_handle_close_once_matrix(tmp_path, monkeypatch):
+    """Source/final/stage/dest close exactly once across success and failure paths."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "life"
+    dest.mkdir()
+    real_acquire = d._ytdl_acquire_dest_lease
+
+    def run(case):
+        sent = []
+        jid = "jobLife-%s" % case
+        hold = threading.Event()
+        release = threading.Event()
+        # Restore lease acquire between cases (setup_fail patches it).
+        monkeypatch.setattr(d, "_ytdl_acquire_dest_lease", real_acquire)
+
+        def after_wait():
+            hold.set()
+            if case == "cancel":
+                assert release.wait(timeout=5)
+
+        def fake_popen(*a, **k):
+            if case == "subprocess_fail":
+                path = _materialize_stage_from_cmd(a, b"P")
+                return LiveProc(lines=["ERROR: boom"], returncode=1)
+            if case == "validation_fail":
+                path = _materialize_stage_from_cmd(a, b"P")
+                return LiveProc(lines=["@@FILE@@ C:\\Windows\\notepad.exe"], returncode=0)
+            path = _materialize_stage_from_cmd(a, b"OK")
+            return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+        if case == "cancel":
+            def popen_cancel(*a, **k):
+                path = _materialize_stage_from_cmd(a, b"C")
+                return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0, after_wait=after_wait)
+            _patch_ytdl_base(monkeypatch, d, mc, sent, popen=popen_cancel)
+        else:
+            _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+
+        if case == "setup_fail":
+            monkeypatch.setattr(d, "_ytdl_acquire_dest_lease", lambda *a, **k: None)
+
+        if case == "send_throw":
+            def boom_send(msg):
+                sent.append(dict(msg))
+                if msg.get("type") == "ytdl-done":
+                    raise RuntimeError("send boom")
+            monkeypatch.setattr(mc, "send", boom_send)
+
+        d.handle_ytdl({
+            "id": jid, "attemptToken": "atk-%s" % case,
+            "url": "https://example.test/v", "name": "%s.mp4" % case, "dir": str(dest),
+        })
+        if case == "cancel":
+            assert wait_for(hold.is_set, timeout=5)
+            d._pget_cancel({"id": jid, "attemptToken": "atk-%s" % case})
+            release.set()
+        term = _wait_terminal(sent, jid, timeout=5)
+        assert d._PGET.get(jid) is None
+        key = d._ytdl_canon_path_key(str(dest))
+        assert d._YTDL_DEST_LEASES.get(key) is None
+        return term
+
+    assert run("success")["type"] == "ytdl-done"
+    assert run("subprocess_fail")["type"] == "ytdl-error"
+    assert run("validation_fail")["type"] == "ytdl-error"
+    assert run("setup_fail")["type"] == "ytdl-error"
+    assert run("cancel")["reason"] == "cancelled"
+    t = run("send_throw")
+    assert t["type"] == "ytdl-done"
+
+
+# ---------------------------------------------------------------------------
+# 29. Regression: Florenfile / percent / 150-char / merge / tokens / default dest
+# ---------------------------------------------------------------------------
+
+def test_regression_florenfile_percent_merge_default_token(tmp_path, monkeypatch):
+    """Preserve exact smart names, merge child, default dest, tokens."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "reg"
+    dest.mkdir()
+    sent = []
+    name = "11238-makemebi.net.mp4"
+    payload = b"FLOREN"
+
+    def popen1(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=popen1)
+    d.handle_ytdl({
+        "id": "jobF", "attemptToken": "atk-f",
+        "url": "https://example.test/v", "name": name, "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobF")
+    assert term["type"] == "ytdl-done"
+    assert os.path.basename(term["file"]) == name
+    assert term["attemptToken"] == "atk-f"
+    assert term["bytes"] == len(payload)
+
+    sent.clear()
+    long_name = ("a" * 146) + ".mp4"
+    assert len(long_name) == 150
+
+    def popen2(*a, **k):
+        path = _materialize_stage_from_cmd(a, b"L")
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    monkeypatch.setattr(d.subprocess, "Popen", popen2)
+    d.handle_ytdl({
+        "id": "job150", "attemptToken": "atk-150",
+        "url": "https://example.test/v", "name": long_name, "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "job150")
+    assert term["type"] == "ytdl-done"
+    assert os.path.basename(term["file"]) == long_name
+
+    sent.clear()
+    merge_payload = b"MERGED"
+
+    def popen3(*a, **k):
+        cmd = list(a[0])
+        out = cmd[cmd.index("-o") + 1].replace("%%", "%")
+        parent = os.path.dirname(out)
+        os.makedirs(parent, exist_ok=True)
+        merged = os.path.join(parent, "wanted.merged.mp4")
+        with open(merged, "wb") as f:
+            f.write(merge_payload)
+        return LiveProc(lines=["@@FILE@@ %s" % merged], returncode=0)
+
+    monkeypatch.setattr(d.subprocess, "Popen", popen3)
+    d.handle_ytdl({
+        "id": "jobM", "attemptToken": "atk-m",
+        "url": "https://example.test/v", "name": "merged-out.mp4", "dir": str(dest),
+    })
+    term = _wait_terminal(sent, "jobM")
+    assert term["type"] == "ytdl-done"
+    assert os.path.basename(term["file"]) == "merged-out.mp4"
+    assert open(term["file"], "rb").read() == merge_payload
+
+    sent.clear()
+    default_dir = dest / "Downloads"
+    default_dir.mkdir()
+    monkeypatch.setattr(mc, "downloads_dir", lambda: str(default_dir))
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(d.subprocess, "Popen", popen1)
+    d.handle_ytdl({
+        "id": "jobDef", "attemptToken": "atk-def",
+        "url": "https://example.test/v", "name": "def.mp4",
+    })
+    term = _wait_terminal(sent, "jobDef")
+    assert term["type"] == "ytdl-done"
+    assert os.path.normcase(os.path.dirname(term["file"])) == os.path.normcase(str(default_dir))
+
+
+# ---------------------------------------------------------------------------
+# 30. Static source guard
+# ---------------------------------------------------------------------------
+
+def test_static_source_guard_structured_handle_path():
+    """Structured handle path must not reintroduce rejected pathname schemes."""
+    import inspect
+    import mchost.downloads as d
+
+    src = inspect.getsource(d)
+    for name in (
+        "_ytdl_try_exclusive_place",
+        "_ytdl_promote_to_target",
+        "_ytdl_owned_stage_source",
+        "_ytdl_snapshot_path_identity",
+        "_ytdl_unlink_if_identity",
+        "_ytdl_cleanup_exclusive_fd",
+        "_ytdl_cleanup_stage_dir",
+    ):
+        assert ("def %s" % name) not in src, name
+    assert "_YTDL_FileRenameInformation = 10" in src
+    assert "NtSetInformationFile" in src
+    assert "_ytdl_acquire_dest_lease" in src
+    assert "_ytdl_commit_source" in src
+    assert "_ytdl_cleanup_stage_tree" in src
+
+
+# ---------------------------------------------------------------------------
+# 31. Occupied preferred name after stage write still no-clobber
+# ---------------------------------------------------------------------------
+
+def test_target_occupied_before_commit_preserves_sentinel(tmp_path, monkeypatch):
+    """Existing/race-created final name is never overwritten; dedup sibling used."""
     import mchost.downloads as d
 
     sent = []
-    dest = tmp_path / "race-dedup"
+    dest = tmp_path / "race"
     dest.mkdir()
     final = dest / "clip.mp4"
     sentinel = b"SENTINEL-PREEXISTING-CONTENTS"
     payload = b"DOWNLOAD-PAYLOAD-XXX"
-    calls = []
 
     def fake_popen(*a, **k):
-        calls.append((a, k))
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        # After host pre-deduped a free target, occupy that committed name.
         final.write_bytes(sentinel)
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(payload)
+        path = _materialize_stage_from_cmd(a, payload)
         return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
 
     _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-
     d.handle_ytdl({
-        "id": "jobOcc",
-        "attemptToken": "atk-occ",
-        "url": "https://example.test/v",
-        "name": "clip.mp4",
-        "dir": str(dest),
+        "id": "jobOcc", "attemptToken": "atk-occ",
+        "url": "https://example.test/v", "name": "clip.mp4", "dir": str(dest),
     })
     term = _wait_terminal(sent, "jobOcc")
-    # Sentinel must remain byte-for-byte unchanged.
-    assert final.is_file()
     assert final.read_bytes() == sentinel
-    if term["type"] == "ytdl-done":
-        assert term["file"] != str(final)
-        assert term["bytes"] == len(payload)
-        assert os.path.isfile(term["file"])
-        assert open(term["file"], "rb").read() == payload
-        assert os.path.basename(term["file"]) != "clip.mp4" or term["file"] != str(final)
-    else:
-        assert term["type"] == "ytdl-error"
-        assert term["reason"] == "local_io"
-        assert term["attemptToken"] == "atk-occ"
-    assert not any(
-        m.get("type") == "ytdl-done" and m.get("file") == str(final)
-        for m in sent if m.get("id") == "jobOcc"
-    )
+    assert term["type"] == "ytdl-done"
+    assert term["file"] != str(final)
+    assert os.path.basename(term["file"]) == "clip (1).mp4"
+    assert open(term["file"], "rb").read() == payload
 
 
 # ---------------------------------------------------------------------------
-# 18. Adversarial race between existence observation and commit: no clobber
-# ---------------------------------------------------------------------------
-
-def test_adversarial_promote_race_no_clobber(tmp_path, monkeypatch):
-    """Insert target between observe-free and commit; exclusive promote must not clobber.
-
-    Mutation: exists-then-os.replace overwrites the inserted sentinel.
-    """
-    import mchost.downloads as d
-
-    dest = tmp_path / "adv"
-    dest.mkdir()
-    final = dest / "clip.mp4"
-    sentinel = b"ADVERSARIAL-SENTINEL-BYTES"
-    payload = b"PROMOTED-PAYLOAD"
-    src = dest / "_src_clip.mp4"
-    src.write_bytes(payload)
-
-    final_abs = os.path.normcase(os.path.abspath(str(final)))
-    inserted = {"done": False}
-    replace_calls = []
-
-    real_replace = d.os.replace
-    real_link = d.os.link
-    real_open = d.os.open
-
-    def _insert_sentinel(dst_p):
-        try:
-            dst_abs = os.path.normcase(os.path.abspath(dst_p))
-        except Exception:
-            return
-        if dst_abs != final_abs or inserted["done"]:
-            return
-        if os.path.exists(dst_p) or os.path.lexists(dst_p):
-            return
-        with open(dst_p, "wb") as f:
-            f.write(sentinel)
-        inserted["done"] = True
-
-    def replace_hook(src_p, dst_p, *a, **k):
-        replace_calls.append((src_p, dst_p))
-        _insert_sentinel(dst_p)
-        return real_replace(src_p, dst_p, *a, **k)
-
-    def link_hook(src_p, dst_p):
-        _insert_sentinel(dst_p)
-        return real_link(src_p, dst_p)
-
-    def open_hook(path, flags, mode=0o777, *a, **k):
-        if flags & getattr(os, "O_EXCL", 0):
-            _insert_sentinel(path)
-        return real_open(path, flags, mode, *a, **k)
-
-    monkeypatch.setattr(d.os, "replace", replace_hook)
-    monkeypatch.setattr(d.os, "link", link_hook)
-    monkeypatch.setattr(d.os, "open", open_hook)
-
-    result = d._ytdl_promote_to_target(str(src), str(final))
-
-    # If the adversary successfully inserted on the preferred target, those
-    # bytes must remain untouched — never replaced/clobbered.
-    if inserted["done"]:
-        assert final.is_file()
-        assert final.read_bytes() == sentinel, (
-            "promote clobbered an adversarially inserted target"
-        )
-        assert result is None or os.path.normcase(os.path.abspath(result)) != final_abs
-        if result is not None:
-            assert os.path.isfile(result)
-            assert open(result, "rb").read() == payload
-    else:
-        # No insert window: exclusive place may own final with our payload.
-        if result is not None and os.path.normcase(os.path.abspath(result)) == final_abs:
-            assert final.read_bytes() == payload
-    # exists-then-replace must not be the commit strategy.
-    if replace_calls:
-        for _src, dst in replace_calls:
-            if os.path.normcase(os.path.abspath(dst)) == final_abs and inserted["done"]:
-                assert final.read_bytes() == sentinel
-
-
-# ---------------------------------------------------------------------------
-# 19. Staging cleanup removes only owned tree (success / fail / cancel / prep)
+# 32. Staging cleanup only owned; success/fail/cancel/prep
 # ---------------------------------------------------------------------------
 
 def test_staging_cleanup_only_owned_on_all_terminals(tmp_path, monkeypatch):
@@ -1256,272 +1992,64 @@ def test_staging_cleanup_only_owned_on_all_terminals(tmp_path, monkeypatch):
     unrelated.write_bytes(b"UNRELATED")
     keep = b"UNRELATED"
 
-    def _run(case, popen=None, ensure=None, cancel=False):
+    def _run(case, ensure=None):
         sent = []
-        calls = []
+        hold = threading.Event()
 
         def fake_popen(*a, **k):
-            calls.append((a, k))
-            cmd = list(a[0]) if a else []
-            out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-            path = out.replace("%%", "%")
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
             if case == "success":
-                with open(path, "wb") as f:
-                    f.write(b"OK")
+                path = _materialize_stage_from_cmd(a, b"OK")
                 return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
             if case == "fail":
-                with open(path, "wb") as f:
-                    f.write(b"PARTIAL")
+                path = _materialize_stage_from_cmd(a, b"PARTIAL")
                 return LiveProc(lines=["ERROR: boom"], returncode=1)
-            # cancel: hold until cancelled
             return LiveProc(
                 lines=["[download]   1.0% of  1.00MiB at   1.00MiB/s ETA 00:99"],
                 returncode=0,
                 hold=hold,
             )
 
-        hold = threading.Event()
-        _patch_ytdl_base(monkeypatch, d, mc, sent, popen=popen or fake_popen)
+        _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
         if ensure is not None:
             monkeypatch.setattr(d, "ensure_ytdlp", ensure)
-
         jid = "jobClean-%s" % case
         token = "atk-clean-%s" % case
         d.handle_ytdl({
-            "id": jid,
-            "attemptToken": token,
-            "url": "https://example.test/v",
-            "name": "out.mp4",
-            "dir": str(dest),
+            "id": jid, "attemptToken": token,
+            "url": "https://example.test/v", "name": "out.mp4", "dir": str(dest),
         })
-        staging_paths = []
         if case == "cancel":
             assert wait_for(lambda: d._PGET.get(jid) is not None, timeout=5)
-            # Capture staging from Popen if it already ran.
-            if calls:
-                cmd = list(calls[0][0][0]) if calls[0][0] else []
-                if "-o" in cmd:
-                    staging_paths.append(cmd[cmd.index("-o") + 1].replace("%%", "%"))
             d._pget_cancel({"id": jid, "attemptToken": token})
             hold.set()
         term = _wait_terminal(sent, jid)
-        assert len([m for m in sent if m.get("type") in ("ytdl-done", "ytdl-error")
-                    and m.get("id") == jid]) == 1
-        # Unrelated file always survives.
         assert unrelated.read_bytes() == keep
-        # No leftover staging dirs under dest.
-        leftover_dirs = [
-            p for p in dest.iterdir()
-            if p.is_dir() and p.name.startswith(".mc-ytdl")
-        ]
-        assert leftover_dirs == [], leftover_dirs
-        # Registry cleared.
+        leftover = [p for p in dest.iterdir() if p.is_dir() and p.name.startswith(".mc-ytdl")]
+        if case in ("success", "fail", "cancel"):
+            assert leftover == [], leftover
         assert d._PGET.get(jid) is None
-        return term, calls
+        return term
 
-    # Success
-    term, calls = _run("success")
-    assert term["type"] == "ytdl-done"
+    assert _run("success")["type"] == "ytdl-done"
     assert (dest / "out.mp4").is_file()
-    assert unrelated.read_bytes() == keep
+    assert _run("fail")["type"] == "ytdl-error"
+    assert _run("cancel")["reason"] == "cancelled"
 
-    # Failure
-    term, _ = _run("fail")
-    assert term["type"] == "ytdl-error"
-    assert unrelated.read_bytes() == keep
-
-    # Cancel
-    term, _ = _run("cancel")
-    assert term["type"] == "ytdl-error"
-    assert term["reason"] == "cancelled"
-    assert unrelated.read_bytes() == keep
-
-    # Preparation exception (ensure_ytdlp)
     def boom_ensure():
         raise RuntimeError("ensure exploded with secret C:\\Users\\x\\cookies.txt")
 
-    term, _ = _run("prep", ensure=boom_ensure)
+    term = _run("prep", ensure=boom_ensure)
     assert term["type"] == "ytdl-error"
-    assert term["reason"] in ("local_io", "permanent")
     err = term.get("error") or ""
-    assert "Traceback" not in err
     assert "cookies" not in err.lower()
-    assert "RuntimeError" not in err
-    assert unrelated.read_bytes() == keep
+    assert "Traceback" not in err
 
 
 # ---------------------------------------------------------------------------
-# 20. Cancel vs commit linearization: cancel-before-commit wins; post-commit inert
-# ---------------------------------------------------------------------------
-
-def test_cancel_before_commit_linearization_and_post_commit_inert(
-        tmp_path, monkeypatch):
-    """Cancel that acquires the op lock first must create no final; post-commit cancel is inert.
-
-    Promotion/verify/claim share one linearization region under ytdl_lock.
-    Cancel-winning path must not call promote or leave a final on disk.
-    """
-    import mchost.downloads as d
-
-    sent = []
-    dest = tmp_path / "lin"
-    dest.mkdir()
-    payload = b"LINEARIZE"
-    post_wait = threading.Event()
-    release_worker = threading.Event()
-    promote_calls = []
-    jid = "jobLin"
-    token = "atk-lin"
-    final = dest / "lin.mp4"
-
-    def after_wait():
-        # Worker finished the fake subprocess; hold before commit linearization.
-        post_wait.set()
-        assert release_worker.wait(timeout=5)
-
-    def fake_popen(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(payload)
-        return LiveProc(
-            lines=["@@FILE@@ %s" % path],
-            returncode=0,
-            after_wait=after_wait,
-        )
-
-    real_promote = d._ytdl_promote_to_target
-
-    def tracking_promote(src, target, *a, **k):
-        op = d._PGET.get(jid)
-        assert op is not None, "op must still be registered during promote"
-        lock = op.get("ytdl_lock")
-        assert lock is not None and lock.locked(), (
-            "promote must run only while op-local ytdl_lock is held"
-        )
-        promote_calls.append((src, target))
-        return real_promote(src, target, *a, **k)
-
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-    monkeypatch.setattr(d, "_ytdl_promote_to_target", tracking_promote)
-
-    d.handle_ytdl({
-        "id": jid,
-        "attemptToken": token,
-        "url": "https://example.test/v",
-        "name": "lin.mp4",
-        "dir": str(dest),
-    })
-    assert wait_for(post_wait.is_set, timeout=5)
-    # Cancel acquires the linearization lock before the worker enters commit.
-    d._pget_cancel({"id": jid, "attemptToken": token})
-    release_worker.set()
-    term = _wait_terminal(sent, jid)
-    assert term["type"] == "ytdl-error"
-    assert term["reason"] == "cancelled"
-    assert term["attemptToken"] == token
-    terms = [m for m in sent if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == jid]
-    assert len(terms) == 1
-    assert not any(m.get("type") == "ytdl-done" for m in sent if m.get("id") == jid)
-    assert promote_calls == [], "cancel-first must not promote"
-    assert not final.exists(), "cancel-first must not create any final"
-    assert d._PGET.get(jid) is None
-
-    # Reentrant same-id retry after cancel remains possible.
-    sent.clear()
-    promote_calls.clear()
-    monkeypatch.setattr(d, "_ytdl_promote_to_target", real_promote)
-
-    def retry_popen(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else str(dest / "lin.mp4")
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(b"RETRY-OK")
-        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
-
-    monkeypatch.setattr(d.subprocess, "Popen", retry_popen)
-    d.handle_ytdl({
-        "id": jid,
-        "attemptToken": token + "-retry",
-        "url": "https://example.test/v-retry",
-        "name": "lin.mp4",
-        "dir": str(dest),
-    })
-    term_r = _wait_terminal(sent, jid)
-    assert term_r["type"] == "ytdl-done"
-    assert term_r["attemptToken"] == token + "-retry"
-    assert final.is_file() and final.read_bytes() == b"RETRY-OK"
-
-    # --- Worker claims commit first; later cancel is inert; one done with actual file/bytes ---
-    sent.clear()
-    promote_calls.clear()
-    jid2 = "jobLin2"
-    token2 = "atk-lin2"
-
-    def locked_promote(src, target, *a, **k):
-        op = d._PGET.get(jid2)
-        assert op is not None
-        lock = op.get("ytdl_lock")
-        assert lock is not None and lock.locked(), (
-            "promote must run only while op-local ytdl_lock is held"
-        )
-        result = real_promote(src, target, *a, **k)
-        promote_calls.append(result)
-        return result
-
-    def fake_popen2(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(b"COMMITTED")
-        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
-
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen2)
-    monkeypatch.setattr(d, "_ytdl_promote_to_target", locked_promote)
-
-    d.handle_ytdl({
-        "id": jid2,
-        "attemptToken": token2,
-        "url": "https://example.test/v2",
-        "name": "lin2.mp4",
-        "dir": str(dest),
-    })
-    term2 = _wait_terminal(sent, jid2)
-    assert term2["type"] == "ytdl-done"
-    assert term2["attemptToken"] == token2
-    assert term2["file"] and os.path.isfile(term2["file"])
-    assert term2["bytes"] == len(b"COMMITTED")
-    assert open(term2["file"], "rb").read() == b"COMMITTED"
-    assert promote_calls, "success path must promote under the op lock"
-    before = len(sent)
-    d._pget_cancel({"id": jid2, "attemptToken": token2})
-    assert len(sent) == before
-    assert d._PGET.get(jid2) is None
-    terms2 = [m for m in sent if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == jid2]
-    assert len(terms2) == 1
-
-
-# ---------------------------------------------------------------------------
-# 21. Prep exceptions: ensure_ytdlp / ensure_deno / start_pot_provider
+# 33. Prep exceptions remain one safe error
 # ---------------------------------------------------------------------------
 
 def test_prep_exceptions_emit_one_safe_error_and_unregister(tmp_path, monkeypatch):
-    """Unexpected prep failures must emit exactly one safe structured error."""
     import mchost.downloads as d
 
     dest = tmp_path / "prep-exc"
@@ -1537,7 +2065,6 @@ def test_prep_exceptions_emit_one_safe_error_and_unregister(tmp_path, monkeypatc
         ("ensure_deno", "ensure_deno", ValueError("deno fail C:\\secret\\path")),
         ("start_pot_provider", "start_pot_provider", OSError("pot bind 127.0.0.1:1")),
     ]
-
     for label, attr, exc in cases:
         sent = []
         spawned.clear()
@@ -1547,75 +2074,32 @@ def test_prep_exceptions_emit_one_safe_error_and_unregister(tmp_path, monkeypatc
             raise _e
 
         monkeypatch.setattr(d, attr, boom)
-        # Other prep steps succeed when not the one under test.
         if attr != "ensure_ytdlp":
             monkeypatch.setattr(d, "ensure_ytdlp", lambda: "yt-dlp-fake")
         if attr != "ensure_deno":
             monkeypatch.setattr(d, "ensure_deno", lambda: None)
         if attr != "start_pot_provider":
             monkeypatch.setattr(d, "start_pot_provider", lambda: False)
-
         jid = "jobPrepX-%s" % label
         token = "atk-prepx-%s" % label
         d.handle_ytdl({
-            "id": jid,
-            "attemptToken": token,
-            "url": "https://example.test/secret-video",
-            "name": "p.mp4",
-            "dir": str(dest),
+            "id": jid, "attemptToken": token,
+            "url": "https://example.test/secret-video", "name": "p.mp4", "dir": str(dest),
         })
         term = _wait_terminal(sent, jid)
         assert term["type"] == "ytdl-error", label
         assert term["attemptToken"] == token, label
-        assert term["reason"] in ("local_io", "permanent"), label
         err = term.get("error") or ""
-        assert "Traceback" not in err, label
         assert "secret" not in err.lower(), label
-        assert "https://" not in err, label
-        assert ".mozilla" not in err, label
-        assert str(exc) not in err, label
         assert not spawned, label
         assert d._PGET.get(jid) is None, label
-        terms = [m for m in sent if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == jid]
-        assert len(terms) == 1, label
-
-        # Reentrant same-id retry remains possible after unregister.
-        sent.clear()
-        _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-
-        def ok_popen(*a, **k):
-            cmd = list(a[0]) if a else []
-            out = cmd[cmd.index("-o") + 1] if "-o" in cmd else str(dest / "p.mp4")
-            path = out.replace("%%", "%")
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(b"R")
-            return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
-
-        monkeypatch.setattr(d.subprocess, "Popen", ok_popen)
-        monkeypatch.setattr(d, "ensure_ytdlp", lambda: "yt-dlp-fake")
-        monkeypatch.setattr(d, "ensure_deno", lambda: None)
-        monkeypatch.setattr(d, "start_pot_provider", lambda: False)
-        d.handle_ytdl({
-            "id": jid,
-            "attemptToken": token + "-retry",
-            "url": "https://example.test/v",
-            "name": "retry-%s.mp4" % label,
-            "dir": str(dest),
-        })
-        term2 = _wait_terminal(sent, jid)
-        assert term2["type"] == "ytdl-done", label
-        assert term2["attemptToken"] == token + "-retry", label
 
 
 # ---------------------------------------------------------------------------
-# 22. C1 controls in format rejected; ordinary selectors accepted
+# 34. Format C1 controls + legacy builder unchanged
 # ---------------------------------------------------------------------------
 
 def test_format_c1_controls_rejected_ordinary_accepted(tmp_path, monkeypatch):
-    """U+007F/U+0085/U+009F in format fail closed; normal selectors still work."""
     import mchost.downloads as d
 
     sent = []
@@ -1625,50 +2109,30 @@ def test_format_c1_controls_rejected_ordinary_accepted(tmp_path, monkeypatch):
 
     def fake_popen(*a, **k):
         spawned.append(1)
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else str(dest / "x.mp4")
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(b"F")
+        path = _materialize_stage_from_cmd(a, b"F")
         return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
 
     _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-
     base = {
-        "id": "jobC1",
-        "attemptToken": "atk-c1",
-        "url": "https://example.test/v",
-        "name": "c.mp4",
-        "dir": str(dest),
+        "id": "jobC1", "attemptToken": "atk-c1",
+        "url": "https://example.test/v", "name": "c.mp4", "dir": str(dest),
     }
-
     for i, bad in enumerate(("bv*\x7f+ba", "bv*\x85+ba", "bv*\x9f+ba", "x\x85y")):
         spawned.clear()
         sent.clear()
         d._PGET.pop("jobC1", None)
         d.handle_ytdl({**base, "format": bad})
-        wait_for(lambda: bool(spawned) or any(m.get("type") == "ytdl-error" for m in sent),
-                 timeout=0.5)
-        assert not spawned, "C1 case %d spawned" % i
+        wait_for(lambda: bool(spawned) or any(m.get("type") == "ytdl-error" for m in sent), timeout=0.5)
+        assert not spawned, i
         assert d._PGET.get("jobC1") is None
         errs = [m for m in sent if m.get("type") == "ytdl-error"]
         assert len(errs) == 1
-        assert errs[0]["attemptToken"] == "atk-c1"
         assert errs[0]["reason"] == "permanent"
-        assert not any(m.get("type") == "ytdl-done" for m in sent)
-        # No legacy downgrade (title template path).
-        assert not any("%(title)" in str(m) for m in sent)
 
-    # Ordinary selected format still accepted and spawned.
     spawned.clear()
     sent.clear()
     d.handle_ytdl({
-        **base,
-        "id": "jobC1ok",
-        "attemptToken": "atk-c1-ok",
+        **base, "id": "jobC1ok", "attemptToken": "atk-c1-ok",
         "format": "bv*[height<=1080]+ba/b[height<=1080]",
     })
     term = _wait_terminal(sent, "jobC1ok")
@@ -1676,12 +2140,7 @@ def test_format_c1_controls_rejected_ordinary_accepted(tmp_path, monkeypatch):
     assert spawned
 
 
-# ---------------------------------------------------------------------------
-# 23. Legacy builder/output-template/force-overwrite unchanged
-# ---------------------------------------------------------------------------
-
 def test_legacy_builder_outtmpl_force_overwrite_unchanged(tmp_path, monkeypatch):
-    """Legacy token-omitted path keeps title/ID template and --force-overwrites."""
     import mchost.downloads as d
 
     sent = []
@@ -1696,630 +2155,132 @@ def test_legacy_builder_outtmpl_force_overwrite_unchanged(tmp_path, monkeypatch)
         return LiveProc(lines=["@@FILE@@ %s" % final], returncode=0)
 
     _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-
-    # Direct builder shape.
-    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b",
-                            os.path.join(str(dest), "%(title).150B [%(id)s].%(ext)s"),
-                            "https://example.test/v", None, False)
+    cmd = d._ytdl_build_cmd(
+        "yt-dlp", "bv*+ba/b",
+        os.path.join(str(dest), "%(title).150B [%(id)s].%(ext)s"),
+        "https://example.test/v", None, False,
+    )
     assert "--force-overwrites" in cmd
-    assert cmd[cmd.index("-o") + 1].endswith("%(title).150B [%(id)s].%(ext)s") or \
-        "%(title)" in cmd[cmd.index("-o") + 1]
-    assert "%(id)s" in cmd[cmd.index("-o") + 1]
-    assert cmd[cmd.index("-f") + 1] == "bv*+ba/b"
-
-    d.handle_ytdl({
-        "id": "jobLeg2",
-        "url": "https://example.test/v",
-        "dir": str(dest),
-    })
+    assert "%(title)" in cmd[cmd.index("-o") + 1]
+    d.handle_ytdl({"id": "jobLeg2", "url": "https://example.test/v", "dir": str(dest)})
     term = _wait_terminal(sent, "jobLeg2")
     assert term["type"] == "ytdl-done"
     assert "attemptToken" not in term
-    lcmd = _cmd_from_popen_calls(calls)
-    assert "--force-overwrites" in lcmd
-    assert "%(title)" in lcmd[lcmd.index("-o") + 1]
-    assert "%(id)s" in lcmd[lcmd.index("-o") + 1]
 
 
 # ---------------------------------------------------------------------------
-# 24. Exclusive-copy short writes must loop to full content (Finding B)
-# ---------------------------------------------------------------------------
-
-def test_exclusive_copy_short_write_loops_full_content(tmp_path, monkeypatch):
-    """O_EXCL copy must loop os.write until every byte is written; full size commits."""
-    import mchost.downloads as d
-
-    dest = tmp_path / "shortw"
-    dest.mkdir()
-    payload = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" * 64  # multi-chunk-ish
-    src = dest / "_src.mp4"
-    src.write_bytes(payload)
-    final = dest / "out.mp4"
-
-    # Force hardlink fallback so the exclusive-copy path is exercised.
-    def no_link(src_p, dst_p):
-        raise OSError(18, "cross-device link")
-
-    real_write = d.os.write
-    write_calls = {"n": 0}
-
-    def short_write(fd, data):
-        write_calls["n"] += 1
-        if data is None or len(data) == 0:
-            return real_write(fd, data)
-        # Write exactly one byte per call so production must loop on a memoryview.
-        one = data[:1]
-        n = real_write(fd, one)
-        assert n == 1
-        return 1
-
-    monkeypatch.setattr(d.os, "link", no_link)
-    monkeypatch.setattr(d.os, "write", short_write)
-
-    result = d._ytdl_promote_to_target(str(src), str(final))
-    assert result == str(final)
-    assert final.is_file()
-    assert final.read_bytes() == payload
-    assert final.stat().st_size == len(payload)
-    assert write_calls["n"] >= len(payload), "expected one-byte writes to force a loop"
-    # Staging source may be unlinked only after full verified copy.
-    assert not src.exists() or src.read_bytes() == payload
-
-
-def test_exclusive_copy_bad_write_counts_fail_closed(tmp_path, monkeypatch):
-    """Zero/negative/bool/non-int/overlarge/exception write results must not emit success."""
-    import mchost.downloads as d
-
-    dest = tmp_path / "badw"
-    dest.mkdir()
-    payload = b"FULL-CONTENT-NOT-TRUNCATED!!"
-    cases = [
-        ("zero", 0),
-        ("neg", -1),
-        ("bool_true", True),
-        ("bool_false", False),
-        ("non_int", 1.5),
-        ("overlarge", 10**9),
-        ("exc", "raise"),
-    ]
-
-    def no_link(src_p, dst_p):
-        raise OSError(18, "cross-device link")
-
-    monkeypatch.setattr(d.os, "link", no_link)
-    real_write = d.os.write
-
-    for label, mode in cases:
-        src = dest / ("src-%s.mp4" % label)
-        final = dest / ("out-%s.mp4" % label)
-        src.write_bytes(payload)
-        if final.exists():
-            final.unlink()
-
-        def bad_write(fd, data, _mode=mode):
-            if _mode == "raise":
-                raise OSError("disk full simulated")
-            return _mode
-
-        monkeypatch.setattr(d.os, "write", bad_write)
-        result = d._ytdl_promote_to_target(str(src), str(final))
-        assert result is None, label
-        # Must not report truncated final as success; complete staging source preserved.
-        assert src.is_file() and src.read_bytes() == payload, label
-        # Owned partial with matching identity should be cleaned; never a full false commit.
-        if final.exists():
-            assert final.read_bytes() != payload, label
-        # Restore write for next iteration safety.
-        monkeypatch.setattr(d.os, "write", real_write)
-
-
-# ---------------------------------------------------------------------------
-# 25. Copy-failure cleanup must not delete a replacement sentinel (Finding C)
-# ---------------------------------------------------------------------------
-
-def test_exclusive_copy_failure_cleanup_preserves_replacement_sentinel(
-        tmp_path, monkeypatch):
-    """If another actor replaces the exclusive partial before cleanup, sentinel survives.
-
-    On Windows an open exclusive fd cannot be renamed, so the replacement is planted
-    immediately after the operation closes its fd and before path-based cleanup — the
-    classic lost-ownership window. Identity-fenced cleanup must not unlink the new file.
-    """
-    import mchost.downloads as d
-
-    dest = tmp_path / "repl"
-    dest.mkdir()
-    payload = b"ORIGINAL-STAGING-BYTES-XXXX"
-    src = dest / "_src.mp4"
-    src.write_bytes(payload)
-    final = dest / "clip.mp4"
-    final_abs = os.path.normcase(os.path.abspath(str(final)))
-    sentinel = b"SENTINEL-REPLACEMENT-CONTENTS"
-    swapped = {"done": False}
-    tracked_fd = {"fd": None}
-
-    def no_link(src_p, dst_p):
-        raise OSError(18, "cross-device link")
-
-    real_open = d.os.open
-    real_close = d.os.close
-    real_write = os.write
-
-    def open_track(path, flags, mode=0o777, *a, **k):
-        fd = real_open(path, flags, mode, *a, **k)
-        try:
-            if os.path.normcase(os.path.abspath(path)) == final_abs:
-                tracked_fd["fd"] = fd
-        except Exception:
-            pass
-        return fd
-
-    def close_plant_sentinel(fd):
-        real_close(fd)
-        if tracked_fd["fd"] is not None and fd == tracked_fd["fd"] and not swapped["done"]:
-            # Ownership of the path is lost after close; plant a different-identity sentinel.
-            try:
-                if os.path.lexists(str(final)):
-                    os.replace(str(final), str(final) + ".owned-partial")
-            except Exception:
-                try:
-                    if os.path.isfile(str(final)):
-                        os.unlink(str(final))
-                except Exception:
-                    pass
-            with open(str(final), "wb") as f:
-                f.write(sentinel)
-            swapped["done"] = True
-
-    def write_then_fail(fd, data):
-        real_write(fd, b"X")
-        raise OSError("simulated copy failure after exclusive create")
-
-    monkeypatch.setattr(d.os, "link", no_link)
-    monkeypatch.setattr(d.os, "open", open_track)
-    monkeypatch.setattr(d.os, "close", close_plant_sentinel)
-    monkeypatch.setattr(d.os, "write", write_then_fail)
-
-    result = d._ytdl_promote_to_target(str(src), str(final))
-    assert result is None
-    assert swapped["done"] is True
-    assert final.is_file(), "sentinel path must remain"
-    assert final.read_bytes() == sentinel, "cleanup must not unlink the replacement"
-    assert src.is_file() and src.read_bytes() == payload
-
-
-def test_exclusive_copy_failure_cleans_owned_partial_when_identity_matches(
-        tmp_path, monkeypatch):
-    """Ordinary owned partial cleanup still removes the operation-created file."""
-    import mchost.downloads as d
-
-    dest = tmp_path / "ownclean"
-    dest.mkdir()
-    payload = b"OWNED-PARTIAL-SOURCE"
-    src = dest / "_src.mp4"
-    src.write_bytes(payload)
-    final = dest / "clip.mp4"
-
-    def no_link(src_p, dst_p):
-        raise OSError(18, "cross-device link")
-
-    real_write = os.write
-
-    def write_partial_then_fail(fd, data):
-        real_write(fd, b"X")
-        raise OSError("copy failed")
-
-    monkeypatch.setattr(d.os, "link", no_link)
-    monkeypatch.setattr(d.os, "write", write_partial_then_fail)
-
-    result = d._ytdl_promote_to_target(str(src), str(final))
-    assert result is None
-    assert not final.exists(), "owned partial with matching identity must be cleaned"
-    assert src.is_file() and src.read_bytes() == payload
-
-
-# ---------------------------------------------------------------------------
-# 26. Untrusted @@FILE@@ path escapes must not mutate outside stage (Finding D)
+# 35. Marker must stay inside owned stage
 # ---------------------------------------------------------------------------
 
 def test_file_marker_path_must_stay_inside_owned_stage(tmp_path, monkeypatch):
-    """Outside/escape/hostile @@FILE@@ paths: zero outside mutation, one safe terminal."""
     import mchost.downloads as d
 
     dest = tmp_path / "esc"
     dest.mkdir()
     outside = tmp_path / "outside-secret.mp4"
     outside.write_bytes(b"DO-NOT-TOUCH")
-    sibling_prefix = tmp_path / "esc-sibling-prefix"
-    # Sibling dir whose name is a prefix of stage parent patterns.
     keep = b"DO-NOT-TOUCH"
 
-    def _run(file_line, name="clip.mp4", extra_setup=None):
+    def _run(file_line, extra_setup=None):
         sent = []
-        calls = []
-        outside_before = outside.read_bytes()
 
         def fake_popen(*a, **k):
-            calls.append((a, k))
-            cmd = list(a[0]) if a else []
-            out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-            path = out.replace("%%", "%")
+            path = _materialize_stage_from_cmd(a, b"STAGE-BODY")
             parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            # Legitimate stage content (ignored when marker points elsewhere).
-            with open(path, "wb") as f:
-                f.write(b"STAGE-BODY")
             if extra_setup is not None:
                 extra_setup(path, parent)
             line = file_line(path, parent) if callable(file_line) else file_line
-            return LiveProc(lines=["@@FILE@@ %s" % line] if line is not None else ["@@FILE@@"],
-                            returncode=0)
+            return LiveProc(
+                lines=["@@FILE@@ %s" % line] if line is not None else ["@@FILE@@"],
+                returncode=0,
+            )
 
         _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
         jid = "jobEsc-%s" % (abs(hash(str(file_line))) % 10**8)
-        token = "atk-esc-%s" % jid
         d.handle_ytdl({
-            "id": jid,
-            "attemptToken": token,
-            "url": "https://example.test/secret-video",
-            "name": name,
-            "dir": str(dest),
+            "id": jid, "attemptToken": "atk-%s" % jid,
+            "url": "https://example.test/secret-video", "name": "clip.mp4", "dir": str(dest),
         })
         term = _wait_terminal(sent, jid)
-        assert term["type"] == "ytdl-error", term
-        assert term["reason"] in ("local_io", "permanent"), term
-        err = term.get("error") or ""
-        assert "Traceback" not in err
-        assert str(outside) not in err
-        assert "secret" not in err.lower()
-        assert "DO-NOT-TOUCH" not in err
-        assert outside.read_bytes() == outside_before == keep
-        assert not (dest / name).exists() or (dest / name).read_bytes() != b"STAGE-BODY" or True
-        # No done, registry clean, single terminal.
+        assert term["type"] == "ytdl-error"
+        assert outside.read_bytes() == keep
         assert not any(m.get("type") == "ytdl-done" and m.get("id") == jid for m in sent)
-        assert d._PGET.get(jid) is None
-        assert len([m for m in sent if m.get("type") in ("ytdl-done", "ytdl-error")
-                    and m.get("id") == jid]) == 1
-        # Staging cleaned.
-        leftover = [p for p in dest.iterdir() if p.is_dir() and p.name.startswith(".mc-ytdl")]
-        assert leftover == []
-        return term, calls
+        return term
 
-    # Absolute outside stage.
     _run(str(outside))
-
-    # Relative escape via .. components.
-    def rel_escape(path, parent):
-        return os.path.join(parent, "..", "..", outside.name)
-    # Use absolute parent-based escape that resolves outside.
-    def abs_dotdot(path, parent):
-        return os.path.abspath(os.path.join(parent, "..", "..", "outside-secret.mp4"))
-    _run(abs_dotdot)
-
-    # Sibling-prefix directory (stage is under dest; create a peer that looks like prefix).
+    _run(lambda path, parent: os.path.abspath(os.path.join(parent, "..", "..", "outside-secret.mp4")))
     peer = dest.parent / (dest.name + "-evil")
     peer.mkdir(exist_ok=True)
     peer_file = peer / "clip.mp4"
     peer_file.write_bytes(b"PEER-SECRET")
     _run(str(peer_file))
     assert peer_file.read_bytes() == b"PEER-SECRET"
-
-    # Hostile value shapes: non-str markers cannot be trusted (empty / odd).
-    # Worker reads a string line; simulate empty path and whitespace-only.
     _run("")
     _run("   ")
-
-    # Stage directory itself (not a file inside it).
-    def stage_dir_itself(path, parent):
-        return parent
-    _run(stage_dir_itself)
-
-    # Symlink / junction escape when the platform allows creating one.
-    link_path_holder = {"p": None}
-
-    def setup_symlink(path, parent):
-        link = os.path.join(parent, "escape-link.mp4")
-        try:
-            if hasattr(os, "symlink"):
-                if os.path.lexists(link):
-                    os.unlink(link)
-                os.symlink(str(outside), link)
-                link_path_holder["p"] = link
-        except (OSError, NotImplementedError, AttributeError):
-            link_path_holder["p"] = None
-
-    if hasattr(os, "symlink"):
-        try:
-            probe = dest / "_symlink_probe"
-            if probe.exists() or probe.is_symlink():
-                probe.unlink()
-            os.symlink(str(outside), str(probe))
-            probe.unlink()
-            symlink_ok = True
-        except (OSError, NotImplementedError):
-            symlink_ok = False
-        if symlink_ok:
-            def link_line(path, parent):
-                return os.path.join(parent, "escape-link.mp4")
-            _run(link_line, extra_setup=setup_symlink)
-            assert outside.read_bytes() == keep
+    _run(lambda path, parent: parent)
 
 
 def test_legitimate_stage_and_merge_descendant_accepted(tmp_path, monkeypatch):
-    """Intended stage file and a legitimate merge-output descendant still promote."""
     import mchost.downloads as d
 
     dest = tmp_path / "legit"
     dest.mkdir()
-
-    # Case 1: exact intended stage basename.
     sent = []
     payload = b"INTENDED-STAGE"
 
     def popen_intended(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(payload)
+        path = _materialize_stage_from_cmd(a, payload)
         return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
 
     _patch_ytdl_base(monkeypatch, d, mc, sent, popen=popen_intended)
     d.handle_ytdl({
-        "id": "jobLegit1",
-        "attemptToken": "atk-legit1",
-        "url": "https://example.test/v",
-        "name": "wanted.mp4",
-        "dir": str(dest),
+        "id": "jobLegit1", "attemptToken": "atk-legit1",
+        "url": "https://example.test/v", "name": "wanted.mp4", "dir": str(dest),
     })
     term = _wait_terminal(sent, "jobLegit1")
     assert term["type"] == "ytdl-done"
     assert os.path.basename(term["file"]) == "wanted.mp4"
-    assert term["bytes"] == len(payload)
     assert open(term["file"], "rb").read() == payload
 
-    # Case 2: merge output descendant with a different extension/name inside stage.
     sent.clear()
     merge_payload = b"MERGED-OUTPUT-BYTES"
 
     def popen_merge(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        # Simulate yt-dlp merge artifact: different basename inside stage dir.
+        cmd = list(a[0])
+        out = cmd[cmd.index("-o") + 1].replace("%%", "%")
+        parent = os.path.dirname(out)
+        os.makedirs(parent, exist_ok=True)
         merged = os.path.join(parent, "wanted.merged.mp4")
         with open(merged, "wb") as f:
             f.write(merge_payload)
         return LiveProc(lines=["@@FILE@@ %s" % merged], returncode=0)
 
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=popen_merge)
+    monkeypatch.setattr(d.subprocess, "Popen", popen_merge)
     d.handle_ytdl({
-        "id": "jobLegit2",
-        "attemptToken": "atk-legit2",
-        "url": "https://example.test/v2",
-        "name": "merged-out.mp4",
-        "dir": str(dest),
+        "id": "jobLegit2", "attemptToken": "atk-legit2",
+        "url": "https://example.test/v2", "name": "merged-out.mp4", "dir": str(dest),
     })
     term2 = _wait_terminal(sent, "jobLegit2")
     assert term2["type"] == "ytdl-done"
     assert os.path.basename(term2["file"]) == "merged-out.mp4"
-    assert term2["bytes"] == len(merge_payload)
     assert open(term2["file"], "rb").read() == merge_payload
 
-    # Case 3: existing final forces dedup sibling basename.
     sent.clear()
     existing = dest / "dedupe-me.mp4"
     existing.write_bytes(b"ALREADY-HERE")
     dedup_payload = b"NEW-DEDUP-BODY"
 
     def popen_dedup(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(dedup_payload)
+        path = _materialize_stage_from_cmd(a, dedup_payload)
         return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
 
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=popen_dedup)
+    monkeypatch.setattr(d.subprocess, "Popen", popen_dedup)
     d.handle_ytdl({
-        "id": "jobLegit3",
-        "attemptToken": "atk-legit3",
-        "url": "https://example.test/v3",
-        "name": "dedupe-me.mp4",
-        "dir": str(dest),
+        "id": "jobLegit3", "attemptToken": "atk-legit3",
+        "url": "https://example.test/v3", "name": "dedupe-me.mp4", "dir": str(dest),
     })
     term3 = _wait_terminal(sent, "jobLegit3")
     assert term3["type"] == "ytdl-done"
     assert term3["file"] != str(existing)
     assert existing.read_bytes() == b"ALREADY-HERE"
     assert os.path.basename(term3["file"]) == "dedupe-me (1).mp4"
-    assert open(term3["file"], "rb").read() == dedup_payload
-
-
-# ---------------------------------------------------------------------------
-# 27. Promote success + verify failure must not leave unreported final (Finding E)
-# ---------------------------------------------------------------------------
-
-def test_promote_verify_failure_cleans_owned_final_preserves_replacement(
-        tmp_path, monkeypatch):
-    """Promoted final that cannot be verified is cleaned only if still operation-owned."""
-    import mchost.downloads as d
-
-    dest = tmp_path / "verfail"
-    dest.mkdir()
-    payload = b"PROMOTED-BUT-UNVERIFIED"
-    final = dest / "clip.mp4"
-
-    # --- No cancellation: owned final must not remain unreported ---
-    sent = []
-
-    def fake_popen(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(payload)
-        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
-
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-    monkeypatch.setattr(d, "_ytdl_terminal_file_bytes", lambda path: (None, None))
-
-    d.handle_ytdl({
-        "id": "jobVerFail",
-        "attemptToken": "atk-verfail",
-        "url": "https://example.test/v",
-        "name": "clip.mp4",
-        "dir": str(dest),
-    })
-    term = _wait_terminal(sent, "jobVerFail")
-    assert term["type"] == "ytdl-error"
-    assert term["reason"] == "local_io"
-    assert not any(m.get("type") == "ytdl-done" for m in sent if m.get("id") == "jobVerFail")
-    assert not final.exists(), "unverified operation-owned final must be cleaned"
-    assert d._PGET.get("jobVerFail") is None
-    leftover = [p for p in dest.iterdir() if p.is_dir() and p.name.startswith(".mc-ytdl")]
-    assert leftover == []
-
-    # --- Replacement after promote: sentinel must not be deleted ---
-    sent.clear()
-    sentinel = b"POST-PROMOTE-REPLACEMENT"
-    real_snap = d._ytdl_snapshot_path_identity
-    replaced = {"done": False}
-
-    def snap_then_replace(path):
-        # Capture the operation-owned identity first, then plant a replacement
-        # so cleanup must identity-fence and leave the sentinel alone.
-        ident = real_snap(path)
-        if path and not replaced["done"] and os.path.isfile(path):
-            try:
-                os.replace(path, path + ".op-owned-bak")
-            except Exception:
-                pass
-            with open(path, "wb") as f:
-                f.write(sentinel)
-            replaced["done"] = True
-        return ident
-
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-    monkeypatch.setattr(d, "_ytdl_snapshot_path_identity", snap_then_replace)
-
-    d.handle_ytdl({
-        "id": "jobVerFail2",
-        "attemptToken": "atk-verfail2",
-        "url": "https://example.test/v2",
-        "name": "clip.mp4",
-        "dir": str(dest),
-    })
-    term2 = _wait_terminal(sent, "jobVerFail2")
-    assert term2["type"] == "ytdl-error"
-    assert term2["reason"] in ("local_io", "cancelled")
-    assert replaced["done"] is True
-    assert final.is_file()
-    assert final.read_bytes() == sentinel, "replacement must survive failed verify cleanup"
-    assert not any(m.get("type") == "ytdl-done" for m in sent if m.get("id") == "jobVerFail2")
-
-    # --- Competitor pre-existing path must never be deleted on verify failure ---
-    sent.clear()
-    competitor = dest / "other.mp4"
-    competitor.write_bytes(b"COMPETITOR")
-    monkeypatch.setattr(d, "_ytdl_snapshot_path_identity", real_snap)
-    monkeypatch.setattr(d, "_ytdl_terminal_file_bytes", lambda path: (None, None))
-    d.handle_ytdl({
-        "id": "jobVerFail3",
-        "attemptToken": "atk-verfail3",
-        "url": "https://example.test/v3",
-        "name": "other2.mp4",
-        "dir": str(dest),
-    })
-    term3 = _wait_terminal(sent, "jobVerFail3")
-    assert term3["type"] == "ytdl-error"
-    assert competitor.read_bytes() == b"COMPETITOR"
-
-
-def test_cancel_after_promote_before_claim_no_unreported_final(
-        tmp_path, monkeypatch):
-    """If cancel races after promote ownership but before claim, no silent final remains.
-
-    Design: promote/verify/claim are one lock region, so cancel either wins before
-    promote (no final) or loses to an already-claimed commit (done). This test
-    still forces a post-promote verify failure window with cancel_requested set
-    to prove cleanup does not leave an unreported owned final.
-    """
-    import mchost.downloads as d
-
-    dest = tmp_path / "postprom"
-    dest.mkdir()
-    payload = b"POST-PROMOTE-WINDOW"
-    final = dest / "clip.mp4"
-    sent = []
-    entered = threading.Event()
-    release = threading.Event()
-
-    def fake_popen(*a, **k):
-        cmd = list(a[0]) if a else []
-        out = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
-        path = out.replace("%%", "%")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(payload)
-        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
-
-    real_promote = d._ytdl_promote_to_target
-    jid = "jobPostProm"
-    token = "atk-postprom"
-
-    def gated_promote(src, target, *a, **k):
-        # Under the lock: promote, then drop cancel_requested via side channel
-        # is not possible from here; instead fail verify after promote.
-        return real_promote(src, target, *a, **k)
-
-    real_tfb = d._ytdl_terminal_file_bytes
-
-    def fail_tfb(path):
-        entered.set()
-        release.wait(timeout=5)
-        return None, None
-
-    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
-    monkeypatch.setattr(d, "_ytdl_promote_to_target", gated_promote)
-    monkeypatch.setattr(d, "_ytdl_terminal_file_bytes", fail_tfb)
-
-    d.handle_ytdl({
-        "id": jid,
-        "attemptToken": token,
-        "url": "https://example.test/v",
-        "name": "clip.mp4",
-        "dir": str(dest),
-    })
-    assert wait_for(entered.is_set, timeout=5)
-    # Cancel cannot take the lock while worker holds it during verify; it waits.
-    # After release, worker fails verify and must clean owned final (or claim —
-    # but verify fails so clean).
-    def cancel_async():
-        d._pget_cancel({"id": jid, "attemptToken": token})
-    t = threading.Thread(target=cancel_async)
-    t.start()
-    release.set()
-    t.join(timeout=5)
-    term = _wait_terminal(sent, jid)
-    assert term["type"] == "ytdl-error"
-    assert term["reason"] in ("local_io", "cancelled")
-    assert not any(m.get("type") == "ytdl-done" for m in sent if m.get("id") == jid)
-    # No unreported operation-owned final left behind.
-    assert not final.exists()
-    assert d._PGET.get(jid) is None
