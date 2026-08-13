@@ -2513,6 +2513,25 @@
     }
 
     /**
+     * Fail-closed identity check for work owned by the current logical attempt.
+     * This is a read-only predicate: it never mints or exposes an attempt token.
+     */
+    function isAttemptActive(jobId, attemptToken) {
+      if (!isNonblankString(jobId) || !isNonblankString(attemptToken)) {
+        return false;
+      }
+      var job = jobs.get(jobId);
+      return !!(
+        job &&
+        job.state === "running" &&
+        job.holdsGlobalSlot === true &&
+        job.cancelRequested !== true &&
+        isNonblankString(job.attemptToken) &&
+        job.attemptToken === attemptToken
+      );
+    }
+
+    /**
      * Terminalize cancelRequested running/pausing work after helper disconnect has
      * confirmed native-open zero, any authenticated owner release, AND full
      * wrapper/observed permit quiescence. Exact-once slot/queue/deadline/ephemeral
@@ -3246,6 +3265,7 @@
       nativeLeaseFor: nativeLeaseFor,
       userStatus: userStatus,
       issueAttemptToken: issueAttemptToken,
+      isAttemptActive: isAttemptActive,
       manualRetry: manualRetry,
       requestFirefoxHandoff: requestFirefoxHandoff,
       tick: tick,
