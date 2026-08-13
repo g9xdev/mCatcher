@@ -1267,6 +1267,10 @@
       var scheduler = null;
       var MessageRouter = null;
       var NativeResultAdapter = null;
+      // Authoritative popup proof is bound to one direct job and consumed only
+      // by the scheduler. It is never projected or returned to popup callers.
+      var popupTokenStore = new Map();
+      var firefoxHandoffRequests = new Set();
 
       function getMessageRouter() {
         if (!MessageRouter) MessageRouter = resolveDownloadMessageRouter();
@@ -1284,6 +1288,20 @@
             maxConcurrent: settings.maxConcurrent,
             now: safeNow,
             randomToken: randomTokenFn,
+            popupTokenStore: popupTokenStore,
+            firefoxDownload: function (adapterInput) {
+              var tokenStore = new Set([adapterInput.intent.userActionToken]);
+              return firefoxGuard.downloadWithFirefox({
+                intent: adapterInput.intent,
+                tokenStore: tokenStore,
+                source: {
+                  type: "url",
+                  getUrl: function () {
+                    return readEphemeralUrl(adapterInput.sourceHandle);
+                  },
+                },
+              });
+            },
           });
         }
         return scheduler;
@@ -2153,6 +2171,7 @@
             ephemeral: sourceHandle,
           });
           jobBindings.set(jobId, binding);
+          popupTokenStore.set(jobId, intent.userActionToken);
           getScheduler().enqueue(jobId);
           return pump().then(
             function () {
@@ -2264,8 +2283,80 @@
         });
       }
 
-      function requestFirefoxHandoff(/* message, sender */) {
-        return lease1Reject();
+      function requestFirefoxHandoff(message, sender) {
+        try {
+          requirePopupSender(sender);
+          var decision = getMessageRouter().routeNativeMessage(message);
+          if (!decision || decision.action !== "request-firefox-handoff") return Promise.resolve(false);
+
+          var job = getScheduler().getJob(decision.jobId);
+          var binding = jobBindings.get(decision.jobId);
+          if (
+            !job ||
+            !binding ||
+            job.mediaKind !== "direct" ||
+            job.state !== "needs_user" ||
+            !popupTokenStore.has(decision.jobId) ||
+            popupTokenStore.get(decision.jobId) !== decision.intent.userActionToken ||
+            firefoxHandoffRequests.has(decision.jobId)
+          ) {
+            return Promise.resolve(false);
+          }
+
+          var beforeSig = jobAdmissionSig();
+          firefoxHandoffRequests.add(decision.jobId);
+          var handoff;
+          try {
+            handoff = getScheduler().requestFirefoxHandoff(
+              decision.jobId,
+              decision.intent
+            );
+          } catch (err) {
+            firefoxHandoffRequests.delete(decision.jobId);
+            publishJobsIfChanged(beforeSig);
+            throw err;
+          }
+          // The scheduler makes its handing_off_firefox transition before its
+          // first await, so publish that safe state immediately.
+          publishJobsIfChanged(beforeSig);
+
+          return Promise.resolve(handoff).then(
+            function () {
+              firefoxHandoffRequests.delete(decision.jobId);
+              var settled = getScheduler().getJob(decision.jobId);
+              if (
+                settled &&
+                (settled.state === "needs_user" ||
+                  settled.state === "handed_to_firefox" ||
+                  settled.state === "completed" ||
+                  settled.state === "failed" ||
+                  settled.state === "cancelled")
+              ) {
+                popupTokenStore.delete(decision.jobId);
+              }
+              publishJobsIfChanged(beforeSig);
+              return projectReturnedJob(decision.jobId);
+            },
+            function (err) {
+              firefoxHandoffRequests.delete(decision.jobId);
+              var failed = getScheduler().getJob(decision.jobId);
+              if (
+                failed &&
+                (failed.state === "needs_user" ||
+                  failed.state === "handed_to_firefox" ||
+                  failed.state === "completed" ||
+                  failed.state === "failed" ||
+                  failed.state === "cancelled")
+              ) {
+                popupTokenStore.delete(decision.jobId);
+              }
+              publishJobsIfChanged(beforeSig);
+              throw err;
+            }
+          );
+        } catch (errOuter) {
+          return Promise.reject(errOuter);
+        }
       }
 
       function cancel(/* jobId */) {
