@@ -1311,17 +1311,34 @@
             randomToken: randomTokenFn,
             popupTokenStore: popupTokenStore,
             firefoxDownload: function (adapterInput) {
+              var binding = jobBindings.get(adapterInput.jobId);
+              if (!binding) throw genericTypeError();
               var tokenStore = new Set([adapterInput.intent.userActionToken]);
-              return firefoxGuard.downloadWithFirefox({
+              var guardInput = {
                 intent: adapterInput.intent,
                 tokenStore: tokenStore,
-                source: {
+              };
+              if (binding.mediaKind === "direct") {
+                guardInput.source = {
                   type: "url",
                   getUrl: function () {
                     return readEphemeralUrl(adapterInput.sourceHandle);
                   },
-                },
-              });
+                };
+              } else if (isAssembledKind(binding.mediaKind) && binding.assembled) {
+                guardInput.filename = assembledFilename(
+                  binding.intent.requestedFilename,
+                  binding.assembled.extension
+                );
+                guardInput.source = {
+                  type: "bytes",
+                  bytes: binding.assembled.bytes,
+                  mime: binding.assembled.mime,
+                };
+              } else {
+                throw genericTypeError();
+              }
+              return firefoxGuard.downloadWithFirefox(guardInput);
             },
           });
         }
@@ -1508,7 +1525,11 @@
         }
         var effect;
         try {
-          effect = fetchArrayBuffer.apply(null, args);
+          effect = fetchArrayBuffer(
+            transfer.binding.tabId,
+            args[0],
+            args[1]
+          );
         } catch (errSync) {
           effect = Promise.reject(errSync);
         }
@@ -2604,6 +2625,8 @@
             intent: intent,
             effectiveDir: effectiveDir,
             mediaKind: record.mediaKind,
+            tabId: record.tabId,
+            mediaId: record.mediaId,
             selection: selected.selection,
             mirrors: future.mirrors,
             referer: future.referer,
@@ -2873,10 +2896,15 @@
 
           var job = getScheduler().getJob(decision.jobId);
           var binding = jobBindings.get(decision.jobId);
+          var hasEligibleSource =
+            job &&
+            binding &&
+            (job.mediaKind === "direct" ||
+              (isAssembledKind(job.mediaKind) && binding.assembled));
           if (
             !job ||
             !binding ||
-            job.mediaKind !== "direct" ||
+            !hasEligibleSource ||
             job.state !== "needs_user" ||
             !popupTokenStore.has(decision.jobId) ||
             popupTokenStore.get(decision.jobId) !== decision.intent.userActionToken ||
@@ -2915,6 +2943,9 @@
                   settled.state === "cancelled")
               ) {
                 popupTokenStore.delete(decision.jobId);
+              }
+              if (settled && settled.state === "handed_to_firefox") {
+                clearAssembledBytes(binding);
               }
               publishJobsIfChanged(beforeSig);
               return projectReturnedJob(decision.jobId);

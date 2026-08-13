@@ -115,6 +115,41 @@ test("owned HLS starts one private assembly attempt without blocking enqueue or 
   assembly.reject(new Error("end pending attempt"));
 });
 
+test("assembly fetches stay bound to the immutable captured source tab", async () => {
+  const assembly = deferred();
+  let assemblyInput;
+  const h = makeHarness({
+    assembleMedia(input) {
+      h.effects.assembled.push(input);
+      assemblyInput = input;
+      return assembly.promise;
+    },
+  });
+  const mediaId = capture(h.ctrl, "hls", "41");
+  const popupMessage = {
+    type: "save-as-download",
+    tabId: 41,
+    item: { id: mediaId },
+    intent: intent("captured.m3u8"),
+  };
+
+  await h.ctrl.enqueueDownload(popupMessage, {});
+  popupMessage.tabId = 99;
+  popupMessage.item = { id: "different-media" };
+  const requestOptions = { headers: { Range: "bytes=0-9" } };
+  await assemblyInput.fetchArrayBuffer(
+    "https://segments.example/private-41.ts",
+    requestOptions
+  );
+
+  assert.deepEqual(h.effects.fetches, [[
+    41,
+    "https://segments.example/private-41.ts",
+    requestOptions,
+  ]]);
+  assembly.reject(new Error("end pending attempt"));
+});
+
 test("assembled HLS streams through a four-chunk window and completes only on commit", async () => {
   const assembly = deferred();
   const h = makeHarness({ assembleMedia(input) { h.effects.assembled.push(input); return assembly.promise; } });
@@ -173,8 +208,8 @@ test("assembly failure waits for every provider-permitted fetch before admitting
   const peerAssembly = deferred();
   let calls = 0;
   const h = makeHarness({
-    fetchArrayBuffer(url) {
-      h.effects.fetches.push([url]);
+    fetchArrayBuffer(tabId, url) {
+      h.effects.fetches.push([tabId, url]);
       return url.endsWith("a") ? fetchA.promise : fetchB.promise;
     },
     assembleMedia(input) {
