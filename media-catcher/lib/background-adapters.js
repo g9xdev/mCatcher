@@ -1978,13 +1978,7 @@
       }
 
       function jobAdmissionSig() {
-        var snap = getScheduler().getSnapshot();
-        var jobs = snap.jobs || [];
-        var parts = [];
-        for (var i = 0; i < jobs.length; i++) {
-          parts.push(String(jobs[i].id) + ":" + String(jobs[i].state));
-        }
-        return parts.join("|");
+        return JSON.stringify(projectPopupJobsArray());
       }
 
       function projectPopupJobsArray() {
@@ -2205,10 +2199,31 @@
 
           if (decision.action !== "transport-result" && decision.action !== "start-single-connection") return false;
           var switchEffects = [];
-          var terminalJob = getScheduler().getJob(decision.jobId);
-          if (terminalJob && terminalJob.state === "running" && terminalJob.attemptToken === decision.attemptToken) {
-            getScheduler().noteNativeOpen(decision.jobId, 0);
-          }
+          var accepted = false;
+          var facade = {
+            getJob: function (id) { return getScheduler().getJob(id); },
+            onDrainingTransportResult: function (id, token, result) {
+              var changed = getScheduler().onDrainingTransportResult(id, token, result);
+              accepted = changed === true;
+              return changed;
+            },
+            onTransportResult: function (id, token, result) {
+              var before = getScheduler().getJob(id);
+              if (!before || before.state !== "running" || before.attemptToken !== token) return;
+              getScheduler().noteNativeOpen(id, 0);
+              getScheduler().onTransportResult(id, token, result);
+              var after = getScheduler().getJob(id);
+              accepted = !!after && (after.stateVersion !== before.stateVersion || after.state !== before.state || after.mode !== before.mode);
+            },
+            onCapabilitySwitch: function (id, result) {
+              var before = getScheduler().getJob(id);
+              if (!before || before.state !== "running") return;
+              getScheduler().noteNativeOpen(id, 0);
+              getScheduler().onCapabilitySwitch(id, result);
+              var after = getScheduler().getJob(id);
+              accepted = !!after && after.mode !== before.mode;
+            }
+          };
           var switchStart = function (post) {
             var job = getScheduler().getJob(post.id);
             if (!job || job.state !== "running" || job.attemptToken !== post.attemptToken || job.mode !== "single-connection") return;
@@ -2228,11 +2243,12 @@
             return effect;
           };
           try {
-            getNativeResultAdapter().handlePgetResult(getScheduler(), message, { startSingleConnection: switchStart });
+            getNativeResultAdapter().handlePgetResult(facade, message, { startSingleConnection: switchStart });
           } catch (err) {
             publishJobsIfChanged(beforeSig);
             throw err;
           }
+          if (!accepted) return false;
           var terminalBinding = jobBindings.get(decision.jobId);
           if (terminalBinding) {
             delete terminalBinding.progress;
@@ -2310,6 +2326,8 @@
             var binding = jobBindings.get(job.id);
             if (!binding) continue;
             startedAttempts.add(key);
+            delete binding.progress;
+            delete binding.limitAck;
             var lease = scheduler.nativeLeaseFor(job.id);
             var input = {
               kind: "pget",
