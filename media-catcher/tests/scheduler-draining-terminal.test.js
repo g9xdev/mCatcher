@@ -254,7 +254,11 @@ function installHostileGate(realGate, gatePath, hooks) {
             : g.completeOwner.bind(g),
           designateRecoveryOwner: g.designateRecoveryOwner.bind(g),
           recoverToNormal: g.recoverToNormal.bind(g),
-          snapshot: g.snapshot.bind(g),
+          snapshot: hooks.snapshot
+            ? function () {
+                return hooks.snapshot(g);
+              }
+            : g.snapshot.bind(g),
         };
       },
     },
@@ -3885,5 +3889,666 @@ test("17H cancel+unavailable with held permit: noteNativeOpen/completeOwner thro
     assert.equal(s4.getJob("owner").holdsGlobalSlot, false);
   } finally {
     restoreModuleCache(gatePath, schedPath, prevGate4, prevSched4);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 16. Local-activity release capacity strand: terminal settlement + drain faults
+//     must leave release retryable until the capacity progress edge is confirmed.
+// ---------------------------------------------------------------------------
+
+function assertLocalReleaseNoThrow(lease) {
+  var threw = false;
+  var result = undefined;
+  try {
+    result = lease.release();
+  } catch (e) {
+    threw = true;
+  }
+  assert.equal(threw, false, "public local release must never throw");
+  assert.equal(typeof result, "boolean");
+  return result;
+}
+
+/**
+ * Build: B pausing with authenticated pending terminal + one local lease;
+ * global capacity full; unrelated provider q.com recovering-blocked with D queued.
+ */
+function setupPendingLocalBWithQueuedRecoveringD(create, pendingOutcome) {
+  var clearB = { n: 0 };
+  var s = create({
+    maxConcurrent: 3,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      throw new Error("Firefox must not be called");
+    },
+  });
+
+  // --- q.com: recovering-blocked, then fill capacity before D enqueues ---
+  s.createJob({
+    id: "E",
+    providerKey: "q.com",
+    intent: intent("e.mp4"),
+    segmentConcurrency: 2,
+    retries: 3,
+  });
+  s.createJob({
+    id: "F",
+    providerKey: "q.com",
+    intent: intent("f.mp4"),
+    segmentConcurrency: 2,
+    retries: 3,
+  });
+  s.enqueue("E");
+  s.enqueue("F");
+  s.notePermitAcquired("E");
+  s.noteNativeOpen("E", 1);
+  s.noteNativeOpen("F", 1);
+  s.onTransportResult("F", s.getJob("F").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  // Make F ineligible as recovery owner so E completion leaves recovering-blocked.
+  s.cancel("F");
+  if (s.getJob("F").state === "pausing_provider") {
+    s.noteNativeOpen("F", 0);
+    if (s.getJob("F").state === "pausing_provider") {
+      s.onQuiesced("F");
+    }
+  }
+  s.noteNativeOpen("E", 0);
+  s.releasePermit("E");
+  s.onTransportResult("E", s.getJob("E").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getSnapshot().providers["q.com"].gate.state, "recovering");
+  assert.equal(s.getSnapshot().providers["q.com"].gate.ownerJobId, null);
+
+  // --- p.com: A/B/C fill capacity; B local + pending terminal ---
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+    ephemeral: {
+      clear: function () {
+        clearB.n += 1;
+      },
+    },
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  assert.equal(s.getJob("A").state, "running");
+  assert.equal(s.getJob("B").state, "running");
+  assert.equal(s.getJob("C").state, "running");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  s.noteNativeOpen("B", 1);
+  const leaseB = s.acquireLocalActivity("B", "assembly");
+  s.noteNativeOpen("C", 1);
+  var bToken = s.getJob("B").attemptToken;
+  s.onTransportResult("C", s.getJob("C").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.onDrainingTransportResult("B", bToken, pendingOutcome), true);
+  // Native zero; local activity keeps B pausing with pending terminal.
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").localActivities, 1);
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+
+  // Capacity still full (A running, B+C pausing) — D queues under recovering-blocked.
+  s.createJob({
+    id: "D",
+    providerKey: "q.com",
+    intent: intent("d.mp4"),
+    segmentConcurrency: 2,
+    retries: 2,
+  });
+  s.enqueue("D");
+  assert.equal(s.getJob("D").state, "queued");
+  assert.equal(s.getSnapshot().globalRunning, 3);
+
+  return { s: s, leaseB: leaseB, clearB: clearB };
+}
+
+test("16a pending completed + two drain snapshot faults: release false then capacity drains D", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let throwsLeft = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (throwsLeft > 0) {
+          throwsLeft -= 1;
+          throw new Error("simulated drain snapshot throw");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const topo = setupPendingLocalBWithQueuedRecoveringD(create, completedResult());
+    const s = topo.s;
+    const leaseB = topo.leaseB;
+    const verBefore = s.getJob("B").stateVersion;
+    const clearBefore = topo.clearB.n;
+
+    throwsLeft = 2;
+    const r1 = assertLocalReleaseNoThrow(leaseB);
+    assert.equal(r1, false, "unconfirmed capacity drain must not seal release=true");
+    // B may already be completed (mutate-then) but D must not be stranded forever.
+    assert.ok(s.getJob("B").localActivities >= 0);
+    assert.equal(s.getJob("D").state, "queued");
+
+    throwsLeft = 0;
+    // No manual onQuiesced — retry completes the outstanding drain obligation.
+    const r2 = assertLocalReleaseNoThrow(leaseB);
+    assert.equal(r2, true);
+    assert.equal(s.getJob("B").state, "completed");
+    assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    assert.equal(s.getJob("B").localActivities, 0);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    // Terminal settlement at most once across retries.
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("16b pending completed persistent drain fault: three false then D admits once", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let fault = false;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (fault) throw new Error("persistent drain snapshot fault");
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    // Setup completes with fault disarmed so onTransportResult can run.
+    const topo = setupPendingLocalBWithQueuedRecoveringD(create, completedResult());
+    const s = topo.s;
+    const leaseB = topo.leaseB;
+    const verBefore = s.getJob("B").stateVersion;
+    const clearBefore = topo.clearB.n;
+
+    // Arm only for the release/progress edge under test.
+    fault = true;
+    for (var i = 0; i < 3; i++) {
+      assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+      assert.equal(s.getJob("D").state, "queued");
+      fault = false;
+      assertSlotInvariant(s);
+      fault = true;
+    }
+
+    fault = false;
+    assert.equal(assertLocalReleaseNoThrow(leaseB), true);
+    assert.equal(s.getJob("B").state, "completed");
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("16c cancel-before-pending-completed settles cancelled once under drain faults", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let throwsLeft = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (throwsLeft > 0) {
+          throwsLeft -= 1;
+          throw new Error("cancel-path drain snapshot throw");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const topo = setupPendingLocalBWithQueuedRecoveringD(create, completedResult());
+    const s = topo.s;
+    const leaseB = topo.leaseB;
+    const clearBefore = topo.clearB.n;
+
+    // User cancel wins over pending completed.
+    s.cancel("B");
+    const verBefore = s.getJob("B").stateVersion;
+
+    throwsLeft = 2;
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    throwsLeft = 0;
+    assert.equal(assertLocalReleaseNoThrow(leaseB), true);
+    assert.equal(s.getJob("B").state, "cancelled");
+    assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    // Capacity edge still drains D.
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    assert.equal(s.getJob("B").state, "cancelled");
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("16d pending local_io needs_user under two drain faults is retryable; D admits", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let throwsLeft = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (throwsLeft > 0) {
+          throwsLeft -= 1;
+          throw new Error("local_io drain snapshot throw");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const topo = setupPendingLocalBWithQueuedRecoveringD(
+      create,
+      failedResult("local_io", "partial", "multi-range")
+    );
+    const s = topo.s;
+    const leaseB = topo.leaseB;
+    const verBefore = s.getJob("B").stateVersion;
+
+    throwsLeft = 2;
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    throwsLeft = 0;
+    assert.equal(assertLocalReleaseNoThrow(leaseB), true);
+    assert.equal(s.getJob("B").state, "needs_user");
+    assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("16e pending permanent needs_user under persistent drain fault then recover", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let fault = false;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (fault) throw new Error("permanent drain snapshot fault");
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    // Setup completes with fault disarmed.
+    const topo = setupPendingLocalBWithQueuedRecoveringD(
+      create,
+      failedResult("permanent", "partial", "multi-range")
+    );
+    const s = topo.s;
+    const leaseB = topo.leaseB;
+    const verBefore = s.getJob("B").stateVersion;
+
+    fault = true;
+    for (var i = 0; i < 3; i++) {
+      assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    }
+    fault = false;
+    assert.equal(assertLocalReleaseNoThrow(leaseB), true);
+    assert.equal(s.getJob("B").state, "needs_user");
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(assertLocalReleaseNoThrow(leaseB), false);
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 17. No-local lease: onDrainingTransportResult must not seal true while capacity
+//     progress remains incomplete. Private durable progress (or false + replay)
+//     recovers D exactly once without double terminal/slot/cleanup.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pausing B with retained private drain auth, native already zero, no local
+ * activity, no wrapper/observed permits. Capacity full; D queued under
+ * recovering-blocked q.com.
+ */
+function setupNoLocalQuiescentAuthBWithQueuedD(create) {
+  var clearB = { n: 0 };
+  var s = create({
+    maxConcurrent: 3,
+    now: function () {
+      return 0;
+    },
+    firefoxDownload: function () {
+      throw new Error("Firefox must not be called");
+    },
+  });
+
+  // q.com recovering-blocked so D can queue under capacity pressure.
+  s.createJob({
+    id: "E",
+    providerKey: "q.com",
+    intent: intent("e.mp4"),
+    segmentConcurrency: 2,
+    retries: 3,
+  });
+  s.createJob({
+    id: "F",
+    providerKey: "q.com",
+    intent: intent("f.mp4"),
+    segmentConcurrency: 2,
+    retries: 3,
+  });
+  s.enqueue("E");
+  s.enqueue("F");
+  s.notePermitAcquired("E");
+  s.noteNativeOpen("E", 1);
+  s.noteNativeOpen("F", 1);
+  s.onTransportResult("F", s.getJob("F").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  s.cancel("F");
+  if (s.getJob("F").state === "pausing_provider") {
+    s.noteNativeOpen("F", 0);
+    if (s.getJob("F").state === "pausing_provider") {
+      s.onQuiesced("F");
+    }
+  }
+  s.noteNativeOpen("E", 0);
+  s.releasePermit("E");
+  s.onTransportResult("E", s.getJob("E").attemptToken, {
+    status: "completed",
+    failureCategory: null,
+  });
+  assert.equal(s.getSnapshot().providers["q.com"].gate.state, "recovering");
+  assert.equal(s.getSnapshot().providers["q.com"].gate.ownerJobId, null);
+
+  s.createJob({
+    id: "A",
+    providerKey: "p.com",
+    intent: intent("a.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.createJob({
+    id: "B",
+    providerKey: "p.com",
+    intent: intent("b.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+    ephemeral: {
+      clear: function () {
+        clearB.n += 1;
+      },
+    },
+  });
+  s.createJob({
+    id: "C",
+    providerKey: "p.com",
+    intent: intent("c.mp4"),
+    segmentConcurrency: 4,
+    retries: 3,
+  });
+  s.enqueue("A");
+  s.enqueue("B");
+  s.enqueue("C");
+  s.notePermitAcquired("A");
+  s.noteNativeOpen("A", 1);
+  // Native open captures private drain auth on pause; no local lease, no permits on B.
+  s.noteNativeOpen("B", 1);
+  s.noteNativeOpen("C", 1);
+  var bToken = s.getJob("B").attemptToken;
+  s.onTransportResult("C", s.getJob("C").attemptToken, {
+    status: "failed",
+    failureCategory: "http_429",
+  });
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  // Native zero while auth retained → still pausing, fully quiescent, no local/permits.
+  s.noteNativeOpen("B", 0);
+  assert.equal(s.getJob("B").state, "pausing_provider");
+  assert.equal(s.getJob("B").localActivities, 0);
+  assert.equal(s.getJob("B").inFlightPermits, 0);
+  assert.equal(s.getJob("B").nativeOpenConnections, 0);
+  assert.equal(s.getJob("B").holdsGlobalSlot, true);
+
+  s.createJob({
+    id: "D",
+    providerKey: "q.com",
+    intent: intent("d.mp4"),
+    segmentConcurrency: 2,
+    retries: 2,
+  });
+  s.enqueue("D");
+  assert.equal(s.getJob("D").state, "queued");
+  assert.equal(s.getSnapshot().globalRunning, 3);
+
+  return { s: s, bToken: bToken, clearB: clearB };
+}
+
+test("17a no-local completed terminal under drain fault does not strand D (returns false / durable progress)", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let fault = false;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        // Fault only the capacity edge for D (q.com). p.com confirmNativeOpenZero
+        // and terminal mutation must still run so progress is post-settlement.
+        if (fault && g.providerKey === "q.com") {
+          throw new Error("no-local completed drain snapshot fault");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const topo = setupNoLocalQuiescentAuthBWithQueuedD(create);
+    const s = topo.s;
+    const bToken = topo.bToken;
+    const clearBefore = topo.clearB.n;
+    const verBefore = s.getJob("B").stateVersion;
+    assertProjectionKeys(s.getJob("B"));
+
+    // Fault only on the terminal→progress edge (after setup).
+    fault = true;
+    const accepted = s.onDrainingTransportResult("B", bToken, completedResult());
+    // Must not claim success while capacity progress is unconfirmed and D is stranded.
+    assert.equal(accepted, false);
+    assert.equal(s.getJob("D").state, "queued");
+    // Terminal may already be settled (mutate-then) at most once — no double cleanup later.
+    const stateDuringFault = s.getJob("B").state;
+    const verDuringFault = s.getJob("B").stateVersion;
+    const clearDuringFault = topo.clearB.n;
+    assert.ok(
+      stateDuringFault === "completed" || stateDuringFault === "pausing_provider",
+      "state=" + stateDuringFault
+    );
+    if (stateDuringFault === "completed") {
+      assert.equal(verDuringFault, verBefore + 1);
+      assert.equal(clearDuringFault, clearBefore + 1);
+      assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    }
+
+    fault = false;
+    // Replay: either private durable progress via tick, or retryable terminal replay.
+    const replay = s.onDrainingTransportResult("B", bToken, completedResult());
+    if (replay !== true) {
+      s.tick(0);
+    }
+    assert.equal(s.getJob("B").state, "completed");
+    assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assert.equal(s.getJob("D").state, "running");
+    // Stale replay inert; no double terminal/slot/cleanup.
+    assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), false);
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assertProjectionKeys(s.getJob("B"));
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("17b no-local local_io needs_user under drain fault then tick recovers D once", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let fault = false;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (fault && g.providerKey === "q.com") {
+          throw new Error("no-local local_io drain snapshot fault");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const topo = setupNoLocalQuiescentAuthBWithQueuedD(create);
+    const s = topo.s;
+    const bToken = topo.bToken;
+    const verBefore = s.getJob("B").stateVersion;
+
+    fault = true;
+    assert.equal(
+      s.onDrainingTransportResult(
+        "B",
+        bToken,
+        failedResult("local_io", "partial", "multi-range")
+      ),
+      false
+    );
+    assert.equal(s.getJob("D").state, "queued");
+
+    fault = false;
+    if (s.onDrainingTransportResult("B", bToken, failedResult("local_io", "partial", "multi-range")) !== true) {
+      s.tick(0);
+    }
+    assert.equal(s.getJob("B").state, "needs_user");
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("B").holdsGlobalSlot, false);
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(
+      s.onDrainingTransportResult(
+        "B",
+        bToken,
+        failedResult("local_io", "partial", "multi-range")
+      ),
+      false
+    );
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assertProjectionKeys(s.getJob("B"));
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+test("17c no-local cancel precedence under drain fault then recover once", () => {
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let fault = false;
+  try {
+    installHostileGate(realGate, gatePath, {
+      snapshot: function (g) {
+        if (fault && g.providerKey === "q.com") {
+          throw new Error("no-local cancel drain snapshot fault");
+        }
+        return g.snapshot();
+      },
+    });
+    const create = loadSchedulerFresh(schedPath);
+    const topo = setupNoLocalQuiescentAuthBWithQueuedD(create);
+    const s = topo.s;
+    const bToken = topo.bToken;
+    const clearBefore = topo.clearB.n;
+
+    s.cancel("B");
+    const verBefore = s.getJob("B").stateVersion;
+
+    fault = true;
+    assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), false);
+    assert.equal(s.getJob("D").state, "queued");
+
+    fault = false;
+    if (s.onDrainingTransportResult("B", bToken, completedResult()) !== true) {
+      s.tick(0);
+    }
+    assert.equal(s.getJob("B").state, "cancelled");
+    assert.equal(s.getJob("B").stateVersion, verBefore + 1);
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assert.equal(s.getJob("D").state, "running");
+    assert.equal(s.onDrainingTransportResult("B", bToken, completedResult()), false);
+    assert.equal(s.getJob("B").state, "cancelled");
+    assert.equal(topo.clearB.n, clearBefore + 1);
+    assertProjectionKeys(s.getJob("B"));
+    assertSlotInvariant(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
   }
 });
