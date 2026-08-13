@@ -2103,3 +2103,252 @@ test("integration: omitted completed reaches real scheduler draining API; hostil
     assert.equal(firefoxCalls.n, 0);
   }
 });
+
+// ---------------------------------------------------------------------------
+// 13. Task20: failed failureCategory exact primitive validation (no non-string launder)
+// ---------------------------------------------------------------------------
+
+function failedWireMsg(token, categoryVariant, partState) {
+  const msg = {
+    type: "pget-result",
+    id: "j1",
+    attemptToken: token,
+    status: "failed",
+    mode: "multi-range",
+    partState: partState || "partial",
+  };
+  if (categoryVariant === "absent") {
+    // omit failureCategory
+  } else if (categoryVariant === "own-undefined") {
+    msg.failureCategory = undefined;
+  } else if (categoryVariant === "own-null") {
+    msg.failureCategory = null;
+  } else if (
+    categoryVariant &&
+    typeof categoryVariant === "object" &&
+    Object.prototype.hasOwnProperty.call(categoryVariant, "value")
+  ) {
+    msg.failureCategory = categoryVariant.value;
+  } else {
+    msg.failureCategory = categoryVariant;
+  }
+  return msg;
+}
+
+test("running failed: non-string failureCategory types are ignored (no permanent launder)", () => {
+  const { handlePgetResult } = loadAdapter();
+  // Every non-string type that current normalizeFailureCategory would coerce to
+  // permanent must instead fail closed with zero scheduler/start/Firefox effect.
+  const hostiles = [
+    { label: "boxed-known", value: new String("timeout") },
+    { label: "boxed-permanent", value: new String("permanent") },
+    { label: "boxed-empty", value: new String("") },
+    { label: "object", value: {} },
+    { label: "array", value: [] },
+    { label: "number-0", value: 0 },
+    { label: "number-1", value: 1 },
+    { label: "bool-true", value: true },
+    { label: "bool-false", value: false },
+    { label: "bigint", value: 1n },
+    { label: "symbol", value: Symbol("timeout") },
+    {
+      label: "function",
+      value: function timeout() {
+        return "timeout";
+      },
+    },
+    {
+      label: "toString-object",
+      value: {
+        toString() {
+          return "timeout";
+        },
+      },
+    },
+    {
+      label: "valueOf-object",
+      value: {
+        valueOf() {
+          return "timeout";
+        },
+      },
+    },
+  ];
+
+  for (const h of hostiles) {
+    const job = baseJob({ state: "running", attemptToken: "atk-1" });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    const msg = failedWireMsg("atk-1", { value: h.value }, "partial");
+    // Trap any accidental String()/coercion of the hostile value.
+    if (h.value && typeof h.value === "object") {
+      Object.defineProperty(h.value, Symbol.toPrimitive, {
+        configurable: true,
+        value() {
+          throw new Error("must-not-coerce-" + h.label);
+        },
+      });
+    }
+    assert.doesNotThrow(() => {
+      handlePgetResult(sched, msg, optionsBag(started, firefoxHits));
+    }, h.label);
+    assertNoEffects(sched, firefoxHits, started);
+    // Must not launder into permanent via onTransportResult.
+    assert.equal(
+      sched.calls.transport.some((c) => c.result && c.result.failureCategory === "permanent"),
+      false,
+      `must not launder ${h.label} to permanent`
+    );
+    assert.equal(JSON.stringify(sched.calls).includes("must-not-coerce"), false);
+  }
+});
+
+test("pausing failed: non-string failureCategory types are ignored (no permanent launder)", () => {
+  const { handlePgetResult } = loadAdapter();
+  const hostiles = [
+    { label: "boxed-known", value: new String("timeout") },
+    { label: "boxed-permanent", value: new String("permanent") },
+    { label: "boxed-empty", value: new String("") },
+    { label: "object", value: {} },
+    { label: "array", value: [] },
+    { label: "number-0", value: 0 },
+    { label: "number-1", value: 1 },
+    { label: "bool-true", value: true },
+    { label: "bool-false", value: false },
+    { label: "bigint", value: 1n },
+    { label: "symbol", value: Symbol("timeout") },
+    {
+      label: "function",
+      value: function timeout() {
+        return "timeout";
+      },
+    },
+  ];
+
+  for (const h of hostiles) {
+    const job = baseJob({ state: "pausing_provider", attemptToken: null });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    const msg = failedWireMsg("atk-drain", { value: h.value }, "partial");
+    assert.doesNotThrow(() => {
+      handlePgetResult(sched, msg, optionsBag(started, firefoxHits));
+    }, h.label);
+    assertNoEffects(sched, firefoxHits, started);
+    assert.equal(
+      sched.calls.draining.some((c) => c.result && c.result.failureCategory === "permanent"),
+      false,
+      `pausing must not launder ${h.label} to permanent`
+    );
+  }
+});
+
+test("running failed: absent/undefined/null/unknown primitive string normalize to permanent; known preserved", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  // Controls: intentional permanent fallback for absent / own undefined / own null /
+  // unknown exact primitive strings.
+  for (const variant of [
+    "absent",
+    "own-undefined",
+    "own-null",
+    { value: "weird" },
+    { value: "RANGE_UNSUPPORTED" },
+    { value: "" },
+    { value: "constructor" },
+  ]) {
+    const job = baseJob({ state: "running", attemptToken: "atk-1" });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      failedWireMsg("atk-1", variant, "empty"),
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(started.length, 0);
+    assert.equal(firefoxHits.count, 0);
+    assert.equal(sched.calls.capability.length, 0);
+    assert.equal(sched.calls.draining.length, 0);
+    assert.equal(sched.calls.transport.length, 1, `running control ${JSON.stringify(variant)}`);
+    assert.equal(sched.calls.transport[0].result.failureCategory, "permanent");
+    assert.equal(sched.calls.transport[0].result.status, "failed");
+  }
+
+  // Known exact primitive strings must be preserved (not rewritten).
+  for (const cat of [
+    "timeout",
+    "local_io",
+    "connection_reset",
+    "short_read",
+    "http_429",
+    "http_5xx_temporary",
+    "cancelled",
+    "permanent",
+    "range_unsupported",
+  ]) {
+    const job = baseJob({ state: "running", attemptToken: "atk-1" });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    // range_unsupported + empty is the capability-switch path; use partial so
+    // ordinary transport preserves the category without switching.
+    const partState = cat === "range_unsupported" ? "partial" : "empty";
+    handlePgetResult(
+      sched,
+      failedWireMsg("atk-1", { value: cat }, partState),
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(started.length, 0, cat);
+    assert.equal(firefoxHits.count, 0, cat);
+    assert.equal(sched.calls.capability.length, 0, cat);
+    assert.equal(sched.calls.transport.length, 1, cat);
+    assert.equal(sched.calls.transport[0].result.failureCategory, cat);
+  }
+});
+
+test("pausing failed: missing/unknown primitive string remain inert; known exact preserved", () => {
+  const { handlePgetResult } = loadAdapter();
+
+  // Stricter than running: no permanent launder for missing/unknown.
+  for (const variant of [
+    "absent",
+    "own-undefined",
+    "own-null",
+    { value: "weird" },
+    { value: "RANGE_UNSUPPORTED" },
+    { value: "" },
+    { value: "constructor" },
+  ]) {
+    const job = baseJob({ state: "pausing_provider", attemptToken: null });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      failedWireMsg("atk-drain", variant, "partial"),
+      optionsBag(started, firefoxHits)
+    );
+    assertNoEffects(sched, firefoxHits, started);
+  }
+
+  // Known exact primitive still drains once.
+  for (const cat of ["timeout", "local_io", "permanent", "range_unsupported", "cancelled"]) {
+    const job = baseJob({ state: "pausing_provider", attemptToken: null });
+    const sched = fakeScheduler(job);
+    const started = [];
+    const firefoxHits = { count: 0 };
+    handlePgetResult(
+      sched,
+      failedWireMsg("atk-drain", { value: cat }, "partial"),
+      optionsBag(started, firefoxHits)
+    );
+    assert.equal(started.length, 0, cat);
+    assert.equal(firefoxHits.count, 0, cat);
+    assert.equal(sched.calls.capability.length, 0, cat);
+    assert.equal(sched.calls.transport.length, 0, cat);
+    assert.equal(sched.calls.draining.length, 1, cat);
+    assert.equal(sched.calls.draining[0].result.failureCategory, cat);
+  }
+});

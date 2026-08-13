@@ -90,19 +90,32 @@
       }
     }
 
-    /** Running failed path: missing/unknown → permanent after descriptor-safe snapshot. */
+    /**
+     * Running failed path after descriptor-safe snapshot:
+     * - absent / own undefined / own null → permanent (compat)
+     * - known exact primitive string → preserve
+     * - unknown exact primitive string → permanent (compat)
+     * - any other type (boxed string/object/array/number/bool/bigint/symbol/fn)
+     *   → reject; never coerce or launder to permanent
+     */
     function normalizeFailureCategory(value) {
-      if (isPrimitiveString(value) && isOwnAllowlisted(KNOWN_FAILURE_CATEGORIES, value)) {
-        return value;
+      if (value === undefined || value === null) {
+        return { ok: true, category: "permanent" };
       }
-      return "permanent";
+      if (!isPrimitiveString(value)) {
+        return { ok: false };
+      }
+      if (isOwnAllowlisted(KNOWN_FAILURE_CATEGORIES, value)) {
+        return { ok: true, category: value };
+      }
+      return { ok: true, category: "permanent" };
     }
 
     /**
      * Validate completed/cancelled/failed category rules shared by running and pausing.
      * Returns { ok:true, category } or { ok:false }.
      * Pausing failed requires a known exact category (scheduler contract).
-     * Running failed still normalizes missing/unknown to permanent.
+     * Running failed still normalizes missing/unknown primitive strings to permanent.
      */
     function resolveTerminalCategory(status, partState, failureCategory, pausing) {
       if (status === "completed") {
@@ -137,7 +150,7 @@
           }
           return { ok: true, category: failureCategory };
         }
-        return { ok: true, category: normalizeFailureCategory(failureCategory) };
+        return normalizeFailureCategory(failureCategory);
       }
       return { ok: false };
     }
