@@ -31,6 +31,7 @@ const CONTROLLER_KEYS = Object.freeze([
   "popupJobs",
 ]);
 
+const LEASE1_MSG = "background adapter behavior not implemented in Lease 1";
 
 const FLOREN_FIXTURE = JSON.parse(
   fs.readFileSync(
@@ -1130,8 +1131,17 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
   const jobs2 = ctrl.popupJobs();
   assert.notEqual(jobs, jobs2, "popupJobs must return a fresh array");
 
+  const disconnected = await ctrl.helperDisconnected();
+  const disconnectedAgain = await ctrl.helperDisconnected();
+  assert.equal(await ctrl.cancel("j1"), false);
+  assert.equal(await ctrl.manualRetry("j1"), false);
+  assert.ok(Array.isArray(disconnected));
+  assert.equal(disconnected.length, 0);
+  assertDeepFrozen(disconnected, "helperDisconnected empty");
+  assert.notEqual(disconnected, disconnectedAgain);
+  assertDeepFrozen(disconnectedAgain, "helperDisconnected fresh empty");
   assert.equal(await ctrl.handleNativeMessage({}), false);
-  // Stubs must not invoke effects or mutate by publishing.
+  // Inert lifecycle controls must not invoke effects or mutate by publishing.
   assert.equal(effectHits, 0);
   assert.equal(fx.counts.publishDetection, 0);
   assert.equal(fx.counts.postNative, 0);
@@ -8150,6 +8160,21 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
         assertRegistryDormant(inst.registryHits, "BA06 inv");
         assertVariantRegError(err);
       }
+
+      const materialBefore = snapshotEffectBaseline(fx);
+      const privacyBefore = inst.privacyCalls.length;
+      const disconnected = await ctrl.helperDisconnected();
+      const disconnectedAgain = await ctrl.helperDisconnected();
+      assert.equal(await ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"), false);
+      assert.equal(await ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"), false);
+      assert.ok(Array.isArray(disconnected));
+      assert.equal(disconnected.length, 0);
+      assertDeepFrozen(disconnected, "BA06 helperDisconnected");
+      assert.notEqual(disconnected, disconnectedAgain);
+      assertDeepFrozen(disconnectedAgain, "BA06 helperDisconnected fresh");
+      assert.equal(inst.privacyCalls.length, privacyBefore);
+      assertEffectBaseline(fx, materialBefore, "BA06 inert lifecycle");
+
       const surfaces = [
         netRows,
         domRows,
