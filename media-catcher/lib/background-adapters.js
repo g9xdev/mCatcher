@@ -1315,7 +1315,6 @@
       var variantRegInFlight = new Map();
       /** @type {Map<string, object>} media ID → provider-observation evidence (Batch 2) */
       var providerObservationByMediaId = new Map();
-      void providerObservationByMediaId;
 
       /**
        * Prepare public ID: invoke randomToken and validate base only.
@@ -1360,13 +1359,13 @@
       }
 
       function deriveProviderKey(sourceContext) {
-        var site = sourceContext && sourceContext.topLevelSite;
+        var site = ownData(sourceContext, "topLevelSite");
         if (typeof site === "string" && site.trim().length > 0) {
           return site;
         }
-        var documentId = sourceContext && sourceContext.documentId;
-        if (documentId != null && String(documentId).length > 0) {
-          var docKey = String(documentId);
+        var documentId = ownData(sourceContext, "documentId");
+        if (typeof documentId === "string" && documentId.length > 0) {
+          var docKey = documentId;
           if (sessionDocIdentity.has(docKey)) {
             return sessionDocIdentity.get(docKey);
           }
@@ -1375,10 +1374,12 @@
           sessionDocIdentity.set(docKey, docId);
           return docId;
         }
+        var pageUrl = ownData(sourceContext, "topLevelPageUrl");
+        var tabId = ownData(sourceContext, "tabId");
         var pageKey =
-          (sourceContext && sourceContext.topLevelPageUrl) ||
-          ("tab:" + String(sourceContext && sourceContext.tabId));
-        pageKey = String(pageKey);
+          typeof pageUrl === "string" && pageUrl.length > 0
+            ? pageUrl
+            : "tab:" + (typeof tabId === "number" ? String(tabId) : "unknown");
         if (sessionPageIdentity.has(pageKey)) {
           return sessionPageIdentity.get(pageKey);
         }
@@ -1386,6 +1387,104 @@
         var pageId = "page-session:" + sessionPageCounter;
         sessionPageIdentity.set(pageKey, pageId);
         return pageId;
+      }
+
+      function normalizeSourceProviderKey(sourceContext) {
+        var raw = deriveProviderKey(sourceContext);
+        if (typeof raw !== "string" || raw.trim().length === 0) return "";
+        try {
+          var normalized = ProviderRegistryApi.normalizeProviderKey(raw);
+          return typeof normalized === "string" && normalized.trim().length > 0
+            ? normalized
+            : "";
+        } catch (e) {
+          return "";
+        }
+      }
+
+      function normalizedHttpOrigin(sourceContext) {
+        var raw = ownData(sourceContext, "mediaOrigin");
+        if (
+          typeof raw !== "string" ||
+          raw.trim().length === 0 ||
+          hasControlChars(raw)
+        ) {
+          return "";
+        }
+        var parsed;
+        try {
+          parsed = new URL(raw);
+        } catch (e) {
+          return "";
+        }
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          return "";
+        }
+        var normalized;
+        try {
+          normalized = ProviderRegistryApi.normalizeOrigin(raw);
+        } catch (e) {
+          return "";
+        }
+        if (typeof normalized !== "string" || normalized.length === 0) return "";
+        try {
+          var normalizedUrl = new URL(normalized);
+          if (
+            (normalizedUrl.protocol !== "http:" &&
+              normalizedUrl.protocol !== "https:") ||
+            normalizedUrl.origin !== normalized
+          ) {
+            return "";
+          }
+        } catch (e) {
+          return "";
+        }
+        return normalized;
+      }
+
+      function providerEvidence(status, providerKey) {
+        return Object.freeze({ status: status, providerKey: providerKey });
+      }
+
+      function copyProviderEvidence(result, sourceProviderKey) {
+        var status = ownData(result, "status");
+        var providerKey = ownData(result, "providerKey");
+        if (
+          status === "one" &&
+          providerKey === sourceProviderKey &&
+          typeof providerKey === "string"
+        ) {
+          return providerEvidence("one", providerKey);
+        }
+        if (status === "ambiguous" && providerKey === null) {
+          return providerEvidence("ambiguous", null);
+        }
+        if (status === "none" && providerKey === null) {
+          return providerEvidence("none", null);
+        }
+        return providerEvidence("none", null);
+      }
+
+      /** Claim first; then observe and take one current lookup. Never retries. */
+      function observeProviderOnce(mediaId, sourceContext, sourceProviderKey) {
+        if (providerObservationByMediaId.has(mediaId)) {
+          return providerObservationByMediaId.get(mediaId);
+        }
+        var none = providerEvidence("none", null);
+        providerObservationByMediaId.set(mediaId, none);
+        var origin = normalizedHttpOrigin(sourceContext);
+        if (!sourceProviderKey || !origin) return none;
+        try {
+          providerRegistry.observe(origin, sourceProviderKey);
+          var evidence = copyProviderEvidence(
+            providerRegistry.lookup(origin),
+            sourceProviderKey
+          );
+          providerObservationByMediaId.set(mediaId, evidence);
+          return evidence;
+        } catch (e) {
+          return none;
+        }
       }
 
       function reportSafeDiagnostic(code, mediaId) {
@@ -1461,10 +1560,12 @@
           // Exact frozen sourceContext from finalizer; propose-once filename.
           var sourceContext = item.sourceContext;
           var proposedFilename = item.proposedFilename;
-          var providerKey = deriveProviderKey(sourceContext);
+          var providerKey = normalizeSourceProviderKey(sourceContext);
+          observeProviderOnce(mediaId, sourceContext, providerKey);
 
-          // ProviderRegistry is reserved for Lease 2 — no observe/lookup in Lease 1.
-          void providerRegistry;
+          // A registry callback may have reentered reconciliation and completed
+          // this exact detection while the outer association call was in flight.
+          if (reconciledDetectionIds.has(detId)) continue;
 
           var record = {
             mediaId: mediaId,

@@ -401,6 +401,8 @@ function loadInstrumentedClassic() {
   const RealPR = root.McProviderRegistry;
   const realCreatePR = RealPR.createProviderRegistry;
   root.McProviderRegistry = {
+    normalizeOrigin: RealPR.normalizeOrigin,
+    normalizeProviderKey: RealPR.normalizeProviderKey,
     createProviderRegistry() {
       registryHits.create += 1;
       const reg = realCreatePR.call(RealPR);
@@ -1959,21 +1961,11 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
   );
 
   await t.test(
-    "ProviderRegistry is constructed once but never observed in Lease 1",
+    "ProviderRegistry is constructed once and never cleared or snapshotted",
     async () => {
       const src = productionSource();
       const creates = src.match(/createProviderRegistry\s*\(/g) || [];
       assert.equal(creates.length, 1, "createProviderRegistry exactly once");
-      assert.equal(
-        (src.match(/\.observe\s*\(/g) || []).length,
-        0,
-        "Lease 1 must not call .observe("
-      );
-      assert.equal(
-        (src.match(/\.lookup\s*\(/g) || []).length,
-        0,
-        "Lease 1 must not call .lookup("
-      );
       assert.equal(
         (src.match(/providerRegistry\.clear\s*\(/g) || []).length,
         0,
@@ -4949,6 +4941,8 @@ function loadVariantInstrumentedClassic(hooks) {
   const RealPR = root.McProviderRegistry;
   const realCreatePR = RealPR.createProviderRegistry;
   root.McProviderRegistry = {
+    normalizeOrigin: RealPR.normalizeOrigin,
+    normalizeProviderKey: RealPR.normalizeProviderKey,
     createProviderRegistry() {
       registryHits.create += 1;
       const reg = realCreatePR.call(RealPR);
@@ -5011,8 +5005,11 @@ function loadVariantInstrumentedClassic(hooks) {
 
 function assertRegistryDormant(registryHits, label) {
   const prefix = label ? label + " " : "";
-  assert.equal(registryHits.observe, 0, prefix + "registry observe");
-  assert.equal(registryHits.lookup, 0, prefix + "registry lookup");
+  assert.equal(
+    registryHits.observe,
+    registryHits.lookup,
+    prefix + "registry observe/lookup balance"
+  );
   assert.equal(registryHits.clear, 0, prefix + "registry clear");
   assert.equal(registryHits.snapshot, 0, prefix + "registry snapshot");
 }
@@ -8317,4 +8314,489 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
       assertDeepFrozen(again, "ba06 replay");
     }
   );
+});
+
+// ---------------------------------------------------------------------------
+// BA07–BA08 — provider association at observable dependency/public boundaries
+// ---------------------------------------------------------------------------
+
+function loadProviderObservedClassic(hooks) {
+  const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const root = Object.create(null);
+  const sandbox = classicVmBuiltins(root);
+  loadClassicDependencies(sandbox, root);
+
+  const events = [];
+  const registryHits = {
+    create: 0,
+    observe: 0,
+    lookup: 0,
+    clear: 0,
+    snapshot: 0,
+  };
+  const RealPR = root.McProviderRegistry;
+  root.McProviderRegistry = {
+    normalizeOrigin: RealPR.normalizeOrigin,
+    normalizeProviderKey: RealPR.normalizeProviderKey,
+    createProviderRegistry() {
+      registryHits.create += 1;
+      const registry = RealPR.createProviderRegistry();
+      return {
+        observe(origin, providerKey) {
+          registryHits.observe += 1;
+          const event = { kind: "observe", origin, providerKey };
+          events.push(event);
+          if (hooks && typeof hooks.onObserve === "function") {
+            hooks.onObserve(event);
+          }
+          return registry.observe(origin, providerKey);
+        },
+        lookup(origin) {
+          registryHits.lookup += 1;
+          const event = { kind: "lookup", origin };
+          events.push(event);
+          if (hooks && typeof hooks.onLookup === "function") {
+            hooks.onLookup(event);
+          }
+          const result = registry.lookup(origin);
+          event.status = result.status;
+          event.providerKey = result.providerKey;
+          return result;
+        },
+        clear() {
+          registryHits.clear += 1;
+          return registry.clear();
+        },
+        snapshot() {
+          registryHits.snapshot += 1;
+          return registry.snapshot();
+        },
+      };
+    },
+  };
+
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  return {
+    api: root.McBackgroundAdapters,
+    events,
+    registryHits,
+  };
+}
+
+function makeProviderController(hooks, effectOverrides) {
+  const inst = loadProviderObservedClassic(hooks);
+  const fx = makeEffects();
+  const ctrl = inst.api.createBackgroundAdapters(fx.options(effectOverrides));
+  return { inst, fx, ctrl };
+}
+
+function providerDomInput(opts) {
+  const has = Object.prototype.hasOwnProperty;
+  const documentId = has.call(opts, "documentId")
+    ? opts.documentId
+    : "doc-provider-" + opts.tabId;
+  const pageUrl = has.call(opts, "pageUrl")
+    ? opts.pageUrl
+    : "https://www.FlorenFile.com/watch";
+  const fileTag = String(opts.fileTag || opts.tabId).replace(/[^A-Za-z0-9._-]/g, "-");
+  return {
+    mediaUrl:
+      opts.mediaUrl ||
+      "https://payload.example/" + fileTag + ".mp4?sig=PRIVATE_MEDIA_QUERY",
+    mediaOrigin: opts.mediaOrigin,
+    contentDisposition: null,
+    referrerUrl: pageUrl,
+    frameOrigin: pageUrl ? new URL(pageUrl).origin : "",
+    ts: 1_000_000 + opts.tabId,
+    snapshot: {
+      documentId,
+      tabId: opts.tabId,
+      frameId: 0,
+      pageUrl,
+      topLevelPageUrl: pageUrl,
+      documentNonce: "nonce-" + fileTag,
+      candidates: [{ kind: "visible-filename", value: fileTag + ".mp4" }],
+      capturedAt: "2026-08-12T12:00:00.000Z",
+    },
+    transport:
+      opts.transport || { mediaKind: "direct", requestHeaders: null },
+  };
+}
+
+function captureProviderDom(env, opts) {
+  const before = env.fx.publishDetections.length;
+  const input = providerDomInput(opts);
+  const mediaId = env.ctrl.captureDomMedia(input);
+  assert.ok(isSafeOpaqueId(mediaId));
+  assert.equal(env.fx.publishDetections.length, before + 1);
+  const published = env.fx.publishDetections[env.fx.publishDetections.length - 1];
+  assert.equal(published.id, mediaId);
+  return { mediaId, input, published };
+}
+
+function providerEventRows(events) {
+  return events.map((event) =>
+    event.kind === "observe"
+      ? ["observe", event.origin, event.providerKey]
+      : ["lookup", event.origin, event.status, event.providerKey]
+  );
+}
+
+function assertProviderPublicBoundary(env, forbiddenValues) {
+  assert.equal(env.inst.registryHits.create, 1);
+  assert.equal(env.inst.registryHits.clear, 0);
+  assert.equal(env.inst.registryHits.snapshot, 0);
+  for (const published of env.fx.publishDetections) {
+    assert.deepEqual(Object.keys(published), [
+      "id",
+      "proposedFilename",
+      "kind",
+      "providerKey",
+    ]);
+    assertDeepFrozen(published, "provider publication");
+  }
+  const popupRows = [];
+  for (let tabId = 500; tabId < 700; tabId++) {
+    const rows = env.ctrl.popupMedia(tabId);
+    for (const row of rows) popupRows.push(row);
+  }
+  for (const row of popupRows) {
+    assert.deepEqual(Object.keys(row), [
+      "id",
+      "proposedFilename",
+      "kind",
+      "variants",
+    ]);
+    assertDeepFrozen(row, "provider popup row");
+  }
+  const publicJson = JSON.stringify({
+    detections: env.fx.publishDetections,
+    popupRows,
+    diagnostics: env.fx.diagnostics,
+  });
+  assert.equal(publicJson.includes('"status"'), false);
+  assert.equal(publicJson.includes('"mediaOrigin"'), false);
+  for (const value of forbiddenValues || []) {
+    assert.equal(publicJson.includes(value), false, "public provider boundary: " + value);
+  }
+}
+
+test("BA07 — finalized media associates to its source provider exactly once", async (t) => {
+  await t.test("distinct HTTP(S) CDN origins keep the same referring provider", () => {
+    const env = makeProviderController();
+    captureProviderDom(env, {
+      tabId: 501,
+      fileTag: "distinct-a",
+      mediaOrigin: "https://CDN-A.Example:443/video/a.mp4?sig=PRIVATE_A#frag",
+    });
+    captureProviderDom(env, {
+      tabId: 502,
+      fileTag: "distinct-b",
+      mediaOrigin: "http://CDN-B.Example:80/video/b.mp4?sig=PRIVATE_B",
+    });
+
+    assert.deepEqual(providerEventRows(env.inst.events), [
+      ["observe", "https://cdn-a.example", "florenfile.com"],
+      ["lookup", "https://cdn-a.example", "one", "florenfile.com"],
+      ["observe", "http://cdn-b.example", "florenfile.com"],
+      ["lookup", "http://cdn-b.example", "one", "florenfile.com"],
+    ]);
+    assert.deepEqual(
+      env.fx.publishDetections.map((row) => row.providerKey),
+      ["florenfile.com", "florenfile.com"]
+    );
+    assertProviderPublicBoundary(env, ["cdn-a.example", "cdn-b.example", "PRIVATE_A"]);
+  });
+
+  await t.test("document and page fallbacks are stable and session-separated", () => {
+    const env = makeProviderController();
+    const rows = [
+      { tabId: 510, documentId: "doc-shared", mediaOrigin: "https://d1.example/a" },
+      { tabId: 511, documentId: "doc-shared", mediaOrigin: "https://d2.example/b" },
+      { tabId: 512, documentId: "doc-other", mediaOrigin: "https://d3.example/c" },
+      { tabId: 513, documentId: null, mediaOrigin: "https://d4.example/d" },
+      { tabId: 513, documentId: null, mediaOrigin: "https://d5.example/e" },
+    ];
+    rows.forEach((row, index) =>
+      captureProviderDom(env, Object.assign({ pageUrl: "", fileTag: "fallback-" + index }, row))
+    );
+
+    assert.deepEqual(
+      env.inst.events.filter((event) => event.kind === "observe").map((event) => event.providerKey),
+      [
+        "document-session:1",
+        "document-session:1",
+        "document-session:2",
+        "page-session:1",
+        "page-session:1",
+      ]
+    );
+    assert.deepEqual(
+      env.fx.publishDetections.map((row) => row.providerKey),
+      [
+        "document-session:1",
+        "document-session:1",
+        "document-session:2",
+        "page-session:1",
+        "page-session:1",
+      ]
+    );
+    assert.equal(env.inst.registryHits.observe, 5);
+    assert.equal(env.inst.registryHits.lookup, 5);
+  });
+
+  await t.test("unusable raw origins fail closed while HTTP(S) remains live", () => {
+    const env = makeProviderController();
+    captureProviderDom(env, {
+      tabId: 520,
+      fileTag: "origin-positive-before",
+      mediaOrigin: "https://GOOD-A.Example:443/path?q=private",
+    });
+    const invalidOrigins = [
+      "blob:https://hidden.example/id",
+      "ftp://hidden.example/file",
+      "file:///C:/private.mp4",
+      "data:video/mp4;base64,AAAA",
+      "",
+      "not a URL",
+    ];
+    invalidOrigins.forEach((mediaOrigin, index) => {
+      captureProviderDom(env, {
+        tabId: 521 + index,
+        fileTag: "origin-invalid-" + index,
+        mediaOrigin,
+      });
+    });
+    let coercionHits = 0;
+    const hostileOrigin = {
+      [Symbol.toPrimitive]() {
+        coercionHits += 1;
+        return "https://coerced.example";
+      },
+    };
+    assert.throws(
+      () =>
+        env.ctrl.captureDomMedia(
+          providerDomInput({
+            tabId: 528,
+            fileTag: "origin-hostile",
+            mediaOrigin: hostileOrigin,
+          })
+        ),
+      TypeError
+    );
+    assert.equal(coercionHits, 0);
+    captureProviderDom(env, {
+      tabId: 529,
+      fileTag: "origin-positive-after",
+      mediaOrigin: "http://GOOD-B.Example:80/after",
+    });
+
+    assert.deepEqual(providerEventRows(env.inst.events), [
+      ["observe", "https://good-a.example", "florenfile.com"],
+      ["lookup", "https://good-a.example", "one", "florenfile.com"],
+      ["observe", "http://good-b.example", "florenfile.com"],
+      ["lookup", "http://good-b.example", "one", "florenfile.com"],
+    ]);
+    assert.equal(env.fx.publishDetections.length, invalidOrigins.length + 2);
+    assertProviderPublicBoundary(env, ["hidden.example", "coerced.example"]);
+  });
+
+  await t.test("registry callback reentrancy cannot duplicate association or publication", async () => {
+    const hooks = {};
+    const env = makeProviderController(hooks);
+    const input = providerDomInput({
+      tabId: 540,
+      fileTag: "reentrant",
+      mediaOrigin: "https://reentrant-cdn.example/video",
+    });
+    const ticks = [];
+    function reenter() {
+      env.ctrl.popupMedia(540);
+      env.ctrl.acceptPageSnapshot(input.snapshot);
+      ticks.push(env.ctrl.tick(1_001_000));
+    }
+    hooks.onObserve = reenter;
+    hooks.onLookup = reenter;
+
+    const mediaId = env.ctrl.captureDomMedia(input);
+    await Promise.all(ticks);
+    assert.ok(isSafeOpaqueId(mediaId));
+    assert.deepEqual(providerEventRows(env.inst.events), [
+      ["observe", "https://reentrant-cdn.example", "florenfile.com"],
+      ["lookup", "https://reentrant-cdn.example", "one", "florenfile.com"],
+    ]);
+    assert.equal(env.fx.publishDetections.length, 1);
+    assert.equal(env.ctrl.popupMedia(540).length, 1);
+  });
+
+  await t.test("observe and lookup failures are contained and never retried", async () => {
+    const observations = [];
+    for (const failingMethod of ["observe", "lookup"]) {
+      const hooks = {};
+      const env = makeProviderController(hooks);
+      const sentinel = "PRIVATE_REGISTRY_FAILURE_" + failingMethod;
+      hooks[failingMethod === "observe" ? "onObserve" : "onLookup"] = () => {
+        throw new Error(sentinel);
+      };
+      const result = captureProviderDom(env, {
+        tabId: failingMethod === "observe" ? 550 : 551,
+        fileTag: "failure-" + failingMethod,
+        mediaOrigin: "https://failure-" + failingMethod + ".example/path",
+      });
+      assert.equal(result.published.providerKey, "florenfile.com");
+      const before = env.inst.events.length;
+      env.ctrl.popupMedia(failingMethod === "observe" ? 550 : 551);
+      env.ctrl.acceptPageSnapshot(result.input.snapshot);
+      await env.ctrl.tick(1_001_100);
+      observations.push({ failingMethod, env, sentinel, before });
+    }
+    for (const observation of observations) {
+      const { failingMethod, env, sentinel, before } = observation;
+      assert.equal(env.inst.events.length, before);
+      assert.deepEqual(
+        env.inst.events.map((event) => event.kind),
+        failingMethod === "observe" ? ["observe"] : ["observe", "lookup"]
+      );
+      assert.equal(env.fx.publishDetections.length, 1);
+      assert.equal(JSON.stringify(env.fx.publishDetections).includes(sentinel), false);
+      assert.equal(JSON.stringify(env.fx.diagnostics).includes(sentinel), false);
+      assert.ok(env.fx.diagnostics.length <= 1);
+    }
+  });
+
+  await t.test("later reads, variants, and caller overrides cannot reassociate or leak", async () => {
+    const retainedUrl = "https://retained.example/private-retained.mp4";
+    const explicitUrl = "https://explicit.example/private-explicit.mp4";
+    const transport = {
+      mediaKind: "direct",
+      requestHeaders: null,
+      variants: [{ url: retainedUrl, label: "retained" }],
+    };
+    const env = makeProviderController();
+    const result = captureProviderDom(env, {
+      tabId: 560,
+      fileTag: "later-reads",
+      mediaOrigin: "https://stable-cdn.example/private-path",
+      transport,
+    });
+    const eventRows = providerEventRows(env.inst.events);
+    const publishCount = env.fx.publishDetections.length;
+    env.ctrl.popupMedia(560);
+    env.ctrl.acceptPageSnapshot(result.input.snapshot);
+    await env.ctrl.tick(1_001_200);
+    const variants = env.ctrl.registerVariants(result.mediaId, [
+      {
+        url: explicitUrl,
+        label: "explicit",
+        providerKey: "caller-override.example",
+        mediaId: "caller-media-id",
+      },
+    ]);
+    let replayHits = 0;
+    const hostileReplay = new Proxy([], {
+      get() {
+        replayHits += 1;
+        throw new Error("PRIVATE_REPLAY_READ");
+      },
+      getOwnPropertyDescriptor() {
+        replayHits += 1;
+        throw new Error("PRIVATE_REPLAY_DESCRIPTOR");
+      },
+    });
+    const replay = env.ctrl.registerVariants(result.mediaId, hostileReplay);
+
+    assert.deepEqual(eventRows, [
+      ["observe", "https://stable-cdn.example", "florenfile.com"],
+      ["lookup", "https://stable-cdn.example", "one", "florenfile.com"],
+    ]);
+    assert.equal(replayHits, 0);
+    assert.deepEqual(replay.map((row) => row.id), variants.map((row) => row.id));
+    assert.deepEqual(providerEventRows(env.inst.events), eventRows);
+    assert.equal(env.fx.publishDetections.length, publishCount);
+    assert.equal(Object.prototype.hasOwnProperty.call(variants[0], "url"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(variants[0], "providerKey"), false);
+    assertProviderPublicBoundary(env, [
+      retainedUrl,
+      explicitUrl,
+      "caller-override.example",
+      "stable-cdn.example",
+    ]);
+  });
+});
+
+test("BA08 — shared CDN ambiguity stays live and session-scoped", async (t) => {
+  await t.test("shared CDN A→B→A returns one, ambiguous, ambiguous without rewriting ownership", () => {
+    const env = makeProviderController();
+    const shared = "https://SHARED-CDN.Example:443/video/path?private=1";
+    const providers = [
+      "https://www.Provider-A.Example/watch",
+      "https://Provider-B.Example/watch",
+      "https://provider-a.example/again",
+    ];
+    providers.forEach((pageUrl, index) =>
+      captureProviderDom(env, {
+        tabId: 600 + index,
+        fileTag: "shared-" + index,
+        mediaOrigin: shared,
+        pageUrl,
+      })
+    );
+
+    assert.deepEqual(providerEventRows(env.inst.events), [
+      ["observe", "https://shared-cdn.example", "provider-a.example"],
+      ["lookup", "https://shared-cdn.example", "one", "provider-a.example"],
+      ["observe", "https://shared-cdn.example", "provider-b.example"],
+      ["lookup", "https://shared-cdn.example", "ambiguous", null],
+      ["observe", "https://shared-cdn.example", "provider-a.example"],
+      ["lookup", "https://shared-cdn.example", "ambiguous", null],
+    ]);
+    assert.deepEqual(
+      env.fx.publishDetections.map((row) => row.providerKey),
+      ["provider-a.example", "provider-b.example", "provider-a.example"]
+    );
+    assertProviderPublicBoundary(env, ["shared-cdn.example", "private=1"]);
+  });
+
+  await t.test("registry ambiguity cannot cross controller sessions", async () => {
+    const shared = "https://session-cdn.example/path";
+    const first = makeProviderController();
+    captureProviderDom(first, {
+      tabId: 610,
+      fileTag: "session-a",
+      mediaOrigin: shared,
+      pageUrl: "https://provider-a.example/watch",
+    });
+    captureProviderDom(first, {
+      tabId: 611,
+      fileTag: "session-b",
+      mediaOrigin: shared,
+      pageUrl: "https://provider-b.example/watch",
+    });
+
+    const second = makeProviderController();
+    const result = captureProviderDom(second, {
+      tabId: 612,
+      fileTag: "session-fresh",
+      mediaOrigin: shared,
+      pageUrl: "https://provider-a.example/watch",
+    });
+    assert.deepEqual(providerEventRows(first.inst.events), [
+      ["observe", "https://session-cdn.example", "provider-a.example"],
+      ["lookup", "https://session-cdn.example", "one", "provider-a.example"],
+      ["observe", "https://session-cdn.example", "provider-b.example"],
+      ["lookup", "https://session-cdn.example", "ambiguous", null],
+    ]);
+    assert.deepEqual(providerEventRows(second.inst.events), [
+      ["observe", "https://session-cdn.example", "provider-a.example"],
+      ["lookup", "https://session-cdn.example", "one", "provider-a.example"],
+    ]);
+    const before = second.inst.events.length;
+    second.ctrl.popupMedia(612);
+    second.ctrl.acceptPageSnapshot(result.input.snapshot);
+    await second.ctrl.tick(1_001_300);
+    assert.equal(second.inst.events.length, before);
+    assert.equal(second.fx.publishDetections[0].providerKey, "provider-a.example");
+  });
 });
