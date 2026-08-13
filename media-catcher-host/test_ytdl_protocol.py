@@ -4068,3 +4068,265 @@ def test_close_handle_bool_once_no_double_close(tmp_path, monkeypatch):
     assert close_final_calls, "expected at least one post-claim final-handle close"
     assert len(close_final_calls) == len(set(close_final_calls)), close_final_calls
     assert d._PGET.get("jobCloseFinal") is None
+
+
+# ---------------------------------------------------------------------------
+# 49. Committed-pin adopt: retain original when duplication fails
+# ---------------------------------------------------------------------------
+
+def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
+    """Real commit path while forcing readonly-pin duplication to fail.
+
+    case:
+      - "none": duplicate returns None
+      - "raise": duplicate raises
+      - "zero": duplicate returns 0 (invalid)
+      - "invalid": duplicate returns INVALID_HANDLE_VALUE
+    """
+    import mchost.downloads as d
+
+    dest = tmp_path / ("pinfail-%s" % case)
+    dest.mkdir()
+    sent = []
+    payload = b"PIN-FAIL-%s" % case.encode("ascii")
+    race = {
+        "checked": False,
+        "replace_ok": None,
+        "path_exists": None,
+        "payload": None,
+    }
+    close_calls = []
+    real_close = d._ytdl_close_handle
+    real_dup = d._ytdl_duplicate_readonly_pin
+    invalid = int(d._YTDL_INVALID_HANDLE_VALUE)
+
+    def dup_fail(handle):
+        if case == "none":
+            return None
+        if case == "raise":
+            raise RuntimeError("dup pin inject")
+        if case == "zero":
+            return 0
+        if case == "invalid":
+            return invalid
+        raise AssertionError("unknown case %r" % (case,))
+
+    def track_close(handle):
+        if handle:
+            close_calls.append(int(handle))
+        return real_close(handle)
+
+    def capturing_send(msg):
+        # Always record first so a probe fault cannot drop the terminal frame.
+        sent.append(dict(msg))
+        if msg.get("type") == "ytdl-done" and not race["checked"]:
+            race["checked"] = True
+            path = msg.get("file")
+            try:
+                os.replace(path, path + ".moved")
+                race["replace_ok"] = True
+            except OSError:
+                race["replace_ok"] = False
+            # Do not open the path while the owned handle may still hold it:
+            # DELETE-capable pins can deny concurrent readers. Existence + later
+            # post-terminal read prove the payload and release contract.
+            try:
+                race["path_exists"] = bool(path) and os.path.isfile(path)
+            except OSError:
+                race["path_exists"] = False
+
+    monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", dup_fail)
+    monkeypatch.setattr(d, "_ytdl_close_handle", track_close)
+
+    def fake_popen(*a, **k):
+        path = _materialize_stage_from_cmd(a, payload)
+        return LiveProc(lines=["@@FILE@@ %s" % path], returncode=0)
+
+    monkeypatch.setattr(mc, "send", capturing_send)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_ytdlp", lambda: "yt-dlp-fake")
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+    monkeypatch.setattr(d, "_no_window", lambda: (0, None))
+    monkeypatch.setattr(mc, "FFMPEG", None)
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+
+    d.handle_ytdl({
+        "id": jid, "attemptToken": "atk-%s" % case,
+        "url": "https://example.test/v", "name": "%s.mp4" % case, "dir": str(dest),
+    })
+    term = _wait_terminal(sent, jid)
+    assert wait_for(lambda: d._PGET.get(jid) is None, timeout=5)
+
+    # Restore real helpers for post-terminal rename probe and teardown.
+    monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", real_dup)
+    monkeypatch.setattr(d, "_ytdl_close_handle", real_close)
+
+    return {
+        "d": d,
+        "dest": dest,
+        "sent": sent,
+        "term": term,
+        "race": race,
+        "payload": payload,
+        "close_calls": close_calls,
+        "jid": jid,
+    }
+
+
+def _assert_pin_fail_e2e(r, jid):
+    """Shared post-conditions for pin-duplication failure e2e cases."""
+    term, race, payload, sent, close_calls = (
+        r["term"], r["race"], r["payload"], r["sent"], r["close_calls"],
+    )
+    assert term["type"] == "ytdl-done"
+    assert term["bytes"] == len(payload)
+    assert race["checked"] is True
+    assert race["replace_ok"] is False, "owned handle must deny replace during ytdl-done"
+    assert race["path_exists"] is True
+    # After worker terminal + final close, payload is readable and renameable.
+    assert open(term["file"], "rb").read() == payload
+    terminals = [
+        m for m in sent
+        if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == jid
+    ]
+    assert len(terminals) == 1
+    assert not any(m.get("type") == "ytdl-error" and m.get("id") == jid for m in sent)
+    assert r["d"]._PGET.get(jid) is None
+    assert len(close_calls) == len(set(close_calls)), close_calls
+    # Ownership released: ordinary same-volume rename must succeed after terminal.
+    moved = term["file"] + ".after"
+    os.replace(term["file"], moved)
+    assert not os.path.exists(term["file"])
+    assert open(moved, "rb").read() == payload
+
+
+def test_pin_dup_none_retains_handle_through_done_then_releases(tmp_path, monkeypatch):
+    """Duplicate returns None: original pins final through ytdl-done, then releases once."""
+    r = _run_commit_with_pin_failure(tmp_path, monkeypatch, "none", "jobPinNone")
+    _assert_pin_fail_e2e(r, "jobPinNone")
+
+
+def test_pin_dup_raise_retains_handle_through_done_then_releases(tmp_path, monkeypatch):
+    """Duplicate raises: original remains owned through terminal and closes once later."""
+    r = _run_commit_with_pin_failure(tmp_path, monkeypatch, "raise", "jobPinRaise")
+    _assert_pin_fail_e2e(r, "jobPinRaise")
+
+
+def test_pin_dup_zero_retains_handle_through_done_then_releases(tmp_path, monkeypatch):
+    """Invalid zero pin result is treated as no pin; original held through terminal."""
+    r = _run_commit_with_pin_failure(tmp_path, monkeypatch, "zero", "jobPinZero")
+    _assert_pin_fail_e2e(r, "jobPinZero")
+
+
+def test_pin_dup_invalid_handle_retains_through_done_then_releases(tmp_path, monkeypatch):
+    """INVALID_HANDLE_VALUE pin result is treated as no pin; original held through terminal."""
+    r = _run_commit_with_pin_failure(tmp_path, monkeypatch, "invalid", "jobPinInv")
+    _assert_pin_fail_e2e(r, "jobPinInv")
+
+
+def test_ytdl_adopt_committed_pin_close_accounting_matrix(monkeypatch):
+    """Unit matrix: adopt never closes original without a valid replacement pin."""
+    import mchost.downloads as d
+
+    original = 9001
+    pin = 9002
+    invalid = int(d._YTDL_INVALID_HANDLE_VALUE)
+    closes = []
+
+    # --- no duplicate => do not close inside adopt; return original ---
+    closes[:] = []
+    monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: None)
+
+    def close_must_not(handle):
+        closes.append(int(handle) if handle else None)
+        raise AssertionError("must not close original when no pin")
+
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+    assert d._ytdl_adopt_committed_pin(original) == original
+    assert closes == []
+
+    # zero / invalid pin results also mean "no pin"
+    for bad in (0, invalid, None):
+        closes[:] = []
+        monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h, b=bad: b)
+        monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+        got = d._ytdl_adopt_committed_pin(original)
+        assert got == original, bad
+        assert closes == []
+
+    # duplicate raises => return original, no close
+    closes[:] = []
+
+    def dup_raise(handle):
+        raise RuntimeError("dup boom")
+
+    monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", dup_raise)
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+    assert d._ytdl_adopt_committed_pin(original) == original
+    assert closes == []
+
+    # --- duplicate succeeds + original close TRUE => return duplicate ---
+    closes[:] = []
+    monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: pin)
+
+    def close_true(handle):
+        closes.append(int(handle) if handle else None)
+        return True
+
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_true)
+    assert d._ytdl_adopt_committed_pin(original) == pin
+    assert closes == [original]
+
+    # --- duplicate succeeds + original close FALSE => return pin; never retry original ---
+    closes[:] = []
+
+    def close_false(handle):
+        closes.append(int(handle) if handle else None)
+        return False
+
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_false)
+    assert d._ytdl_adopt_committed_pin(original) == pin
+    assert closes == [original]
+
+    # --- duplicate succeeds + original close raises => close unused pin once; return original ---
+    closes[:] = []
+
+    def close_raise_original_then_ok(handle):
+        hv = int(handle) if handle else None
+        closes.append(hv)
+        if hv == original:
+            raise RuntimeError("close original inject")
+        return True
+
+    monkeypatch.setattr(d, "_ytdl_close_handle", close_raise_original_then_ok)
+    assert d._ytdl_adopt_committed_pin(original) == original
+    assert closes == [original, pin]
+
+    # No branch returns None while a valid original is still owned.
+    for mode in ("none", "zero", "invalid", "raise", "true", "false", "raise_close"):
+        closes[:] = []
+        if mode == "none":
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: None)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+        elif mode == "zero":
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: 0)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+        elif mode == "invalid":
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: invalid)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+        elif mode == "raise":
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", dup_raise)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_must_not)
+        elif mode == "true":
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: pin)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_true)
+        elif mode == "false":
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: pin)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_false)
+        else:
+            monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", lambda h: pin)
+            monkeypatch.setattr(d, "_ytdl_close_handle", close_raise_original_then_ok)
+        got = d._ytdl_adopt_committed_pin(original)
+        assert got is not None, mode
+        assert got in (original, pin), mode
