@@ -2317,10 +2317,10 @@ async function runLiveControllerAction(sender, action) {
   }
 }
 
-function isUnpromotedStaticVod(item) {
+function isUnpromotedManagedMedia(item) {
   if (!item || typeof item !== "object") return false;
-  if (item.kind === "hls") return item.isLive === false;
-  if (item.kind === "dash") return item.isDynamic === false;
+  if (item.kind === "direct") return true;
+  if (item.kind === "hls" || item.kind === "dash") return true;
   return false;
 }
 
@@ -2438,7 +2438,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse(await runLiveControllerAction(sender, (controller) => controller.enqueueDownload(msg, sender)));
         } else if (itemId.present) {
           sendResponse({ ok: false, error: "Download action rejected." });
-        } else if (isUnpromotedStaticVod(item)) {
+        } else if (isUnpromotedManagedMedia(item)) {
           sendResponse({ ok: false, error: "This static media is not ready for the managed download queue." });
         } else if (item.kind === "hls") {
           downloadHls(item, tabId, filename, variantUrl);

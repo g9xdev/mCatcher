@@ -29,6 +29,7 @@ function clone(value) {
 function createHarness() {
   const runtimeMessages = event();
   const calls = { enqueue: [], enqueueAttempts: [], retry: [], cancel: [], firefox: [], setMax: [] };
+  const nativePosts = [];
   const browserDownloads = [];
   const fetches = [];
   const storedSettings = [];
@@ -78,7 +79,10 @@ function createHarness() {
   };
 
   const noopEvent = () => event();
-  const nativePort = { onMessage: noopEvent(), onDisconnect: noopEvent(), postMessage() {} };
+  const nativePort = {
+    onMessage: noopEvent(), onDisconnect: noopEvent(),
+    postMessage(message) { nativePosts.push(clone(message)); },
+  };
   const browser = {
     storage: { local: {
       get() { return Promise.resolve({ pd4done: true, dq1done: true }); },
@@ -138,7 +142,7 @@ function createHarness() {
   }
 
   return {
-    send, calls, browserDownloads, fetches, storedSettings,
+    send, calls, nativePosts, browserDownloads, fetches, storedSettings,
     popupSender: { id: browser.runtime.id, url: browser.runtime.getURL("popup/popup.html") },
   };
 }
@@ -256,10 +260,26 @@ test("forged and non-popup opaque actions fail closed while numeric legacy cance
   assert.deepEqual(h.browserDownloads, []);
 });
 
-test("unpromoted static VOD fails visibly without legacy HLS DASH or browser downloads", async () => {
+test("unpromoted direct HLS and DASH fail visibly without any legacy save effect", async () => {
   const h = createHarness();
   await settle();
+  const nativeBefore = clone(h.nativePosts);
 
+  const direct = await h.send({
+    type: "download", tabId: 6,
+    item: { url: "https://cdn.example/private.mp4?token=SECRET", kind: "direct" },
+    filename: "private-direct",
+  }, h.popupSender);
+  const liveHls = await h.send({
+    type: "download", tabId: 6,
+    item: { url: "https://stream.example/live.m3u8", kind: "hls", isLive: true },
+    filename: "live-hls",
+  }, h.popupSender);
+  const dynamicDash = await h.send({
+    type: "download", tabId: 6,
+    item: { url: "https://stream.example/live.mpd", kind: "dash", isDynamic: true },
+    filename: "dynamic-dash",
+  }, h.popupSender);
   const hls = await h.send({
     type: "download", tabId: 7,
     item: { url: "https://stream.example/static.m3u8", kind: "hls", isLive: false, drm: false },
@@ -270,12 +290,23 @@ test("unpromoted static VOD fails visibly without legacy HLS DASH or browser dow
     item: { url: "https://stream.example/static.mpd", kind: "dash", isDynamic: false, drm: false },
     filename: "static-dash",
   }, h.popupSender);
+  assert.equal(direct.ok, false);
+  assert.equal(liveHls.ok, false);
+  assert.equal(dynamicDash.ok, false);
   assert.equal(hls.ok, false);
   assert.equal(dash.ok, false);
+  assert.match(direct.error, /not ready|unsupported/i);
+  assert.match(liveHls.error, /not ready|unsupported/i);
+  assert.match(dynamicDash.error, /not ready|unsupported/i);
   assert.match(hls.error, /not ready/i);
   assert.match(dash.error, /not ready/i);
+  assert.deepEqual(h.calls.enqueueAttempts, [], "unpromoted rows must not reach the controller action");
+  assert.deepEqual(h.nativePosts, nativeBefore, "unpromoted rows must not post any legacy native save command");
   assert.deepEqual(h.fetches, []);
   assert.deepEqual(h.browserDownloads, []);
+
+  const publicState = await h.send({ type: "get-media", tabId: 6 }, h.popupSender);
+  assert.deepEqual(publicState.downloads, [], "unpromoted rows must not create a legacy save job");
 
   const drmStatic = await h.send({
     type: "download", tabId: 9,
