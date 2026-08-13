@@ -390,6 +390,41 @@ function loadInstrumentedClassic() {
 
   loadClassicDependencies(sandbox, root);
 
+  // Probe ProviderRegistry observation methods (Lease 1 must never call them).
+  const registryHits = {
+    observe: 0,
+    lookup: 0,
+    clear: 0,
+    snapshot: 0,
+    create: 0,
+  };
+  const RealPR = root.McProviderRegistry;
+  const realCreatePR = RealPR.createProviderRegistry;
+  root.McProviderRegistry = {
+    createProviderRegistry() {
+      registryHits.create += 1;
+      const reg = realCreatePR.call(RealPR);
+      return {
+        observe(mediaOrigin, providerKey) {
+          registryHits.observe += 1;
+          return reg.observe(mediaOrigin, providerKey);
+        },
+        lookup(mediaOrigin) {
+          registryHits.lookup += 1;
+          return reg.lookup(mediaOrigin);
+        },
+        clear() {
+          registryHits.clear += 1;
+          return reg.clear();
+        },
+        snapshot() {
+          registryHits.snapshot += 1;
+          return reg.snapshot();
+        },
+      };
+    },
+  };
+
   const finalizers = [];
   const RealDF = root.McDetectionFinalizer;
   const realCreate = RealDF.createDetectionFinalizer;
@@ -398,6 +433,31 @@ function loadInstrumentedClassic() {
     mapWebRequestDetails: RealDF.mapWebRequestDetails,
     createDetectionFinalizer(deps) {
       const instance = realCreate.call(RealDF, deps);
+      // Count real finalizer mutation entry points (pending + finalized).
+      const origBegin = instance.beginNetworkDetection;
+      const origDom = instance.finalizeFromDom;
+      const origTick = instance.tick;
+      const origProvide = instance.provideDocumentSnapshot;
+      instance._beginNetworkCalls = 0;
+      instance._finalizeDomCalls = 0;
+      instance._tickCalls = 0;
+      instance._provideSnapshotCalls = 0;
+      instance.beginNetworkDetection = function (event) {
+        instance._beginNetworkCalls += 1;
+        return origBegin.call(instance, event);
+      };
+      instance.finalizeFromDom = function (input) {
+        instance._finalizeDomCalls += 1;
+        return origDom.call(instance, input);
+      };
+      instance.tick = function (now) {
+        instance._tickCalls += 1;
+        return origTick.call(instance, now);
+      };
+      instance.provideDocumentSnapshot = function (snapshot) {
+        instance._provideSnapshotCalls += 1;
+        return origProvide.call(instance, snapshot);
+      };
       finalizers.push(instance);
       return instance;
     },
@@ -410,8 +470,40 @@ function loadInstrumentedClassic() {
     api: root.McBackgroundAdapters,
     trackedMaps,
     finalizers,
+    registryHits,
     sessionFinalizer() {
       return finalizers[0] || null;
+    },
+    /**
+     * Finalizer-internal allocations (pending {event,deadline} + finalized
+     * items). Do not use listFinalized alone — pending IDs stay hidden there.
+     */
+    finalizerAllocations() {
+      let pending = 0;
+      let finalized = 0;
+      for (const m of trackedMaps) {
+        for (const entry of m._sets) {
+          const v = entry.value;
+          if (!v || typeof v !== "object") continue;
+          const keys = Object.keys(v);
+          if (
+            keys.includes("event") &&
+            keys.includes("deadline") &&
+            keys.length === 2
+          ) {
+            pending += 1;
+          }
+          if (
+            keys.includes("detectionId") &&
+            keys.includes("mediaUrl") &&
+            keys.includes("sourceContext") &&
+            keys.includes("proposedFilename")
+          ) {
+            finalized += 1;
+          }
+        }
+      }
+      return { pending: pending, finalized: finalized };
     },
     pendingRecords() {
       const out = [];
@@ -541,6 +633,289 @@ function assertFirstObservableIds(mediaId, pendingRec) {
   assert.ok(isSafeOpaqueId(mediaId));
   assert.match(mediaId, /:1$/);
   assert.equal(pendingRec.detectionId, 1);
+}
+
+function snapshotEffectBaseline(fx) {
+  return {
+    now: fx.counts.now,
+    randomToken: fx.counts.randomToken,
+    publishDetection: fx.counts.publishDetection,
+    publishJobs: fx.counts.publishJobs,
+    persistHistory: fx.counts.persistHistory,
+    reportDiagnostic: fx.counts.reportDiagnostic,
+    isPopupSender: fx.counts.isPopupSender,
+    getEffectiveDestinationDirectory: fx.counts.getEffectiveDestinationDirectory,
+    postNative: fx.counts.postNative,
+    downloadsDownload: fx.counts.downloadsDownload,
+    fetchArrayBuffer: fx.counts.fetchArrayBuffer,
+    assembleMedia: fx.counts.assembleMedia,
+    createObjectURL: fx.counts.createObjectURL,
+    revokeObjectURL: fx.counts.revokeObjectURL,
+  };
+}
+
+function assertEffectBaseline(fx, baseline, label) {
+  const prefix = label ? label + " " : "";
+  assert.equal(fx.counts.now, baseline.now, prefix + "now");
+  assert.equal(fx.counts.randomToken, baseline.randomToken, prefix + "randomToken");
+  assert.equal(
+    fx.counts.publishDetection,
+    baseline.publishDetection,
+    prefix + "publishDetection"
+  );
+  assert.equal(fx.counts.publishJobs, baseline.publishJobs, prefix + "publishJobs");
+  assert.equal(
+    fx.counts.persistHistory,
+    baseline.persistHistory,
+    prefix + "persistHistory"
+  );
+  assert.equal(
+    fx.counts.reportDiagnostic,
+    baseline.reportDiagnostic,
+    prefix + "reportDiagnostic"
+  );
+  assert.equal(
+    fx.counts.isPopupSender,
+    baseline.isPopupSender,
+    prefix + "isPopupSender"
+  );
+  assert.equal(
+    fx.counts.getEffectiveDestinationDirectory,
+    baseline.getEffectiveDestinationDirectory,
+    prefix + "getEffectiveDestinationDirectory"
+  );
+  assert.equal(fx.counts.postNative, baseline.postNative, prefix + "postNative");
+  assert.equal(
+    fx.counts.downloadsDownload,
+    baseline.downloadsDownload,
+    prefix + "downloadsDownload"
+  );
+  assert.equal(
+    fx.counts.fetchArrayBuffer,
+    baseline.fetchArrayBuffer,
+    prefix + "fetchArrayBuffer"
+  );
+  assert.equal(
+    fx.counts.assembleMedia,
+    baseline.assembleMedia,
+    prefix + "assembleMedia"
+  );
+  assert.equal(
+    fx.counts.createObjectURL,
+    baseline.createObjectURL,
+    prefix + "createObjectURL"
+  );
+  assert.equal(
+    fx.counts.revokeObjectURL,
+    baseline.revokeObjectURL,
+    prefix + "revokeObjectURL"
+  );
+}
+
+function assertRegistryIdle(inst, label) {
+  const prefix = label ? label + " " : "";
+  assert.equal(inst.registryHits.observe, 0, prefix + "ProviderRegistry.observe");
+  assert.equal(inst.registryHits.lookup, 0, prefix + "ProviderRegistry.lookup");
+  assert.equal(inst.registryHits.clear, 0, prefix + "ProviderRegistry.clear");
+  assert.equal(inst.registryHits.snapshot, 0, prefix + "ProviderRegistry.snapshot");
+}
+
+/**
+ * Fresh instrumented controller per rejected capture.
+ * Proves generic TypeError, zero effects vs baseline, single unmutated session
+ * finalizer (no disposable preflight; no pending/finalized allocation), zero
+ * ProviderRegistry observation, orphan-proof snapshot/tick, then valid recovery
+ * as first allocation (media:...:1 / detectionId 1) publishing exactly once.
+ */
+async function assertRejectedCaptureAtomic(opts) {
+  const label = opts.label || "rejected capture";
+  const method = opts.method || "network";
+  const tabId = opts.tabId != null ? opts.tabId : method === "network" ? 42 : 70;
+  const inst = loadInstrumentedClassic();
+  const fx = makeEffects();
+  const ctrl = inst.api.createBackgroundAdapters(
+    fx.options(opts.optionOverrides || {})
+  );
+  const finalizer = inst.sessionFinalizer();
+  assert.ok(finalizer, label + " session finalizer");
+  assert.equal(inst.finalizers.length, 1, label + " one session finalizer at start");
+  assert.equal(finalizer._beginNetworkCalls, 0);
+  assert.equal(finalizer._finalizeDomCalls, 0);
+
+  const baseline = snapshotEffectBaseline(fx);
+  const registryCreateAtStart = inst.registryHits.create;
+
+  let threw = null;
+  try {
+    opts.run(ctrl, fx);
+  } catch (err) {
+    threw = err;
+  }
+  assert.ok(threw, label + " must reject");
+  if (opts.expectIdentity != null) {
+    assert.equal(threw, opts.expectIdentity, label + " exception identity");
+  } else {
+    assertGenericTypeError(threw, {
+      notSameAs: opts.notSameAs,
+    });
+  }
+
+  if (opts.hits) {
+    for (const k of Object.keys(opts.hits)) {
+      assert.equal(opts.hits[k], 0, label + " hostile " + k + " must not run");
+    }
+  }
+
+  // Rejected-phase effects frozen at baseline (including now/token/diagnostic).
+  assertEffectBaseline(fx, baseline, label + " rejected-phase");
+  assertRegistryIdle(inst, label + " rejected-phase");
+  // createProviderRegistry runs once at controller construction only.
+  assert.equal(
+    inst.registryHits.create,
+    registryCreateAtStart,
+    label + " no extra ProviderRegistry create"
+  );
+
+  // No disposable preflight finalizer and no session finalizer mutation.
+  assert.equal(
+    inst.finalizers.length,
+    1,
+    label + " no disposable preflight finalizer"
+  );
+  assert.equal(
+    finalizer._beginNetworkCalls,
+    0,
+    label + " session beginNetworkDetection must not run"
+  );
+  assert.equal(
+    finalizer._finalizeDomCalls,
+    0,
+    label + " session finalizeFromDom must not run"
+  );
+  assert.equal(finalizer.listFinalized().length, 0, label + " no finalized");
+  assert.equal(finalizer.getItem(1), null, label + " getItem(1) empty");
+  assert.equal(finalizer.getItem(0), null, label + " getItem(0) empty");
+  const alloc = inst.finalizerAllocations();
+  assert.equal(alloc.pending, 0, label + " no pending finalizer allocation");
+  assert.equal(alloc.finalized, 0, label + " no finalized finalizer allocation");
+  assert.equal(inst.pendingRecords().length, 0, label + " no pending record");
+  assert.equal(inst.sourceRecords().length, 0, label + " no source record");
+  assert.equal(ctrl.popupMedia(tabId).length, 0, label + " no popup row");
+
+  // Matching snapshot / tick cannot surface an orphan.
+  if (method === "network") {
+    ctrl.acceptPageSnapshot(opts.orphanSnapshot || florenSnapshot());
+    await ctrl.tick(1_000_750);
+  } else {
+    await ctrl.tick(1_000_750);
+  }
+  assert.equal(finalizer.listFinalized().length, 0, label + " orphan listFinalized");
+  assert.equal(
+    finalizer._beginNetworkCalls,
+    0,
+    label + " orphan must not begin network"
+  );
+  assert.equal(inst.finalizerAllocations().pending, 0, label + " orphan pending");
+  assert.equal(inst.finalizerAllocations().finalized, 0, label + " orphan finalized");
+  // Token / publication / material browser effects stay at rejected baseline.
+  assert.equal(fx.counts.randomToken, baseline.randomToken, label + " orphan token");
+  assert.equal(
+    fx.counts.publishDetection,
+    baseline.publishDetection,
+    label + " orphan publish"
+  );
+  assert.equal(fx.counts.postNative, baseline.postNative, label + " orphan native");
+  assert.equal(
+    fx.counts.downloadsDownload,
+    baseline.downloadsDownload,
+    label + " orphan download"
+  );
+  assert.equal(
+    fx.counts.reportDiagnostic,
+    baseline.reportDiagnostic,
+    label + " orphan diagnostic"
+  );
+  assert.equal(
+    fx.counts.isPopupSender,
+    baseline.isPopupSender,
+    label + " orphan isPopupSender"
+  );
+  assert.equal(
+    fx.counts.getEffectiveDestinationDirectory,
+    baseline.getEffectiveDestinationDirectory,
+    label + " orphan getEffectiveDestinationDirectory"
+  );
+  assert.equal(ctrl.popupMedia(tabId).length, 0, label + " orphan popup");
+  assert.equal(inst.pendingRecords().length, 0, label + " orphan pending records");
+  assert.equal(inst.sourceRecords().length, 0, label + " orphan source records");
+  assertRegistryIdle(inst, label + " orphan-phase");
+
+  // Recovery: restore one-shot traps only when applicable.
+  if (opts.restore) opts.restore(fx);
+  const recoveryBaseline = snapshotEffectBaseline(fx);
+
+  let okId;
+  if (method === "network") {
+    okId = ctrl.captureNetwork(
+      opts.validInput ? opts.validInput() : validNetworkCapture()
+    );
+  } else {
+    okId = ctrl.captureDomMedia(
+      opts.validInput ? opts.validInput() : validDomCapture()
+    );
+  }
+  const pendings = inst.pendingRecords();
+  assert.ok(pendings.length >= 1, label + " recovery pending");
+  const lastPending = pendings[pendings.length - 1];
+  assertFirstObservableIds(okId, lastPending);
+  assert.equal(lastPending.detectionId, 1, label + " recovery detectionId");
+
+  // Recovery is allowed to increment clock/token/publish after rejected baseline.
+  assert.ok(
+    fx.counts.randomToken > recoveryBaseline.randomToken,
+    label + " recovery mints token"
+  );
+
+  if (method === "network") {
+    if (finalizer.listFinalized().length === 0) {
+      assert.equal(
+        fx.counts.publishDetection,
+        recoveryBaseline.publishDetection,
+        label + " network recovery still pending"
+      );
+      ctrl.acceptPageSnapshot(opts.recoverySnapshot || florenSnapshot());
+    }
+    assert.equal(
+      fx.counts.publishDetection,
+      recoveryBaseline.publishDetection + 1,
+      label + " recovery publishes once"
+    );
+    assert.equal(fx.publishDetections[fx.publishDetections.length - 1].id, okId);
+    assert.equal(finalizer.listFinalized().length, 1);
+    assert.equal(finalizer.listFinalized()[0].detectionId, 1);
+    ctrl.acceptPageSnapshot(opts.recoverySnapshot || florenSnapshot());
+    await ctrl.tick(1_000_900);
+    assert.equal(
+      fx.counts.publishDetection,
+      recoveryBaseline.publishDetection + 1,
+      label + " recovery exactly once"
+    );
+    assert.equal(ctrl.popupMedia(tabId).length, 1);
+    assert.equal(ctrl.popupMedia(tabId)[0].id, okId);
+  } else {
+    assert.equal(
+      fx.counts.publishDetection,
+      recoveryBaseline.publishDetection + 1,
+      label + " DOM recovery publishes once"
+    );
+    assert.equal(fx.publishDetections[fx.publishDetections.length - 1].id, okId);
+    assert.equal(finalizer.listFinalized().length, 1);
+    assert.equal(finalizer.listFinalized()[0].detectionId, 1);
+    assert.equal(ctrl.popupMedia(tabId).length, 1);
+    assert.equal(ctrl.popupMedia(tabId)[0].id, okId);
+  }
+
+  return { inst, fx, ctrl, okId, threw };
 }
 
 // ---------------------------------------------------------------------------
@@ -3391,6 +3766,880 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
         assert.equal(
           JSON.stringify(fx.publishDetections[0]).includes("\u0085"),
           false
+        );
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 network media URL is required absolute HTTP(S) with preserved spelling",
+    async () => {
+      // Mutation caught: absent/empty/non-URL details.url falling through to
+      // about:blank, Privacy non-generic whitespace errors, or normalizing
+      // accepted URL spelling before private ephemeral retention.
+
+      const ABSENT = Symbol("absent");
+      const INHERITED = Symbol("inherited");
+
+      function detailsWithUrl(url, extra) {
+        const d = Object.assign({}, florenNetworkInput().details, extra || {});
+        if (url === ABSENT) {
+          delete d.url;
+        } else if (url === INHERITED) {
+          delete d.url;
+          return Object.create(
+            { url: "https://cdn.example/inherited-only.mp4" },
+            Object.getOwnPropertyDescriptors(d)
+          );
+        } else {
+          d.url = url;
+        }
+        return d;
+      }
+
+      // --- rejects: required URL grammar (fresh controller per row) ---
+      const rejectCases = [];
+
+      rejectCases.push({
+        label: "absent details.url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl(ABSENT) }),
+      });
+      {
+        const d = Object.assign({}, florenNetworkInput().details);
+        Object.defineProperty(d, "url", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: undefined,
+        });
+        rejectCases.push({
+          label: "own-data undefined url",
+          build: () => validNetworkCapture({ details: d }),
+        });
+      }
+      rejectCases.push({
+        label: "own-data null url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl(null) }),
+      });
+      rejectCases.push({
+        label: "empty url",
+        build: () => validNetworkCapture({ details: detailsWithUrl("") }),
+      });
+      rejectCases.push({
+        label: "whitespace-padded url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("  https://cdn.example/pad.mp4  "),
+          }),
+      });
+      rejectCases.push({
+        label: "blank whitespace url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl("   \t\n  ") }),
+      });
+      rejectCases.push({
+        label: "query-only url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl("?token=x") }),
+      });
+      rejectCases.push({
+        label: "fragment-only url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl("#clip") }),
+      });
+      rejectCases.push({
+        label: "relative path url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("/relative/path.mp4"),
+          }),
+      });
+      rejectCases.push({
+        label: "arbitrary non-URL",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("not a url at all"),
+          }),
+      });
+      rejectCases.push({
+        label: "ftp scheme",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("ftp://cdn.example/a.mp4"),
+          }),
+      });
+      rejectCases.push({
+        label: "file scheme",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("file:///tmp/a.mp4"),
+          }),
+      });
+      rejectCases.push({
+        label: "data scheme",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("data:video/mp4;base64,AAA"),
+          }),
+      });
+      rejectCases.push({
+        label: "blob scheme",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("blob:https://cdn.example/uuid"),
+          }),
+      });
+      rejectCases.push({
+        label: "C0 in url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("https://cdn.example/\u0001x.mp4"),
+          }),
+      });
+      rejectCases.push({
+        label: "DEL in url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("https://cdn.example/\u007fx.mp4"),
+          }),
+      });
+      rejectCases.push({
+        label: "C1 in url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("https://cdn.example/\u0085x.mp4"),
+          }),
+      });
+      rejectCases.push({
+        label: "boxed String url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl(
+              Object("https://cdn.example/boxed.mp4")
+            ),
+          }),
+      });
+      rejectCases.push({
+        label: "number url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl(12345) }),
+      });
+      rejectCases.push({
+        label: "object url",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl({ href: "https://cdn.example/o.mp4" }),
+          }),
+      });
+      {
+        const hits = { urlGet: 0 };
+        const d = Object.assign({}, florenNetworkInput().details);
+        Object.defineProperty(d, "url", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            hits.urlGet += 1;
+            throw new Error("HOSTILE_SECRET_URL_ACCESSOR");
+          },
+        });
+        rejectCases.push({
+          label: "accessor url",
+          hits,
+          build: () => validNetworkCapture({ details: d }),
+        });
+      }
+      rejectCases.push({
+        label: "inherited-only url",
+        build: () =>
+          validNetworkCapture({ details: detailsWithUrl(INHERITED) }),
+      });
+      {
+        const hits = { toString: 0, valueOf: 0 };
+        const hostile = {
+          toString() {
+            hits.toString += 1;
+            return "https://HOSTILE_SECRET_toString.example/x.mp4";
+          },
+          valueOf() {
+            hits.valueOf += 1;
+            return "https://HOSTILE_SECRET_valueOf.example/x.mp4";
+          },
+        };
+        rejectCases.push({
+          label: "toString/valueOf trap url",
+          hits,
+          build: () =>
+            validNetworkCapture({ details: detailsWithUrl(hostile) }),
+        });
+      }
+      {
+        const target = { url: "https://cdn.example/proxy.mp4" };
+        const rev = Proxy.revocable(target, {});
+        rev.revoke();
+        rejectCases.push({
+          label: "revoked Proxy url value",
+          build: () =>
+            validNetworkCapture({
+              details: Object.assign({}, florenNetworkInput().details, {
+                url: rev.proxy,
+              }),
+            }),
+        });
+      }
+      {
+        // Descriptor-safe contract may invoke getOwnPropertyDescriptor; it must
+        // not invoke value getters/coercion and must not leak trap identity.
+        const hits = { get: 0, toString: 0 };
+        const hostileErr = new Error("HOSTILE_SECRET_URL_GOPD");
+        const base = Object.assign({}, florenNetworkInput().details);
+        delete base.url;
+        const details = new Proxy(base, {
+          getOwnPropertyDescriptor(t, prop) {
+            if (prop === "url") throw hostileErr;
+            return Reflect.getOwnPropertyDescriptor(t, prop);
+          },
+          get(t, prop, r) {
+            if (prop === "url") {
+              hits.get += 1;
+              throw new Error("HOSTILE_SECRET_URL_GET");
+            }
+            return Reflect.get(t, prop, r);
+          },
+        });
+        rejectCases.push({
+          label: "getOwnPropertyDescriptor trap on details.url",
+          hits,
+          notSameAs: hostileErr,
+          build: () => validNetworkCapture({ details }),
+        });
+      }
+      {
+        const rev = Proxy.revocable(
+          Object.assign({}, florenNetworkInput().details, {
+            url: "https://cdn.example/whole.mp4",
+          }),
+          {}
+        );
+        rev.revoke();
+        rejectCases.push({
+          label: "whole-details revoked Proxy",
+          build: () => validNetworkCapture({ details: rev.proxy }),
+        });
+      }
+
+      const urlRed = [];
+      async function expectUrlReject(row) {
+        try {
+          await assertRejectedCaptureAtomic({
+            label: row.label,
+            method: "network",
+            tabId: 42,
+            hits: row.hits,
+            notSameAs: row.notSameAs,
+            run(ctrl) {
+              ctrl.captureNetwork(row.build());
+            },
+          });
+        } catch (err) {
+          // Production gaps: still accepts, or rejects with non-generic text
+          // (e.g. Privacy whitespace). Collect and continue so already-correct
+          // rows still exercise the full helper + recovery.
+          if (err && err.code === "ERR_ASSERTION") {
+            urlRed.push(row.label + " → " + String(err.message).split("\n")[0]);
+            return;
+          }
+          throw err;
+        }
+      }
+
+      for (const row of rejectCases) {
+        await expectUrlReject(row);
+      }
+
+      // Cross-realm boxed String url rejects; plain cross-realm primitives accept.
+      {
+        const realm = vm.createContext({
+          Object,
+          String,
+          Number,
+          Boolean,
+          Array,
+          undefined,
+        });
+        const boxed = vm.runInContext(
+          'new String("https://cdn.example/cross-boxed.mp4")',
+          realm
+        );
+        await expectUrlReject({
+          label: "cross-realm boxed String url",
+          build: () =>
+            validNetworkCapture({
+              details: Object.assign({}, florenNetworkInput().details, {
+                url: boxed,
+              }),
+            }),
+        });
+      }
+
+      // --- positive controls: exact spelling retained privately ---
+      const acceptUrls = [
+        "http://cdn.example/plain.mp4",
+        "https://cdn.example/plain.mp4",
+        "https://user:pass@cdn.example/cred.mp4",
+        "https://[2001:db8::1]/media/v.mp4",
+        "https://cdn.example:8443/port.mp4",
+        "https://cdn.example/path/with%20space/a.mp4?q=1&x=%2F#frag-ok",
+        "https://cdn.example/a.mp4?token=benign-query-value&exp=99",
+      ];
+
+      for (let i = 0; i < acceptUrls.length; i++) {
+        const exact = acceptUrls[i];
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const docId = "doc-url-accept-" + i;
+        const mediaId = ctrl.captureNetwork(
+          validNetworkCapture({
+            details: Object.assign({}, florenNetworkInput().details, {
+              url: exact,
+              documentId: docId,
+            }),
+          })
+        );
+        assert.ok(isSafeOpaqueId(mediaId));
+        assert.match(mediaId, /:1$/);
+        const pendings = inst.pendingRecords();
+        assert.equal(pendings.length, 1);
+        assert.equal(
+          pendings[0].ephemeral.mediaUrl,
+          exact,
+          "private ephemeral must retain exact signed spelling"
+        );
+        ctrl.acceptPageSnapshot(
+          florenSnapshot({
+            documentId: docId,
+            candidates: [
+              { kind: "visible-filename", value: "accept-" + i + ".mp4" },
+            ],
+          })
+        );
+        assert.equal(fx.counts.publishDetection, 1);
+        const sources = inst.sourceRecords();
+        assert.ok(sources.length >= 1);
+        assert.equal(
+          sources[sources.length - 1].ephemeral.mediaUrl,
+          exact,
+          "finalized private ephemeral retains exact spelling"
+        );
+        // Public surfaces never expose mediaUrl.
+        assertNoSentinels(fx.publishDetections, "url-accept publish");
+        assertNoSentinels(ctrl.popupMedia(42), "url-accept popup");
+      }
+
+      // Cross-realm plain details/hints with primitive strings still succeed.
+      {
+        const realm = vm.createContext({
+          Object,
+          String,
+          Number,
+          Boolean,
+          Array,
+          undefined,
+        });
+        const exact =
+          "https://cross-realm.example:9443/v.mp4?q=benign#frag";
+        const details = vm.runInContext(
+          `({
+            url: ${JSON.stringify(exact)},
+            documentUrl: "https://florenfile.com/page",
+            originUrl: "https://florenfile.com/page",
+            tabId: 42,
+            frameId: 0,
+            documentId: "doc-cross-realm-plain",
+            timeStamp: 1000000,
+            responseHeaders: [{ name: "Content-Type", value: "video/mp4" }]
+          })`,
+          realm
+        );
+        const hints = vm.runInContext(
+          `({
+            topLevelUrlHint: "https://florenfile.com/page",
+            frameOrigin: "https://florenfile.com"
+          })`,
+          realm
+        );
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const mediaId = ctrl.captureNetwork({
+          details,
+          hints,
+          transport: { mediaKind: "direct", requestHeaders: null },
+        });
+        assert.match(mediaId, /:1$/);
+        assert.equal(inst.pendingRecords()[0].ephemeral.mediaUrl, exact);
+        ctrl.acceptPageSnapshot(
+          florenSnapshot({ documentId: "doc-cross-realm-plain" })
+        );
+        assert.equal(fx.counts.publishDetection, 1);
+        assert.equal(
+          inst.sourceRecords()[0].ephemeral.mediaUrl,
+          exact
+        );
+      }
+
+      // Outer whitespace / control still reject after positive controls.
+      await expectUrlReject({
+        label: "leading whitespace after positives",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl(" https://cdn.example/x.mp4"),
+          }),
+      });
+      await expectUrlReject({
+        label: "trailing whitespace after positives",
+        build: () =>
+          validNetworkCapture({
+            details: detailsWithUrl("https://cdn.example/x.mp4 "),
+          }),
+      });
+
+      if (urlRed.length > 0) {
+        assert.fail(
+          "network media URL RED (" +
+            urlRed.length +
+            "): " +
+            urlRed.join(" | ")
+        );
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 present network hints require primitive strings",
+    async () => {
+      // Mutation caught: present null/undefined topLevelUrlHint or frameOrigin
+      // treated as absence and still committing/publishing.
+
+      const hintFields = ["topLevelUrlHint", "frameOrigin"];
+      const hintRed = [];
+      async function expectHintReject(label, run, extra) {
+        try {
+          await assertRejectedCaptureAtomic(
+            Object.assign(
+              {
+                label,
+                method: "network",
+                run,
+              },
+              extra || {}
+            )
+          );
+        } catch (err) {
+          if (err && err.code === "ERR_ASSERTION") {
+            hintRed.push(label + " → " + String(err.message).split("\n")[0]);
+            return;
+          }
+          throw err;
+        }
+      }
+
+      for (const field of hintFields) {
+        const other =
+          field === "topLevelUrlHint"
+            ? { frameOrigin: "https://florenfile.com" }
+            : { topLevelUrlHint: florenPageUrl() };
+
+        await expectHintReject(field + " present undefined", (ctrl) => {
+          const hints = Object.assign({}, other);
+          Object.defineProperty(hints, field, {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: undefined,
+          });
+          ctrl.captureNetwork(validNetworkCapture({ hints }));
+        });
+
+        await expectHintReject(field + " present null", (ctrl) => {
+          const hints = Object.assign({}, other);
+          hints[field] = null;
+          ctrl.captureNetwork(validNetworkCapture({ hints }));
+        });
+
+        await expectHintReject(field + " boxed String", (ctrl) => {
+          const hints = Object.assign({}, other);
+          hints[field] = Object("https://florenfile.com");
+          ctrl.captureNetwork(validNetworkCapture({ hints }));
+        });
+
+        await expectHintReject(field + " number", (ctrl) => {
+          const hints = Object.assign({}, other);
+          hints[field] = 99;
+          ctrl.captureNetwork(validNetworkCapture({ hints }));
+        });
+
+        await expectHintReject(field + " object", (ctrl) => {
+          const hints = Object.assign({}, other);
+          hints[field] = { href: "https://florenfile.com" };
+          ctrl.captureNetwork(validNetworkCapture({ hints }));
+        });
+
+        {
+          const hits = { get: 0 };
+          await expectHintReject(
+            field + " accessor",
+            (ctrl) => {
+              const hints = Object.assign({}, other);
+              Object.defineProperty(hints, field, {
+                enumerable: true,
+                configurable: true,
+                get() {
+                  hits.get += 1;
+                  throw new Error("HOSTILE_SECRET_HINT_ACCESSOR_" + field);
+                },
+              });
+              ctrl.captureNetwork(validNetworkCapture({ hints }));
+            },
+            { hits }
+          );
+        }
+
+        {
+          const hits = { toString: 0, valueOf: 0 };
+          await expectHintReject(
+            field + " coercion traps",
+            (ctrl) => {
+              const hints = Object.assign({}, other);
+              hints[field] = {
+                toString() {
+                  hits.toString += 1;
+                  return "https://HOSTILE_SECRET_hint.example";
+                },
+                valueOf() {
+                  hits.valueOf += 1;
+                  return "https://HOSTILE_SECRET_hint.example";
+                },
+              };
+              ctrl.captureNetwork(validNetworkCapture({ hints }));
+            },
+            { hits }
+          );
+        }
+
+        {
+          const rev = Proxy.revocable({ v: "https://florenfile.com" }, {});
+          rev.revoke();
+          await expectHintReject(field + " revoked Proxy value", (ctrl) => {
+            const hints = Object.assign({}, other);
+            hints[field] = rev.proxy;
+            ctrl.captureNetwork(validNetworkCapture({ hints }));
+          });
+        }
+
+        {
+          // getOwnPropertyDescriptor may run under the descriptor-safe contract;
+          // value getters must not.
+          const hits = { get: 0 };
+          const hostileErr = new Error("HOSTILE_SECRET_HINT_GOPD_" + field);
+          await expectHintReject(
+            field + " getOwnPropertyDescriptor trap",
+            (ctrl) => {
+              const base = Object.assign({}, other);
+              const hints = new Proxy(base, {
+                getOwnPropertyDescriptor(t, prop) {
+                  if (prop === field) throw hostileErr;
+                  return Reflect.getOwnPropertyDescriptor(t, prop);
+                },
+                get(t, prop, r) {
+                  if (prop === field) {
+                    hits.get += 1;
+                    throw new Error("HOSTILE_SECRET_HINT_GET_" + field);
+                  }
+                  return Reflect.get(t, prop, r);
+                },
+              });
+              ctrl.captureNetwork(validNetworkCapture({ hints }));
+            },
+            { hits, notSameAs: hostileErr }
+          );
+        }
+
+        // C0 / DEL / C1 already covered elsewhere; keep field-local locks green.
+        for (const [tag, ch] of [
+          ["C0", "\u0001"],
+          ["DEL", "\u007f"],
+          ["C1", "\u0085"],
+        ]) {
+          await expectHintReject(field + " " + tag, (ctrl) => {
+            const hints = Object.assign({}, other);
+            hints[field] =
+              field === "topLevelUrlHint"
+                ? "https://site.example/" + ch + "path"
+                : "https://site.example" + ch;
+            ctrl.captureNetwork(validNetworkCapture({ hints }));
+          });
+        }
+      }
+
+      // Absence may default — empty hints object still commits.
+      {
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const id = ctrl.captureNetwork(
+          validNetworkCapture({ hints: {} })
+        );
+        assert.match(id, /:1$/);
+        ctrl.acceptPageSnapshot(florenSnapshot());
+        assert.equal(fx.counts.publishDetection, 1);
+        assert.equal(ctrl.popupMedia(42).length, 1);
+      }
+
+      // Ordinary valid primitive strings stay green.
+      {
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const id = ctrl.captureNetwork(
+          validNetworkCapture({
+            hints: {
+              topLevelUrlHint: "https://florenfile.com/ok-hint",
+              frameOrigin: "https://florenfile.com",
+            },
+          })
+        );
+        assert.match(id, /:1$/);
+        ctrl.acceptPageSnapshot(florenSnapshot());
+        assert.equal(fx.counts.publishDetection, 1);
+      }
+
+      if (hintRed.length > 0) {
+        assert.fail(
+          "present network hints RED (" +
+            hintRed.length +
+            "): " +
+            hintRed.join(" | ")
+        );
+      }
+    }
+  );
+
+  await t.test(
+    "BA04 tabId and frameId preserve exact signed-int32 identity",
+    async () => {
+      // Mutation caught: accepting safe integers above signed int32 so the
+      // real finalizer `| 0` truncates immutable capture identity (e.g.
+      // 4294967296 → tab 0). Do not mock away `| 0`.
+
+      const INT32_MAX = 0x7fffffff;
+      const rejectIds = [
+        0x80000000,
+        0xffffffff,
+        0x100000000,
+        Number.MAX_SAFE_INTEGER,
+      ];
+      const nonIntegral = [
+        { label: "NaN", value: Number.NaN },
+        { label: "Infinity", value: Number.POSITIVE_INFINITY },
+        { label: "fraction", value: 1.5 },
+        { label: "negative", value: -1 },
+      ];
+      const idRed = [];
+      async function expectIdReject(label, method, tabId, run) {
+        try {
+          await assertRejectedCaptureAtomic({
+            label,
+            method,
+            tabId,
+            run,
+          });
+        } catch (err) {
+          if (err && err.code === "ERR_ASSERTION") {
+            idRed.push(label + " → " + String(err.message).split("\n")[0]);
+            return;
+          }
+          throw err;
+        }
+      }
+
+      // --- network details.tabId / details.frameId ---
+      for (const field of ["tabId", "frameId"]) {
+        for (const bad of rejectIds) {
+          await expectIdReject(
+            "network details." + field + " " + String(bad),
+            "network",
+            42,
+            (ctrl) => {
+              const details = Object.assign({}, florenNetworkInput().details, {
+                [field]: bad,
+              });
+              // Keep the other identity field valid and in-range.
+              if (field === "tabId") details.frameId = 0;
+              else details.tabId = 42;
+              ctrl.captureNetwork(validNetworkCapture({ details }));
+            }
+          );
+        }
+        for (const row of nonIntegral) {
+          await expectIdReject(
+            "network details." + field + " " + row.label,
+            "network",
+            42,
+            (ctrl) => {
+              const details = Object.assign({}, florenNetworkInput().details, {
+                [field]: row.value,
+              });
+              if (field === "tabId") details.frameId = 0;
+              else details.tabId = 42;
+              ctrl.captureNetwork(validNetworkCapture({ details }));
+            }
+          );
+        }
+      }
+
+      // --- DOM snapshot.tabId / snapshot.frameId ---
+      for (const field of ["tabId", "frameId"]) {
+        for (const bad of rejectIds) {
+          await expectIdReject(
+            "DOM snapshot." + field + " " + String(bad),
+            "dom",
+            70,
+            (ctrl) => {
+              const snapshot = Object.assign({}, validDomCapture().snapshot, {
+                [field]: bad,
+              });
+              if (field === "tabId") snapshot.frameId = 0;
+              else snapshot.tabId = 70;
+              ctrl.captureDomMedia(validDomCapture({ snapshot }));
+            }
+          );
+        }
+        for (const row of nonIntegral) {
+          await expectIdReject(
+            "DOM snapshot." + field + " " + row.label,
+            "dom",
+            70,
+            (ctrl) => {
+              const snapshot = Object.assign({}, validDomCapture().snapshot, {
+                [field]: row.value,
+              });
+              if (field === "tabId") snapshot.frameId = 0;
+              else snapshot.tabId = 70;
+              ctrl.captureDomMedia(validDomCapture({ snapshot }));
+            }
+          );
+        }
+      }
+
+      // --- accepted boundaries: 0 and 0x7fffffff, exact identity ---
+      async function assertNetworkIdentity(tabId, frameId, docSuffix) {
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const docId = "doc-id-net-" + docSuffix;
+        const mediaId = ctrl.captureNetwork(
+          validNetworkCapture({
+            details: Object.assign({}, florenNetworkInput().details, {
+              tabId,
+              frameId,
+              documentId: docId,
+              url: "https://cdn.example/id-" + docSuffix + ".mp4",
+            }),
+          })
+        );
+        assert.match(mediaId, /:1$/);
+        ctrl.acceptPageSnapshot(
+          florenSnapshot({
+            documentId: docId,
+            tabId,
+            frameId,
+            candidates: [
+              { kind: "visible-filename", value: "id-" + docSuffix + ".mp4" },
+            ],
+          })
+        );
+        assert.equal(fx.counts.publishDetection, 1);
+        const sources = inst.sourceRecords();
+        assert.ok(sources.length >= 1);
+        const src = sources[sources.length - 1];
+        assert.equal(
+          src.sourceContext.tabId,
+          tabId,
+          "network sourceContext.tabId exact"
+        );
+        assert.equal(
+          src.sourceContext.frameId,
+          frameId,
+          "network sourceContext.frameId exact"
+        );
+        // Popup rows do not expose frameId; lookup uses exact accepted tab ID.
+        const pop = ctrl.popupMedia(tabId);
+        assert.equal(pop.length, 1);
+        assert.equal(pop[0].id, mediaId);
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(pop[0], "frameId"),
+          false
+        );
+        return { inst, fx, ctrl, mediaId, src };
+      }
+
+      async function assertDomIdentity(tabId, frameId, docSuffix) {
+        const inst = loadInstrumentedClassic();
+        const fx = makeEffects();
+        const ctrl = inst.api.createBackgroundAdapters(fx.options());
+        const mediaId = ctrl.captureDomMedia(
+          validDomCapture({
+            mediaUrl: "https://cdn.example/dom-id-" + docSuffix + ".mp4",
+            snapshot: {
+              documentId: "doc-id-dom-" + docSuffix,
+              tabId,
+              frameId,
+              pageUrl: "https://site.example/watch",
+              topLevelPageUrl: "https://site.example/watch",
+              documentNonce: "n-id-" + docSuffix,
+              candidates: [
+                {
+                  kind: "visible-filename",
+                  value: "dom-id-" + docSuffix + ".mp4",
+                },
+              ],
+              capturedAt: "2026-08-12T12:00:00.000Z",
+            },
+          })
+        );
+        assert.match(mediaId, /:1$/);
+        assert.equal(fx.counts.publishDetection, 1);
+        const sources = inst.sourceRecords();
+        assert.ok(sources.length >= 1);
+        const src = sources[sources.length - 1];
+        assert.equal(src.sourceContext.tabId, tabId, "DOM tabId exact");
+        assert.equal(src.sourceContext.frameId, frameId, "DOM frameId exact");
+        const pop = ctrl.popupMedia(tabId);
+        assert.equal(pop.length, 1);
+        assert.equal(pop[0].id, mediaId);
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(pop[0], "frameId"),
+          false
+        );
+        return { mediaId, src };
+      }
+
+      // tabId / frameId independently at 0 and INT32_MAX.
+      await assertNetworkIdentity(0, 0, "t0-f0");
+      await assertNetworkIdentity(0, INT32_MAX, "t0-fmax");
+      await assertNetworkIdentity(INT32_MAX, 0, "tmax-f0");
+      await assertNetworkIdentity(INT32_MAX, INT32_MAX, "tmax-fmax");
+      await assertDomIdentity(0, 0, "t0-f0");
+      await assertDomIdentity(0, INT32_MAX, "t0-fmax");
+      await assertDomIdentity(INT32_MAX, 0, "tmax-f0");
+      await assertDomIdentity(INT32_MAX, INT32_MAX, "tmax-fmax");
+
+      if (idRed.length > 0) {
+        assert.fail(
+          "tabId/frameId RED (" + idRed.length + "): " + idRed.join(" | ")
         );
       }
     }
