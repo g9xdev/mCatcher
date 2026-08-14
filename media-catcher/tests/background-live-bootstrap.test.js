@@ -22,6 +22,7 @@ const policyScripts = [
   "lib/privacy.js",
   "lib/download-message-router.js",
   "lib/live-media-assembler.js",
+  "lib/media-size.js",
   "lib/background-adapters.js",
 ];
 
