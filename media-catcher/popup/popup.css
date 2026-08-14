@@ -38,7 +38,33 @@
    exact rail width inline to fit the browser window (Firefox clips a popup wider
    than its window); this 660px is only a safety fallback if that JS never runs. */
 html { width: 420px; }
-html.rail { width: 560px; }
+html.rail { width: auto; }
+
+/* Rail mode asks for Firefox's maximum popup box. The viewport caps keep the
+   request inside whatever the browser actually granted, so nothing clips. */
+html.rail body {
+  width: 800px;
+  height: 600px;
+  max-width: 100vw;
+  max-height: 100vh;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The panes fill whatever height the granted box has, instead of a fixed 408. */
+html.rail .main { flex: 1; min-height: 0; height: auto; }
+
+html.rail .main,
+html.rail .pane-left,
+html.rail .pane-right,
+html.rail .rail-scroll,
+html.rail #queue,
+html.rail .rail-card {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
 
 html,
 body {
@@ -951,6 +977,22 @@ html.rail .pane-right {
   background: rgba(0, 0, 0, 0.10);
 }
 html.rail .list { max-height: none; flex: 1; min-height: 0; padding-top: 10px; }
+
+/* Too narrow for two columns: stack them. Downloads stays visible below the
+   media pane — it is never hidden, and nothing overflows sideways. */
+html.rail-stacked .main {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  height: auto;
+  grid-template-columns: none;
+}
+
+html.rail-stacked .pane-right {
+  display: flex;
+  border-left: 0;
+  border-top: 1px solid var(--stroke);
+}
 
 /* Section headers inside each pane. */
 html.rail .pane-title {
