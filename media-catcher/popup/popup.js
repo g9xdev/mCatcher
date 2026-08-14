@@ -509,11 +509,28 @@ function renderItem(item) {
   }
 
   function appendSaveAs(selection) {
+    // Managed rows open a persistent extension window: a toolbar popup is
+    // destroyed the moment the native folder dialog takes focus. Only opaque
+    // IDs cross — never a media or variant URL. Legacy rows keep the inline
+    // form, which this repair deliberately leaves alone.
+    const managed = typeof item.id === "string";
     actions.appendChild(h("button", {
       class: "btn ghost sm",
       text: "Save As…",
       title: "Edit filename and choose folder before downloading",
-      onClick: () => openSaveAsForm(item, el, selection || {}),
+      onClick: () => {
+        if (!managed) {
+          openSaveAsForm(item, el, selection || {});
+          return;
+        }
+        const chosen = selection || {};
+        send({
+          type: "open-save-as",
+          tabId: Number.isInteger(item.tabId) ? item.tabId : currentTabId,
+          mediaId: item.id,
+          variantId: typeof chosen.variantId === "string" ? chosen.variantId : null,
+        });
+      },
     }));
   }
 

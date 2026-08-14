@@ -73,6 +73,46 @@ function isExtensionPopupSender(sender) {
     sender.url === api.runtime.getURL("popup/popup.html");
 }
 
+// Opaque IDs the controller mints. Deliberately narrow: no separators that
+// could smuggle a URL, and bounded so a hostile query cannot grow unbounded.
+function isSafeOpaqueActionId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 200 &&
+    /^[A-Za-z0-9:_-]+$/.test(value);
+}
+
+// The Save As page's identity is whatever the background put in the URL when it
+// created the window — never anything the page later claims in a message.
+function parseSaveAsSender(sender) {
+  try {
+    if (!sender || sender.id !== api.runtime.id || typeof sender.url !== "string") return null;
+    const parsed = new URL(sender.url);
+    const base = new URL(api.runtime.getURL("saveas/saveas.html"));
+    if (parsed.origin !== base.origin || parsed.pathname !== base.pathname) return null;
+    if (parsed.hash) return null;
+    const params = parsed.searchParams;
+    const keys = Array.from(params.keys());
+    if (keys.length !== new Set(keys).size) return null;
+    for (const key of keys) {
+      if (key !== "tabId" && key !== "mediaId" && key !== "variantId") return null;
+    }
+    const rawTabId = params.get("tabId");
+    if (typeof rawTabId !== "string" || !/^\d{1,9}$/.test(rawTabId)) return null;
+    const mediaId = params.get("mediaId");
+    if (!isSafeOpaqueActionId(mediaId)) return null;
+    const hasVariant = params.has("variantId");
+    const variantId = hasVariant ? params.get("variantId") : null;
+    if (hasVariant && !isSafeOpaqueActionId(variantId)) return null;
+    return { tabId: Number(rawTabId), mediaId, variantId };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Managed download actions come from exactly two extension surfaces.
+function isExtensionActionSender(sender) {
+  return isExtensionPopupSender(sender) || parseSaveAsSender(sender) !== null;
+}
+
 function initializeLiveController() {
   if (liveControllerInitialized) return liveController;
   liveControllerInitialized = true;
@@ -96,7 +136,9 @@ function initializeLiveController() {
     revokeObjectURL: (url) => URL.revokeObjectURL(url),
     fetchArrayBuffer: (tabId, url, options) => makeOneShotFetchFn(tabId)(url, options),
     assembleMedia: liveAssembler,
-    isPopupSender: isExtensionPopupSender,
+    // Keeps the controller's existing dependency key; the predicate now also
+    // admits the exact validated Save As page.
+    isPopupSender: isExtensionActionSender,
     getEffectiveDestinationDirectory: () => settings.saveFolder || null,
     publishDetection: () => broadcast({ type: "live-media-updated" }),
     publishJobs: (jobs) => broadcast({ type: "live-jobs-updated", jobs }),
@@ -2454,7 +2496,7 @@ function readOwnActionId(record) {
 async function runLiveControllerAction(sender, action) {
   try {
     await settingsReady;
-    if (!liveController || !isExtensionPopupSender(sender)) {
+    if (!liveController || !isExtensionActionSender(sender)) {
       return { ok: false, error: "Download action rejected." };
     }
     const job = await action(liveController);
@@ -2464,6 +2506,85 @@ async function runLiveControllerAction(sender, action) {
     return { ok: true, job };
   } catch (e) {
     return { ok: false, error: "Download action rejected." };
+  }
+}
+
+// One Save As window per media/variant. Repeat clicks focus the live one.
+const saveAsWindows = new Map();
+
+function saveAsWindowKey(tabId, mediaId, variantId) {
+  return tabId + "|" + mediaId + "|" + (variantId || "");
+}
+
+if (api.windows && api.windows.onRemoved) {
+  api.windows.onRemoved.addListener((windowId) => {
+    for (const [key, id] of saveAsWindows) {
+      if (id === windowId) saveAsWindows.delete(key);
+    }
+  });
+}
+
+function knownExtensionFromFilename(name) {
+  const match = /\.([A-Za-z0-9]{1,8})$/.exec(typeof name === "string" ? name : "");
+  return match ? "." + match[1].toLowerCase() : ".mp4";
+}
+
+// Fresh allowlist projection of an owned row. Never a spread, never a URL, and
+// only the exact variant the caller already owns.
+function safeSaveAsContext(tabId, mediaId, variantId) {
+  const row = liveRowsForTab(tabId).find((candidate) => candidate && candidate.id === mediaId);
+  if (!row) return null;
+  const safe = decorateLiveRow(row, tabId);
+  if (!safe) return null;
+  let ownedVariantId = null;
+  if (variantId !== null && variantId !== undefined) {
+    const variant = safe.variants.find((candidate) => candidate && candidate.id === variantId);
+    if (!variant) return null;
+    ownedVariantId = variant.id;
+  }
+  const context = {
+    tabId,
+    mediaId: safe.id,
+    variantId: ownedVariantId,
+    proposedFilename: safe.proposedFilename,
+    knownExtension: knownExtensionFromFilename(safe.proposedFilename),
+    kind: safe.kind,
+  };
+  if (Number.isInteger(safe.sizeBytes) && typeof safe.sizeConfidence === "string") {
+    context.sizeBytes = safe.sizeBytes;
+    context.sizeConfidence = safe.sizeConfidence;
+  }
+  return context;
+}
+
+async function openSaveAsWindow(tabId, mediaId, variantId) {
+  if (!api.windows || typeof api.windows.create !== "function") {
+    return { ok: false, error: "Save As window unavailable." };
+  }
+  const key = saveAsWindowKey(tabId, mediaId, variantId);
+  const existing = saveAsWindows.get(key);
+  if (existing !== undefined) {
+    try {
+      await api.windows.update(existing, { focused: true });
+      return { ok: true, focused: true };
+    } catch (e) {
+      saveAsWindows.delete(key);
+    }
+  }
+  let relative = "saveas/saveas.html?tabId=" + encodeURIComponent(String(tabId)) +
+    "&mediaId=" + encodeURIComponent(mediaId);
+  if (variantId) relative += "&variantId=" + encodeURIComponent(variantId);
+  try {
+    const created = await api.windows.create({
+      url: api.runtime.getURL(relative),
+      type: "popup",
+      width: 520,
+      height: 360,
+    });
+    if (created && Number.isInteger(created.id)) saveAsWindows.set(key, created.id);
+    return { ok: true, focused: false };
+  } catch (e) {
+    return { ok: false, error: "Save As window unavailable." };
   }
 }
 
@@ -2602,6 +2723,42 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else {
           await downloadDirect(item, tabId, filename);
           sendResponse({ ok: true });
+        }
+      } else if (msg.type === "open-save-as") {
+        await settingsReady;
+        const mediaId = readOwnActionId({ id: msg.mediaId });
+        const variantId = msg.variantId == null ? null : msg.variantId;
+        if (!isExtensionPopupSender(sender) ||
+            mediaId.kind !== "string" || !isSafeOpaqueActionId(mediaId.value) ||
+            !Number.isInteger(msg.tabId) || msg.tabId < 0 ||
+            (variantId !== null && !isSafeOpaqueActionId(variantId)) ||
+            !safeSaveAsContext(msg.tabId, mediaId.value, variantId)) {
+          sendResponse({ ok: false, error: "Save As is unavailable for this item." });
+        } else {
+          sendResponse(await openSaveAsWindow(msg.tabId, mediaId.value, variantId));
+        }
+      } else if (msg.type === "get-save-as-context") {
+        await settingsReady;
+        const identity = parseSaveAsSender(sender);
+        const context = identity
+          ? safeSaveAsContext(identity.tabId, identity.mediaId, identity.variantId)
+          : null;
+        sendResponse(context
+          ? { ok: true, context, helper: helperStatus() }
+          : { ok: false, error: "Save As context unavailable." });
+      } else if (msg.type === "save-as-download") {
+        const identity = parseSaveAsSender(sender);
+        const itemId = readOwnActionId(msg.item);
+        const messageVariantId = msg.variantId == null ? null : msg.variantId;
+        // The window's own URL is the authority; a mismatched message is inert.
+        if (!identity || itemId.kind !== "string" ||
+            itemId.value !== identity.mediaId ||
+            msg.tabId !== identity.tabId ||
+            messageVariantId !== identity.variantId) {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else {
+          sendResponse(await runLiveControllerAction(sender,
+            (controller) => controller.enqueueDownload(msg, sender)));
         }
       } else if (msg.type === "retry-download") {
         const retryId = readOwnActionId(msg);

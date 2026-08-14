@@ -564,9 +564,11 @@ function loadPopupRenderHarness() {
     replaceChildren() { this.children = Array.from(arguments); },
     appendChild(child) { this.children.push(child); return child; },
   };
+  const sentMessages = [];
   const sandbox = {
     URL,
     console,
+    send: (message) => { sentMessages.push(JSON.parse(JSON.stringify(message))); return Promise.resolve({ ok: true }); },
     pageTitle: "",
     currentTabId: 7,
     castUiReady: true,
@@ -595,7 +597,7 @@ function loadPopupRenderHarness() {
     "bitrateLabel", "mediaSizeLabel", "renderQualities", "renderItem", "render",
   ].map((name) => extractNamedFunction(source, name));
   vm.runInNewContext(pieces.join("\n") + "\nthis.render = render;", sandbox);
-  return { sandbox, starts, progress, listEl };
+  return { sandbox, starts, progress, listEl, sentMessages };
 }
 
 function popupNodes(root, predicate, out) {
@@ -1231,4 +1233,81 @@ test("legacy non-opaque rows keep their existing exact transfer size text", () =
     h.sandbox.mediaSizeLabel({ id: "media:s8:1", sizeBytes: 1024, sizeConfidence: "estimated" }),
     "Est. 1.0 KB"
   );
+});
+
+// ---------------------------------------------------------------------------
+// Managed Save As launches a persistent window (Task 3)
+// ---------------------------------------------------------------------------
+
+function clickSaveAs(h, row) {
+  const button = popupNodes(row, (node) => node.tag === "button" && node.props.text === "Save As…")[0];
+  assert.ok(button, "row must offer Save As…");
+  button.props.onClick();
+  return button;
+}
+
+test("managed Save As asks background to open a persistent opaque window", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:opaque:1",
+    tabId: 7,
+    kind: "direct",
+    proposedFilename: "11474-makemebi.net.mp4",
+  }]);
+  clickSaveAs(h, h.listEl.children[0]);
+
+  assert.deepEqual(h.sentMessages.at(-1), {
+    type: "open-save-as",
+    tabId: 7,
+    mediaId: "media:opaque:1",
+    variantId: null,
+  });
+  assert.equal(h.sentMessages.length, 1);
+});
+
+test("a managed variant selection travels as an opaque variant ID only", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:opaque:2",
+    tabId: 9,
+    kind: "hls",
+    proposedFilename: "episode.mp4",
+    variants: [{
+      id: "variant:opaque:1",
+      label: "1080p",
+      height: 1080,
+      uri: "https://must-not-cross.example/SIGNED_URL_SENTINEL.m3u8",
+    }],
+  }]);
+  clickSaveAs(h, h.listEl.children[0]);
+
+  const sent = h.sentMessages.at(-1);
+  assert.equal(sent.type, "open-save-as");
+  assert.equal(sent.mediaId, "media:opaque:2");
+  assert.equal(sent.tabId, 9);
+  assert.equal(Object.prototype.hasOwnProperty.call(sent, "variantUrl"), false);
+  assert.equal(JSON.stringify(h.sentMessages).includes("SIGNED_URL_SENTINEL"), false);
+});
+
+test("a managed row without its own tabId falls back to the current tab", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.currentTabId = 7;
+  h.sandbox.render([{ id: "media:opaque:3", kind: "direct", proposedFilename: "clip.mp4" }]);
+  clickSaveAs(h, h.listEl.children[0]);
+  assert.equal(h.sentMessages.at(-1).tabId, 7);
+});
+
+test("non-opaque legacy rows keep the inline form and never serialize a URL", () => {
+  const h = loadPopupRenderHarness();
+  const openings = [];
+  h.sandbox.openSaveAsForm = (item) => openings.push(item);
+  h.sandbox.render([{
+    url: "https://cdn.example/legacy.mp4?token=SIGNED_URL_SENTINEL",
+    kind: "direct",
+    name: "legacy.mp4",
+  }]);
+  clickSaveAs(h, h.listEl.children[0]);
+
+  assert.equal(openings.length, 1, "legacy rows keep their existing inline path");
+  assert.equal(h.sentMessages.length, 0, "no open-save-as message for a legacy row");
 });

@@ -35,19 +35,44 @@ function createHarness() {
   const storedSettings = [];
   const knownMedia = new Set(["media:opaque:hls", "media:opaque:dash"]);
   const knownJobs = new Set(["job:opaque:1", "job:opaque:2"]);
+  const createdWindows = [];
+  const focusedWindows = [];
+  const windowsRemoved = event();
+  let pendingVariants = [];
+  let mediaSeq = 0;
+  let windowSeq = 0;
 
+  // The real controller receives this predicate from background.js; the fake
+  // mirrors it so both extension action surfaces are exercised.
   function requirePopup(sender) {
-    if (!sender || sender.id !== "media-catcher@test" ||
-        sender.url !== "moz-extension://media-catcher/popup/popup.html") {
-      throw new Error("SECRET_NON_POPUP_REJECTION");
-    }
+    const isPopup = sender && sender.id === "media-catcher@test" &&
+      sender.url === "moz-extension://media-catcher/popup/popup.html";
+    const isSaveAs = sender && sender.id === "media-catcher@test" &&
+      typeof sender.url === "string" &&
+      sender.url.startsWith("moz-extension://media-catcher/saveas/saveas.html?");
+    if (!isPopup && !isSaveAs) throw new Error("SECRET_NON_POPUP_REJECTION");
   }
 
+  const liveRows = new Map();
+
   const controller = {
-    popupMedia() { return Object.freeze([]); },
+    popupMedia(tabId) { return liveRows.get(tabId) || Object.freeze([]); },
     popupJobs() { return Object.freeze([]); },
     acceptPageSnapshot() {},
-    captureDomMedia() { return "media:unused"; },
+    captureDomMedia(input) {
+      const tabId = input && input.snapshot && input.snapshot.tabId;
+      const mediaId = "media:opaque:dom" + (++mediaSeq);
+      const rows = (liveRows.get(tabId) || []).slice();
+      rows.push(Object.freeze({
+        id: mediaId,
+        proposedFilename: "11474-makemebi.net.mp4",
+        kind: "direct",
+        variants: Object.freeze(pendingVariants.slice()),
+      }));
+      liveRows.set(tabId, Object.freeze(rows));
+      knownMedia.add(mediaId);
+      return mediaId;
+    },
     async handleNativeMessage() { return false; },
     helperDisconnected() {},
     enqueueDownload(message, sender) {
@@ -102,6 +127,21 @@ function createHarness() {
       onRemoved: noopEvent(), onUpdated: noopEvent(), query() { return Promise.resolve([]); },
       create() { return Promise.resolve(); }, update() { return Promise.resolve(); }, executeScript() { return Promise.resolve(); },
     },
+    windows: {
+      onRemoved: windowsRemoved,
+      create(options) {
+        const id = ++windowSeq;
+        createdWindows.push({ id, options: clone(options) });
+        return Promise.resolve({ id });
+      },
+      update(id, options) {
+        if (!createdWindows.some((entry) => entry.id === id)) {
+          return Promise.reject(new Error("no such window"));
+        }
+        focusedWindows.push({ id, options: clone(options) });
+        return Promise.resolve({ id });
+      },
+    },
     webRequest: { onSendHeaders: noopEvent(), onHeadersReceived: noopEvent(), onBeforeSendHeaders: noopEvent() },
     browserAction: { setBadgeText() {}, setBadgeBackgroundColor() {} },
     contextMenus: { onClicked: noopEvent(), removeAll(callback) { if (callback) callback(); }, create() {} },
@@ -141,8 +181,38 @@ function createHarness() {
     });
   }
 
+  // Claims real background ownership for a tab so the row is publicly visible,
+  // exactly as a DOM detection would.
+  async function captureMedia(tabId, variants) {
+    pendingVariants = variants || [];
+    const pageUrl = "https://site.example/watch-" + tabId;
+    await send({
+      type: "content-media",
+      item: { kind: "direct", url: "https://cdn.example/" + tabId + "/movie.mp4", ts: 1 },
+      referrerUrl: pageUrl,
+      frameOrigin: "https://site.example",
+      snapshot: {
+        type: "page-snapshot", documentId: "doc-" + tabId, documentNonce: "nonce-" + tabId,
+        tabId, frameId: 0, pageUrl, topLevelPageUrl: pageUrl,
+        candidates: [{ kind: "visible-filename", value: "11474-makemebi.net.mp4" }],
+        capturedAt: "2026-08-13T12:00:00.000Z",
+      },
+    }, { tab: { id: tabId, url: pageUrl }, frameId: 0, documentId: "doc-" + tabId });
+    pendingVariants = [];
+    const rows = liveRows.get(tabId) || [];
+    return rows[rows.length - 1].id;
+  }
+
+  function saveAsSender(query) {
+    return {
+      id: browser.runtime.id,
+      url: browser.runtime.getURL("saveas/saveas.html") + query,
+    };
+  }
+
   return {
     send, calls, nativePosts, browserDownloads, fetches, storedSettings,
+    captureMedia, saveAsSender, createdWindows, focusedWindows, windowsRemoved,
     popupSender: { id: browser.runtime.id, url: browser.runtime.getURL("popup/popup.html") },
   };
 }
@@ -404,4 +474,156 @@ test("privacy projects only a safe primitive mediaId", () => {
   assert.deepEqual(Privacy.projectPopupJob({ id: "job:2", mediaId: "https://secret.example/x" }), { id: "job:2" });
   assert.deepEqual(Privacy.projectPopupJob({ id: "job:3", mediaId: 7 }), { id: "job:3" });
   assert.deepEqual(Privacy.projectPopupJob(accessor), {});
+});
+
+// ---------------------------------------------------------------------------
+// Persistent Save As window authorization (Task 3)
+// ---------------------------------------------------------------------------
+
+test("the toolbar popup opens exactly one Save As window per media and refocuses it", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaId = await h.captureMedia(7);
+
+  const first = await h.send({ type: "open-save-as", tabId: 7, mediaId, variantId: null }, h.popupSender);
+  assert.deepEqual(first, { ok: true, focused: false });
+  assert.equal(h.createdWindows.length, 1);
+  assert.equal(h.createdWindows[0].options.type, "popup");
+
+  const url = new URL(h.createdWindows[0].options.url);
+  assert.equal(url.pathname.endsWith("/saveas/saveas.html"), true);
+  assert.deepEqual(Array.from(url.searchParams.keys()).sort(), ["mediaId", "tabId"]);
+  assert.equal(url.searchParams.get("tabId"), "7");
+  assert.equal(url.searchParams.get("mediaId"), mediaId);
+
+  const second = await h.send({ type: "open-save-as", tabId: 7, mediaId, variantId: null }, h.popupSender);
+  assert.deepEqual(second, { ok: true, focused: true });
+  assert.equal(h.createdWindows.length, 1, "a second click must focus, not duplicate");
+  assert.deepEqual(h.focusedWindows.at(-1).options, { focused: true });
+
+  // Once closed, a later click may open a fresh window.
+  h.windowsRemoved.emit(h.createdWindows[0].id);
+  await h.send({ type: "open-save-as", tabId: 7, mediaId, variantId: null }, h.popupSender);
+  assert.equal(h.createdWindows.length, 2);
+});
+
+test("an owned variant travels in the URL and an unowned one is refused", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaId = await h.captureMedia(8, [{ id: "variant:opaque:1", label: "1080p", height: 1080 }]);
+
+  await h.send({ type: "open-save-as", tabId: 8, mediaId, variantId: "variant:opaque:1" }, h.popupSender);
+  const url = new URL(h.createdWindows[0].options.url);
+  assert.deepEqual(Array.from(url.searchParams.keys()).sort(), ["mediaId", "tabId", "variantId"]);
+  assert.equal(url.searchParams.get("variantId"), "variant:opaque:1");
+
+  const forged = await h.send(
+    { type: "open-save-as", tabId: 8, mediaId, variantId: "variant:forged" }, h.popupSender);
+  assert.equal(forged.ok, false);
+  assert.equal(h.createdWindows.length, 1);
+});
+
+test("only the exact toolbar popup may open a Save As window", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaId = await h.captureMedia(9);
+
+  const rejected = [
+    [{ type: "open-save-as", tabId: 9, mediaId: "media:forged", variantId: null }, h.popupSender],
+    [{ type: "open-save-as", tabId: 4242, mediaId, variantId: null }, h.popupSender],
+    [{ type: "open-save-as", tabId: "9", mediaId, variantId: null }, h.popupSender],
+    [{ type: "open-save-as", tabId: 9, mediaId: { toString() { return mediaId; } }, variantId: null }, h.popupSender],
+    [{ type: "open-save-as", tabId: 9, mediaId, variantId: null }, { id: "media-catcher@test", url: "https://evil.example/page" }],
+    [{ type: "open-save-as", tabId: 9, mediaId, variantId: null }, { id: "media-catcher@test", url: "moz-extension://media-catcher/options/options.html" }],
+    [{ type: "open-save-as", tabId: 9, mediaId, variantId: null }, { id: "other@addon", url: "moz-extension://media-catcher/popup/popup.html" }],
+    [{ type: "open-save-as", tabId: 9, mediaId, variantId: null }, h.saveAsSender("?tabId=9&mediaId=" + mediaId)],
+  ];
+  for (const [message, sender] of rejected) {
+    const response = await h.send(message, sender);
+    assert.equal(response.ok, false, "must refuse " + JSON.stringify(message.mediaId));
+  }
+  assert.equal(h.createdWindows.length, 0);
+});
+
+test("get-save-as-context derives identity from the sender URL alone", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaId = await h.captureMedia(11);
+
+  const good = await h.send({ type: "get-save-as-context" },
+    h.saveAsSender("?tabId=11&mediaId=" + mediaId));
+  assert.equal(good.ok, true);
+  assert.deepEqual(Object.keys(good.context).sort(),
+    ["kind", "knownExtension", "mediaId", "proposedFilename", "tabId", "variantId"]);
+  assert.equal(good.context.mediaId, mediaId);
+  assert.equal(good.context.tabId, 11);
+  assert.equal(good.context.proposedFilename, "11474-makemebi.net.mp4");
+  assert.equal(good.context.variantId, null);
+
+  // Caller-supplied identity is ignored; only the URL counts.
+  const spoofed = await h.send(
+    { type: "get-save-as-context", tabId: 4242, mediaId: "media:forged" },
+    h.saveAsSender("?tabId=11&mediaId=" + mediaId));
+  assert.deepEqual(spoofed.context, good.context);
+
+  for (const query of [
+    "?tabId=11&mediaId=media:forged",
+    "?tabId=4242&mediaId=" + mediaId,
+    "?mediaId=" + mediaId,
+    "?tabId=11",
+    "?tabId=11&mediaId=" + mediaId + "&extra=1",
+    "?tabId=11&mediaId=" + mediaId + "&tabId=12",
+    "?tabId=-1&mediaId=" + mediaId,
+    "?tabId=11&mediaId=" + encodeURIComponent("https://cdn.example/movie.mp4"),
+  ]) {
+    const response = await h.send({ type: "get-save-as-context" }, h.saveAsSender(query));
+    assert.equal(response.ok, false, "must refuse query " + query);
+  }
+  const wrongPage = await h.send({ type: "get-save-as-context" }, h.popupSender);
+  assert.equal(wrongPage.ok, false);
+});
+
+test("the Save As context carries no URL, header, cookie, or provider identity", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaId = await h.captureMedia(12);
+  const response = await h.send({ type: "get-save-as-context" },
+    h.saveAsSender("?tabId=12&mediaId=" + mediaId));
+  const json = JSON.stringify(response);
+  for (const sentinel of ["http", "cdn.example", "Cookie", "Authorization", "providerKey", "site.example"]) {
+    assert.equal(json.includes(sentinel), false, "leaked " + sentinel);
+  }
+});
+
+test("save-as-download is accepted only from the matching Save As window", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaId = await h.captureMedia(13);
+  const sender = h.saveAsSender("?tabId=13&mediaId=" + mediaId);
+  const intent = {
+    requestedFilename: "edited.mp4", destinationDirectory: "D:\\Videos",
+    saveMode: "save-as", userSelectedFirefox: false,
+    userActionToken: "tok", createdAt: "2026-08-13T12:00:00.000Z",
+  };
+  const message = { type: "save-as-download", tabId: 13, item: { id: mediaId }, variantId: null, intent };
+
+  const ok = await h.send(message, sender);
+  assert.equal(ok.ok, true);
+  assert.equal(h.calls.enqueue.length, 1);
+  assert.equal(h.calls.enqueue[0].message.intent.requestedFilename, "edited.mp4");
+
+  const mismatches = [
+    [Object.assign({}, message, { item: { id: "media:opaque:hls" } }), sender],
+    [Object.assign({}, message, { tabId: 4242 }), sender],
+    [Object.assign({}, message, { variantId: "variant:opaque:1" }), sender],
+    [message, h.popupSender],
+    [message, h.saveAsSender("?tabId=4242&mediaId=" + mediaId)],
+    [message, { id: "media-catcher@test", url: "https://evil.example/page" }],
+    [message, {}],
+  ];
+  for (const [bad, badSender] of mismatches) {
+    const response = await h.send(bad, badSender);
+    assert.equal(response.ok, false);
+  }
+  assert.equal(h.calls.enqueue.length, 1, "a mismatched sender reaches zero controller calls");
 });
