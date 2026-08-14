@@ -103,7 +103,9 @@ function wireBrowse(btnId, inputId) {
     if (r && r.ok && r.dir) { get(inputId).value = r.dir; await save(); }
     else if (r && r.ok === false) {
       const s = get("status");
-      s.textContent = r.error || "Folder picker needs the helper.";
+      s.textContent = r.error === "folder_picker_timeout"
+        ? "The folder dialog timed out."
+        : "Couldn't open the folder dialog — the helper may be unavailable.";
       setTimeout(() => (s.textContent = ""), 2500);
     }
   });

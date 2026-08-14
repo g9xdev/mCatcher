@@ -813,7 +813,9 @@ function openSaveAsForm(item, el, selection) {
         folderText.textContent = "Folder: " + resp.dir;
         setFeedback("", "");
       } else if (resp && resp.ok === false) {
-        setFeedback(resp.error || "Couldn't pick a folder.", "error");
+        setFeedback(resp.error === "folder_picker_timeout"
+          ? "The folder dialog timed out."
+          : "Couldn't pick a folder.", "error");
       }
       // Cancel / no-response: leave form and prior destination intact.
     } finally {

@@ -104,10 +104,30 @@ function createHarness() {
   };
 
   const noopEvent = () => event();
+  const nativeMessages = event();
+  const nativeDisconnect = event();
   const nativePort = {
-    onMessage: noopEvent(), onDisconnect: noopEvent(),
+    onMessage: nativeMessages, onDisconnect: nativeDisconnect,
     postMessage(message) { nativePosts.push(clone(message)); },
   };
+
+  // Controllable timers so picker timeouts are provable without waiting.
+  const timers = new Map();
+  let timerSeq = 0;
+  function fakeSetTimeout(fn, delay) {
+    const id = ++timerSeq;
+    timers.set(id, { fn, at: Number.isFinite(delay) ? delay : 0 });
+    return id;
+  }
+  function fakeClearTimeout(id) { timers.delete(id); }
+  function advanceTimers(ms) {
+    for (const [id, entry] of Array.from(timers)) {
+      if (entry.at <= ms) {
+        timers.delete(id);
+        entry.fn();
+      }
+    }
+  }
   const browser = {
     storage: { local: {
       get() { return Promise.resolve({ pd4done: true, dq1done: true }); },
@@ -154,7 +174,7 @@ function createHarness() {
     Promise, Map, Set, WeakMap, Object, Array, ArrayBuffer, Uint8Array,
     TextDecoder, TextEncoder, URL, Blob, Date, Math, JSON, Number, String,
     Boolean, RegExp, Error, TypeError, RangeError, Symbol, Reflect, Proxy,
-    AbortController, setTimeout() { return 1; }, clearTimeout() {},
+    AbortController, setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
     fetch(url) { fetches.push(String(url)); return Promise.reject(new Error("unexpected legacy fetch")); },
     crypto: { randomUUID() { return "00000000-0000-4000-8000-000000000001"; } },
   };
@@ -213,6 +233,7 @@ function createHarness() {
   return {
     send, calls, nativePosts, browserDownloads, fetches, storedSettings,
     captureMedia, saveAsSender, createdWindows, focusedWindows, windowsRemoved,
+    nativeMessages, nativeDisconnect, advanceTimers,
     popupSender: { id: browser.runtime.id, url: browser.runtime.getURL("popup/popup.html") },
   };
 }
@@ -626,4 +647,110 @@ test("save-as-download is accepted only from the matching Save As window", async
     assert.equal(response.ok, false);
   }
   assert.equal(h.calls.enqueue.length, 1, "a mismatched sender reaches zero controller calls");
+});
+
+// ---------------------------------------------------------------------------
+// Folder picker correlation and terminal states (Task 4)
+// ---------------------------------------------------------------------------
+
+function lastPickRequestId(h) {
+  const posts = h.nativePosts.filter((post) => post.cmd === "pickFolder");
+  assert.ok(posts.length, "expected a pickFolder command");
+  return posts[posts.length - 1].requestId;
+}
+
+test("each native picker outcome maps to its own extension response", async () => {
+  const cases = [
+    [{ status: "selected", directory: "D:\\Videos" }, { ok: true, status: "selected", dir: "D:\\Videos" }],
+    [{ status: "cancelled" }, { ok: true, status: "cancelled" }],
+    [{ status: "error", code: "picker_unavailable" }, { ok: false, error: "folder_picker_failed" }],
+    [{ status: "error", code: "invalid_selection" }, { ok: false, error: "folder_picker_failed" }],
+    // Malformed / unknown frames must not be mistaken for a selection.
+    [{ status: "selected" }, { ok: false, error: "folder_picker_failed" }],
+    [{ status: "selected", directory: "" }, { ok: false, error: "folder_picker_failed" }],
+    [{ status: "weird" }, { ok: false, error: "folder_picker_failed" }],
+    [{}, { ok: false, error: "folder_picker_failed" }],
+  ];
+  for (const [frame, expected] of cases) {
+    const h = createHarness();
+    await settle();
+    const pending = h.send({ type: "pick-folder", dir: "" });
+    await settle();
+    const requestId = lastPickRequestId(h);
+    h.nativeMessages.emit(Object.assign({ type: "folder", requestId }, frame));
+    assert.deepEqual(await pending, expected, JSON.stringify(frame));
+  }
+});
+
+test("legacy folder frames still resolve as selected or cancelled", async () => {
+  for (const [frame, expected] of [
+    [{ dir: "D:\\Legacy" }, { ok: true, status: "selected", dir: "D:\\Legacy" }],
+    [{ dir: "" }, { ok: true, status: "cancelled" }],
+  ]) {
+    const h = createHarness();
+    await settle();
+    const pending = h.send({ type: "pick-folder", dir: "" });
+    await settle();
+    const requestId = lastPickRequestId(h);
+    // Legacy hosts echo reqId, not requestId.
+    h.nativeMessages.emit(Object.assign({ type: "folder", reqId: requestId }, frame));
+    assert.deepEqual(await pending, expected);
+  }
+});
+
+test("a picker request settles exactly once and later frames are inert", async () => {
+  const h = createHarness();
+  await settle();
+  const pending = h.send({ type: "pick-folder", dir: "" });
+  await settle();
+  const requestId = lastPickRequestId(h);
+
+  h.nativeMessages.emit({ type: "folder", requestId, status: "cancelled" });
+  assert.deepEqual(await pending, { ok: true, status: "cancelled" });
+
+  // Duplicate and unknown frames must not throw or re-respond.
+  h.nativeMessages.emit({ type: "folder", requestId, status: "selected", directory: "D:\\Late" });
+  h.nativeMessages.emit({ type: "folder", requestId: "fp-unknown", status: "selected", directory: "D:\\X" });
+  await settle();
+});
+
+test("a picker that never answers times out and a late selection is inert", async () => {
+  const h = createHarness();
+  await settle();
+  const pending = h.send({ type: "pick-folder", dir: "" });
+  await settle();
+  const requestId = lastPickRequestId(h);
+
+  h.advanceTimers(180000);
+  assert.deepEqual(await pending, { ok: false, error: "folder_picker_timeout" });
+
+  h.nativeMessages.emit({ type: "folder", requestId, status: "selected", directory: "D:\\TooLate" });
+  await settle();
+});
+
+test("a helper disconnect settles every pending picker as failed", async () => {
+  const h = createHarness();
+  await settle();
+  const first = h.send({ type: "pick-folder", dir: "" });
+  await settle();
+  const second = h.send({ type: "pick-folder", dir: "" });
+  await settle();
+
+  h.nativeDisconnect.emit();
+  assert.deepEqual(await first, { ok: false, error: "folder_picker_failed" });
+  assert.deepEqual(await second, { ok: false, error: "folder_picker_failed" });
+});
+
+test("the picker request carries a correlating id and the requested directory", async () => {
+  const h = createHarness();
+  await settle();
+  const pending = h.send({ type: "pick-folder", dir: "C:\\Prior" });
+  await settle();
+  const post = h.nativePosts.filter((entry) => entry.cmd === "pickFolder").at(-1);
+  assert.equal(post.dir, "C:\\Prior");
+  assert.equal(typeof post.requestId, "string");
+  assert.equal(post.reqId, post.requestId, "legacy hosts still receive reqId");
+
+  h.nativeMessages.emit({ type: "folder", requestId: post.requestId, status: "cancelled" });
+  await pending;
 });

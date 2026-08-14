@@ -16,7 +16,11 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
     {"cmd":"snapshot","id":N,"base":"name","dir":D?}  # save current bytes WITHOUT stopping
     {"cmd":"save","id":N,"base":"name","dir":D?}      # auto-save into dir (or Downloads)
     {"cmd":"saveAs","id":N,"base":"name","dir":D?}    # native Save-As dialog
-    {"cmd":"pickFolder","reqId":R,"dir":D?}           # native folder picker (settings)
+    {"cmd":"pickFolder","requestId":R,"dir":D?}       # native folder picker ("reqId" accepted)
+      # replies with exactly one terminal frame:
+      #   {"type":"folder","requestId":R,"status":"selected","directory":D}
+      #   {"type":"folder","requestId":R,"status":"cancelled"}
+      #   {"type":"folder","requestId":R,"status":"error","code":"picker_unavailable"|"invalid_selection"}
     {"cmd":"open","path":P}        # open a saved file with the OS default app
     {"cmd":"update","extDir":D,"zipDir":D?,"profileDir":D?}  # self-update from a packaged zip
     {"cmd":"watch","enable":bool,"extDir":D?,"zipDir":D?}    # auto-install when a package appears

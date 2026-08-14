@@ -530,39 +530,117 @@ def _ask_save_path(default_dir, default_name):
     return ""
 
 
-def _ask_folder(default_dir):
-    """Native Win32 folder picker (shell32, no tkinter). Returns "" on cancel."""
-    try:
+class _WinFolderApi:
+    """Narrow Win32 shell adapter so picker policy stays testable off-Windows."""
+
+    def foreground_window(self):
+        import ctypes
+        return ctypes.windll.user32.GetForegroundWindow()
+
+    def browse(self, owner, initial_dir):
+        """Show the folder dialog owned by `owner`, opened at `initial_dir`.
+
+        Returns the selected path, or None when the user cancelled. Raises on a
+        genuine shell failure so the caller can tell the two apart.
+        """
         import ctypes
         from ctypes import wintypes
-        try: ctypes.windll.ole32.CoInitialize(None)
-        except Exception: pass
 
-        class BROWSEINFO(ctypes.Structure):
-            _fields_ = [
-                ("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
-                ("pszDisplayName", wintypes.LPWSTR), ("lpszTitle", wintypes.LPCWSTR),
-                ("ulFlags", wintypes.UINT), ("lpfn", ctypes.c_void_p),
-                ("lParam", ctypes.c_void_p), ("iImage", ctypes.c_int),
-            ]
-        disp = ctypes.create_unicode_buffer(260)
-        bi = BROWSEINFO()
-        bi.pszDisplayName = ctypes.cast(disp, wintypes.LPWSTR)
-        bi.lpszTitle = "Select a folder"
-        bi.ulFlags = 0x1 | 0x40   # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
-        shell32 = ctypes.windll.shell32
-        shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
-        pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
-        if not pidl:
-            return ""
-        path = ctypes.create_unicode_buffer(260)
-        shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), path)
-        try: ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
-        except Exception: pass
-        return path.value or ""
+        BFFM_INITIALIZED = 1
+        BFFM_SETSELECTIONW = 0x467
+        MAX_PATH = 260
+
+        co_ok = False
+        try:
+            ctypes.windll.ole32.CoInitialize(None)
+            co_ok = True
+        except Exception:
+            co_ok = False
+        try:
+            class BROWSEINFO(ctypes.Structure):
+                _fields_ = [
+                    ("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
+                    ("pszDisplayName", wintypes.LPWSTR), ("lpszTitle", wintypes.LPCWSTR),
+                    ("ulFlags", wintypes.UINT), ("lpfn", ctypes.c_void_p),
+                    ("lParam", ctypes.c_void_p), ("iImage", ctypes.c_int),
+                ]
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+
+            # Preselect the caller's directory and pull the dialog to the front
+            # once it exists — otherwise it can open behind the browser.
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.c_int, wintypes.HWND, wintypes.UINT,
+                ctypes.c_void_p, ctypes.c_void_p)
+            selection = ctypes.create_unicode_buffer(initial_dir or "")
+
+            def _on_message(hwnd, message, _lparam, _data):
+                if message == BFFM_INITIALIZED:
+                    try:
+                        user32.SendMessageW(hwnd, BFFM_SETSELECTIONW, 1,
+                                            ctypes.cast(selection, ctypes.c_void_p))
+                        user32.SetForegroundWindow(hwnd)
+                    except Exception:
+                        pass
+                return 0
+
+            # Keep the callback and buffers alive for the dialog's whole life.
+            callback = callback_type(_on_message)
+            display = ctypes.create_unicode_buffer(MAX_PATH)
+
+            info = BROWSEINFO()
+            info.hwndOwner = owner
+            info.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
+            info.lpszTitle = "Select a folder"
+            info.ulFlags = 0x1 | 0x40   # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+            info.lpfn = ctypes.cast(callback, ctypes.c_void_p)
+
+            shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+            pidl = shell32.SHBrowseForFolderW(ctypes.byref(info))
+            if not pidl:
+                return None                      # user cancelled
+            try:
+                path = ctypes.create_unicode_buffer(MAX_PATH)
+                if not shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), path):
+                    raise OSError("SHGetPathFromIDListW failed")
+                return path.value
+            finally:
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+                except Exception:
+                    pass
+        finally:
+            if co_ok:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+
+def _ask_folder(default_dir, api=None):
+    """Foreground-owned folder picker with three distinct outcomes.
+
+    Cancellation and failure used to be indistinguishable (both ""), so the
+    extension could not tell "user changed their mind" from "picker broke".
+    Never logs `default_dir` or the selected path.
+    """
+    api = api or _WinFolderApi()
+    try:
+        owner = api.foreground_window()
     except Exception:
-        pass
-    return ""
+        return {"status": "error", "code": "picker_unavailable"}
+    if not owner:
+        return {"status": "error", "code": "picker_unavailable"}
+    try:
+        selected = api.browse(owner, default_dir)
+    except Exception:
+        return {"status": "error", "code": "picker_unavailable"}
+    if selected is None:
+        return {"status": "cancelled"}
+    if not isinstance(selected, str) or not selected or not os.path.isdir(selected):
+        return {"status": "error", "code": "invalid_selection"}
+    return {"status": "selected", "directory": selected}
 
 
 def handle_save(req):
@@ -612,10 +690,34 @@ def handle_save_as(req):
 
 
 def handle_pick_folder(req):
-    """Native folder picker for the settings page. Replies {type:folder,dir}."""
+    """Native folder picker. Replies with exactly one terminal folder frame:
+    {type:folder,requestId,status:selected,directory} | {...,status:cancelled} |
+    {...,status:error,code:picker_unavailable|invalid_selection}.
+    """
+    request_id = req.get("requestId")
+    if request_id is None:
+        request_id = req.get("reqId")          # legacy settings-page callers
+    default_dir = req.get("dir") or _h().downloads_dir()
+
     def worker():
-        d = _ask_folder(req.get("dir") or _h().downloads_dir())
-        _h().send({"type": "folder", "reqId": req.get("reqId"), "dir": d or ""})
+        try:
+            outcome = _ask_folder(default_dir)
+        except Exception:
+            outcome = {"status": "error", "code": "picker_unavailable"}
+        # Allowlist-copy: never echo anything else the picker returned.
+        frame = {"type": "folder", "requestId": request_id}
+        status = outcome.get("status") if isinstance(outcome, dict) else None
+        if status == "selected":
+            frame["status"] = "selected"
+            frame["directory"] = outcome.get("directory")
+        elif status == "cancelled":
+            frame["status"] = "cancelled"
+        else:
+            frame["status"] = "error"
+            code = outcome.get("code") if isinstance(outcome, dict) else None
+            frame["code"] = code if code in ("picker_unavailable", "invalid_selection") \
+                else "picker_unavailable"
+        _h().send(frame)
     threading.Thread(target=worker, daemon=True).start()
 
 

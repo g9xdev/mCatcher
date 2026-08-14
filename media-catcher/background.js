@@ -265,7 +265,47 @@ let downloadCounter = 0;
 const pendingSaves = new Map();
 
 // reqId -> sendResponse, for the settings-page "Browse folder" round trip.
+// requestId -> { respond, timer }. Every request settles exactly once: on a
+// terminal native frame, on the timeout, or when the helper disconnects.
 const pendingFolderPicks = new Map();
+const FOLDER_PICK_TIMEOUT_MS = 180000;
+
+// Maps one native folder frame to the extension-facing response. A frame for an
+// unknown or already-settled request is inert, so a late selection after a
+// timeout can never revive a resolved picker.
+function finishFolderPick(requestId, nativeFrame) {
+  const pending = pendingFolderPicks.get(requestId);
+  if (!pending) return;
+  pendingFolderPicks.delete(requestId);
+  if (pending.timer !== null) { try { clearTimeout(pending.timer); } catch (e) {} }
+  let response;
+  const status = nativeFrame && nativeFrame.status;
+  if (status === "selected") {
+    response = typeof nativeFrame.directory === "string" && nativeFrame.directory
+      ? { ok: true, status: "selected", dir: nativeFrame.directory }
+      : { ok: false, error: "folder_picker_failed" };
+  } else if (status === "cancelled") {
+    response = { ok: true, status: "cancelled" };
+  } else if (status === "error") {
+    response = { ok: false, error: "folder_picker_failed" };
+  } else if (status === "timeout") {
+    response = { ok: false, error: "folder_picker_timeout" };
+  } else if (nativeFrame && typeof nativeFrame.dir === "string") {
+    // Legacy frame: a nonempty dir meant selected, an empty one meant cancelled.
+    response = nativeFrame.dir
+      ? { ok: true, status: "selected", dir: nativeFrame.dir }
+      : { ok: true, status: "cancelled" };
+  } else {
+    response = { ok: false, error: "folder_picker_failed" };
+  }
+  try { pending.respond(response); } catch (e) {}
+}
+
+function failAllFolderPicks() {
+  for (const requestId of Array.from(pendingFolderPicks.keys())) {
+    finishFolderPick(requestId, { status: "error" });
+  }
+}
 
 // ---- Native helper (ffmpeg via native messaging) ----
 // When the companion host is installed, recording is handed off to it: ffmpeg
@@ -356,6 +396,8 @@ function connectNative() {
       dlog("native host disconnected", err || "");
       mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
       nativePort = null; nativeInfo = null;
+      // No helper means no dialog will ever answer; settle every waiter now.
+      failAllFolderPicks();
       setNativeState("disconnected", err || "Helper not installed.");
       // The host owned the cast session and its status poller — without it the
       // session is gone; don't leave the popup showing a live transport forever.
@@ -472,8 +514,8 @@ function onLegacyNativeMessage(msg) {
     return;
   }
   if (msg.type === "folder") {
-    const cb = pendingFolderPicks.get(msg.reqId);
-    if (cb) { pendingFolderPicks.delete(msg.reqId); try { cb({ ok: true, dir: msg.dir || "" }); } catch (e) {} }
+    const requestId = msg.requestId !== undefined ? msg.requestId : msg.reqId;
+    finishFolderPick(requestId, msg);
     return;
   }
   if (msg.type === "update-result") {
@@ -2838,12 +2880,23 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       } else if (msg.type === "pick-folder") {
         if (nativePort) {
-          const reqId = "fp" + (++downloadCounter);
-          pendingFolderPicks.set(reqId, sendResponse);
-          nativePort.postMessage({ cmd: "pickFolder", reqId, dir: msg.dir || settings.saveFolder || "" });
+          const requestId = "fp" + (++downloadCounter);
+          const timer = setTimeout(
+            () => finishFolderPick(requestId, { status: "timeout" }),
+            FOLDER_PICK_TIMEOUT_MS
+          );
+          pendingFolderPicks.set(requestId, { respond: sendResponse, timer });
+          try {
+            nativePort.postMessage({
+              cmd: "pickFolder", requestId, reqId: requestId,
+              dir: msg.dir || settings.saveFolder || "",
+            });
+          } catch (e) {
+            finishFolderPick(requestId, { status: "error" });
+          }
           return true;   // sendResponse called when the host replies
         }
-        sendResponse({ ok: false, error: "Native helper not available for the folder picker." });
+        sendResponse({ ok: false, error: "folder_picker_failed" });
       } else if (msg.type === "discard-recording") {
         const dl = activeDownloads.get(msg.id);
         if (dl && dl.native && nativePort) nativePort.postMessage({ cmd: "discard", id: msg.id });
