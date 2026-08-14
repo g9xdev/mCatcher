@@ -8,6 +8,7 @@
 !/media-catcher
 !/media-catcher-host
 !/docs
+!/devtools
 
 # --- exclusions inside the tracked projects ---
 
