@@ -186,6 +186,21 @@ function humanSize(bytes) {
   return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
 }
 
+// Managed opaque rows state their size from validated metadata only — an
+// unvalidated item.size must never be relabelled as an exact total. Legacy
+// rows keep their existing exact transfer size.
+function mediaSizeLabel(item) {
+  const sizeApi = (typeof McMediaSize !== "undefined") ? McMediaSize : null;
+  if (item && typeof item.id === "string") {
+    if (!sizeApi) return "Size unknown";
+    return sizeApi.sizeLabel(
+      { sizeBytes: item.sizeBytes, sizeConfidence: item.sizeConfidence },
+      humanSize
+    );
+  }
+  return item && item.size ? humanSize(item.size) : "";
+}
+
 // H.265 conversion outcome: before/after sizes, percent, and which version kept.
 function h265Note(c) {
   if (!c) return "";
@@ -423,7 +438,7 @@ function renderItem(item) {
   const quality = item.height ? item.height + "p" : (item.resolution || "");
   const metaLine = [kindLabel, quality, bitrateLabel(item), item.duration ? fmtDuration(item.duration) : ""]
     .filter(Boolean).join(" · ");
-  const hostLine = [hostOf(item.url), item.size ? humanSize(item.size) : "",
+  const hostLine = [hostOf(item.url), mediaSizeLabel(item),
     item.renditionsHidden ? "top of " + (item.renditionsHidden + 1) : ""].filter(Boolean).join("  ·  ");
 
   const chips = h("div", { class: "chips" });

@@ -592,7 +592,7 @@ function loadPopupRenderHarness() {
   };
   const pieces = [
     "isSafeOpaqueId", "itemIdentity", "hostOf", "proposedFilenameOf", "displayNameOf", "fmtDuration",
-    "bitrateLabel", "renderQualities", "renderItem", "render",
+    "bitrateLabel", "mediaSizeLabel", "renderQualities", "renderItem", "render",
   ].map((name) => extractNamedFunction(source, name));
   vm.runInNewContext(pieces.join("\n") + "\nthis.render = render;", sandbox);
   return { sandbox, starts, progress, listEl };
@@ -1158,4 +1158,77 @@ test("Use Firefox disables before send; two sync clicks produce one send/token; 
   const errEl = card2.children[1];
   assert.ok(errEl);
   assert.match(String(errEl.textContent), /handoff refused/);
+});
+
+// ---------------------------------------------------------------------------
+// Visible size text on opaque rows (Task 2)
+// ---------------------------------------------------------------------------
+
+function sizeRenderHarness() {
+  const h = loadPopupRenderHarness();
+  h.sandbox.McMediaSize = loadLib("lib/media-size.js");
+  h.sandbox.humanSize = function humanSize(bytes) {
+    if (!bytes) return "";
+    const u = ["B", "KB", "MB", "GB"];
+    let i = 0, n = bytes;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
+  };
+  const source = readPopupSource();
+  vm.runInContext(
+    extractNamedFunction(source, "mediaSizeLabel") + "\nthis.mediaSizeLabel = mediaSizeLabel;",
+    h.sandbox
+  );
+  return h;
+}
+
+function cardText(node) {
+  return popupNodes(node, () => true)
+    .map((child) => (child.props && typeof child.props.text === "string" ? child.props.text : ""))
+    .join(" ");
+}
+
+test("opaque rows visibly state exact, estimated, or unknown size", () => {
+  const h = sizeRenderHarness();
+  h.sandbox.render([
+    { id: "media:s1:1", kind: "direct", proposedFilename: "exact.mp4",
+      sizeBytes: 1395864371, sizeConfidence: "exact" },
+    { id: "media:s2:1", kind: "direct", proposedFilename: "estimated.mp4",
+      sizeBytes: 1395864371, sizeConfidence: "estimated" },
+    { id: "media:s3:1", kind: "direct", proposedFilename: "unknown.mp4" },
+  ]);
+
+  const [exactCard, estimatedCard, unknownCard] = h.listEl.children.map(cardText);
+  assert.match(exactCard, /1\.3 GB/);
+  assert.doesNotMatch(exactCard, /Est\./);
+  assert.match(estimatedCard, /Est\. 1\.3 GB/);
+  assert.match(unknownCard, /Size unknown/);
+});
+
+test("an unvalidated item.size can never relabel an opaque row as exact", () => {
+  const h = sizeRenderHarness();
+  // Hostile/legacy scalars on a managed row must not become a visible total.
+  h.sandbox.render([
+    { id: "media:s4:1", kind: "direct", proposedFilename: "spoof.mp4", size: 1395864371 },
+    { id: "media:s5:1", kind: "direct", proposedFilename: "junk.mp4",
+      size: 999, sizeBytes: "1395864371", sizeConfidence: "exact" },
+    { id: "media:s6:1", kind: "direct", proposedFilename: "bogus.mp4",
+      sizeBytes: 1024, sizeConfidence: "guessed" },
+  ]);
+
+  for (const text of h.listEl.children.map(cardText)) {
+    assert.match(text, /Size unknown/);
+    assert.doesNotMatch(text, /1\.3 GB/);
+  }
+});
+
+test("legacy non-opaque rows keep their existing exact transfer size text", () => {
+  const h = sizeRenderHarness();
+  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4", size: 1024 }), "1.0 KB");
+  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4" }), "");
+  assert.equal(h.sandbox.mediaSizeLabel({ id: "media:s7:1" }), "Size unknown");
+  assert.equal(
+    h.sandbox.mediaSizeLabel({ id: "media:s8:1", sizeBytes: 1024, sizeConfidence: "estimated" }),
+    "Est. 1.0 KB"
+  );
 });

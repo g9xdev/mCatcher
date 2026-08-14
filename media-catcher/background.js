@@ -189,6 +189,13 @@ const liveControllerTabs = new Set();
 const liveControllerMediaIds = new Map();
 const livePromotedKeys = new Map();
 const liveDirectSourceKeys = new Map();
+// tabId -> canonical direct source key -> the opaque media ID that owns it.
+// Late evidence for an owned source enriches that row instead of minting a
+// second one. Session-only; cleared with the rest of a tab's ownership.
+const liveDirectMediaOwners = new Map();
+// opaque media ID -> frozen { sizeBytes, sizeConfidence }. Never holds URLs,
+// headers, or any other transport evidence.
+const liveSizeMetadata = new Map();
 // tabId -> { referer, origin, userAgent, cookieUrl, pageTitle, ogTitle }
 const tabContext = new Map();
 // tabId -> JPEG data URL of the playing video (from content script)
@@ -824,6 +831,53 @@ function hasLiveDirectSource(tabId, url) {
   return !!keys && keys.has(directSourceKey(url));
 }
 
+// The opaque media ID that already owns this exact direct source, if any.
+function getLiveDirectOwner(tabId, url) {
+  const bySource = liveDirectMediaOwners.get(tabId);
+  return bySource ? bySource.get(directSourceKey(url)) || null : null;
+}
+
+// Store a validated size only when it actually improves what the row shows.
+// Exact evidence outranks estimates; identical values broadcast nothing.
+function rememberLiveSize(mediaId, candidate, tabId) {
+  if (typeof mediaId !== "string" || !mediaId) return false;
+  const current = liveSizeMetadata.get(mediaId) || null;
+  const next = self.McMediaSize.chooseSize(current, candidate);
+  if (!next || (current && current.sizeBytes === next.sizeBytes &&
+      current.sizeConfidence === next.sizeConfidence)) return false;
+  liveSizeMetadata.set(mediaId, next);
+  broadcast({ type: "media-updated", tabId });
+  return true;
+}
+
+// Exact total from already-copied response headers. A 206 chunk length is not
+// a total, so this returns null unless a valid Content-Range total is present.
+function exactSizeFromEvidence(evidence) {
+  const details = evidence && evidence.details;
+  if (!details) return null;
+  return self.McMediaSize.exactSizeFromHttp({
+    statusCode: details.statusCode,
+    responseHeaders: details.responseHeaders,
+  });
+}
+
+// Bitrate × duration, used only when no exact total is known for this row.
+function estimatedSizeForItem(item, selectedBandwidth) {
+  if (!item) return null;
+  return self.McMediaSize.estimatedSizeFromBitrate({
+    durationSeconds: item.duration,
+    selectedBandwidth,
+    bandwidth: item.bandwidth,
+    sampledKbps: item.estKbps,
+  });
+}
+
+function forgetLiveSizesForTab(tabId) {
+  const ids = liveControllerMediaIds.get(tabId);
+  if (ids) for (const id of ids) liveSizeMetadata.delete(id);
+  liveDirectMediaOwners.delete(tabId);
+}
+
 // Network and DOM are independent evidence producers for the same direct file.
 // Claim their shared tab-scoped identity at ingress so the controller receives
 // one source, while different directGroupKey values remain separate media.
@@ -839,8 +893,14 @@ function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
   }
   if (Array.isArray(directUrls) && directUrls.length) {
     const sources = liveDirectSourceKeys.get(tabId) || new Set();
-    for (const url of directUrls) sources.add(directSourceKey(url));
+    const owners = liveDirectMediaOwners.get(tabId) || new Map();
+    for (const url of directUrls) {
+      const sourceKey = directSourceKey(url);
+      sources.add(sourceKey);
+      owners.set(sourceKey, mediaId);
+    }
     liveDirectSourceKeys.set(tabId, sources);
+    liveDirectMediaOwners.set(tabId, owners);
   }
 
   const map = mediaByTab.get(tabId);
@@ -859,7 +919,16 @@ function addMedia(tabId, item, networkEvidence) {
   const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url)
             : item.kind === "direct" ? directGroupKey(item.url) : item.url;
   item.key = key;
-  if (item.kind === "direct" && hasLiveDirectSource(tabId, item.url)) return;
+  if (item.kind === "direct") {
+    // An owned source keeps its single opaque row; late transport evidence only
+    // enriches it. Never mint a second detection for the same file.
+    const owner = getLiveDirectOwner(tabId, item.url);
+    if (owner) {
+      rememberLiveSize(owner, exactSizeFromEvidence(networkEvidence), tabId);
+      return;
+    }
+    if (hasLiveDirectSource(tabId, item.url)) return;
+  }
   if (hasLiveMediaKey(tabId, key)) return;
   // Stash any audio-track playlist URL (even one we're about to suppress) so the
   // recorder can pair it with the video by directory.
@@ -928,6 +997,9 @@ function buildLiveNetworkEvidence(details, mediaKind) {
     timeStamp: Number.isFinite(details.timeStamp) ? details.timeStamp : Date.now(),
     responseHeaders: copyLiveResponseHeaders(details.responseHeaders),
   };
+  // Safe scalar; the controller allowlists it away but size policy needs it to
+  // tell a 206 chunk length from a real resource total.
+  if (Number.isInteger(details.statusCode)) safeDetails.statusCode = details.statusCode;
   if (typeof details.documentId === "string") safeDetails.documentId = details.documentId;
   if (typeof details.documentUrl === "string") safeDetails.documentUrl = details.documentUrl;
   if (typeof details.originUrl === "string") safeDetails.originUrl = details.originUrl;
@@ -950,7 +1022,7 @@ function buildLiveNetworkEvidence(details, mediaKind) {
   return { details: safeDetails, hints, transport };
 }
 
-async function promoteLiveNetworkItem(tabId, key, item, variants) {
+async function promoteLiveNetworkItem(tabId, key, item, variants, probeSizeMetadata) {
   await settingsReady;
   const controller = liveController;
   const evidence = liveNetworkEvidence.get(item);
@@ -990,6 +1062,13 @@ async function promoteLiveNetworkItem(tabId, key, item, variants) {
     item.kind === "direct" ? (item.mirrors || [item.url]) : null,
     true
   );
+  // Trusted probe/header totals first; a bitrate estimate only fills the gap
+  // when nothing exact is known for this row.
+  rememberLiveSize(mediaId, exactSizeFromEvidence(evidence), tabId);
+  rememberLiveSize(mediaId, probeSizeMetadata, tabId);
+  if (!liveSizeMetadata.has(mediaId)) {
+    rememberLiveSize(mediaId, estimatedSizeForItem(item), tabId);
+  }
   liveNetworkEvidence.delete(item);
   return true;
 }
@@ -1115,10 +1194,16 @@ async function probeDirect(tabId, url) {
       signal: controller.signal,
     });
     const ct = resp.headers.get("content-type") || "";
-    let size = 0;
-    const cr = resp.headers.get("content-range");
-    if (cr) { const m = cr.match(/\/(\d+)\s*$/); if (m) size = parseInt(m[1], 10); }
-    if (!size) { const cl = resp.headers.get("content-length"); if (cl) size = parseInt(cl, 10); }
+    // A ranged probe's Content-Length describes the 256 KB chunk, never the
+    // file. Only a valid Content-Range total (or a full 200) is a real total.
+    const sizeMetadata = self.McMediaSize.exactSizeFromHttp({
+      statusCode: resp.status,
+      responseHeaders: [
+        { name: "Content-Range", value: resp.headers.get("content-range") || "" },
+        { name: "Content-Length", value: resp.headers.get("content-length") || "" },
+      ],
+    });
+    const size = sizeMetadata ? sizeMetadata.sizeBytes : 0;
     const ok = resp.ok || resp.status === 206;
     // Read up to 256 KB, then abort so we never pull a whole file that ignored Range.
     const LIMIT = 262144, chunks = [];
@@ -1135,7 +1220,7 @@ async function probeDirect(tabId, url) {
     const head = new Uint8Array(recv);
     let off = 0;
     for (const c of chunks) { head.set(c, off); off += c.length; }
-    return { status: resp.status, ok, contentType: ct, size, head };
+    return { status: resp.status, ok, contentType: ct, size, sizeMetadata, head };
   } finally {
     clearTimeout(timer);
     taggedRequests.delete(token);
@@ -1264,7 +1349,7 @@ async function enrichDirect(tabId, key) {
       if (codec) item.codec = codec;
     }
     item.enrichState = "done";
-    if (!item.junk) await promoteLiveNetworkItem(tabId, key, item, null);
+    if (!item.junk) await promoteLiveNetworkItem(tabId, key, item, null, r.sizeMetadata);
     dlog("probed direct", { url: item.url, status: r.status, size: item.size, container, junk: item.junk, kbps: item.estKbps });
   } catch (e) {
     item.enrichState = "error";
@@ -2320,6 +2405,13 @@ function decorateLiveRow(row, tabId) {
     tabId,
     thumb: tabThumbs.get(tabId) || null,
   };
+  // Only the validated scalar pair crosses into the public row — never the
+  // record itself and never any raw evidence it was derived from.
+  const size = liveSizeMetadata.get(row.id);
+  if (size) {
+    out.sizeBytes = size.sizeBytes;
+    out.sizeConfidence = size.sizeConfidence;
+  }
   const title = tabTitle(tabId);
   if (title) out.pageTitle = title;
   return out;
@@ -2697,6 +2789,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } else if (msg.type === "clear") {
         mediaByTab.delete(msg.tabId);
+        forgetLiveSizesForTab(msg.tabId);
         liveControllerTabs.delete(msg.tabId);
         liveControllerMediaIds.delete(msg.tabId);
         livePromotedKeys.delete(msg.tabId);
@@ -2784,6 +2877,7 @@ function endTabRecordings(tabId) {
 api.tabs.onRemoved.addListener((tabId) => {
   endTabRecordings(tabId);
   mediaByTab.delete(tabId);
+  forgetLiveSizesForTab(tabId);
   liveControllerTabs.delete(tabId);
   liveControllerMediaIds.delete(tabId);
   livePromotedKeys.delete(tabId);
@@ -2799,6 +2893,7 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url) {
     endTabRecordings(tabId);
     mediaByTab.delete(tabId);
+    forgetLiveSizesForTab(tabId);
     liveControllerTabs.delete(tabId);
     liveControllerMediaIds.delete(tabId);
     livePromotedKeys.delete(tabId);

@@ -389,3 +389,73 @@ test("public background flow keeps static HLS assembly opaque and admits an inde
   assert.equal(/https?:\/\//.test(publicJson), false, "public surfaces must remain URL-free");
   assert.equal(h.browserDownloads.length, 0, "managed HLS must never invoke Firefox implicitly");
 });
+
+test("real controller publishes one opaque direct row carrying only safe exact size", async () => {
+  const signed = "SIGNED_QUERY_SENTINEL";
+  const mediaUrl = "https://gamma.example/media/11474-makemebi.net.mp4?token=" + signed;
+  const tabId = 41;
+  // No fetch fixtures: a DOM-owned direct source must never be probed again.
+  const h = createHarness(new Map());
+  await settle();
+
+  const page = snapshot(tabId, "gamma", "11474-makemebi.net.mp4");
+  const sender = {
+    tab: { id: tabId, url: page.pageUrl, title: "11474-makemebi.net.mp4" },
+    frameId: 0,
+    documentId: page.documentId,
+    url: page.pageUrl,
+  };
+  assert.deepEqual(await h.send(page, sender), { ok: true });
+
+  await h.send({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: page.pageUrl,
+    frameOrigin: "https://gamma.example",
+    snapshot: page,
+  }, sender);
+
+  await eventually(
+    () => h.controller.popupMedia(tabId).some((item) => item.kind === "direct"),
+    "direct row did not reach the controller popup surface"
+  );
+
+  h.headersReceived.emit({
+    tabId,
+    frameId: 0,
+    documentId: page.documentId,
+    documentUrl: page.pageUrl,
+    originUrl: page.pageUrl,
+    url: mediaUrl,
+    statusCode: 206,
+    timeStamp: Date.now(),
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-262143/1395864371" },
+      { name: "Content-Length", value: "262144" },
+      { name: "Set-Cookie", value: "session=COOKIE_SENTINEL" },
+    ],
+  });
+  await settle();
+  await settle();
+
+  const state = await h.send({ type: "get-media", tabId }, h.popupSender);
+  const direct = state.items.filter((item) => item.kind === "direct");
+  assert.equal(direct.length, 1, "late network evidence must not add a second row");
+  assert.equal(typeof direct[0].id, "string");
+  assert.equal(direct[0].sizeBytes, 1395864371);
+  assert.equal(direct[0].sizeConfidence, "exact");
+  assert.equal(h.fetches.length, 0, "an owned direct source must not be reprobed");
+
+  // Fresh projections each call, and no transport evidence anywhere public.
+  const again = await h.send({ type: "get-media", tabId }, h.popupSender);
+  assert.notEqual(again.items[0], state.items[0]);
+  const publicJson = JSON.stringify({
+    responses: h.publicResponses,
+    broadcasts: h.broadcasts,
+  });
+  for (const sentinel of [signed, "COOKIE_SENTINEL", "AUTHORIZATION_SENTINEL",
+    "gamma.example/media", "Content-Range", "Set-Cookie"]) {
+    assert.equal(publicJson.includes(sentinel), false, "leaked " + sentinel);
+  }
+});

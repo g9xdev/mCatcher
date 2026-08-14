@@ -49,15 +49,35 @@ function createHarness() {
   const controllerJobs = Object.freeze([{ id: "job:opaque:1", state: "queued" }]);
   let mediaSeq = 0;
 
+  // Every captured media ID must be observable as exactly one safe popup row so
+  // duplicate-row regressions are visible through the public projection. Rows a
+  // test installed by hand win, so existing explicit fixtures keep their shape.
+  function publishRow(tabId, mediaId, kind) {
+    if (!Number.isInteger(tabId)) return;
+    const existing = popupRows.get(tabId) || [];
+    if (existing.some((row) => row && row.id === mediaId)) return;
+    popupRows.set(tabId, Object.freeze(existing.concat([Object.freeze({
+      id: mediaId,
+      proposedFilename: "movie.mp4",
+      kind: typeof kind === "string" ? kind : "direct",
+      variants: Object.freeze([]),
+    })])));
+  }
+
   const controller = {
     captureNetwork(input) {
       captureNetwork.push(clone(input));
-      return "media:opaque:" + (++mediaSeq);
+      const mediaId = "media:opaque:" + (++mediaSeq);
+      publishRow(input && input.details && input.details.tabId, mediaId,
+        input && input.transport && input.transport.mediaKind);
+      return mediaId;
     },
     acceptPageSnapshot(snapshot) { acceptPageSnapshot.push(clone(snapshot)); },
     captureDomMedia(input) {
       captureDomMedia.push(clone(input));
-      return "media:opaque:" + (++mediaSeq);
+      const mediaId = "media:opaque:" + (++mediaSeq);
+      publishRow(input && input.snapshot && input.snapshot.tabId, mediaId, "direct");
+      return mediaId;
     },
     registerVariants(mediaId, variants) {
       registerVariants.push({ mediaId, variants: clone(variants) });
@@ -317,6 +337,9 @@ test("promotes a probed network direct item and merges opaque frozen controller 
     kind: "direct",
     variants: [],
     tabId: 7,
+    // The probe's Content-Range total is the only exact size evidence here.
+    sizeBytes: 10485760,
+    sizeConfidence: "exact",
     thumb: null,
     pageTitle: "Movie Night",
   }]);
@@ -562,4 +585,193 @@ test("clear then tab reuse publishes only newly captured controller rows", async
   h.popupRows.set(tabId, Object.freeze([oldRow, newRow]));
   result = await h.send({ type: "get-media", tabId });
   assert.deepEqual(result.items.map((item) => item.id), ["media:opaque:2"]);
+});
+
+// ---------------------------------------------------------------------------
+// Size metadata rides the already-owned opaque row (Task 2)
+// ---------------------------------------------------------------------------
+
+function sizedSender(tabId) {
+  return {
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId: 2,
+    documentId: "doc-7",
+    url: "https://frame.example/player",
+  };
+}
+
+test("DOM-first direct media receives late exact network size without a second row", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaUrl = "https://cdn.example/movie.mp4?token=SIGNED_SENTINEL";
+  const sender = sizedSender(7);
+
+  await h.send({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: sender.url,
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  }, sender);
+
+  h.headersReceived.emit({
+    tabId: 7,
+    frameId: 0,
+    documentId: "doc-7",
+    documentUrl: "https://site.example/watch",
+    originUrl: "https://site.example/watch",
+    url: mediaUrl,
+    statusCode: 206,
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-262143/1395864371" },
+      { name: "Content-Length", value: "262144" },
+    ],
+  });
+  await eventually(() => h.broadcasts.some((m) => m.type === "media-updated"), "size update");
+
+  const response = await h.send({ type: "get-media", tabId: 7 });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.equal(direct.length, 1);
+  assert.equal(direct[0].sizeBytes, 1395864371);
+  assert.equal(direct[0].sizeConfidence, "exact");
+  assert.equal(JSON.stringify(response).includes("SIGNED_SENTINEL"), false);
+  assert.equal(h.captureNetwork.length, 0);
+  assert.equal(h.captureDomMedia.length, 1);
+});
+
+test("network-first direct media keeps one row and publishes the probe Content-Range total", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const sender = sizedSender(7);
+
+  emitNetwork(h, 7, mediaUrl, "video/mp4", "doc-7");
+  await eventually(() => h.captureNetwork.length === 1, "network direct promotion");
+
+  await h.send({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: sender.url,
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  }, sender);
+
+  const response = await h.send({ type: "get-media", tabId: 7 });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.equal(direct.length, 1, "matching DOM report must not add a second row");
+  assert.equal(h.captureDomMedia.length, 0);
+  // The harness probe answers "bytes 0-7/10485760" — the total, never the chunk.
+  assert.equal(direct[0].sizeBytes, 10485760);
+  assert.equal(direct[0].sizeConfidence, "exact");
+});
+
+test("a 206 chunk Content-Length is never published as the resource total", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaUrl = "https://cdn.example/chunked.mp4";
+  await h.send({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: "https://site.example/watch",
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  }, sizedSender(7));
+
+  h.headersReceived.emit({
+    tabId: 7, frameId: 0, documentId: "doc-7",
+    documentUrl: "https://site.example/watch", originUrl: "https://site.example/watch",
+    url: mediaUrl,
+    statusCode: 206,
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Length", value: "262144" },
+    ],
+  });
+  await settle();
+  await settle();
+
+  const response = await h.send({ type: "get-media", tabId: 7 });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.equal(direct.length, 1);
+  assert.equal(direct[0].sizeBytes, undefined, "chunk length must not become a total");
+  assert.equal(direct[0].sizeConfidence, undefined);
+});
+
+test("exact evidence replaces an estimate and a later estimate cannot downgrade it", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaUrl = "https://cdn.example/movie.mp4?token=A";
+  await h.send({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: "https://site.example/watch",
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  }, sizedSender(7));
+
+  const emitTotal = (total) => h.headersReceived.emit({
+    tabId: 7, frameId: 0, documentId: "doc-7",
+    documentUrl: "https://site.example/watch", originUrl: "https://site.example/watch",
+    url: mediaUrl,
+    statusCode: 206,
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-9/" + total },
+    ],
+  });
+
+  emitTotal(1395864371);
+  await settle();
+  await settle();
+  let response = await h.send({ type: "get-media", tabId: 7 });
+  let direct = response.items.filter((row) => row.kind === "direct");
+  assert.equal(direct[0].sizeBytes, 1395864371);
+  assert.equal(direct[0].sizeConfidence, "exact");
+
+  // Fresh exact transport evidence for the same source may correct the total.
+  emitTotal(1400000000);
+  await settle();
+  await settle();
+  response = await h.send({ type: "get-media", tabId: 7 });
+  direct = response.items.filter((row) => row.kind === "direct");
+  assert.equal(direct[0].sizeBytes, 1400000000);
+  assert.equal(direct[0].sizeConfidence, "exact", "exact never degrades to estimated");
+});
+
+test("clear then URL reuse never inherits the previous row's size", async () => {
+  const h = createHarness();
+  await settle();
+  const tabId = 7;
+  const mediaUrl = "https://cdn.example/reused.mp4";
+  const send = () => h.send({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: "https://site.example/watch",
+    frameOrigin: "https://frame.example",
+    snapshot: pageSnapshot(),
+  }, sizedSender(tabId));
+
+  await send();
+  h.headersReceived.emit({
+    tabId, frameId: 0, documentId: "doc-7",
+    documentUrl: "https://site.example/watch", originUrl: "https://site.example/watch",
+    url: mediaUrl,
+    statusCode: 206,
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-9/999999" },
+    ],
+  });
+  await settle();
+  await settle();
+  let response = await h.send({ type: "get-media", tabId });
+  assert.equal(response.items.filter((row) => row.kind === "direct")[0].sizeBytes, 999999);
+
+  await h.send({ type: "clear", tabId });
+  await send();
+  response = await h.send({ type: "get-media", tabId });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.equal(direct.length, 1);
+  assert.equal(direct[0].sizeBytes, undefined, "a reused URL must not inherit a stale size");
 });
