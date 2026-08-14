@@ -1435,8 +1435,15 @@ def test_pget_single_cancel_and_thread_start_failure(tmp_path, monkeypatch):
         )
         wait_for(lambda: body_started.is_set(), timeout=5)
         mc._pget_cancel({"id": "sCan"})
-        res = wait_result(sent, timeout=10)
+        # Release the stalled body IMMEDIATELY after cancelling. The worker is
+        # parked inside resp.read(), and the cancel flag is only observed at the
+        # top of the read loop — so the terminal cannot arrive until this read
+        # returns. Leaving the server stalled here made the terminal land at
+        # ~9.8s against a 10s budget: two equal timers racing, ~50% flaky.
+        # cancel_requested is already set, so the next loop-top check still sees
+        # it and the cancel remains midstream.
         hold.set()
+        res = wait_result(sent, timeout=10)
         results = [m for m in sent if m.get("type") == "pget-result"]
         assert len(results) == 1
         assert res["status"] == "cancelled"
