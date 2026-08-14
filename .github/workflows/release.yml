@@ -61,8 +61,10 @@ jobs:
         run: |
           $v = $env:V
           New-Item -ItemType Directory -Force dist | Out-Null
-          # Extension: manifest.json must sit at the zip root -> archive the folder CONTENTS
-          Compress-Archive -Path 'media-catcher/*' -DestinationPath "dist/media_catcher-$v.zip" -Force
+          # Extension: built from the ship set (devtools/ship_set.py), which keeps
+          # manifest.json at the zip root and leaves out tests/ and .vscode/.
+          # Archiving media-catcher/* wholesale shipped 43 development files.
+          python devtools/package_extension.py "dist/media_catcher-$v.zip"
           # Host: only the runtime files (no ffmpeg, tests, installer, or machine files)
           New-Item -ItemType Directory -Force host-staging | Out-Null
           Copy-Item 'media-catcher-host/mc_host.py','media-catcher-host/guardian.ps1','media-catcher-host/README.md' host-staging/
@@ -104,8 +106,13 @@ jobs:
           }
           New-Item -ItemType Directory -Force signed | Out-Null
           # Sign the stamped source as an unlisted (self-distribution) build.
+          # web-ext packages the source directory directly, so the exclusions
+          # must be repeated here -- this is the artifact users install, and it
+          # is NOT built from the zip above. Kept in step with
+          # ship_set.EXTENSION_EXCLUDE_DIRS by test_release_workflow_ignores.
           npx --yes web-ext sign `
             --source-dir media-catcher `
+            --ignore-files "tests/**" ".vscode/**" `
             --api-key "$env:AMO_JWT_ISSUER" --api-secret "$env:AMO_JWT_SECRET" `
             --channel unlisted --artifacts-dir signed --timeout 600000
           $xpi = Get-ChildItem signed -Filter *.xpi -ErrorAction SilentlyContinue | Select-Object -First 1

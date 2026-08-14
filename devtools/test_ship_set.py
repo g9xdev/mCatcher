@@ -142,3 +142,72 @@ def test_extension_root_must_carry_the_manifest(tmp_path):
     (tmp_path / "media-catcher").mkdir()
     with pytest.raises(ship_set.ShipSetError):
         ship_set.extension_ship_set(str(tmp_path))
+
+
+# --------------------------------------------------------------------------
+# The packaged artifact carries only what ships
+# --------------------------------------------------------------------------
+
+def test_packaged_extension_contains_no_tests_or_editor_config(tmp_path):
+    import io as _io
+    import zipfile
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import install_dev
+
+    data = install_dev.build_extension_package(REPO)
+    with zipfile.ZipFile(_io.BytesIO(data)) as archive:
+        entries = archive.namelist()
+    assert "manifest.json" in entries
+    assert not any(e.startswith("tests/") for e in entries)
+    assert not any(e.startswith(".vscode/") for e in entries)
+    assert not any(e.endswith(".test.js") for e in entries)
+
+
+def test_packaged_extension_is_byte_stable():
+    import install_dev
+    assert install_dev.build_extension_package(REPO) == \
+        install_dev.build_extension_package(REPO)
+
+
+def test_package_cli_writes_the_shipped_archive(tmp_path):
+    import zipfile
+    import package_extension
+    out = tmp_path / "ext.zip"
+    assert package_extension.main([str(out), "--repo-root", REPO]) == 0
+    with zipfile.ZipFile(out) as archive:
+        entries = archive.namelist()
+    assert "manifest.json" in entries
+    assert not any(e.startswith("tests/") for e in entries)
+
+
+# --------------------------------------------------------------------------
+# Release workflow: two packaging paths, both must honour the exclusions
+# --------------------------------------------------------------------------
+
+RELEASE_YML = os.path.join(REPO, ".github", "workflows", "release.yml")
+
+
+def _release_text():
+    with open(RELEASE_YML, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_web_ext_ignores_every_excluded_directory():
+    """web-ext packages media-catcher/ directly, so the signed .xpi -- the
+    artifact users install -- is not covered by the zip step's ship set."""
+    text = _release_text()
+    assert "web-ext sign" in text
+    for name in ship_set.EXTENSION_EXCLUDE_DIRS:
+        assert '"%s/**"' % name in text, \
+            "web-ext sign must ignore %s/ or it ships in the signed xpi" % name
+
+
+def test_extension_zip_is_built_from_the_ship_set():
+    text = _release_text()
+    assert "devtools/package_extension.py" in text
+    assert "Compress-Archive -Path 'media-catcher/*'" not in text
+
+
+def test_host_zip_still_stages_rather_than_archiving_the_tree():
+    """The host path is deliberately untouched; its narrower set is correct."""
+    assert "host-staging" in _release_text()

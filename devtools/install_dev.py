@@ -428,6 +428,38 @@ def build_xpi_bytes(source_dir, ship_set=None, excludes=None,
     return buffer.getvalue()
 
 
+def build_zip_from_mapping(mapping, timestamp=XPI_TIMESTAMP,
+                           require_root_manifest=True):
+    """Build an archive from {archive relative path: source path}.
+
+    Same pinned fields as build_xpi_bytes, but sourced from an explicit ship
+    set rather than a pattern walk, so the packaged artifact and the verified
+    artifact are built from the identical mapping.
+    """
+    if require_root_manifest and "manifest.json" not in mapping:
+        raise ValueError("manifest.json must sit at the archive root; got %d entries"
+                         % len(mapping))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for relpath in sorted(mapping):
+            info = zipfile.ZipInfo(relpath, date_time=timestamp)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 0
+            info.create_version = 20
+            info.extract_version = 20
+            info.external_attr = _ZIP_MODE
+            info.internal_attr = 0
+            info.flag_bits = 0
+            with open(mapping[relpath], "rb") as handle:
+                archive.writestr(info, handle.read())
+    return buffer.getvalue()
+
+
+def build_extension_package(repo_root="."):
+    """The extension artifact: shipped files only, tests and editor config out."""
+    return build_zip_from_mapping(_ship_set().extension_ship_set(repo_root))
+
+
 def write_xpi(source_dir, out_path, ship_set=None, excludes=None,
               timestamp=XPI_TIMESTAMP):
     """Build the XPI and write it. Returns {"path", "sha256", "entries"}."""
