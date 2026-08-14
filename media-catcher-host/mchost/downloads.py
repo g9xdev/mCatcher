@@ -3510,6 +3510,104 @@ def _pget_close_resp(resp):
         pass
 
 
+# How long a stalled body read waits before re-checking cancellation.
+_PGET_CANCEL_POLL = 0.25
+
+
+def _pget_response_socket(resp):
+    """The live socket behind an HTTPResponse, or None when unavailable.
+
+    Used ONLY to wait for readability. Never call settimeout() on it: SocketIO
+    latches _timeout_occurred on the first timeout and every later read raises
+    "cannot read from timed out object", which would break the transfer.
+    """
+    import socket as _socket
+    try:
+        raw = getattr(getattr(resp, "fp", None), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if not isinstance(sock, _socket.socket):
+            return None
+        if sock.fileno() < 0:
+            return None
+        return sock
+    except Exception:
+        return None
+
+
+def _pget_response_has_buffered(resp):
+    """True when the response already holds bytes select() cannot see.
+
+    Covers the BufferedReader's own buffer and any decrypted-but-unread TLS
+    bytes. Best-effort: a False here only costs one poll slice.
+    """
+    try:
+        fp = getattr(resp, "fp", None)
+        buf = getattr(fp, "_read_buf", None)
+        pos = getattr(fp, "_read_pos", None)
+        if buf is not None and pos is not None and (len(buf) - pos) > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+        pending = getattr(sock, "pending", None)
+        if callable(pending) and pending() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class _PgetReader:
+    """Chunk reader that lets a stalled transfer still observe cancellation.
+
+    A plain resp.read() parks inside recv until the server sends more, so a
+    cancel could go unnoticed for as long as the server stalled (bounded only
+    by the socket timeout). On Windows neither closing the response nor
+    shutting the socket down wakes that parked read, so instead of trying to
+    interrupt it we never enter it blind: wait for readability in short slices,
+    checking cancellation between them, and only read once data is there.
+
+    Falls back to a plain blocking read whenever the socket handle is
+    unavailable — notably at EOF, where http.client has already closed the
+    connection — so behaviour is never worse than before.
+    """
+
+    def __init__(self, resp, idle_budget):
+        self._resp = resp
+        self._sock = _pget_response_socket(resp)
+        self._idle = 0.0
+        self._budget = idle_budget if idle_budget and idle_budget > 0 else 30.0
+
+    def read(self, size, cancelled):
+        """Up to `size` bytes; b"" at EOF.
+
+        Raises _PgetError("cancelled") as soon as `cancelled()` turns true, and
+        _PgetError("timeout") once the idle budget is exhausted — matching the
+        category a socket timeout produced before.
+        """
+        import select as _select
+        while True:
+            if cancelled():
+                raise _PgetError("cancelled")
+            if self._sock is None:
+                return self._resp.read(size)
+            if not _pget_response_has_buffered(self._resp):
+                try:
+                    ready, _w, _x = _select.select([self._sock], [], [], _PGET_CANCEL_POLL)
+                except Exception:
+                    # Closed or otherwise unusable: degrade to a blocking read.
+                    self._sock = None
+                    continue
+                if not ready:
+                    self._idle += _PGET_CANCEL_POLL
+                    if self._idle >= self._budget:
+                        raise _PgetError("timeout")
+                    continue
+            self._idle = 0.0
+            return self._resp.read1(size)
+
+
 def _pget_safe_int(val, default=0):
     """Parse a finite integer; bool is never a valid generation/limit."""
     if isinstance(val, bool) or val is None:
@@ -3758,11 +3856,11 @@ def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
                 cr_start, cr_end, cr_total = int(m.group(1)), int(m.group(2)), int(m.group(3))
                 if cr_start != start or cr_end != end or cr_total != total_size:
                     raise _PgetError("permanent")
+                reader = _PgetReader(r, timeout)
+                cancelled = lambda: stop.is_set()
                 with open(part_path, "wb") as f:
                     while got < length:
-                        if stop.is_set():
-                            raise _PgetError("cancelled")
-                        chunk = r.read(min(65536, length - got))
+                        chunk = reader.read(min(65536, length - got), cancelled)
                         if not chunk:
                             break
                         f.write(chunk)
@@ -4524,11 +4622,11 @@ def handle_pget_single(req):
                         expected = None
 
                 # wb truncates any pre-existing stale .part (never append).
+                reader = _PgetReader(resp, 30)
+                cancelled = lambda: bool(op.get("cancel_requested") or stop.is_set())
                 with open(part_path, "wb") as f:
                     while True:
-                        if op.get("cancel_requested") or stop.is_set():
-                            raise _PgetError("cancelled")
-                        chunk = resp.read(65536)
+                        chunk = reader.read(65536, cancelled)
                         if not chunk:
                             break
                         f.write(chunk)
