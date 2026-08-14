@@ -136,16 +136,16 @@ let castUiReady = false;
 (function primeLayout() {
   try {
     const raw = localStorage.getItem("mc-layout");
-    const hint = raw ? JSON.parse(raw) : null;
-    if (hint && hint.cast) document.documentElement.classList.add("cast");
-    // Ask for Firefox's maximum popup box synchronously, before first paint.
-    // Firefox grants at most what the window allows; reconcileLayout() then
-    // measures the viewport we actually got and only ever shrinks from here.
-    const requested = McPopupLayout.requested(hint ? !!hint.rail : false);
-    if (requested.rail) {
+    if (!raw) return;
+    const hint = JSON.parse(raw);
+    if (hint.cast) document.documentElement.classList.add("cast");
+    if (hint.rail) {
       document.documentElement.classList.add("rail");
-      document.body.style.width = requested.width + "px";
-      document.body.style.height = requested.height + "px";
+      // Start at a safe narrow width that fits virtually any window; applyLayout then
+      // GROWS it to the measured fit. A Firefox popup grows to its content reliably but
+      // often will NOT shrink after first paint — so we must never start wider than the
+      // window, or the overflow is clipped (taking the Settings button with it).
+      document.documentElement.style.width = "560px";
     }
   } catch (e) {}
 })();
@@ -282,105 +282,37 @@ async function init() {
 // Size the popup to fit the browser window (never wider, or Firefox clips it),
 // show/hide the panel + sections from settings, and cache the result for the next
 // open's synchronous prime.
-// The rail the settings ask for. The viewport we actually get decides only
-// whether the two panes sit side by side or stacked — never whether the rail
-// exists at all.
-let railWanted = false;
-let reconcileScheduled = false;
+async function applyLayout() {
+  const wantRail = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
 
-function minPositive(a, b) {
-  const values = [a, b].filter((value) => Number.isFinite(value) && value > 0);
-  return values.length ? Math.min.apply(null, values) : 0;
-}
+  // A browser-action popup can't exceed the window width — Firefox clips the
+  // overflow rather than shrinking. Measure the real window and size to it; fall
+  // back to the classic single column when there isn't room for two panes.
+  let winW = 0;
+  try { const w = await api.windows.getCurrent(); winW = (w && w.width) || 0; } catch (e) {}
+  const avail = winW ? winW - 44 : 0;        // margin so the popup never touches the window edge
+  const WIDE_MAX = 640, TWO_PANE_MIN = 560;  // 640 fits a narrow window; below MIN → classic column
 
-function measuredViewport() {
-  const visual = typeof visualViewport !== "undefined" ? visualViewport : null;
-  return {
-    width: minPositive(visual ? visual.width : NaN, window.innerWidth),
-    height: minPositive(visual ? visual.height : NaN, window.innerHeight),
-  };
-}
-
-// Last line of defence: if two columns still cross the viewport edge, stack
-// them and keep that mode. Width is never increased after this point.
-function containAfterLayout(viewportWidth) {
-  const root = document.documentElement;
-  const nodes = [
-    document.body,
-    document.querySelector(".main"),
-    document.querySelector(".pane-left"),
-    document.querySelector(".pane-right"),
-    document.getElementById("queue"),
-  ].filter(Boolean);
-  const rects = nodes.map((node) => node.getBoundingClientRect());
-  if (McPopupLayout.geometryContained(viewportWidth, rects, root.scrollWidth)) return;
-  if (root.classList.contains("rail-stacked")) return;
-  root.classList.add("rail-stacked");
-}
-
-function reconcileLayout() {
-  const view = measuredViewport();
-  const result = McPopupLayout.reconcile({
-    wantRail: railWanted,
-    viewportWidth: view.width,
-    viewportHeight: view.height,
-  });
-  const root = document.documentElement;
-  if (!result.rail) {
-    root.classList.remove("rail-stacked");
-    document.body.style.width = "";
-    document.body.style.height = "";
-    return;
+  let railOn = false, width = 0;
+  if (wantRail) {
+    if (avail >= TWO_PANE_MIN) { railOn = true; width = Math.min(WIDE_MAX, avail); }
+    else if (!winW) { railOn = true; width = 560; }  // window API unavailable → safe narrow width
+    // else: window too narrow for two panes → classic single column, nothing clips
   }
-  document.body.style.width = result.width + "px";
-  document.body.style.height = result.height + "px";
-  root.classList.toggle("rail-stacked", result.stacked);
-  containAfterLayout(result.width);
-}
-
-function scheduleLayoutReconcile() {
-  if (reconcileScheduled) return;
-  reconcileScheduled = true;
-  const run = () => { reconcileScheduled = false; reconcileLayout(); };
-  if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
-  else setTimeout(run, 0);
-}
-
-if (typeof visualViewport !== "undefined" && visualViewport &&
-    typeof visualViewport.addEventListener === "function") {
-  visualViewport.addEventListener("resize", scheduleLayoutReconcile);
-}
-window.addEventListener("resize", scheduleLayoutReconcile);
-
-function applyLayout() {
-  railWanted = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
-  const requested = McPopupLayout.requested(railWanted);
 
   // Casting is only offered when the panel is visible — a session started with
   // the rail hidden would have no transport (no pause/stop) anywhere in the UI.
-  castUiReady = requested.rail && !!uiSettings.enableCasting;
-  document.documentElement.classList.toggle("rail", requested.rail);
-  if (requested.rail) {
-    document.body.style.width = requested.width + "px";
-    document.body.style.height = requested.height + "px";
-  } else {
-    document.documentElement.classList.remove("rail-stacked");
-    document.body.style.width = "";
-    document.body.style.height = "";
-  }
+  castUiReady = railOn && !!uiSettings.enableCasting;
+  document.documentElement.classList.toggle("rail", railOn);
+  document.documentElement.style.width = railOn ? width + "px" : "";  // "" → CSS classic 420
   document.documentElement.classList.toggle("cast", castUiReady);
   showEl(castTitleEl, castUiReady);
   showEl(castSlotEl, castUiReady);
   showEl(queueTitleEl, uiSettings.showQueue);
   showEl(queueEl, uiSettings.showQueue);
-  try {
-    localStorage.setItem("mc-layout", JSON.stringify({
-      rail: requested.rail, w: requested.width, cast: castUiReady,
-    }));
-  } catch (e) {}
+  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, w: width, cast: castUiReady })); } catch (e) {}
   if (castUiReady) renderCastSlot();
   renderQueue();
-  scheduleLayoutReconcile();
 }
 
 let helperStatus = { state: "disconnected" };
