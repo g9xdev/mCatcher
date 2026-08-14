@@ -26,8 +26,24 @@ import os
 import re
 import zipfile
 
+
+def _ship_set():
+    """Import lazily and by module name so the pure functions above stay
+    importable on their own, and so the sibling resolves whether this package
+    is imported as `devtools.install_dev` or run from inside `devtools/`."""
+    try:
+        import ship_set as module
+    except ImportError:  # imported as part of a package
+        import os as _os
+        import sys as _sys
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import ship_set as module
+    return module
+
+
 __all__ = [
     "sha256_bytes", "hash_file", "expand_ship_set", "hash_tree", "hash_files",
+    "hash_mapping", "hash_host_ship_set", "hash_extension_ship_set",
     "hash_extension_sources", "hash_host_sources",
     "find_dev_profile",
     "build_xpi_bytes", "write_xpi",
@@ -54,8 +70,11 @@ __all__ = [
 # single decision point rather than being baked into the hasher.
 # ---------------------------------------------------------------------------
 
-HOST_SHIP_SET = ("mc_host.py", "mchost/**")
-EXTENSION_SHIP_SET = ("**",)
+# Generic defaults for the tree hasher below. These are NOT the ship set --
+# `ship_set.py` is, deriving the host set from the installer's own [Files]
+# declaration and the extension set from an explicit exclusion list.
+_DEFAULT_HOST_PATTERNS = ("mc_host.py", "mchost/**")
+_DEFAULT_EXTENSION_PATTERNS = ("**",)
 DEFAULT_EXCLUDES = ("**/__pycache__/**", "**/*.pyc", "**/.DS_Store", "**/Thumbs.db")
 
 # Domain separator: a digest of this tree is never mistakable for a digest of
@@ -182,19 +201,50 @@ def _hash_sources(root, ship_set, excludes):
 def hash_extension_sources(extension_dir, ship_set=None, excludes=None):
     """Digest `media-catcher/`. Returns {"sha256": ..., "files": {rel: sha}}."""
     return _hash_sources(extension_dir,
-                         EXTENSION_SHIP_SET if ship_set is None else ship_set,
+                         _DEFAULT_EXTENSION_PATTERNS if ship_set is None else ship_set,
                          excludes)
 
 
 def hash_host_sources(host_dir, ship_set=None, excludes=None):
     """Digest the host's SHIPPED files under `media-catcher-host/`.
 
-    Defaults to the runtime set (`mc_host.py` + `mchost/**`), not every .py in
-    the directory — see the ship-set note above.
+    Generic over an explicit pattern set. For the real shipped set use
+    `hash_host_ship_set()`, which reads the installer's declaration.
     """
     return _hash_sources(host_dir,
-                         HOST_SHIP_SET if ship_set is None else ship_set,
+                         _DEFAULT_HOST_PATTERNS if ship_set is None else ship_set,
                          excludes)
+
+
+def hash_mapping(mapping):
+    """Digest a {installed relative path: source path} ship set.
+
+    Keyed by where each file LANDS, not where it comes from, so an entry like
+    bootstrap.ps1 -- declared in installer/ but installed at {app}/ -- compares
+    correctly against the install directory.
+    """
+    digest = hashlib.sha256()
+    digest.update(_TREE_DOMAIN)
+    for rel in sorted(mapping):
+        encoded = rel.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        with open(mapping[rel], "rb") as handle:
+            data = handle.read()
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return {"sha256": digest.hexdigest(),
+            "files": {rel: hash_file(mapping[rel]) for rel in sorted(mapping)}}
+
+
+def hash_host_ship_set(repo_root="."):
+    """Digest exactly what the installer declares it ships."""
+    return hash_mapping(_ship_set().host_ship_set(repo_root))
+
+
+def hash_extension_ship_set(repo_root="."):
+    """Digest the extension package contents, tests and editor config excluded."""
+    return hash_mapping(_ship_set().extension_ship_set(repo_root))
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +406,7 @@ def build_xpi_bytes(source_dir, ship_set=None, excludes=None,
     under %LOCALAPPDATA%) ever compares.
     """
     relpaths = expand_ship_set(
-        source_dir, EXTENSION_SHIP_SET if ship_set is None else ship_set, excludes)
+        source_dir, _DEFAULT_EXTENSION_PATTERNS if ship_set is None else ship_set, excludes)
     if require_root_manifest and "manifest.json" not in relpaths:
         raise ValueError(
             "manifest.json must sit at the root of %r; got %d entries"
@@ -520,7 +570,7 @@ def _verdict(component, current, receipt):
         installed = now.get("installedXpiSha256")
         if not installed:
             return Verdict(MISSING, "no installed xpi")
-        if now.get("sourceSha256") != then.get("sourceSha256"):
+        if now.get("shipSetSha256") != then.get("shipSetSha256"):
             return Verdict(STALE, "extension sources changed since the last install")
         if installed != then.get("xpiSha256"):
             return Verdict(STALE, "the installed xpi no longer matches the receipt")
@@ -530,7 +580,7 @@ def _verdict(component, current, receipt):
     if installed_files is None:
         return Verdict(MISSING, "host is not installed")
     source_files = now.get("files") or {}
-    if now.get("sourceSha256") != then.get("sourceSha256"):
+    if now.get("shipSetSha256") != then.get("shipSetSha256"):
         return Verdict(STALE, "host sources changed since the last install",
                        _diff_files(source_files, then.get("files") or {}))
     changed = _diff_files(source_files, installed_files)
@@ -545,8 +595,8 @@ def diff(current, receipt):
     `current` is the freshly resolved state:
 
         {"targets":   {extensionId, devProfile, xpiPath, hostDir},
-         "extension": {"sourceSha256": ..., "installedXpiSha256": ... | None},
-         "host":      {"sourceSha256": ..., "files": {rel: sha},
+         "extension": {"shipSetSha256": ..., "installedXpiSha256": ... | None},
+         "host":      {"shipSetSha256": ..., "files": {rel: sha},
                        "installedFiles": {rel: sha} | None}}
 
     A None `installedXpiSha256` / `installedFiles` means "nothing is installed".

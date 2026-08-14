@@ -460,8 +460,8 @@ HOST_FILES = {"mc_host.py": "aa" * 32, "mchost/downloads.py": "bb" * 32}
 def a_receipt(**over):
     receipt = install_dev.make_receipt(
         targets=dict(TARGETS),
-        extension={"version": "1.10.0", "sourceSha256": "e" * 64, "xpiSha256": "x" * 64},
-        host={"sourceSha256": "h" * 64, "files": dict(HOST_FILES)},
+        extension={"version": "1.10.0", "shipSetSha256": "e" * 64, "xpiSha256": "x" * 64},
+        host={"shipSetSha256": "h" * 64, "files": dict(HOST_FILES)},
         commit="069cb55", dirty=True, installed_at="2026-08-14T10:52:00Z")
     receipt.update(over)
     return receipt
@@ -470,8 +470,8 @@ def a_receipt(**over):
 def a_current(**over):
     current = {
         "targets": dict(TARGETS),
-        "extension": {"sourceSha256": "e" * 64, "installedXpiSha256": "x" * 64},
-        "host": {"sourceSha256": "h" * 64, "files": dict(HOST_FILES),
+        "extension": {"shipSetSha256": "e" * 64, "installedXpiSha256": "x" * 64},
+        "host": {"shipSetSha256": "h" * 64, "files": dict(HOST_FILES),
                  "installedFiles": dict(HOST_FILES)},
     }
     for key, value in over.items():
@@ -521,8 +521,8 @@ def test_an_unknown_schema_reports_missing_rather_than_trusting_it():
 
 def test_changed_sources_report_stale():
     verdicts = install_dev.diff(
-        a_current(extension={"sourceSha256": "f" * 64},
-                  host={"sourceSha256": "g" * 64}),
+        a_current(extension={"shipSetSha256": "f" * 64},
+                  host={"shipSetSha256": "g" * 64}),
         a_receipt())
     assert verdicts["extension"].status == install_dev.STALE
     assert verdicts["host"].status == install_dev.STALE
@@ -585,7 +585,7 @@ def test_an_install_changed_behind_our_back_reports_stale():
 
 
 def test_a_module_present_in_source_but_absent_from_the_install_is_stale():
-    """A file the .iss forgot to ship shows up here, not at runtime."""
+    """A per-file map identifies which module changed, not just that one did."""
     short = {"mc_host.py": HOST_FILES["mc_host.py"]}
     verdicts = install_dev.diff(a_current(host={"installedFiles": short}), a_receipt())
     assert verdicts["host"].status == install_dev.STALE
@@ -595,7 +595,7 @@ def test_a_module_present_in_source_but_absent_from_the_install_is_stale():
 def test_a_stale_host_names_the_changed_module():
     changed_source = dict(HOST_FILES, **{"mchost/downloads.py": "dd" * 32})
     verdicts = install_dev.diff(
-        a_current(host={"sourceSha256": "g" * 64, "files": changed_source,
+        a_current(host={"shipSetSha256": "g" * 64, "files": changed_source,
                         "installedFiles": dict(HOST_FILES)}),
         a_receipt())
     assert verdicts["host"].status == install_dev.STALE
@@ -611,7 +611,7 @@ def test_a_current_extension_never_masks_a_stale_host():
     """
     changed_source = dict(HOST_FILES, **{"mchost/downloads.py": "dd" * 32})
     verdicts = install_dev.diff(
-        a_current(host={"sourceSha256": "g" * 64, "files": changed_source,
+        a_current(host={"shipSetSha256": "g" * 64, "files": changed_source,
                         "installedFiles": dict(HOST_FILES)}),
         a_receipt())
 
@@ -630,13 +630,13 @@ def test_versions_are_never_consulted_for_freshness():
     receipt["extension"]["version"] = "9.9.9"
     assert install_dev.diff(a_current(), receipt)["extension"].status == install_dev.IN_SYNC
 
-    verdicts = install_dev.diff(a_current(extension={"sourceSha256": "f" * 64}), a_receipt())
+    verdicts = install_dev.diff(a_current(extension={"shipSetSha256": "f" * 64}), a_receipt())
     assert verdicts["extension"].status == install_dev.STALE
 
 
 def test_needs_install_lists_both_components_when_both_are_stale():
     verdicts = install_dev.diff(
-        a_current(extension={"sourceSha256": "f" * 64}, host={"sourceSha256": "g" * 64}),
+        a_current(extension={"shipSetSha256": "f" * 64}, host={"shipSetSha256": "g" * 64}),
         a_receipt())
     assert install_dev.needs_install(verdicts) == ["extension", "host"]
 
@@ -714,3 +714,56 @@ def test_empty_path_entries_never_produce_a_bare_relative_candidate():
 
     install_dev.find_iscc(env=env, exists=record)
     assert seen == [os.path.join(r"C:\Tools\Inno", install_dev.ISCC_NAME)]
+
+
+# ---------------------------------------------------------------------------
+# Ship-set driven digests: keyed by where files LAND, from the real authority
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_host_ship_set_digest_covers_the_installer_declaration():
+    result = install_dev.hash_host_ship_set(REPO_ROOT)
+    files = result["files"]
+    # guardian.ps1 and bootstrap.ps1 are shipped but were absent from the
+    # earlier source-derived set; downloads.py is the file that went stale.
+    for rel in ["mc_host.py", "guardian.ps1", "bootstrap.ps1", "mchost/downloads.py"]:
+        assert rel in files, rel
+    assert len(result["sha256"]) == 64
+
+
+def test_host_digest_is_keyed_by_install_location_not_source_location():
+    """bootstrap.ps1 is declared in installer/ but installs at {app}/."""
+    files = install_dev.hash_host_ship_set(REPO_ROOT)["files"]
+    assert "bootstrap.ps1" in files
+    assert "installer/bootstrap.ps1" not in files
+
+
+def test_extension_ship_set_digest_ignores_tests_and_editor_config():
+    files = install_dev.hash_extension_ship_set(REPO_ROOT)["files"]
+    assert "manifest.json" in files
+    assert not any(r.startswith("tests/") for r in files)
+    assert not any(r.startswith(".vscode/") for r in files)
+
+
+def test_a_changed_shipped_file_changes_the_host_digest(tmp_path):
+    mapping = {"a.py": str(tmp_path / "a.py"), "b/c.py": str(tmp_path / "c.py")}
+    (tmp_path / "a.py").write_text("one", encoding="utf-8")
+    (tmp_path / "c.py").write_text("two", encoding="utf-8")
+    before = install_dev.hash_mapping(mapping)
+    (tmp_path / "c.py").write_text("changed", encoding="utf-8")
+    after = install_dev.hash_mapping(mapping)
+    assert after["sha256"] != before["sha256"]
+    assert after["files"]["a.py"] == before["files"]["a.py"]
+    assert after["files"]["b/c.py"] != before["files"]["b/c.py"]
+
+
+def test_mapping_digest_is_independent_of_where_sources_live(tmp_path):
+    """Same landing paths and contents from different roots digest alike."""
+    one, two = tmp_path / "one", tmp_path / "two"
+    one.mkdir(); two.mkdir()
+    (one / "x").write_text("same", encoding="utf-8")
+    (two / "x").write_text("same", encoding="utf-8")
+    assert install_dev.hash_mapping({"mc_host.py": str(one / "x")})["sha256"] == \
+        install_dev.hash_mapping({"mc_host.py": str(two / "x")})["sha256"]
