@@ -102,6 +102,19 @@ files still match those hashes. Both halves are required: the first catches
 "nothing changed", the second catches "something changed the install behind our
 back".
 
+### Per-component independence
+
+The extension and the native host are tracked, reported, and updated
+**independently**. Each resolves to one of `in-sync`, `stale`, `missing`, or
+`target-moved`, and `--check` always reports both — never a single combined
+verdict, which would let a fresh extension mask a stale host (the 2026-08-14
+failure had exactly that shape: the extension was current, the host was not).
+
+`--install` rebuilds and reinstalls only the components that are not `in-sync`,
+and reports the state of both when it finishes. Firefox Developer Edition is
+closed only when at least one component actually needs installing, so a no-op
+run never disturbs a running browser.
+
 Installing from a dirty worktree is allowed — it is the common case when trying
 a change in the real app — and the receipt records `dirty: true` alongside the
 commit SHA, so what is installed is always knowable.
@@ -174,18 +187,30 @@ directory — but the failure is reported with the offending file list.
 ## Interface
 
 ```
-python devtools/install_dev.py --check     # read-only; report drift and staleness
-python devtools/install_dev.py --install   # full deterministic update
+python devtools/install_dev.py --check     # read-only; per-component verdicts
+python devtools/install_dev.py --install   # update whichever components are stale
 python devtools/install_dev.py --install --launch
 python devtools/install_dev.py --check --json
+```
+
+`--check` example output:
+
+```
+extension  in-sync   1.10.0  source c4f1…  installed c4f1…
+host       STALE             source 9ab7…  installed 2d10…
+                             mchost/downloads.py differs
+=> 1 component needs installing; run with --install
 ```
 
 Flags: `--json` machine-readable output · `--launch` relaunch Dev Edition after
 installing · `--adopt` permit installing into a profile that does not already
 carry the extension.
 
-Exit codes: `0` in sync or installed · `1` blocked, drifted, or verification
-failed · `2` usage error.
+Exit codes: `0` every component in sync (or successfully installed) · `1` at
+least one component stale, drifted, or failed verification · `2` usage error.
+
+`--check` returning `1` is the scriptable signal that an install is needed; it
+is not an error condition.
 
 ---
 
@@ -213,6 +238,9 @@ dependencies:
 - `profiles.ini` parsing, including multiple installs and missing dev-edition
 - receipt diffing: unchanged, stale, and target-moved
 - deterministic zip: identical sources produce byte-identical archives
+- per-component verdicts, including the case that motivated them: extension
+  `in-sync` while host is `stale` must report stale and exit non-zero, and must
+  install the host without reinstalling the extension
 
 The destructive operations — process enumeration and termination, file copy,
 `ISCC` and installer invocation — sit behind injectable adapters so they are
