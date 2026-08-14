@@ -107,7 +107,7 @@ function createHarness(fixtures) {
       search() { return Promise.resolve([]); }, open() {}, show() {},
     },
     tabs: {
-      onRemoved: noopEvent(), onUpdated: noopEvent(), query() { return Promise.resolve([]); },
+      onActivated: noopEvent(), onRemoved: noopEvent(), onUpdated: noopEvent(), query() { return Promise.resolve([]); },
       create() { return Promise.resolve(); }, update() { return Promise.resolve(); },
       executeScript() { return Promise.resolve(); },
     },
@@ -116,7 +116,7 @@ function createHarness(fixtures) {
       onHeadersReceived: headersReceived,
       onBeforeSendHeaders: noopEvent(),
     },
-    browserAction: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    browserAction: { onClicked: noopEvent(), setBadgeText() {}, setBadgeBackgroundColor() {} },
     contextMenus: { onClicked: noopEvent(), removeAll(callback) { if (callback) callback(); }, create() {} },
     notifications: { onClicked: noopEvent(), onClosed: noopEvent(), create() {}, clear() {} },
   };

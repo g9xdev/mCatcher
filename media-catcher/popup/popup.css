@@ -33,12 +33,11 @@
   padding: 0;
 }
 
-/* Width is the one thing the side panel changes: classic single column by
-   default, a wide two-pane window when <html> carries .rail. popup.js sets the
-   exact rail width inline to fit the browser window (Firefox clips a popup wider
-   than its window); this 660px is only a safety fallback if that JS never runs. */
-html { width: 420px; }
-html.rail { width: 560px; }
+/* The UI is an extension window, so it fills whatever the window gives it.
+   It used to be a browser-action popup, which sizes itself from its content --
+   Firefox then clipped the rail, and making the width `auto` collapsed the
+   whole thing to a sliver. The window owns the size; CSS just fills it. */
+html { width: 100%; height: 100%; }
 
 html,
 body {
@@ -49,7 +48,7 @@ body {
   font-size: 14px;
 }
 
-body { width: 100%; }
+body { width: 100%; min-height: 100%; display: flex; flex-direction: column; }
 
 body {
   position: relative;
@@ -941,7 +940,8 @@ html.cast .bar-sep { display: inline-block; }
 html.rail .main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 240px;
-  height: 408px;                 /* keeps the popup under Firefox's ~600px ceiling */
+  flex: 1;
+  min-height: 0;                 /* fills the window rather than a fixed height */
 }
 html.rail .pane-left { display: flex; flex-direction: column; }
 html.rail .pane-right {
@@ -951,6 +951,17 @@ html.rail .pane-right {
   background: rgba(0, 0, 0, 0.10);
 }
 html.rail .list { max-height: none; flex: 1; min-height: 0; padding-top: 10px; }
+
+html.rail .main,
+html.rail .pane-left,
+html.rail .pane-right,
+html.rail .rail-scroll,
+html.rail #queue,
+html.rail .rail-card {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
 
 /* Section headers inside each pane. */
 html.rail .pane-title {

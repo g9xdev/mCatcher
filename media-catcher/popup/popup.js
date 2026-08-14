@@ -139,14 +139,10 @@ let castUiReady = false;
     if (!raw) return;
     const hint = JSON.parse(raw);
     if (hint.cast) document.documentElement.classList.add("cast");
-    if (hint.rail) {
-      document.documentElement.classList.add("rail");
-      // Start at a safe narrow width that fits virtually any window; applyLayout then
-      // GROWS it to the measured fit. A Firefox popup grows to its content reliably but
-      // often will NOT shrink after first paint — so we must never start wider than the
-      // window, or the overflow is clipped (taking the Settings button with it).
-      document.documentElement.style.width = "560px";
-    }
+    // Only the mode is primed. This document is an extension window now, so
+    // the window owns the size and CSS fills it; imposing a pixel width here
+    // is what produced a clipped rail (and, when made `auto`, a collapsed one).
+    if (hint.rail) document.documentElement.classList.add("rail");
   } catch (e) {}
 })();
 
@@ -266,16 +262,31 @@ function send(msg) {
   });
 }
 
+// This document runs as an extension window, so `currentWindow` is the window
+// itself and would match no browsing tab. Ask the background, which tracks the
+// active browsing tab, and only fall back to a direct query.
+async function resolveActiveTab() {
+  const answer = await send({ type: "get-active-tab" });
+  if (answer && answer.ok && Number.isInteger(answer.tabId)) {
+    return { id: answer.tabId, title: answer.title || "" };
+  }
+  try {
+    const tabs = await api.tabs.query({ active: true, currentWindow: true });
+    if (tabs.length) return { id: tabs[0].id, title: tabs[0].title || "" };
+  } catch (e) {}
+  return null;
+}
+
 async function init() {
-  const [tabs, sresp] = await Promise.all([
-    api.tabs.query({ active: true, currentWindow: true }),
+  const [tab, sresp] = await Promise.all([
+    resolveActiveTab(),
     send({ type: "get-settings" }),
   ]);
   if (sresp && sresp.settings) uiSettings = Object.assign(uiSettings, sresp.settings);
   await applyLayout();
-  if (!tabs.length) return;
-  currentTabId = tabs[0].id;
-  pageTitle = tabs[0].title || "";
+  if (!tab) return;
+  currentTabId = tab.id;
+  pageTitle = tab.title || "";
   await refresh();
 }
 
@@ -285,32 +296,23 @@ async function init() {
 async function applyLayout() {
   const wantRail = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
 
-  // A browser-action popup can't exceed the window width — Firefox clips the
-  // overflow rather than shrinking. Measure the real window and size to it; fall
-  // back to the classic single column when there isn't room for two panes.
-  let winW = 0;
-  try { const w = await api.windows.getCurrent(); winW = (w && w.width) || 0; } catch (e) {}
-  const avail = winW ? winW - 44 : 0;        // margin so the popup never touches the window edge
-  const WIDE_MAX = 640, TWO_PANE_MIN = 560;  // 640 fits a narrow window; below MIN → classic column
-
-  let railOn = false, width = 0;
-  if (wantRail) {
-    if (avail >= TWO_PANE_MIN) { railOn = true; width = Math.min(WIDE_MAX, avail); }
-    else if (!winW) { railOn = true; width = 560; }  // window API unavailable → safe narrow width
-    // else: window too narrow for two panes → classic single column, nothing clips
-  }
+  // This document is an extension window. The window supplies a real viewport,
+  // so CSS fills it and nothing here imposes a width — the previous measure-
+  // and-set logic existed only because a browser-action popup sizes itself from
+  // its content, which is what clipped the rail.
+  const railOn = wantRail;
 
   // Casting is only offered when the panel is visible — a session started with
   // the rail hidden would have no transport (no pause/stop) anywhere in the UI.
   castUiReady = railOn && !!uiSettings.enableCasting;
   document.documentElement.classList.toggle("rail", railOn);
-  document.documentElement.style.width = railOn ? width + "px" : "";  // "" → CSS classic 420
+  document.documentElement.style.width = "";
   document.documentElement.classList.toggle("cast", castUiReady);
   showEl(castTitleEl, castUiReady);
   showEl(castSlotEl, castUiReady);
   showEl(queueTitleEl, uiSettings.showQueue);
   showEl(queueEl, uiSettings.showQueue);
-  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, w: width, cast: castUiReady })); } catch (e) {}
+  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, cast: castUiReady })); } catch (e) {}
   if (castUiReady) renderCastSlot();
   renderQueue();
 }

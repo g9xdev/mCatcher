@@ -2551,6 +2551,71 @@ async function runLiveControllerAction(sender, action) {
   }
 }
 
+// The main UI is an extension window, not a browser-action popup. A popup
+// derives its size from its content and Firefox clips it, which left the
+// Downloads rail cut off; a window has a real viewport, is resizable, and
+// cannot clip. Same ownership pattern as the Save As window below.
+let mainWindowId = null;
+
+// A browser-action popup could ask for {active:true, currentWindow:true}; an
+// extension window IS the current window, so it would find no tabs. The
+// background tracks the browsing tab instead and the page asks for it.
+let lastActiveTabId = null;
+
+function noteActiveTab(tabId) {
+  if (Number.isInteger(tabId) && tabId >= 0) lastActiveTabId = tabId;
+}
+
+api.tabs.onActivated.addListener((info) => { noteActiveTab(info && info.tabId); });
+
+async function resolveActiveTab() {
+  // Prefer the remembered browsing tab; fall back to querying, ignoring any
+  // tab that belongs to one of our own extension windows.
+  try {
+    if (Number.isInteger(lastActiveTabId)) {
+      const tab = await api.tabs.get(lastActiveTabId);
+      if (tab && tab.windowId !== mainWindowId) return tab;
+    }
+  } catch (e) { lastActiveTabId = null; }
+  try {
+    const tabs = await api.tabs.query({ active: true });
+    const usable = tabs.filter((tab) => tab && tab.windowId !== mainWindowId);
+    if (usable.length) {
+      noteActiveTab(usable[usable.length - 1].id);
+      return usable[usable.length - 1];
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function openMainWindow() {
+  if (!api.windows || typeof api.windows.create !== "function") return;
+  if (mainWindowId !== null) {
+    try {
+      await api.windows.update(mainWindowId, { focused: true });
+      return;
+    } catch (e) {
+      mainWindowId = null;
+    }
+  }
+  await settingsReady;
+  // Two panes need room; a single column does not.
+  const wantRail = !!settings.showRail && (!!settings.showQueue || !!settings.enableCasting);
+  try {
+    const created = await api.windows.create({
+      url: api.runtime.getURL("popup/popup.html"),
+      type: "popup",
+      width: wantRail ? 860 : 470,
+      height: 680,
+    });
+    if (created && Number.isInteger(created.id)) mainWindowId = created.id;
+  } catch (e) {
+    dlog("main window failed", e && e.message);
+  }
+}
+
+api.browserAction.onClicked.addListener(() => { openMainWindow(); });
+
 // One Save As window per media/variant. Repeat clicks focus the live one.
 const saveAsWindows = new Map();
 
@@ -2560,6 +2625,7 @@ function saveAsWindowKey(tabId, mediaId, variantId) {
 
 if (api.windows && api.windows.onRemoved) {
   api.windows.onRemoved.addListener((windowId) => {
+    if (windowId === mainWindowId) mainWindowId = null;
     for (const [key, id] of saveAsWindows) {
       if (id === windowId) saveAsWindows.delete(key);
     }
@@ -2766,6 +2832,13 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await downloadDirect(item, tabId, filename);
           sendResponse({ ok: true });
         }
+      } else if (msg.type === "get-active-tab") {
+        // The main UI runs in an extension window, where a currentWindow query
+        // would resolve to itself. Answer with the browsing tab instead.
+        const tab = await resolveActiveTab();
+        sendResponse(tab
+          ? { ok: true, tabId: tab.id, title: tab.title || "", url: tab.url || "" }
+          : { ok: false });
       } else if (msg.type === "open-save-as") {
         await settingsReady;
         const mediaId = readOwnActionId({ id: msg.mediaId });

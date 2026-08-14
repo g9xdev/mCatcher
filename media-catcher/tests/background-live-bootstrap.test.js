@@ -116,7 +116,7 @@ function createHarness() {
       show() {},
     },
     tabs: {
-      onRemoved: noOpEvent(),
+      onActivated: noOpEvent(), onRemoved: noOpEvent(),
       onUpdated: noOpEvent(),
       query() { return Promise.resolve([]); },
       create() { return Promise.resolve(); },
@@ -128,7 +128,7 @@ function createHarness() {
       onHeadersReceived: noOpEvent(),
       onBeforeSendHeaders: noOpEvent(),
     },
-    browserAction: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    browserAction: { onClicked: noOpEvent(), setBadgeText() {}, setBadgeBackgroundColor() {} },
     contextMenus: {
       onClicked: noOpEvent(),
       removeAll(callback) { if (callback) callback(); },

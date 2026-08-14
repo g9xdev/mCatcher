@@ -38,6 +38,8 @@ function createHarness() {
   const createdWindows = [];
   const focusedWindows = [];
   const windowsRemoved = event();
+  const actionClicked = event();
+  const activeTabs = [];
   let pendingVariants = [];
   let mediaSeq = 0;
   let windowSeq = 0;
@@ -144,7 +146,9 @@ function createHarness() {
       search() { return Promise.resolve([]); }, open() {}, show() {},
     },
     tabs: {
-      onRemoved: noopEvent(), onUpdated: noopEvent(), query() { return Promise.resolve([]); },
+      onActivated: noopEvent(), onRemoved: noopEvent(), onUpdated: noopEvent(),
+      query() { return Promise.resolve(activeTabs.slice()); },
+      get(id) { const t = activeTabs.find((x) => x.id === id); return t ? Promise.resolve(t) : Promise.reject(new Error('no tab')); },
       create() { return Promise.resolve(); }, update() { return Promise.resolve(); }, executeScript() { return Promise.resolve(); },
     },
     windows: {
@@ -163,7 +167,7 @@ function createHarness() {
       },
     },
     webRequest: { onSendHeaders: noopEvent(), onHeadersReceived: noopEvent(), onBeforeSendHeaders: noopEvent() },
-    browserAction: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    browserAction: { onClicked: actionClicked, setBadgeText() {}, setBadgeBackgroundColor() {} },
     contextMenus: { onClicked: noopEvent(), removeAll(callback) { if (callback) callback(); }, create() {} },
     notifications: { onClicked: noopEvent(), onClosed: noopEvent(), create() {}, clear() {} },
   };
@@ -233,7 +237,7 @@ function createHarness() {
   return {
     send, calls, nativePosts, browserDownloads, fetches, storedSettings,
     captureMedia, saveAsSender, createdWindows, focusedWindows, windowsRemoved,
-    nativeMessages, nativeDisconnect, advanceTimers,
+    nativeMessages, nativeDisconnect, advanceTimers, actionClicked, activeTabs,
     popupSender: { id: browser.runtime.id, url: browser.runtime.getURL("popup/popup.html") },
   };
 }
@@ -753,4 +757,59 @@ test("the picker request carries a correlating id and the requested directory", 
 
   h.nativeMessages.emit({ type: "folder", requestId: post.requestId, status: "cancelled" });
   await pending;
+});
+
+
+// ---------------------------------------------------------------------------
+// Toolbar opens the main UI as a window, not a browser-action popup
+// ---------------------------------------------------------------------------
+
+test("clicking the toolbar opens exactly one main window and refocuses it", async () => {
+  const h = createHarness();
+  await settle();
+
+  h.actionClicked.emit({ id: 1 });
+  await settle(); await settle();
+  assert.equal(h.createdWindows.length, 1);
+  const opened = h.createdWindows[0].options;
+  assert.equal(opened.type, "popup");
+  assert.ok(opened.url.endsWith("popup/popup.html"), opened.url);
+  assert.ok(opened.width >= 460, "a window must be wide enough not to clip the rail");
+
+  h.actionClicked.emit({ id: 1 });
+  await settle(); await settle();
+  assert.equal(h.createdWindows.length, 1, "a second click focuses rather than duplicating");
+  assert.deepEqual(h.focusedWindows.at(-1).options, { focused: true });
+
+  h.windowsRemoved.emit(h.createdWindows[0].id);
+  h.actionClicked.emit({ id: 1 });
+  await settle(); await settle();
+  assert.equal(h.createdWindows.length, 2, "after closing, a click opens a fresh window");
+});
+
+test("the main window url carries no query or identity", async () => {
+  const h = createHarness();
+  await settle();
+  h.actionClicked.emit({ id: 1 });
+  await settle(); await settle();
+  const url = new URL(h.createdWindows[0].options.url);
+  assert.equal(url.search, "", "the main UI resolves its tab from the background");
+});
+
+test("get-active-tab answers with the browsing tab, never the extension window", async () => {
+  const h = createHarness();
+  await settle();
+  h.activeTabs.push({ id: 7, windowId: 100, title: "Watch", url: "https://site.example/watch" });
+  const answer = await h.send({ type: "get-active-tab" }, h.popupSender);
+  assert.equal(answer.ok, true);
+  assert.equal(answer.tabId, 7);
+  assert.equal(answer.title, "Watch");
+});
+
+test("get-active-tab reports failure rather than guessing when no tab is available", async () => {
+  const h = createHarness();
+  await settle();
+  const answer = await h.send({ type: "get-active-tab" }, h.popupSender);
+  assert.equal(answer.ok, false);
+  assert.equal(answer.tabId, undefined);
 });
