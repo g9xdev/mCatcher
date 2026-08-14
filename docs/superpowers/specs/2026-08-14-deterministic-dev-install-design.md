@@ -23,20 +23,36 @@ Two properties made it invisible:
 - **Nothing compared installed bytes to source bytes.** The only evidence was a
   file timestamp, which is easy to misread and easy to ignore.
 
-A second, related hazard exists independently: the Inno `.iss` carries its own
-file manifest. A new module added under `mchost/` but not added to the `.iss`
-ships broken while working perfectly in any workflow that copies from the
-working tree.
+What is **not** a cause, despite an early draft of this spec claiming it was:
+the `.iss` does not carry a hand-maintained file list. It recurses
+(`Source: "{#HostSrc}mchost\*" … recursesubdirs createallsubdirs`), so a new
+module ships automatically. The failure was a stale `setup.exe`, and forbidding
+a working-tree copy would not have prevented it.
 
 ## Non-goals
 
 - Replacing the end-user installer or `bootstrap.ps1`.
-- Provisioning dependencies (Python, ffmpeg, Inno Setup). Those are already
-  present on the developer machine; the script fails with a clear message
-  rather than installing anything.
 - Removing PowerShell from the project. That is a separate project (see
   *Future work*).
-- Managing Firefox release channel installs. Only Developer Edition is touched.
+- Managing Firefox release channel installs. Only Developer Edition's profile
+  is written.
+
+### Accepted consequences, not non-goals
+
+An earlier draft claimed this script provisions nothing and touches nothing
+shared. Both were false, because the only supported host path runs the real
+installer:
+
+- `setup.exe` runs `bootstrap.ps1`, which may `winget install` Python and fetch
+  ffmpeg, and which rewrites the single shared
+  `HKCU\…\NativeMessagingHosts\com.mediacatcher.host` key used by every Firefox
+  channel on the machine.
+- Inno may prompt about, or close, applications holding target files.
+
+These are accepted because using the real installer is the point. They are
+recorded here so the spec does not claim a containment it does not have. The
+script does not itself install dependencies, and fails with a clear message
+when Inno Setup is missing.
 
 ---
 
@@ -69,9 +85,45 @@ pinned into the receipt.
 | Target | Derived from |
 |---|---|
 | Extension ID | `media-catcher/manifest.json` → `browser_specific_settings.gecko.id` |
-| Dev profile | `%APPDATA%\Mozilla\Firefox\profiles.ini` → profile named `dev-edition-default` |
+| Dev profile | `%APPDATA%\Mozilla\Firefox\profiles.ini` — see precedence below |
 | XPI path | `<profile>\extensions\<extension-id>.xpi` |
 | Host install dir | `HKCU\Software\Mozilla\NativeMessagingHosts\com.mediacatcher.host` → manifest `path` → dirname |
+
+### Dev profile precedence
+
+`Name=dev-edition-default` is **not** reliably the profile Developer Edition
+actually opened. `media-catcher-host/mchost/variant.py` already documents the
+correct rule: *"Prefer an `[InstallXXChecksum]` Default (the profile the
+last-used install opened)."* Precedence:
+
+1. an explicitly supplied install key
+2. an `[Install<hash>]` section's `Default=`, **accepted only when it resolves
+   to a dev-edition profile**
+3. a `[Profile N]` with `Name=dev-edition-default`
+4. a `[Profile N]` whose directory ends `.dev-edition-default`
+
+The qualifier on (2) matters: a machine with both channels installed has two
+install sections, and taking the first can yield the *release* profile. Note
+that `variant.find_profile()` takes the first unconditionally — a latent bug in
+existing code, out of scope here but worth fixing separately.
+
+`profiles.ini` is written with a UTF-8 BOM; the parser must strip it, or
+`configparser` rejects the first section and the failure is silent.
+
+### The install-directory mismatch guard
+
+`setup.exe` sets `DefaultDirName={localappdata}\MediaCatcher\Host` with
+`DisableDirPage=yes`, so it **always** writes there. But
+`media-catcher-host/install.ps1` registers `$HostDir = $PSScriptRoot` — the
+repository folder — so a dev-registered machine has Firefox launching the host
+from the repo while `setup.exe` updates LocalAppData.
+
+Running the installer would then leave the bytes Firefox actually loads
+untouched, and verification against a staging tree would still pass for the
+directory it checked. The script therefore compares the registry-derived host
+directory against the installer's fixed target and **refuses to install** when
+they differ, naming both paths, rather than performing an install that cannot
+affect what Firefox runs.
 
 Each run re-derives all four and compares them against the pinned values in the
 receipt. A moved profile or a re-registered host surfaces as an explicit
@@ -85,22 +137,62 @@ output so the condition is visible rather than assumed.
 
 ## Freshness model
 
-Freshness is content-addressed. Version strings are never consulted.
+Freshness is content-addressed, and the unit of comparison is **the built
+artifact, never the source tree**. Version strings are never consulted.
 
-- `extension.sourceSha256` — over `media-catcher/**`, file paths and contents,
-  in sorted order.
-- `host.sourceSha256` — over `media-catcher-host/*.py` and
-  `media-catcher-host/mchost/**`, likewise.
-- `host.files` — a per-file map, so a single changed module is identifiable.
+Comparing installed files against the source tree cannot work, for two reasons
+found in review:
 
-The XPI is built deterministically: entries sorted, timestamps fixed. Identical
-sources therefore always produce an identical `xpiSha256`, which makes the
-artifact itself comparable rather than merely dated.
+- The source tree is not the ship set. `media-catcher-host/` contains
+  `conftest.py`, every `test_*.py`, and `__pycache__`, none of which are ever
+  installed. A rule requiring each source file to be present in the install can
+  never pass.
+- Any allowlist added to make that rule pass would be a second ship manifest —
+  the exact duplication content hashing was supposed to remove.
 
-A run is a no-op when the source hashes match the receipt **and** the installed
-files still match those hashes. Both halves are required: the first catches
-"nothing changed", the second catches "something changed the install behind our
-back".
+Each component therefore builds an artifact, and the artifact is what both
+freshness and verification are measured against.
+
+### The two artifacts
+
+**Extension — the XPI.** Built deterministically from `media-catcher/` with
+entries sorted and timestamps fixed, so identical sources always produce a
+byte-identical archive. The installed file *is* an XPI, so verification is a
+single hash equality with no ship-set question at all.
+
+**Host — the staging tree.** A materialised directory containing exactly the
+files that ship, built by the same rule the release workflow already uses:
+
+```
+mc_host.py, guardian.ps1, README.md
+mchost/**  (excluding __pycache__ directories and *.pyc)
+```
+
+This is not a manifest this design invents. It is
+`.github/workflows/release.yml`'s existing staging step, and its shape is
+already asserted by `media-catcher-host/test_packaging_runtime_layout.py`
+(`"Active release packaging stages host-staging then recursive mchost once"`).
+Reusing it keeps one source of truth for what ships, already under test. The
+Inno installer is compiled after staging.
+
+`host.files` maps each staged relative path to its hash, so a single changed
+module is identifiable.
+
+Because the artifact is a distinct materialised tree, verification can never
+degenerate into comparing the working tree against itself — a failure mode the
+earlier source-hash model permitted.
+
+A run is a no-op when the freshly built artifact hashes match the receipt
+**and** the installed files still match those artifact hashes. Both halves are
+required: the first catches "nothing changed", the second catches "something
+changed the install behind our back".
+
+Building the artifact is therefore part of `--check`, not only `--install`.
+That is what makes the check honest — it compares what current sources *would*
+produce against what is installed, rather than trusting a recorded hash. The
+staging step is a file copy and the XPI a zip, so the cost is small; the Inno
+compile is deferred to `--install`, since the installer is not what
+verification compares against.
 
 ### Per-component independence
 
@@ -142,10 +234,18 @@ commit SHA, so what is installed is always knowable.
    - Extension: back up the existing XPI, then write the new one.
    - Host: run `MediaCatcherHostSetup.exe /VERYSILENT /SUPPRESSMSGBOXES
      /NORESTART /LOG=<temp>`; retain the log; check the exit code.
-7. **Verify.** Re-hash what actually landed and compare against source. This is
-   the step that fails today's scenario, and it doubles as a packaging check: a
-   file present in source but absent from the install means the `.iss` manifest
-   is incomplete.
+7. **Verify against the artifact.**
+   - Extension: `sha256(installed .xpi) == sha256(built .xpi)`.
+   - Host: for every file in the staging tree, the installed file at the same
+     relative path must exist and hash equal. Files present in the install
+     directory but absent from staging — `ffmpeg.exe`, `yt-dlp.exe`,
+     `mc_host.bat`, the native-messaging `.json` — are **ignored**; they are
+     provisioned, not shipped.
+
+   This is the step that fails the 2026-08-14 scenario. It is also the only
+   real file-level check available: Inno's `[Run]` step does not fail Setup
+   when `bootstrap.ps1` exits non-zero, so `setup.exe`'s exit code confirms the
+   installer ran, not that the right bytes landed.
 8. **Write the receipt.** Relaunch Developer Edition when `--launch` is given.
 
 On verification failure the extension backup is restored and the run exits
@@ -170,17 +270,17 @@ directory — but the failure is reported with the offending file list.
   },
   "extension": {
     "version": "1.10.0",
-    "sourceSha256": "…",
     "xpiSha256": "…"
   },
   "host": {
-    "sourceSha256": "…",
-    "files": { "mchost/downloads.py": "…", "mc_host.py": "…" }
+    "stagingSha256": "…",
+    "files": { "mchost/downloads.py": "…", "guardian.ps1": "…" }
   }
 }
 ```
 
 `version` is recorded for display only. It is never used to decide freshness.
+Every recorded hash is an **artifact** hash, not a source-tree hash.
 
 ---
 
@@ -234,7 +334,7 @@ is not an error condition.
 Pure logic is unit-tested under the existing pytest layout with no new
 dependencies:
 
-- source hashing and the sorted-tree digest
+- artifact hashing and the sorted-tree digest
 - `profiles.ini` parsing, including multiple installs and missing dev-edition
 - receipt diffing: unchanged, stale, and target-moved
 - deterministic zip: identical sources produce byte-identical archives
