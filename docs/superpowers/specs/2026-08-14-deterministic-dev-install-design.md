@@ -119,8 +119,8 @@ repository folder — so a dev-registered machine has Firefox launching the host
 from the repo while `setup.exe` updates LocalAppData.
 
 Running the installer would then leave the bytes Firefox actually loads
-untouched, and verification against a staging tree would still pass for the
-directory it checked. The script therefore compares the registry-derived host
+untouched, while verification passed against whichever directory it checked.
+The script therefore compares the registry-derived host
 directory against the installer's fixed target and **refuses to install** when
 they differ, naming both paths, rather than performing an install that cannot
 affect what Firefox runs.
@@ -155,32 +155,37 @@ freshness and verification are measured against.
 
 ### The two artifacts
 
-**Extension — the XPI.** Built deterministically from `media-catcher/` with
-entries sorted and timestamps fixed, so identical sources always produce a
-byte-identical archive. The installed file *is* an XPI, so verification is a
-single hash equality with no ship-set question at all.
+**Extension — the XPI.** Built deterministically from the extension ship set —
+`media-catcher/` excluding `tests/` and `.vscode/` — with entries sorted and
+timestamps fixed, so identical sources always produce a byte-identical archive.
+The installed file *is* an XPI, so verification is a single hash equality.
 
-**Host — the staging tree.** A materialised directory containing exactly the
-files that ship, built by the same rule the release workflow already uses:
+Excluding `tests/` matters for more than package hygiene: under an
+"everything" ship set an ordinary test edit marks the extension stale, and an
+`--install` would then close Firefox for a change that cannot affect it.
+
+**Host — the declared ship set.** Inno reads the live tree
+(`#define HostSrc "..\\"`), so no staging copy is what `setup.exe` installs. The
+authority is therefore the `.iss` `[Files]` declaration itself:
 
 ```
-mc_host.py, guardian.ps1, README.md
+mc_host.py, guardian.ps1, README.md, bootstrap.ps1
 mchost/**  (excluding __pycache__ directories and *.pyc)
 ```
 
-This is not a manifest this design invents. It is
-`.github/workflows/release.yml`'s existing staging step, and its shape is
-already asserted by `media-catcher-host/test_packaging_runtime_layout.py`
-(`"Active release packaging stages host-staging then recursive mchost once"`).
-Reusing it keeps one source of truth for what ships, already under test. The
-Inno installer is compiled after staging.
+`devtools/ship_set.py` derives that set, and a test asserts it matches the
+`.iss` declaration — see
+`2026-08-14-packaging-ship-set-reconciliation-design.md`, which is a
+prerequisite for this design. Verification hashes each declared file in the
+install directory against the same file in the working tree.
 
-`host.files` maps each staged relative path to its hash, so a single changed
-module is identifiable.
+Note that `release.yml`'s host zip deliberately omits `bootstrap.ps1`; it is a
+different artifact serving self-update, and is not what this script verifies.
 
-Because the artifact is a distinct materialised tree, verification can never
-degenerate into comparing the working tree against itself — a failure mode the
-earlier source-hash model permitted.
+Verification compares the **install directory** against the working tree, file
+by file, over the declared set only. Files in the install directory that are not
+declared — `ffmpeg.exe`, `yt-dlp.exe`, `mc_host.bat`, the native-messaging
+`.json` — are ignored; they are provisioned, not shipped.
 
 A run is a no-op when the freshly built artifact hashes match the receipt
 **and** the installed files still match those artifact hashes. Both halves are
@@ -216,7 +221,7 @@ commit SHA, so what is installed is always knowable.
 ## Run sequence
 
 1. **Resolve** targets; compare against the receipt; fail on drift.
-2. **Hash** extension and host sources.
+2. **Hash** the declared ship sets: the extension XPI built from its ship set, and each declared host file.
 3. **Short-circuit** if sources match the receipt and the installed files still
    match. Exit 0, change nothing.
 4. **Build**
@@ -224,9 +229,10 @@ commit SHA, so what is installed is always knowable.
    - Host: locate `ISCC.exe` (PATH, then the three standard Inno Setup 6
      install directories) and compile `media-catcher-host.iss` into
      `installer/dist/MediaCatcherHostSetup.exe`. If the compiler is absent the
-     run fails with a pointer to `build.ps1`, which provisions it — the script
-     never falls back to copying files from the working tree, because that is
-     precisely what would mask an incomplete `.iss` manifest.
+     run fails with a pointer to `build.ps1`, which provisions it. The script
+     never falls back to copying files from the working tree: the installer
+     also performs registration and the bootstrap step, which a copy would
+     skip.
 5. **Close Firefox Developer Edition.** Graceful close first so session restore
    works; force-terminate only after a timeout. Filtered strictly on the
    Developer Edition executable path — the release channel is never touched.
@@ -236,11 +242,11 @@ commit SHA, so what is installed is always knowable.
      /NORESTART /LOG=<temp>`; retain the log; check the exit code.
 7. **Verify against the artifact.**
    - Extension: `sha256(installed .xpi) == sha256(built .xpi)`.
-   - Host: for every file in the staging tree, the installed file at the same
-     relative path must exist and hash equal. Files present in the install
-     directory but absent from staging — `ffmpeg.exe`, `yt-dlp.exe`,
-     `mc_host.bat`, the native-messaging `.json` — are **ignored**; they are
-     provisioned, not shipped.
+   - Host: for every file in the declared ship set, the installed file at the
+     same relative path must exist and hash equal to the working-tree file.
+     Files present in the install directory but not declared — `ffmpeg.exe`,
+     `yt-dlp.exe`, `mc_host.bat`, the native-messaging `.json` — are
+     **ignored**; they are provisioned, not shipped.
 
    This is the step that fails the 2026-08-14 scenario. It is also the only
    real file-level check available: Inno's `[Run]` step does not fail Setup
@@ -273,7 +279,7 @@ directory — but the failure is reported with the offending file list.
     "xpiSha256": "…"
   },
   "host": {
-    "stagingSha256": "…",
+    "shipSetSha256": "…",
     "files": { "mchost/downloads.py": "…", "guardian.ps1": "…" }
   }
 }
@@ -287,7 +293,7 @@ Every recorded hash is an **artifact** hash, not a source-tree hash.
 ## Interface
 
 ```
-python devtools/install_dev.py --check     # read-only; per-component verdicts
+python devtools/install_dev.py --check     # no installs; per-component verdicts
 python devtools/install_dev.py --install   # update whichever components are stale
 python devtools/install_dev.py --install --launch
 python devtools/install_dev.py --check --json
@@ -311,6 +317,11 @@ least one component stale, drifted, or failed verification · `2` usage error.
 
 `--check` returning `1` is the scriptable signal that an install is needed; it
 is not an error condition.
+
+`--check` does not modify the machine, but it is not free of writes: it builds
+the XPI in order to compare what current sources *would* produce against what is
+installed. That build goes to a temporary directory, never to the profile or the
+install directory. The Inno compile is not run by `--check`.
 
 ---
 
@@ -349,6 +360,13 @@ pattern already used in `downloads.py`. No test launches a browser or runs a
 real installer.
 
 ---
+
+## Prerequisite
+
+`2026-08-14-packaging-ship-set-reconciliation-design.md` must land first. It
+gives the host a single declared ship set kept honest by test, and gives the
+extension one that excludes tests and editor config. Without it there is no
+authoritative answer for verification to compare against.
 
 ## Future work
 
