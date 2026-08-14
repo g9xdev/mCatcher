@@ -428,6 +428,55 @@ def build_xpi_bytes(source_dir, ship_set=None, excludes=None,
     return buffer.getvalue()
 
 
+# Signing adds these; they are produced by AMO, not by any ship set.
+SIGNATURE_PREFIX = "META-INF/"
+
+
+def hash_zip_members(archive_path):
+    """{member path: sha256} for an installed archive.
+
+    Compares CONTENT rather than container bytes. Two archives holding
+    identical files still differ byte-for-byte when built by different
+    packagers — compression level, entry order and timestamps all vary — and
+    the installed XPI is not always this builder's output: the host rewrites it
+    during in-app self-update, and AMO rewrites it during signing. Byte
+    equality would report those as permanently stale.
+    """
+    members = {}
+    with zipfile.ZipFile(archive_path) as archive:
+        for name in archive.namelist():
+            if name.endswith("/"):
+                continue
+            members[name] = sha256_bytes(archive.read(name))
+    return members
+
+
+def compare_extension_install(archive_path, mapping):
+    """Verdict for an installed XPI against the extension ship set.
+
+    Returns {"verdict", "differing", "missing", "unexpected"}. Signature
+    members are ignored: a signed archive legitimately carries META-INF/.
+    """
+    try:
+        installed = hash_zip_members(archive_path)
+    except FileNotFoundError:
+        return {"verdict": "missing", "differing": [], "missing": sorted(mapping),
+                "unexpected": []}
+    except zipfile.BadZipFile:
+        return {"verdict": "unreadable", "differing": [], "missing": [],
+                "unexpected": []}
+
+    expected = {rel: hash_file(src) for rel, src in mapping.items()}
+    differing = sorted(r for r in expected
+                       if r in installed and installed[r] != expected[r])
+    missing = sorted(r for r in expected if r not in installed)
+    unexpected = sorted(r for r in installed
+                        if r not in expected and not r.startswith(SIGNATURE_PREFIX))
+    verdict = "in-sync" if not (differing or missing or unexpected) else "stale"
+    return {"verdict": verdict, "differing": differing, "missing": missing,
+            "unexpected": unexpected}
+
+
 def build_zip_from_mapping(mapping, timestamp=XPI_TIMESTAMP,
                            require_root_manifest=True):
     """Build an archive from {archive relative path: source path}.

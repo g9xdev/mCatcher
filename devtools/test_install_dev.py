@@ -767,3 +767,92 @@ def test_mapping_digest_is_independent_of_where_sources_live(tmp_path):
     (two / "x").write_text("same", encoding="utf-8")
     assert install_dev.hash_mapping({"mc_host.py": str(one / "x")})["sha256"] == \
         install_dev.hash_mapping({"mc_host.py": str(two / "x")})["sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Installed XPI: compare content, not container bytes
+# ---------------------------------------------------------------------------
+
+def _write_zip(path, files, **kw):
+    import zipfile as z
+    with z.ZipFile(path, "w", **kw) as archive:
+        for rel, text in sorted(files.items()):
+            archive.writestr(rel, text)
+    return str(path)
+
+
+def _mapping(tmp_path, files):
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    out = {}
+    for rel, text in files.items():
+        p = src / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        out[rel] = str(p)
+    return out
+
+
+def test_identical_content_from_a_different_packager_is_in_sync(tmp_path):
+    """The regression that motivates content comparison.
+
+    A self-updated or AMO-signed XPI is not this builder's bytes. Byte equality
+    would call it stale forever even when every shipped file matches.
+    """
+    import zipfile as z
+    files = {"manifest.json": "{}", "lib/a.js": "content"}
+    mapping = _mapping(tmp_path, files)
+    # Deliberately different container: stored, not deflated, reverse order.
+    other = _write_zip(tmp_path / "other.xpi", files, compression=z.ZIP_STORED)
+    ours = tmp_path / "ours.xpi"
+    ours.write_bytes(install_dev.build_zip_from_mapping(mapping))
+
+    assert ours.read_bytes() != open(other, "rb").read(), "containers must differ"
+    assert install_dev.compare_extension_install(other, mapping)["verdict"] == "in-sync"
+    assert install_dev.compare_extension_install(str(ours), mapping)["verdict"] == "in-sync"
+
+
+def test_a_changed_shipped_file_is_stale_and_named(tmp_path):
+    mapping = _mapping(tmp_path, {"manifest.json": "{}", "lib/a.js": "one"})
+    archive = _write_zip(tmp_path / "x.xpi", {"manifest.json": "{}", "lib/a.js": "two"})
+    result = install_dev.compare_extension_install(archive, mapping)
+    assert result["verdict"] == "stale"
+    assert result["differing"] == ["lib/a.js"]
+
+
+def test_a_missing_shipped_file_is_stale(tmp_path):
+    mapping = _mapping(tmp_path, {"manifest.json": "{}", "lib/a.js": "one"})
+    archive = _write_zip(tmp_path / "x.xpi", {"manifest.json": "{}"})
+    result = install_dev.compare_extension_install(archive, mapping)
+    assert result["verdict"] == "stale"
+    assert result["missing"] == ["lib/a.js"]
+
+
+def test_signature_members_are_not_treated_as_unexpected(tmp_path):
+    """AMO signing adds META-INF/; a signed install is still in-sync."""
+    mapping = _mapping(tmp_path, {"manifest.json": "{}"})
+    archive = _write_zip(tmp_path / "signed.xpi", {
+        "manifest.json": "{}",
+        "META-INF/mozilla.rsa": "signature",
+        "META-INF/mozilla.sf": "signature",
+    })
+    assert install_dev.compare_extension_install(archive, mapping)["verdict"] == "in-sync"
+
+
+def test_an_unexpected_shipped_file_is_stale(tmp_path):
+    """A test file reappearing in the package must not read as in-sync."""
+    mapping = _mapping(tmp_path, {"manifest.json": "{}"})
+    archive = _write_zip(tmp_path / "x.xpi",
+                         {"manifest.json": "{}", "tests/smoke.test.js": "x"})
+    result = install_dev.compare_extension_install(archive, mapping)
+    assert result["verdict"] == "stale"
+    assert result["unexpected"] == ["tests/smoke.test.js"]
+
+
+def test_absent_and_corrupt_archives_report_distinctly(tmp_path):
+    mapping = _mapping(tmp_path, {"manifest.json": "{}"})
+    assert install_dev.compare_extension_install(
+        str(tmp_path / "nope.xpi"), mapping)["verdict"] == "missing"
+    junk = tmp_path / "junk.xpi"
+    junk.write_bytes(b"not a zip")
+    assert install_dev.compare_extension_install(str(junk), mapping)["verdict"] == "unreadable"
