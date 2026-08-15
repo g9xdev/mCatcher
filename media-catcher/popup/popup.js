@@ -381,7 +381,7 @@ const HELPER_UI = {
   ready:        { cls: "ok",   label: "helper on",     tip: "Native helper active — recordings use ffmpeg (one muxed file)." },
   "no-ffmpeg":  { cls: "warn", label: "helper: no ffmpeg", tip: "Helper is installed but ffmpeg wasn't found. Re-run the installer or drop ffmpeg.exe next to it." },
   connecting:   { cls: "warn", label: "helper…",       tip: "Connecting to the native helper…" },
-  disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not detected — recording runs in-browser. Click to install it." },
+  disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not connected — recording runs in-browser. Click to reconnect (offers the installer if that fails)." },
 };
 
 function renderHelperBadge() {
@@ -395,15 +395,19 @@ function renderHelperBadge() {
   badge.title = (helperStatus.error ? helperStatus.error + "  ·  " : "") + ui.tip +
     (helperStatus.ffmpegPath ? "\nffmpeg: " + helperStatus.ffmpegPath : "");
   badge.onclick = async () => {
-    if (helperStatus.state === "disconnected") {
-      send({ type: "open-helper-setup" });   // no helper yet — open the install page
-      return;
-    }
+    // Always attempt a live re-check FIRST. Sending a "disconnected" badge
+    // straight to the installer skipped the one call that reconnects, so a
+    // dropped port — routine, since the helper exits with Firefox and is
+    // replaced by every host update — looked like missing software.
     badge.title = "Re-checking…";
     const r = await send({ type: "recheck-helper" });
     if (r && r.helper) helperStatus = r.helper;
-    setTimeout(refresh, 400); // give a fresh ping time to answer
     renderHelperBadge();
+    setTimeout(async () => {
+      await refresh();                      // give a fresh ping time to answer
+      // Offer the installer only once a live re-check has actually failed.
+      if (helperStatus.state === "disconnected") send({ type: "open-helper-setup" });
+    }, 600);
   };
 }
 

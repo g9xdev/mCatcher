@@ -323,6 +323,15 @@ let nativeInfo = null;
 // "ready" (green) | "no-ffmpeg" (amber) | "connecting" | "disconnected" (gray)
 let nativeState = "disconnected";
 let nativeError = null;
+// The helper exits with Firefox, can be killed, and is replaced by every host
+// update, so a dropped port is routine rather than proof it is uninstalled.
+// Nothing else reconnects — connectNative runs only at extension startup or on
+// an explicit re-check — so one drop used to disable the helper for the whole
+// session. Re-dial once per connected session: `handshook` gates that on having
+// actually reached a live helper, and `redialled` stops a helper that is truly
+// gone from spinning.
+let nativeHandshook = false;      // a pong has been seen on some connection
+let nativeRedialled = false;      // the one automatic re-dial is spent
 
 function setNativeState(state, error) {
   nativeState = state;
@@ -398,7 +407,17 @@ function connectNative() {
       nativePort = null; nativeInfo = null;
       // No helper means no dialog will ever answer; settle every waiter now.
       failAllFolderPicks();
-      setNativeState("disconnected", err || "Helper not installed.");
+      if (nativeHandshook && !nativeRedialled) {
+        nativeRedialled = true;
+        mclog("info", "native helper disconnected — reconnecting…");
+        connectNative();          // sets state to "connecting" and re-pings
+      } else {
+        // Only claim it is missing when we never reached a live helper; a drop
+        // after a good handshake is a disconnect, and saying otherwise sent
+        // people to reinstall software that was already there.
+        setNativeState("disconnected", err ||
+          (nativeHandshook ? "Helper disconnected." : "Helper not installed."));
+      }
       // The host owned the cast session and its status poller — without it the
       // session is gone; don't leave the popup showing a live transport forever.
       if (castState.state !== "idle") {
@@ -501,6 +520,10 @@ function onLegacyNativeMessage(msg) {
   }
   if (msg.type === "pong") {
     nativeInfo = msg;
+    // A live helper answered: remember that, and restore the re-dial budget so
+    // the NEXT drop also gets one automatic retry.
+    nativeHandshook = true;
+    nativeRedialled = false;
     setNativeState(msg.ffmpeg ? "ready" : "no-ffmpeg",
       msg.ffmpeg ? null : "Helper is installed but ffmpeg was not found.");
     dlog("native helper", msg.ffmpeg ? "ready (ffmpeg ok)" : "connected but ffmpeg missing", msg.ffmpegPath || "");

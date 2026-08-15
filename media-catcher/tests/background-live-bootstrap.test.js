@@ -279,11 +279,63 @@ test("controller owns recognized native frames while legacy pong and disconnect 
   h.nativeDisconnects.emit();
   await settle();
   assert.equal(h.helperDisconnects.length, 1);
-  assert.equal(h.nativeDisconnects.size, 1);
+  // Two listeners, because the drop triggers one automatic re-dial and this
+  // harness hands back the SAME port object every connect, so its listeners
+  // accumulate. Real runtime.connectNative returns a fresh Port per call, so
+  // nothing accumulates in production.
+  assert.equal(h.nativeDisconnects.size, 2);
   assert.equal(
     h.runtimeMessages.some((message) => message && message.type === "cast-update" &&
       message.cast && message.cast.state === "idle" && /disconnected/i.test(message.error)),
     true,
     "legacy cast cleanup must still run on helper disconnect"
   );
+});
+
+// A dropped native port is not proof the helper is gone: it exits with Firefox,
+// can be killed, and is replaced by every host update. Nothing else ever
+// reconnects — connectNative runs only at extension startup or on an explicit
+// re-check — so before this, one drop left the helper unusable for the rest of
+// the session while the UI reported "Helper not installed."
+test("a dropped helper port re-dials once instead of reporting it uninstalled", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
+  const before = pings();
+
+  h.nativeDisconnects.emit();
+  await settle();
+
+  assert.equal(pings(), before + 1, "the drop must trigger exactly one re-dial");
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const last = statuses[statuses.length - 1];
+  assert.notEqual(last.helper.error, "Helper not installed.",
+    "a dropped port must not be reported as a missing install");
+});
+
+test("a re-dial that also drops settles instead of looping", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
+  const before = pings();
+
+  h.nativeDisconnects.emit();   // drop -> one automatic re-dial
+  await settle();
+  h.nativeDisconnects.emit();   // the re-dial drops too -> must give up, not spin
+  await settle();
+
+  assert.equal(pings(), before + 1, "only one automatic re-dial per connected session");
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses[statuses.length - 1].helper.state, "disconnected",
+    "a re-dial that also fails settles as disconnected");
 });
