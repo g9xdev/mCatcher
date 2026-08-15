@@ -293,6 +293,26 @@ def _reject_reparse_components(path):
             raise RuntimeError("host update path contains a reparse point")
 
 
+def _reject_multiply_linked(dest):
+    """Reject a payload destination that is a hard link to another path.
+
+    A hard link carries no FILE_ATTRIBUTE_REPARSE_POINT, so the ancestor walk in
+    _reject_reparse_components cannot see it, and writing the payload onto the
+    existing path follows the link and overwrites whatever else points at that
+    inode. Mirrors the NumberOfLinks != 1 refusal the yt-dlp staging path in
+    mchost/downloads.py already makes. A missing destination is fine: there is
+    no existing inode to write through.
+    """
+    try:
+        links = os.stat(dest).st_nlink
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError as e:
+        raise RuntimeError("host update destination is unreadable: %s" % e)
+    if links > 1:
+        raise RuntimeError("host update destination is a hard link: %r" % dest)
+
+
 def apply_update(plan, ext_dir, host_dir):
     """Apply only the parts that are newer. Returns {staged: bool}."""
     if plan["host_newer"]:
@@ -323,9 +343,13 @@ def apply_update(plan, ext_dir, host_dir):
             accepted = []
             for n in z.namelist():
                 rel, is_dir = _validate_host_archive_member(n)
-                _host_member_destination(host_dir, rel)
+                dest = _host_member_destination(host_dir, rel)
                 if is_dir:
                     continue
+                # Vet every destination BEFORE the first payload write, so a
+                # linked member late in the archive cannot leave earlier ones
+                # half-applied.
+                _reject_multiply_linked(dest)
                 accepted.append((n, rel))
             for n, rel in accepted:
                 dest = _host_member_destination(host_dir, rel)

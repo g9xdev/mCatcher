@@ -47,6 +47,17 @@ function Assert-NoReparsePath([string]$Path) {
   }
 }
 
+function Assert-NoHardLink([string]$Path) {
+  # A hard link carries no ReparsePoint attribute, so Assert-NoReparsePath cannot
+  # see it, and Copy-Item -Force onto one follows the link and overwrites whatever
+  # else shares that inode. Mirrors _reject_multiply_linked in mc_host.py.
+  # A missing destination is fine: there is no existing inode to write through.
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if ($null -ne $item -and $item.LinkType -eq 'HardLink') {
+    throw "host update destination is a hard link: $Path"
+  }
+}
+
 $cfg = Get-Content -Raw -LiteralPath $Config | ConvertFrom-Json
 if ($cfg.applyHost) {
   # Validate before backup/log directory creation or payload access. Checking
@@ -118,14 +129,19 @@ function Apply-Update {
     Expand-Archive -LiteralPath $cfg.hostZip -DestinationPath $tmp -Force
     # Preserve archive-relative trees into hostDir (no basename flattening).
     $tmpRoot = (Resolve-Path -LiteralPath $tmp).Path
-    Get-ChildItem -LiteralPath $tmpRoot -Recurse -File | ForEach-Object {
-      $rel = $_.FullName.Substring($tmpRoot.Length).TrimStart('\', '/')
-      $dest = Join-Path $cfg.hostDir $rel
-      $parent = Split-Path -Parent $dest
+    $payload = @(Get-ChildItem -LiteralPath $tmpRoot -Recurse -File | ForEach-Object {
+      @{ Src = $_.FullName
+         Dest = (Join-Path $cfg.hostDir $_.FullName.Substring($tmpRoot.Length).TrimStart('\', '/')) }
+    })
+    # Vet every destination BEFORE the first copy, so a linked member late in the
+    # archive cannot leave earlier ones half-applied.
+    foreach ($item in $payload) { Assert-NoHardLink $item.Dest }
+    foreach ($item in $payload) {
+      $parent = Split-Path -Parent $item.Dest
       if (-not (Test-Path -LiteralPath $parent)) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
       }
-      Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+      Copy-Item -LiteralPath $item.Src -Destination $item.Dest -Force
     }
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }

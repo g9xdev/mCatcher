@@ -666,3 +666,95 @@ def test_guardian_rejects_junction_above_host_directory_without_restart(tmp_path
     assert sentinel.read_text(encoding="utf-8") == 'VERSION = "1.0.0"\nKEEP\n'
     assert (real_host / "mchost" / "__init__.py").read_text(encoding="utf-8") == "KEEP_INIT\n"
     assert not (real_host / "mchost" / "cast").exists()
+
+
+def test_apply_update_does_not_write_through_a_hardlinked_destination(tmp_path, monkeypatch):
+    """A hardlinked host file must not carry the payload outside the host directory.
+
+    A hardlink carries no FILE_ATTRIBUTE_REPARSE_POINT, so the ancestor walk in
+    _reject_reparse_components cannot see it. Writing a payload straight onto the
+    existing path would follow the link and overwrite the outside target. The
+    staging path already refuses multiply-linked files (NumberOfLinks != 1 in
+    mchost/downloads.py); the update path must hold the same line.
+
+    Behavioural, not conformance: it asserts only that the outside file survives,
+    so either rejecting the update or replacing the link satisfies it.
+    """
+    mc = load_host()
+    monkeypatch.setattr(mc, "find_profile", lambda: None)
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(mc, "_await_zip", lambda path, tries=10, delay=0.5: True)
+
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("DO-NOT-TOUCH\n", encoding="utf-8")
+
+    # A payload member inside the host dir is a hard link to the outside file.
+    os.link(outside, host_dir / "mc_host.py")
+    assert os.stat(host_dir / "mc_host.py").st_nlink == 2, "hardlink not established"
+
+    zpath = tmp_path / "media-catcher-host-2.0.0.zip"
+    _make_release_shaped_zip(zpath, 'VERSION = "2.0.0"\nCHANGED\n')
+    plan = {
+        "ext_newer": False,
+        "host_newer": True,
+        "ext_zip": None,
+        "host_zip": str(zpath),
+        "ext_to": None,
+        "host_to": "2.0.0",
+    }
+
+    try:
+        mc.apply_update(plan, str(tmp_path / "ext"), str(host_dir))
+    except Exception:
+        pass          # refusing the update is a valid outcome; writing through is not
+
+    assert outside.read_text(encoding="utf-8") == "DO-NOT-TOUCH\n", \
+        "apply_update wrote through a hard link into a file outside the host directory"
+
+
+def test_guardian_does_not_write_through_a_hardlinked_destination(tmp_path):
+    """Guardian applies payloads with Copy-Item -Force, which follows a hard link.
+
+    Same property as the in-process path: whatever else shares the destination's
+    inode must survive. Guardian runs without a restart, so an unguarded copy
+    here reaches outside the host directory exactly as apply_update did.
+    """
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("DO-NOT-TOUCH\n", encoding="utf-8")
+    os.link(outside, host_dir / "mc_host.py")
+    assert os.stat(host_dir / "mc_host.py").st_nlink == 2, "hardlink not established"
+
+    zpath = tmp_path / "media-catcher-host-2.0.0.zip"
+    _make_release_shaped_zip(zpath, 'VERSION = "2.0.0"\nCHANGED\n')
+    cfg = {
+        "applyExt": False,
+        "applyHost": True,
+        "extZip": None,
+        "hostZip": str(zpath),
+        "extDir": str(tmp_path / "ext"),
+        "hostDir": str(host_dir),
+        "profileDir": "",
+        "extId": "{id}",
+        "expectExtVersion": None,
+        "expectHostVersion": "2.0.0",
+        "python": sys.executable,
+        "firefox": "",
+        "restart": False,
+        "backupRoot": str(tmp_path / "backups"),
+        "keep": 3,
+    }
+    confpath = tmp_path / "guardian-config.json"
+    confpath.write_text(json.dumps(cfg), encoding="utf-8")
+
+    subprocess.run(
+        [PS, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(GUARDIAN),
+         "-Config", str(confpath), "-NoUi", "-NoRestart"],
+        capture_output=True, text=True,
+    )
+
+    assert outside.read_text(encoding="utf-8") == "DO-NOT-TOUCH\n", \
+        "guardian wrote through a hard link into a file outside the host directory"
