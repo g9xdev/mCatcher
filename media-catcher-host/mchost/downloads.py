@@ -977,6 +977,8 @@ def _yt_stage_note(s):
     """A yt-dlp status line → a short 'what it's doing now' label for the pre-download
     phase (cookies/player/n-challenge/format pick), so the bar isn't a dead 0%."""
     low = s.lower()
+    if "cookies from" in low:
+        return "Reading cookies"
     if "downloading webpage" in low:
         return "Reading page"
     if "player" in low and "download" in low:
@@ -987,7 +989,7 @@ def _yt_stage_note(s):
         return "Solving JS challenge"
     if s.startswith("[info]") and "format" in low:
         return "Choosing format"
-    if s.startswith("[download] destination"):
+    if low.startswith("[download] destination"):   # yt-dlp capitalises "Destination"
         return "Starting download"
     if "m3u8" in low and "download" in low:
         return "Reading streams"
@@ -2624,13 +2626,65 @@ def _ytdl_cleanup_stage_tree(stage_handle):
 
 
 
+# Seconds of TOTAL silence from yt-dlp while still resolving before we call the
+# job stuck. Resolution normally takes 2-5s, so this is deliberately generous —
+# it only has to beat "forever", and it is disarmed once bytes start flowing.
+_YTDL_RESOLVE_STALL = 90
+
+
+class _StallWatch:
+    """Kills a yt-dlp that goes completely silent while still resolving.
+
+    A dropped (not refused) packet leaves yt-dlp blocked in a socket read that
+    never returns, emitting nothing — the row then sits on "Preparing" forever
+    with nothing to time out against. Armed only until the first real progress
+    line: once bytes flow, a long download or a slow merge is healthy and must
+    never be killed. Both yt-dlp reader loops share this.
+    """
+
+    def __init__(self, proc):
+        self.stalled = threading.Event()
+        self._proc = proc
+        self._downloading = threading.Event()
+        self._done = threading.Event()
+        self._ts = time.time()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def touch(self):
+        """Any output at all counts as liveness."""
+        self._ts = time.time()
+
+    def downloading(self):
+        """First parsed progress line — disarm for the rest of the job."""
+        self._downloading.set()
+
+    def finish(self):
+        """Reader loop is done; release the watchdog thread."""
+        self._done.set()
+
+    def _run(self):
+        while not self._done.wait(2.0):
+            if self._downloading.is_set():
+                return
+            if time.time() - self._ts > _YTDL_RESOLVE_STALL:
+                self.stalled.set()
+                _safe_kill(self._proc)      # unblocks the reader loop
+                return
+
+
 def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
     cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--progress", "--no-warnings",
            "--force-overwrites",
            "-f", fmt, "--merge-output-format", "mp4",
            "--cookies-from-browser", "firefox",
            "-o", outtmpl,
-           # --print puts yt-dlp in quiet mode; --progress above forces the bar back on.
+           # A dropped (not refused) packet leaves a socket read blocked forever.
+           # Bound every read so yt-dlp surfaces an error instead of hanging.
+           "--socket-timeout", "30",
+           # --print puts yt-dlp in QUIET mode, which suppresses the very status
+           # lines _yt_stage_note parses (so the bar sat on "Preparing" all the
+           # way through). --no-quiet keeps them; --print still emits @@FILE@@.
+           "--no-quiet",
            "--print", "after_move:@@FILE@@ %(filepath)s"]
     if _h().FFMPEG:
         cmd += ["--ffmpeg-location", os.path.dirname(_h().FFMPEG)]
@@ -2958,8 +3012,10 @@ def _handle_ytdl_structured(req):
                 last_pct = -1.0
                 last_note = ""
                 last_note_ts = 0.0
+                watch = _StallWatch(p)
                 try:
                     for line in p.stdout:
+                        watch.touch()
                         if cancelled():
                             break
                         raw = line if isinstance(line, str) else str(line)
@@ -2979,6 +3035,7 @@ def _handle_ytdl_structured(req):
                         if s.startswith("[download]"):
                             prog = _parse_yt_progress(s)
                             if prog:
+                                watch.downloading()
                                 pct = prog.get("pct", 0.0)
                                 if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
                                     last_pct = pct
@@ -2995,6 +3052,7 @@ def _handle_ytdl_structured(req):
                                 last_note = note
                                 last_note_ts = now
                                 progress_msg(pct=0, stage="resolving", note=note)
+                    watch.finish()
                     p.wait()
                 except Exception:
                     if cancelled():
@@ -3002,9 +3060,16 @@ def _handle_ytdl_structured(req):
                         return
                     emit_error("permanent", "Download failed.")
                     return
+                finally:
+                    watch.finish()      # idempotent; also covers the exception path
 
                 if cancelled():
                     emit_error("cancelled", "Cancelled.")
+                    return
+                if watch.stalled.is_set():
+                    emit_error("stalled",
+                               "No response while preparing the download. The connection is "
+                               "being blocked (check your firewall/VPN) or the network is down.")
                     return
 
                 if p.returncode == 0:
@@ -3226,8 +3291,10 @@ def _handle_ytdl_legacy(req):
         last_pct = -1.0
         last_note = ""
         last_note_ts = 0.0
+        watch = _StallWatch(p)
         try:
             for line in p.stdout:
+                watch.touch()
                 s = line.strip() if isinstance(line, str) else str(line).strip()
                 if not s:
                     continue
@@ -3237,6 +3304,7 @@ def _handle_ytdl_legacy(req):
                 if s.startswith("[download]"):
                     prog = _parse_yt_progress(s)
                     if prog:
+                        watch.downloading()
                         pct = prog.get("pct", 0.0)
                         # throttle to ~1% steps; resend on a reset (audio stream starts after video)
                         if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
@@ -3255,10 +3323,18 @@ def _handle_ytdl_legacy(req):
                         last_note = note
                         last_note_ts = now
                         _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": note})
+            watch.finish()
             p.wait()
             if op.get("cancel_requested"):
                 _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled",
                            "error": "Cancelled."})
+            elif watch.stalled.is_set():
+                _h()._hlog("error", "yt-dlp: no response for %ds while resolving %s — killed"
+                           % (_YTDL_RESOLVE_STALL, url))
+                _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                           "error": "No response while preparing the download. The connection "
+                                    "is being blocked (check your firewall/VPN) or the network "
+                                    "is down."})
             elif p.returncode == 0 and filepath and os.path.isfile(filepath):
                 try:
                     size = os.path.getsize(filepath)
@@ -3275,6 +3351,7 @@ def _handle_ytdl_legacy(req):
                 _h()._hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
                 _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         finally:
+            watch.finish()          # idempotent; also covers the exception path
             _pget_unregister(jid, op)
     threading.Thread(target=worker, daemon=True).start()
 

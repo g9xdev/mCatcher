@@ -634,6 +634,14 @@ function onLegacyNativeMessage(msg) {
     notifyDone(dl.name || "YouTube video", fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
     setTimeout(() => activeDownloads.delete(dl.id), DONE_RETAIN_MS);
   } else if (msg.type === "ytdl-error") {
+    // Killing yt-dlp makes it exit non-zero, so a user cancel arrives here as a
+    // failure. Settle the row as "Cancelled" rather than a red error — trust the
+    // helper's own verdict as well as our local flag.
+    if (msg.reason === "cancelled" || dl.status === "cancelled") {
+      dl.status = "cancelled";
+      broadcast({ type: "download-update", download: dl });
+      return;
+    }
     dl.status = "error"; dl.error = msg.error || "YouTube download failed"; dl.errReason = msg.reason || "";
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "saved") {
@@ -3054,6 +3062,16 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else if (cancelId.kind === "number") {
           const dl = activeDownloads.get(cancelId.value);
           if (dl) dl.status = "cancelled";
+          // Browser-run loops poll dl.status, but yt-dlp runs INSIDE the helper —
+          // a flag it never sees, so the process kept downloading and the row sat
+          // on "Preparing" forever. Legacy yt-dlp ops are keyed by id alone, so
+          // OMIT attemptToken: the host treats a PRESENT key as a token check and
+          // would no-op the cancel. Unknown ids are a host-side no-op.
+          if (nativePort) {
+            try { nativePort.postMessage({ cmd: "pget-cancel", id: cancelId.value }); }
+            catch (e) { /* helper gone — the flag above still stops browser-run work */ }
+          }
+          if (dl) broadcast({ type: "download-update", download: dl });
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false, error: "Download action rejected." });

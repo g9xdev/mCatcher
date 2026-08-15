@@ -4,6 +4,7 @@ Deterministic fakes only: no network and no real yt-dlp process.
 """
 import os
 import threading
+import time
 
 from conftest import load_host, wait_for
 
@@ -4330,3 +4331,134 @@ def test_ytdl_adopt_committed_pin_close_accounting_matrix(monkeypatch):
         got = d._ytdl_adopt_committed_pin(original)
         assert got is not None, mode
         assert got in (original, pin), mode
+
+
+# ---------------------------------------------------------------------------
+# Pre-download feedback + stall detection
+#
+# The resolution phase used to be a dead "Preparing": --print puts yt-dlp in
+# quiet mode, which suppressed the very status lines _yt_stage_note reads, and
+# nothing bounded a yt-dlp that went silent (a firewall dropping packets leaves
+# it blocked in a socket read with no output, so the row hung indefinitely).
+# ---------------------------------------------------------------------------
+
+class KillableProc(LiveProc):
+    """LiveProc that honours _safe_kill — the base fake defines no kill()."""
+
+    def kill(self):
+        with self._lock:
+            self.killed = True
+        if self._hold is not None:
+            self._hold.set()          # release a blocked reader / wait
+
+
+class ProgressThenSilentProc:
+    """Emits one real progress line, then goes quiet for longer than the stall
+    deadline before finishing — i.e. a slow merge. Must NOT be killed."""
+
+    def __init__(self, quiet_for, final_line):
+        self._lines = ["[download]   1.0% of  100.00MiB at 1.00MiB/s ETA 00:10",
+                       final_line]
+        self._i = 0
+        self._quiet = quiet_for
+        self.killed = False
+        self.returncode = None
+
+    @property
+    def stdout(self):
+        return self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._i >= len(self._lines):
+            raise StopIteration
+        if self._i == 1:
+            time.sleep(self._quiet)   # silent stretch AFTER real bytes flowed
+        line = self._lines[self._i]
+        self._i += 1
+        return line
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = -9 if self.killed else 0
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+def test_ytdl_cmd_keeps_status_lines_and_bounds_socket_reads():
+    import mchost.downloads as d
+
+    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b", "out.%(ext)s",
+                            "https://example.test/v", None, False)
+    assert "--print" in cmd, "still uses --print to learn the saved path"
+    assert "--no-quiet" in cmd, \
+        "--no-quiet keeps the status lines --print would otherwise suppress"
+    assert "--socket-timeout" in cmd, \
+        "socket reads are bounded so a dropped connection cannot block forever"
+
+
+def test_stage_note_reads_capitalised_destination_and_cookies():
+    import mchost.downloads as d
+
+    # yt-dlp capitalises "Destination", so a case-SENSITIVE prefix test silently
+    # never matched and this stage was unreachable.
+    assert d._yt_stage_note("[download] Destination: out.mp4") == "Starting download"
+    assert d._yt_stage_note("Extracting cookies from firefox") == "Reading cookies"
+
+
+def test_silent_ytdlp_is_killed_and_reported_as_stalled(tmp_path, monkeypatch):
+    import mchost.downloads as d
+
+    sent = []
+    hold = threading.Event()          # never set: yt-dlp emits nothing at all
+    procs = []
+
+    def fake_popen(*a, **k):
+        p = KillableProc(lines=[], returncode=0, hold=hold)
+        procs.append(p)
+        return p
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.1)   # trip on the first poll
+
+    d.handle_ytdl({"id": "jobStall", "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
+    term = _wait_terminal(sent, "jobStall", timeout=10)
+    assert term["type"] == "ytdl-error", "a silent yt-dlp still settles the row"
+    assert term.get("reason") == "stalled", \
+        "reported as a stall, not a generic failure"
+    assert procs and procs[0].killed, \
+        "the stuck process is killed rather than left running forever"
+
+
+def test_stall_watchdog_disarms_once_bytes_flow(tmp_path, monkeypatch):
+    """A slow-but-healthy download (or a long merge) must never be killed."""
+    import mchost.downloads as d
+
+    sent = []
+    procs = []
+    final = tmp_path / "T [id].mp4"
+
+    def fake_popen(*a, **k):
+        final.write_bytes(b"OK")
+        # Quiet for 3s — well past the 0.1s deadline and spanning a watchdog poll.
+        p = ProgressThenSilentProc(3.0, "@@FILE@@ %s" % final)
+        procs.append(p)
+        return p
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.1)
+
+    d.handle_ytdl({"id": "jobLive", "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
+    term = _wait_terminal(sent, "jobLive", timeout=15)
+    assert term["type"] == "ytdl-done", "a progressing download completes normally"
+    assert procs and not procs[0].killed, \
+        "a download that produced bytes is never killed by the stall watchdog"

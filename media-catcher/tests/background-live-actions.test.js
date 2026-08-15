@@ -813,3 +813,24 @@ test("get-active-tab reports failure rather than guessing when no tab is availab
   assert.equal(answer.ok, false);
   assert.equal(answer.tabId, undefined);
 });
+
+// yt-dlp runs INSIDE the helper, so a numeric legacy cancel that only flips a
+// local status flag never stops it: the process kept downloading and the row sat
+// on "Preparing" forever. The cancel must reach the helper, and it must stay
+// token-free — the host treats a PRESENT attemptToken as a token check and would
+// no-op an id-only legacy cancel.
+test("a numeric legacy cancel reaches the helper token-free without touching the live controller", async () => {
+  const h = createHarness();
+  await settle();
+
+  assert.deepEqual(await h.send({ type: "cancel", id: 42 }, h.popupSender), { ok: true });
+
+  const cancels = h.nativePosts.filter((post) => post.cmd === "pget-cancel");
+  assert.equal(cancels.length, 1, "cancel is forwarded to the helper exactly once");
+  assert.equal(cancels[0].id, 42, "it cancels the requested job id");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(cancels[0], "attemptToken"), false,
+    "attemptToken must be ABSENT — a present key fails the host's token check",
+  );
+  assert.deepEqual(h.calls.cancel, [], "a numeric id never reaches the live controller");
+});
