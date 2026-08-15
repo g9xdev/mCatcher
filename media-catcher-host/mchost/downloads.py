@@ -280,9 +280,31 @@ def _codec_args(codec, encoder, quality):
     return ["-c:v", "libx265", "-crf", str(q), "-preset", "slow"]
 
 def _safe_kill(p):
+    """Kill p AND its descendants.
+
+    yt-dlp's PyInstaller onefile build is a launcher that re-execs the real
+    program as a CHILD, and that grandchild inherits our stdout pipe. Killing
+    only the launcher orphans it: the pipe never closes, so `for line in
+    p.stdout` never ends, p.wait() is never reached, and the job hangs on
+    "Preparing" forever with no terminal message — the stall watchdog fires and
+    is then unable to report. taskkill /T takes the whole tree; the direct
+    p.kill() below still covers the non-Windows and taskkill-unavailable cases.
+    """
     try:
-        if p and p.poll() is None:
-            p.kill()
+        if not p or p.poll() is not None:
+            return
+    except Exception:
+        return
+    if os.name == "nt":
+        try:
+            cf, si = _no_window()
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=cf, startupinfo=si, timeout=15)
+        except Exception:
+            pass
+    try:
+        p.kill()
     except Exception:
         pass
 

@@ -372,3 +372,37 @@ def test_canonical_alias_under_script_mode_main():
                        capture_output=True, text=True, timeout=60,
                        stdin=subprocess.DEVNULL)
     assert "ALIAS-MAIN-OK" in p.stdout, (p.stdout or "") + (p.stderr or "")
+
+
+def test_safe_kill_takes_the_whole_process_tree():
+    """yt-dlp's PyInstaller onefile build is a launcher that re-execs the real
+    program as a CHILD, and that grandchild inherits our stdout pipe. Killing
+    only the launcher orphans it: the pipe never closes, so the reader loop never
+    ends, p.wait() is never reached, and the job hangs on "Preparing" forever
+    with no terminal message ever sent."""
+    import mchost.downloads as dl
+
+    code = (
+        "import subprocess, sys, time\n"
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "print(c.pid, flush=True)\n"
+        "time.sleep(120)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        grandchild = int(p.stdout.readline().strip())
+
+        def alive(pid):
+            r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                               capture_output=True, text=True)
+            return str(pid) in (r.stdout or "")
+
+        assert alive(grandchild), "grandchild is running"
+        dl._safe_kill(p)
+        assert wait_for(lambda: not alive(grandchild), timeout=20), \
+            "_safe_kill must take descendants too, not just the direct child"
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
