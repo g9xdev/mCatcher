@@ -216,6 +216,10 @@ function createHarness() {
     handledNative,
     helperDisconnects,
     assemblerCreates,
+    // background.js declares its entry points at top level, so they land on the
+    // vm global — the only way to drive one directly, since runtime.onMessage
+    // is a no-op event here.
+    sandbox,
   };
 }
 
@@ -338,4 +342,30 @@ test("a re-dial that also drops settles instead of looping", async () => {
   const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
   assert.equal(statuses[statuses.length - 1].helper.state, "disconnected",
     "a re-dial that also fails settles as disconnected");
+});
+
+// Every YouTube click minted a fresh id and spawned another yt-dlp writing to
+// the SAME output path. Two of them then fought over one .part file
+// ("WinError 32: used by another process"), one wedged, and cancelling a row
+// stopped only its own job while the others kept reporting — which is what
+// "cancel doesn't work, it keeps re-adding" actually was.
+test("a second click on a downloading YouTube URL does not start a second yt-dlp", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const item = { url: "https://www.youtube.com/watch?v=DUP", kind: "youtube", name: "dup" };
+  const ytdls = () => h.nativePosts.filter((p) => p && p.cmd === "ytdl");
+
+  await h.sandbox.downloadYouTube(item, 7, "dup.mp4", {});
+  await settle();
+  assert.equal(ytdls().length, 1, "the first click starts the download");
+
+  await h.sandbox.downloadYouTube(item, 7, "dup.mp4", {});
+  await settle();
+  assert.equal(ytdls().length, 1,
+    "a second click on the same URL must not spawn a competing yt-dlp");
 });

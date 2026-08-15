@@ -357,8 +357,26 @@ function helperStatus() {
 // YouTube (and any yt-dlp-supported site): hand the canonical URL to the native
 // helper, which runs yt-dlp (best video+audio, merged) with the PO-token provider
 // and Firefox cookies. Progress/done/error arrive as ytdl-* native messages.
+// Statuses that mean a job still owns its output path.
+const YT_IN_FLIGHT = new Set(["downloading", "converting"]);
+
 async function downloadYouTube(item, tabId, filename, opts) {
   opts = opts || {};
+  // One yt-dlp per URL. A second click used to mint a fresh id and start a
+  // competing process writing the SAME output template: the two then fought
+  // over one .part file ("WinError 32: used by another process"), one wedged,
+  // and cancelling a row killed only its own job while the survivors kept
+  // reporting progress — which read as "cancel doesn't work, it keeps
+  // re-adding". Terminal rows (done/error/cancelled) are not in flight, so a
+  // deliberate retry still works.
+  for (const existing of activeDownloads.values()) {
+    if (existing.kind === "youtube" && existing.url === item.url &&
+        YT_IN_FLIGHT.has(existing.status)) {
+      mclog("info", "yt-dlp: already downloading " + item.url + " — ignoring duplicate request");
+      broadcast({ type: "download-update", download: existing });   // resurface the live row
+      return;
+    }
+  }
   const id = ++downloadCounter;
   const dl = { id, url: item.url, name: sanitizeFilename(filename || item.name || "YouTube video"),
                kind: "youtube", status: "downloading", live: true, tabId,
