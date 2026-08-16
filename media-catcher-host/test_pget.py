@@ -3717,3 +3717,320 @@ def test_hostile_negative_getsize_completed_omits_metadata_pair(tmp_path, monkey
         assert res.get("bytes") != -1
     finally:
         shutdown_server(httpd)
+
+
+# ---------------------------------------------------------------------------
+# Fix2: exact primitive identity (reject str/int subclasses that lie)
+# ---------------------------------------------------------------------------
+
+
+class _HostileEqStr(str):
+    """str subclass with wrong visible value that claims equality with anything."""
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    def __hash__(self):
+        return hash(str(self))
+
+
+class _LyingNegInt(int):
+    """int subclass whose value is -1 but comparison operators claim nonnegative."""
+
+    def __lt__(self, other):
+        return False
+
+    def __le__(self, other):
+        return False
+
+    def __gt__(self, other):
+        return True
+
+    def __ge__(self, other):
+        return True
+
+
+def test_hostile_str_subclass_token_never_acts_on_set_limit_or_cancel(tmp_path, monkeypatch):
+    """End-to-end: str subclass overloading __eq__ must never fence-pass.
+
+    A provided token whose visible text is wrong but __eq__ returns True must not
+    mutate, ack, cancel, or stop. A stored non-exact-string token also cannot be
+    acted upon by a provided exact string. Omitted-key legacy still works for a
+    tokenless op.
+    """
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"H" * (512 * 1024)
+    httpd = ThreadingHTTPServer(
+        ("127.0.0.1", 0), _slow_body_handler(payload, body_started, hold)
+    )
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    jid = "jobHostileStrTok"
+    stored_plain = "live"
+    try:
+        mc.handle_pget_single({
+            "id": jid,
+            "attemptToken": stored_plain,
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        op = d._PGET.get(jid)
+        assert op is not None
+        assert type(op.get("attemptToken")) is str
+        assert op.get("attemptToken") == stored_plain
+        assert op.get("cancel_requested") is False
+
+        acks_before = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+        # Visible value is wrong; __eq__ lies and would match plain 'live'.
+        hostile_wrong = _HostileEqStr("not-live-but-eq-true")
+        assert hostile_wrong == stored_plain  # proves the lie works
+        assert str(hostile_wrong) != stored_plain
+
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": hostile_wrong,
+            "maxConnections": 0,
+            "providerGeneration": 1,
+        })
+        time.sleep(0.08)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+        assert op["maxConnections"] == 1
+        assert op.get("cancel_requested") is False
+        assert not (op.get("stop") and op["stop"].is_set())
+
+        mc._pget_cancel({"id": jid, "attemptToken": hostile_wrong})
+        time.sleep(0.05)
+        assert op.get("cancel_requested") is False
+        assert not (op.get("stop") and op["stop"].is_set())
+
+        # Stored non-exact-string token cannot be acted on by a provided plain token.
+        op["attemptToken"] = _HostileEqStr("live")
+        assert type(op.get("attemptToken")) is not str
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": "live",
+            "maxConnections": 0,
+            "providerGeneration": 2,
+        })
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+        assert op["maxConnections"] == 1
+
+        mc._pget_cancel({"id": jid, "attemptToken": "live"})
+        time.sleep(0.05)
+        assert op.get("cancel_requested") is False
+        assert not (op.get("stop") and op["stop"].is_set())
+
+        # Restore plain stored token; exact built-in match still acts.
+        op["attemptToken"] = stored_plain
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": stored_plain,
+            "maxConnections": 0,
+            "providerGeneration": 3,
+        })
+        ack = _wait_ack(sent, jid, timeout=5)
+        assert ack["providerGeneration"] == 3
+        assert ack["maxConnections"] == 0
+        assert type(ack.get("attemptToken")) is str
+        assert ack.get("attemptToken") == stored_plain
+        assert op["providerGeneration"] == 3
+        assert op["maxConnections"] == 0
+
+        # Matching exact cancel acts.
+        mc._pget_cancel({"id": jid, "attemptToken": stored_plain})
+        assert op.get("cancel_requested") is True
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert res["attemptToken"] == stored_plain
+        assert d._PGET.get(jid) is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_hostile_str_subclass_on_tokenless_op_still_omitted_only(tmp_path, monkeypatch):
+    """Tokenless op: hostile present str subclass no-ops; omitted key still works."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"K" * (256 * 1024)
+    httpd = ThreadingHTTPServer(
+        ("127.0.0.1", 0), _slow_body_handler(payload, body_started, hold)
+    )
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    jid = "jobHostileTokenless"
+    try:
+        mc.handle_pget_single({
+            "id": jid,
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        op = d._PGET.get(jid)
+        assert op is not None
+        assert op.get("attemptToken") is None
+
+        acks_before = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+        hostile = _HostileEqStr("anything")
+        # Even if __eq__ would match None-ish paths, present subclass must no-op.
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": hostile,
+            "maxConnections": 0,
+            "providerGeneration": 1,
+        })
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+        assert op["maxConnections"] == 1
+
+        mc._pget_cancel({"id": jid, "attemptToken": hostile})
+        time.sleep(0.05)
+        assert op.get("cancel_requested") is False
+        assert not (op.get("stop") and op["stop"].is_set())
+
+        # Omitted-key legacy still accepted for tokenless op.
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "maxConnections": 0,
+            "providerGeneration": 5,
+        })
+        ack = _wait_ack(sent, jid, timeout=5)
+        assert ack["providerGeneration"] == 5
+        assert ack["maxConnections"] == 0
+        assert ack.get("attemptToken") is None
+
+        mc._pget_cancel({"id": jid})
+        assert op.get("cancel_requested") is True
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert res.get("attemptToken") is None
+        assert d._PGET.get(jid) is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_lying_int_subclass_negative_omits_file_bytes_pair(tmp_path, monkeypatch):
+    """int subclass valued -1 with lying __lt__ must omit BOTH file/bytes.
+
+    Committed success remains. Exact built-in zero/positive int stay accepted;
+    bool/float/string/object/subclass are invalid.
+    """
+    import mchost.downloads as d
+
+    path = str(tmp_path / "meta-lie.bin")
+    with open(path, "wb") as f:
+        f.write(b"abcd")
+
+    lying = _LyingNegInt(-1)
+    assert int(lying) == -1
+    # Prove the comparison lie: isinstance path would accept it under val < 0.
+    assert isinstance(lying, int)
+    assert not (lying < 0)
+    assert type(lying) is not int
+
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: lying)
+    monkeypatch.setattr(d.os.path, "isfile", lambda p: True)
+    assert d._pget_terminal_file_bytes({"final_path": path}) == (None, None)
+
+    # Positive subclass is also invalid (exact built-in int only).
+    class PosSub(int):
+        pass
+
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: PosSub(4))
+    assert d._pget_terminal_file_bytes({"final_path": path}) == (None, None)
+
+    # Exact zero / positive still accepted; return plain int identity.
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: 0)
+    got = d._pget_terminal_file_bytes({"final_path": path})
+    assert got == (path, 0)
+    assert type(got[1]) is int
+    monkeypatch.setattr(d.os.path, "getsize", lambda p: 4)
+    got = d._pget_terminal_file_bytes({"final_path": path})
+    assert got == (path, 4)
+    assert type(got[1]) is int
+
+    # Direct nonneg helper: subclass / bool / float / string / object invalid.
+    for bad in (lying, PosSub(0), PosSub(9), True, False, 3.5, "12", None, object(), []):
+        assert d._pget_nonneg_int_bytes(bad) is None
+    assert d._pget_nonneg_int_bytes(0) == 0
+    assert type(d._pget_nonneg_int_bytes(0)) is int
+    assert d._pget_nonneg_int_bytes(42) == 42
+    assert type(d._pget_nonneg_int_bytes(42)) is int
+    assert d._pget_nonneg_int_bytes(-1) is None
+
+    # send_result path: lying negative subclass omits pair; status stays completed.
+    sent = []
+    monkeypatch.setattr(
+        d, "_h",
+        lambda: type("H", (), {"send": staticmethod(lambda m: sent.append(dict(m)))})(),
+    )
+    d._pget_send_result(
+        "idLie", "tok", "completed", "multi-range", None, "committed",
+        file=path, bytes=lying,
+    )
+    msg = sent[-1]
+    assert msg["status"] == "completed"
+    assert msg["partState"] == "committed"
+    assert "file" not in msg
+    assert "bytes" not in msg
+
+    # Integration: getsize returns lying -1 subclass after commit.
+    sent2 = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent2.append(dict(msg)))
+    orig_getsize = d.os.path.getsize
+
+    def hostile_getsize(p):
+        base = os.path.basename(str(p))
+        if base == "clip.mp4" or base.endswith("clip.mp4"):
+            if os.path.isfile(p) and not str(p).endswith(".part"):
+                return _LyingNegInt(-1)
+        return orig_getsize(p)
+
+    monkeypatch.setattr(d.os.path, "getsize", hostile_getsize)
+    httpd, _state = run_server("range")
+    try:
+        mc.handle_pget({
+            "id": "jobLieBytes",
+            "attemptToken": "atk-lie-bytes",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent2, timeout=10)
+        assert res["status"] == "completed"
+        assert res["partState"] == "committed"
+        assert res["failureCategory"] is None
+        assert (tmp_path / "clip.mp4").is_file()
+        assert (tmp_path / "clip.mp4").read_bytes() == DEFAULT_PAYLOAD
+        assert "file" not in res
+        assert "bytes" not in res
+    finally:
+        shutdown_server(httpd)

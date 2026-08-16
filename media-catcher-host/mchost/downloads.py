@@ -1156,32 +1156,36 @@ class _PgetError(Exception):
 def _pget_nonneg_int_bytes(val):
     """Integral nonnegative byte count, or None.
 
-    Rejects bool (bool is a subclass of int), floats, strings, and negatives.
-    No lossy coercion — only real int values >= 0 are accepted.
+    Accepts only exact built-in ints (type(val) is int): bool, float, string,
+    object, and int subclasses are invalid even when their comparisons lie.
+    No lossy coercion — only plain int values >= 0 are accepted; returns a
+    plain int (never a subclass instance).
     """
-    if isinstance(val, bool) or not isinstance(val, int):
+    if type(val) is not int:
         return None
     if val < 0:
         return None
-    return val
+    return int(val)
 
 
 def _pget_attempt_token_allows(req, op):
     """True when cancel / set-limit may act on the live op.
 
     ONLY ABSENCE of the attemptToken key enables legacy id-only compatibility.
-    When the key is present, its value must be a nonblank primitive string that
-    exactly equals the stored active token (also a nonblank string). Present
-    null/None, empty/whitespace, bool, number, object, or different string is
-    a no-op — even when the stored token is None.
+    When the key is present, both the provided value and the stored active
+    token must be exact built-in strings (type(x) is str) that are nonblank
+    and equal. Present null/None, empty/whitespace, bool, number, object,
+    str subclass (even with a lying __eq__), or different string is a no-op —
+    even when the stored token is None. A stored non-exact-string token also
+    cannot be acted upon by a provided token.
     """
     if not isinstance(req, dict) or "attemptToken" not in req:
         return True
     provided = req.get("attemptToken")
-    if not isinstance(provided, str) or not provided.strip():
+    if type(provided) is not str or not provided.strip():
         return False
     stored = op.get("attemptToken") if isinstance(op, dict) else None
-    if not isinstance(stored, str) or not stored.strip():
+    if type(stored) is not str or not stored.strip():
         return False
     return provided == stored
 
