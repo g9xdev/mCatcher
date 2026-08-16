@@ -837,6 +837,16 @@ _YTDLP_VER = None
 
 
 def _ytdlp_version():
+    # Prefer the in-process library: this runs at every startup/reconnect and was
+    # the most frequent thing an antivirus held at launch.
+    try:
+        from mchost import ytdlp_lib
+        if ytdlp_lib.available():
+            v = ytdlp_lib.lib_version()
+            if v:
+                return v
+    except Exception:
+        pass
     if not YTDLP:
         return None
     cf, si = _no_window()
@@ -852,9 +862,43 @@ def ytdlp_version_cached():
     return _YTDLP_VER or ""
 
 
+_PYLIB_SPEC = "yt-dlp[default,curl-cffi,deno]"
+
+
+def _pip_upgrade_pylib():
+    """Upgrade the vendored library in place with the same targeted install
+    bootstrap performs. Returns the last line of output, or None on failure."""
+    from mchost import ytdlp_lib
+    cf, si = _no_window()
+    try:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--target",
+                            ytdlp_lib.lib_dir(), "--upgrade", "--disable-pip-version-check",
+                            _PYLIB_SPEC],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           creationflags=cf, startupinfo=si, timeout=300)
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        _h()._hlog("info", "yt-dlp library update: %s" % (out.splitlines()[-1] if out else "done"))
+        return out
+    except Exception as e:
+        _h()._hlog("warn", "yt-dlp library update failed: %s" % e)
+        return None
+
+
 def ytdlp_update():
     """Ask yt-dlp to update itself (it breaks often as YouTube changes). Best-effort."""
     global _YTDLP_VER
+    # The in-process library updates via pip, not the exe's -U (there may be no
+    # exe, and updating one would not touch the other). Re-run the same targeted
+    # install bootstrap uses; leave the exe -U for exe-only installs.
+    try:
+        from mchost import ytdlp_lib
+        if ytdlp_lib.available():
+            out = _pip_upgrade_pylib()
+            if out is not None:
+                _YTDLP_VER = _ytdlp_version() or _YTDLP_VER
+                return out
+    except Exception as e:
+        _h()._hlog("warn", "yt-dlp library update failed: %s" % e)
     if not YTDLP:
         return None
     cf, si = _no_window()
@@ -1075,64 +1119,97 @@ def _simplify_vcodec(vc):
     return vc.split(".")[0].upper()
 
 
+def _ytdlp_lib():
+    """Late import so the module loads even where the vendored library is absent
+    (its own import adds the pylib dir to sys.path)."""
+    from mchost import ytdlp_lib
+    return ytdlp_lib
+
+
+def _ytmeta_info_via_exe(reqid, url, deno):
+    """The exe -J path, kept as a fallback for installs without the library.
+    Returns the parsed info dict, or None after sending the error."""
+    ytdlp = find_ytdlp()
+    if not ytdlp:
+        _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "yt-dlp not installed"})
+        return None
+    cmd = [ytdlp, "-J", "--no-warnings", "--no-playlist", "--skip-download",
+           "--cookies-from-browser", "firefox"]
+    if deno:
+        cmd += ["--js-runtimes", "deno:%s" % deno]
+    cmd += [url]
+    cf, si = _no_window()
+    # Popen + explicit tree kill, NOT subprocess.run(timeout=...): yt-dlp's
+    # onefile launcher re-execs the real program as a child that inherits
+    # these pipes, so run()'s timeout path kills only the launcher and then
+    # blocks in its cleanup communicate(), waiting on a pipe the surviving
+    # grandchild still holds. The popup then sits on "Reading formats…"
+    # forever and the grandchild is orphaned. Kept under the extension's 60s
+    # wait so a completed probe is never orphaned the other way.
+    p = None
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             creationflags=cf, startupinfo=si)
+        try:
+            out, err = p.communicate(timeout=_YTMETA_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _safe_kill(p)                      # whole tree, else the pipe stays open
+            try:
+                out, err = p.communicate(timeout=15)
+            except Exception:
+                out, err = b"", b""
+            _h()._hlog("warn", "yt-dlp -J: no answer in %ds for %s — stopped%s"
+                       % (_YTMETA_TIMEOUT, url,
+                          ("; last output:\n" + (err or b"").decode("utf-8", "replace")[-2000:])
+                          if err else ""))
+            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False,
+                       "error": "Timed out reading formats after %ds. The log console "
+                                "has yt-dlp's last output." % _YTMETA_TIMEOUT})
+            return None
+    except Exception as e:
+        _safe_kill(p)
+        _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": str(e)})
+        return None
+    if p.returncode != 0 or not out:
+        _reason, emsg = _map_yt_error((err or b"").decode("utf-8", "replace"))
+        _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": emsg})
+        return None
+    try:
+        return json.loads(out.decode("utf-8", "replace"))
+    except Exception as e:
+        _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "parse: %s" % e})
+        return None
+
+
 def handle_ytmeta(req):
-    """Probe a yt-dlp URL (yt-dlp -J, no download) for its real formats so the popup
-    can show codec/resolution/bitrate/size + a quality picker. Best format per height,
-    with a video+audio size estimate. Replies once with a {type:"ytmeta"} message."""
+    """Probe a yt-dlp URL (-J, no download) for its real formats so the popup can
+    show codec/resolution/bitrate/size + a quality picker. Best format per height,
+    with a video+audio size estimate. Replies once with a {type:"ytmeta"} message.
+
+    Prefers the in-process library (no exe launch to be scanned/held); falls back
+    to the exe -J path where the library is absent."""
     def worker():
         reqid = req.get("reqId")
         url = req.get("url") or ""
-        ytdlp = find_ytdlp()   # display-only; don't self-fetch here — download still can
-        if not ytdlp:
-            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "yt-dlp not installed"})
-            return
         deno = DENO or find_deno()
-        cmd = [ytdlp, "-J", "--no-warnings", "--no-playlist", "--skip-download",
-               "--cookies-from-browser", "firefox"]
-        if deno:
-            cmd += ["--js-runtimes", "deno:%s" % deno]
-        cmd += [url]
-        cf, si = _no_window()
-        # Popen + explicit tree kill, NOT subprocess.run(timeout=...): yt-dlp's
-        # onefile launcher re-execs the real program as a child that inherits
-        # these pipes, so run()'s timeout path kills only the launcher and then
-        # blocks in its cleanup communicate(), waiting on a pipe the surviving
-        # grandchild still holds. The popup then sits on "Reading formats…"
-        # forever and the grandchild is orphaned. Kept under the extension's 60s
-        # wait so a completed probe is never orphaned the other way.
-        p = None
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 creationflags=cf, startupinfo=si)
+        lib = _ytdlp_lib()
+        if lib.available():
+            argv = ["-J", "--no-warnings", "--no-playlist", "--skip-download",
+                    "--cookies-from-browser", "firefox"]
+            if deno:
+                argv += ["--js-runtimes", "deno:%s" % deno]
+            argv += [url]
             try:
-                out, err = p.communicate(timeout=_YTMETA_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                _safe_kill(p)                      # whole tree, else the pipe stays open
-                try:
-                    out, err = p.communicate(timeout=15)
-                except Exception:
-                    out, err = b"", b""
-                _h()._hlog("warn", "yt-dlp -J: no answer in %ds for %s — stopped%s"
-                           % (_YTMETA_TIMEOUT, url,
-                              ("; last output:\n" + (err or b"").decode("utf-8", "replace")[-2000:])
-                              if err else ""))
-                _h().send({"type": "ytmeta", "reqId": reqid, "ok": False,
-                           "error": "Timed out reading formats after %ds. The log console "
-                                    "has yt-dlp's last output." % _YTMETA_TIMEOUT})
+                info = lib.extract_info(argv)
+            except Exception as e:
+                _reason, emsg = _map_yt_error(str(e))
+                _h()._hlog("error", "yt-dlp -J (lib): %s" % str(e)[:300], "ytdlp")
+                _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": emsg})
                 return
-        except Exception as e:
-            _safe_kill(p)
-            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": str(e)})
-            return
-        if p.returncode != 0 or not out:
-            _reason, emsg = _map_yt_error((err or b"").decode("utf-8", "replace"))
-            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": emsg})
-            return
-        try:
-            info = json.loads(out.decode("utf-8", "replace"))
-        except Exception as e:
-            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "parse: %s" % e})
-            return
+        else:
+            info = _ytmeta_info_via_exe(reqid, url, deno)
+            if info is None:
+                return
         fmts = info.get("formats") or []
         dur = info.get("duration") or 0
         # Best audio-only stream (for the size estimate + an audio-only download option).
@@ -3342,16 +3419,101 @@ def _handle_ytdl_structured(req):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _ytdl_lib_argv(fmt, outtmpl, url, deno, pot):
+    """The download flags for the in-process path — the same selection
+    _ytdl_build_cmd produces, minus the exe/stdout-only options (--newline,
+    --progress, --no-quiet, --print @@FILE@@): in-process, progress comes from
+    hooks and the saved path from the info dict, and output is hardened to a
+    logger so nothing reaches the native-messaging channel."""
+    argv = ["--no-playlist", "--no-mtime", "--no-warnings", "--force-overwrites",
+            "-f", fmt, "--merge-output-format", "mp4",
+            "--cookies-from-browser", "firefox",
+            "-o", outtmpl,
+            "--socket-timeout", "30", "--encoding", "utf-8", "--restrict-filenames"]
+    if _h().FFMPEG:
+        argv += ["--ffmpeg-location", os.path.dirname(_h().FFMPEG)]
+    if deno:
+        argv += ["--js-runtimes", "deno:%s" % deno]
+    if pot:
+        argv += ["--extractor-args",
+                 "youtubepot-bgutilhttp:base_url=http://127.0.0.1:%d" % _POT_PORT]
+    argv += [url]
+    return argv
+
+
+def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
+    """In-process download for the legacy (tokenless) path. Emits the same
+    ytdl-progress / ytdl-done / ytdl-error wire shapes the exe worker did.
+
+    Cancellation is by flag, polled inside yt-dlp's hooks: the hooks fire once
+    bytes flow, so a cancel during the (now fast, in-process) resolve is seen at
+    the first progress callback rather than instantly. No stall watchdog — the
+    launch-scan hang it guarded against cannot happen in-process, and a network
+    stall is bounded by --socket-timeout."""
+    lib = _ytdlp_lib()
+    op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
+    if not _pget_register(jid, op):
+        _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn",
+                   "error": "Download id already in use."})
+        return
+    _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
+               % (url, "on" if pot else "off"))
+    _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving",
+               "note": "Preparing"})
+    last = {"pct": -1.0}
+
+    def on_progress(m):
+        if m.get("stage") == "merging" or m.get("pct") is None:
+            _h().send({"type": "ytdl-progress", "id": jid, **m})
+            return
+        pct = m["pct"]
+        # throttle to ~1% steps; resend on a reset (audio stream starts after video)
+        if pct < last["pct"] or pct - last["pct"] >= 1.0 or pct >= 100.0:
+            last["pct"] = pct
+            _h().send({"type": "ytdl-progress", "id": jid, **m})
+
+    def on_note(note):
+        if last["pct"] < 0:
+            _h().send({"type": "ytdl-progress", "id": jid, "pct": 0,
+                       "stage": "resolving", "note": note})
+
+    def _cancelled():
+        _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled", "error": "Cancelled."})
+
+    try:
+        path = lib.download(_ytdl_lib_argv(fmt, outtmpl, url, deno, pot),
+                            on_progress=on_progress, on_note=on_note,
+                            should_cancel=lambda: op.get("cancel_requested"))
+    except lib.Cancelled:
+        _cancelled()
+        return
+    except Exception as e:
+        if op.get("cancel_requested"):
+            _cancelled()
+            return
+        reason, msg = _map_yt_error(str(e))
+        _h()._hlog("error", "yt-dlp (lib) failed (%s): %s" % (reason, str(e)[:500]), "ytdlp")
+        _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+        return
+    finally:
+        _pget_unregister(jid, op)
+
+    if op.get("cancel_requested"):
+        _cancelled()
+    elif path and os.path.isfile(path):
+        _h().send({"type": "ytdl-done", "id": jid, "file": path, "bytes": os.path.getsize(path)})
+        _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(path))
+    else:
+        _h().send({"type": "ytdl-error", "id": jid, "reason": "generic",
+                   "error": "Download failed — open the log console for yt-dlp's output."})
+
+
 def _handle_ytdl_legacy(req):
-    """Token-omitted path: preserve title/ID template and tokenless wire shapes."""
+    """Token-omitted path: preserve title/ID template and tokenless wire shapes.
+    Prefers the in-process library; falls back to the exe worker below."""
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
-        ytdlp = ensure_ytdlp()
-        if not ytdlp:
-            _h().send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
-                  "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
-            return
         deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
         outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
         try:
@@ -3362,6 +3524,16 @@ def _handle_ytdl_legacy(req):
         outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
         # Optional format selector from the popup's quality picker; default = best.
         fmt = req.get("format") or "bv*+ba/b"
+
+        if _ytdlp_lib().available():
+            _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot)
+            return
+
+        ytdlp = ensure_ytdlp()
+        if not ytdlp:
+            _h().send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
+                  "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
+            return
         cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
         _h()._hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
         _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": "Preparing"})

@@ -176,6 +176,36 @@ if (Test-Path $localYtdlp) {
   } catch { Warn ("yt-dlp: download failed (" + $_ + "). Put yt-dlp.exe in " + $InstallDir + " to enable YouTube.") }
 }
 
+# ---------- 3b-lib. yt-dlp as an in-process library ----------
+# The exe launch was the biggest and most frequent target for antivirus image
+# scanning; under a browser-descended process each launch was held (a hang
+# indistinguishable from a network fault). Imported into the resident host
+# instead, there is no per-call binary to scan. `pip install --target` collects
+# yt-dlp and its deps into pylib\ against the user's own Python, so wheels always
+# match; the exe above stays as a fallback for hosts without the library.
+$pyExeForPip = $null
+$cand = Join-Path (Split-Path $pythonw) "python.exe"
+if (Test-Path $cand) { $pyExeForPip = $cand }
+$pylib = Join-Path $InstallDir "pylib"
+if ($SkipYtdlp) {
+  Warn "yt-dlp library: skipped"
+} elseif (-not $pyExeForPip) {
+  Warn "yt-dlp library: no python.exe next to pythonw - the exe fallback will be used"
+} elseif ((Test-Path (Join-Path $pylib "yt_dlp\__init__.py"))) {
+  Step "yt-dlp library: present"
+} else {
+  Warn "yt-dlp library: installing (in-process yt-dlp, avoids per-launch AV scans)..."
+  try {
+    & $pyExeForPip -m pip install --target $pylib --disable-pip-version-check --quiet "yt-dlp[default,curl-cffi,deno]" 2>&1 | Out-Null
+    # Trim CLI-pretty deps the host never calls.
+    foreach ($d in @("rich", "pygments", "markdown_it", "mdurl")) {
+      Get-ChildItem $pylib -Filter "$d*" -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path (Join-Path $pylib "yt_dlp\__init__.py")) { Step "yt-dlp library: installed" }
+    else { throw "yt_dlp not present after install" }
+  } catch { Warn ("yt-dlp library: install failed (" + $_ + "). The exe fallback will be used.") }
+}
+
 # ---------- 3c. Deno (JS runtime yt-dlp needs to solve YouTube's 'n' challenge) ----------
 # Without it, YouTube offers only storyboard images. Auto-detected because it sits next
 # to yt-dlp.exe. yt-dlp-ejs (the solver scripts) is bundled inside yt-dlp.exe already.

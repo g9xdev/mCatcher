@@ -4641,3 +4641,31 @@ def test_ytdl_cmd_restricts_filenames_to_ascii():
                             "https://example.test/v", None, False)
     assert "--restrict-filenames" in cmd, "saved names are ASCII-only"
     assert "--encoding" in cmd, "still tells yt-dlp which encoding to emit"
+
+
+def test_lib_argv_omits_the_stdout_only_flags(monkeypatch):
+    """The in-process argv must carry the real download flags but NOT the
+    exe/stdout-only ones: --newline/--progress/--no-quiet dump to the screen and
+    --print @@FILE@@ is replaced by reading the path from the info dict. In the
+    host, stdout is the native-messaging channel, so a stray --no-quiet would
+    corrupt the framing."""
+    import mchost.downloads as d
+    monkeypatch.setattr(mc, "FFMPEG", r"C:\H\ffmpeg.exe")
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    argv = d._ytdl_lib_argv("bv*+ba/b", "out.%(ext)s", "https://x.test/v",
+                            r"C:\H\deno.exe", pot=False)
+    for good in ("-f", "--restrict-filenames", "--encoding", "--socket-timeout",
+                 "--cookies-from-browser", "--merge-output-format"):
+        assert good in argv, "missing %s" % good
+    for bad in ("--newline", "--progress", "--no-quiet", "--print"):
+        assert bad not in argv, "%s must not reach the in-process path" % bad
+    assert argv[-1] == "https://x.test/v"
+    assert ("deno:" + r"C:\H\deno.exe") in argv
+
+
+def test_lib_argv_carries_the_pot_extractor_arg_only_when_pot_is_on():
+    import mchost.downloads as d
+    on = d._ytdl_lib_argv("b", "o.%(ext)s", "u", None, pot=True)
+    off = d._ytdl_lib_argv("b", "o.%(ext)s", "u", None, pot=False)
+    assert any("youtubepot" in a for a in on)
+    assert not any("youtubepot" in a for a in off)
