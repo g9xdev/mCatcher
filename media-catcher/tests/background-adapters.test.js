@@ -1097,10 +1097,17 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 
   // Synchronous contracts
   assert.equal(ctrl.acceptPageSnapshot(null), undefined);
+  // Lease 2: unknown media fails with generic variant registration TypeError
+  // without reading variants or minting tokens/ephemerals/effects.
+  const ba01TokBefore = fx.counts.randomToken;
   assert.throws(
     () => ctrl.registerVariants("media-x", []),
-    (err) => err instanceof Error && err.message === LEASE1_MSG
+    (err) =>
+      err instanceof TypeError &&
+      err.message === "invalid media variant registration"
   );
+  assert.equal(fx.counts.randomToken, ba01TokBefore);
+  assert.equal(effectHits, 0);
   const jobs = ctrl.popupJobs();
   assert.ok(Array.isArray(jobs));
   assert.equal(jobs.length, 0);
@@ -4754,4 +4761,1412 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
       }
     }
   );
+});
+
+// ---------------------------------------------------------------------------
+// BA05–BA06 helpers (Lease 2 variant registration)
+// ---------------------------------------------------------------------------
+
+const VARIANT_REG_MSG = "invalid media variant registration";
+const VARIANT_TRAP_SENTINEL = "HOSTILE_VARIANT_TRAP_SENTINEL_Z9";
+const VARIANT_URL_SENTINEL = "SECRET_VARIANT_SIGNED_QUERY_Q1";
+const VARIANT_USERINFO_SENTINEL = "SECRET_VARIANT_USERINFO_U2";
+const VARIANT_LABEL_SENTINEL = "SECRET_VARIANT_LABEL_COOKIE_L3";
+const VARIANT_OVERRIDE_SENTINEL = "SECRET_VARIANT_OVERRIDE_O4";
+
+function assertVariantTypeError(err, opts) {
+  assert.ok(err instanceof TypeError, "expected TypeError, got " + err);
+  assert.equal(err.name, "TypeError");
+  assert.equal(err.message, VARIANT_REG_MSG);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(err, "cause") ? err.cause : undefined,
+    undefined,
+    "variant TypeError must not retain a cause"
+  );
+  if (opts && opts.notSameAs != null) {
+    assert.notEqual(err, opts.notSameAs, "must not rethrow hostile identity");
+  }
+  const blob = String(err.message) + "\n" + String(err.stack || "");
+  assert.equal(
+    blob.includes(VARIANT_TRAP_SENTINEL),
+    false,
+    "variant error must not contain trap sentinel"
+  );
+  if (opts && opts.forbidden) {
+    for (const s of opts.forbidden) {
+      assert.equal(blob.includes(s), false, "variant error must not contain " + s);
+    }
+  }
+}
+
+/**
+ * Classic load with Privacy + Map instrumentation for Lease-2 variant proofs.
+ * Delegates real Privacy.createEphemeral; records exact URL/header arguments.
+ */
+function loadInstrumentedClassicVariants() {
+  const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
+  const code = fs.readFileSync(abs, "utf8");
+  const root = Object.create(null);
+  const sandbox = classicVmBuiltins(root);
+
+  const trackedMaps = [];
+  class TrackingMap extends Map {
+    constructor() {
+      super();
+      this._sets = [];
+      trackedMaps.push(this);
+    }
+    set(key, value) {
+      this._sets.push({ key: key, value: value });
+      return super.set(key, value);
+    }
+  }
+  sandbox.Map = TrackingMap;
+
+  loadClassicDependencies(sandbox, root);
+
+  const registryHits = {
+    observe: 0,
+    lookup: 0,
+    clear: 0,
+    snapshot: 0,
+    create: 0,
+  };
+  const registryEvents = [];
+  const RealPR = root.McProviderRegistry;
+  const realCreatePR = RealPR.createProviderRegistry;
+  root.McProviderRegistry = {
+    createProviderRegistry() {
+      registryHits.create += 1;
+      const reg = realCreatePR.call(RealPR);
+      return {
+        observe(mediaOrigin, providerKey) {
+          registryHits.observe += 1;
+          registryEvents.push({
+            op: "observe",
+            mediaOrigin: mediaOrigin,
+            providerKey: providerKey,
+          });
+          return reg.observe(mediaOrigin, providerKey);
+        },
+        lookup(mediaOrigin) {
+          registryHits.lookup += 1;
+          const result = reg.lookup(mediaOrigin);
+          registryEvents.push({
+            op: "lookup",
+            mediaOrigin: mediaOrigin,
+            result: {
+              status: result && result.status,
+              providerKey: result ? result.providerKey : undefined,
+            },
+          });
+          return result;
+        },
+        clear() {
+          registryHits.clear += 1;
+          return reg.clear();
+        },
+        snapshot() {
+          registryHits.snapshot += 1;
+          return reg.snapshot();
+        },
+      };
+    },
+    normalizeOrigin: RealPR.normalizeOrigin,
+    normalizeProviderKey: RealPR.normalizeProviderKey,
+  };
+
+  const privacyHits = [];
+  const RealPrivacy = root.McPrivacy;
+  const realCreateEph = RealPrivacy.createEphemeral;
+  root.McPrivacy = {
+    createEphemeral(url, headers) {
+      privacyHits.push({
+        url: url,
+        headers: headers,
+        headersType: headers === null ? "null" : typeof headers,
+      });
+      return realCreateEph.call(RealPrivacy, url, headers);
+    },
+    // preserve other exports used by production if any
+    projectPopupJob: RealPrivacy.projectPopupJob,
+    projectHistoryEntry: RealPrivacy.projectHistoryEntry,
+    redactLogArgs: RealPrivacy.redactLogArgs,
+    isTerminalState: RealPrivacy.isTerminalState,
+    clearEphemeralOnTerminal: RealPrivacy.clearEphemeralOnTerminal,
+  };
+
+  const finalizers = [];
+  const RealDF = root.McDetectionFinalizer;
+  const realCreate = RealDF.createDetectionFinalizer;
+  root.McDetectionFinalizer = {
+    CONTEXT_WAIT_MS: RealDF.CONTEXT_WAIT_MS,
+    mapWebRequestDetails: RealDF.mapWebRequestDetails,
+    createDetectionFinalizer(deps) {
+      const instance = realCreate.call(RealDF, deps);
+      finalizers.push(instance);
+      return instance;
+    },
+  };
+
+  vm.runInNewContext(code, sandbox, { filename: abs });
+  assert.equal(typeof root.McBackgroundAdapters, "object");
+
+  return {
+    api: root.McBackgroundAdapters,
+    trackedMaps,
+    finalizers,
+    registryHits,
+    registryEvents,
+    privacyHits,
+    sessionFinalizer() {
+      return finalizers[0] || null;
+    },
+    pendingRecords() {
+      const out = [];
+      for (const m of trackedMaps) {
+        for (const entry of m._sets) {
+          const v = entry.value;
+          if (!v || typeof v !== "object") continue;
+          const keys = Object.keys(v).slice().sort();
+          if (
+            keys.length === 4 &&
+            keys[0] === "detectionId" &&
+            keys[1] === "ephemeral" &&
+            keys[2] === "mediaKind" &&
+            keys[3] === "tabId"
+          ) {
+            out.push(v);
+          }
+        }
+      }
+      return out;
+    },
+    sourceRecords() {
+      const out = [];
+      for (const m of trackedMaps) {
+        for (const entry of m._sets) {
+          const v = entry.value;
+          if (!v || typeof v !== "object") continue;
+          const keys = Object.keys(v);
+          if (
+            keys.includes("mediaId") &&
+            keys.includes("proposedFilename") &&
+            keys.includes("mediaKind")
+          ) {
+            out.push(v);
+          }
+        }
+      }
+      return out;
+    },
+    /** Private variant ownership rows: {safeProjection, sourceHandle}. */
+    variantPrivateRows() {
+      const out = [];
+      for (const m of trackedMaps) {
+        for (const entry of m._sets) {
+          const v = entry.value;
+          if (!v || typeof v !== "object") continue;
+          if (Array.isArray(v)) {
+            for (const row of v) {
+              if (
+                row &&
+                typeof row === "object" &&
+                Object.prototype.hasOwnProperty.call(row, "safeProjection") &&
+                Object.prototype.hasOwnProperty.call(row, "sourceHandle")
+              ) {
+                out.push(row);
+              }
+            }
+            continue;
+          }
+          if (
+            Object.prototype.hasOwnProperty.call(v, "safeProjection") &&
+            Object.prototype.hasOwnProperty.call(v, "sourceHandle")
+          ) {
+            out.push(v);
+          }
+        }
+      }
+      return out;
+    },
+  };
+}
+
+/** Build a genuine foreign-realm dense Array of plain/null-proto entries. */
+function foreignRealmVariantArray(specs) {
+  // Do not inject host Object/Array — foreign intrinsics only.
+  const src =
+    "(function () {\n" +
+    "  var specs = " +
+    JSON.stringify(specs) +
+    ";\n" +
+    "  var arr = [];\n" +
+    "  for (var i = 0; i < specs.length; i++) {\n" +
+    "    var s = specs[i];\n" +
+    "    var o = s.nullProto ? Object.create(null) : {};\n" +
+    "    var keys = Object.keys(s.fields);\n" +
+    "    for (var k = 0; k < keys.length; k++) {\n" +
+    "      o[keys[k]] = s.fields[keys[k]];\n" +
+    "    }\n" +
+    "    arr.push(o);\n" +
+    "  }\n" +
+    "  return arr;\n" +
+    "})()";
+  const foreign = vm.runInNewContext(src);
+  assert.ok(Array.isArray(foreign));
+  // Prove realm separation: foreign Array ctor is not host Array.
+  assert.notEqual(foreign.constructor, Array);
+  assert.notEqual(Object.getPrototypeOf(foreign), Array.prototype);
+  if (foreign.length > 0 && !specs[0].nullProto) {
+    assert.notEqual(Object.getPrototypeOf(foreign[0]), Object.prototype);
+  }
+  return foreign;
+}
+
+function capturePendingMedia(ctrl, fx, overrides) {
+  const mediaId = ctrl.captureNetwork(validNetworkCapture(overrides));
+  return mediaId;
+}
+
+function captureFinalizedMedia(ctrl, fx, overrides) {
+  const mediaId = ctrl.captureNetwork(validNetworkCapture(overrides));
+  ctrl.acceptPageSnapshot(florenSnapshot());
+  return mediaId;
+}
+
+function variantSafeKeys(row) {
+  return Object.keys(row);
+}
+
+test("BA05 — opaque variant IDs bind original private URLs and replay cannot replace the owned set", async (t) => {
+  await t.test("binds exact original URLs, mints opaque IDs, freezes safe projections", () => {
+    const inst = loadInstrumentedClassicVariants();
+    const fx = makeEffects();
+    let variantTokenCalls = 0;
+    const ctrl = inst.api.createBackgroundAdapters(
+      fx.options({
+        randomToken(ns) {
+          fx.counts.randomToken += 1;
+          if (ns === "variant") variantTokenCalls += 1;
+          return "tok-repeat";
+        },
+      })
+    );
+
+    const url1 =
+      "https://" +
+      VARIANT_USERINFO_SENTINEL +
+      ":pw@cdn-a.example/v1.mp4?sig=" +
+      VARIANT_URL_SENTINEL +
+      "&exp=1#frag-" +
+      VARIANT_URL_SENTINEL;
+    const url2 =
+      "https://cdn-b.example/v2.mp4?token=" +
+      VARIANT_URL_SENTINEL +
+      "2&x=1";
+
+    const getterHits = { id: 0, variantId: 0, variantUrl: 0, providerKey: 0, toString: 0 };
+    const entry0 = {
+      url: url1,
+      label: "  1080p clean  ",
+      width: 1920,
+      height: 1080,
+      bandwidth: 5000000,
+      mime: "video/mp4",
+      id: VARIANT_OVERRIDE_SENTINEL + "-caller-id",
+      variantId: VARIANT_OVERRIDE_SENTINEL + "-vid",
+      variantUrl: "https://evil.example/" + VARIANT_OVERRIDE_SENTINEL,
+      providerKey: "evil-provider",
+      mediaId: "caller-media",
+      headers: { Cookie: "x=" + VARIANT_OVERRIDE_SENTINEL },
+    };
+    Object.defineProperty(entry0, "sneaky", {
+      enumerable: true,
+      get() {
+        getterHits.id += 1;
+        throw new Error(VARIANT_TRAP_SENTINEL);
+      },
+    });
+    // Unknown field accessor must never run — define on a second unknown name via proto? own unknown with getter:
+    Object.defineProperty(entry0, "item", {
+      enumerable: true,
+      get() {
+        getterHits.variantId += 1;
+        return VARIANT_TRAP_SENTINEL;
+      },
+    });
+
+    const entry1 = Object.create(null);
+    entry1.url = url2;
+    entry1.label = "720p";
+    entry1.width = 0; // omit
+    entry1.height = 720;
+    entry1.bandwidth = -1; // omit
+    entry1.mime = "video/mp4; codecs=avc1"; // omit unsafe
+    entry1.id = "ignored-id";
+
+    const coercion = {
+      url: {
+        valueOf() {
+          getterHits.toString += 1;
+          return url1;
+        },
+        toString() {
+          getterHits.toString += 1;
+          return url1;
+        },
+      },
+    };
+
+    // Pending media first — register while pending, invisible in popup.
+    const pendingId = capturePendingMedia(ctrl, fx, {
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: "https://s40.example-cdn.invalid/base.mp4?token=SECRET_SIGNED_QUERY_XYZ",
+        documentId: "doc-var-1",
+      }),
+    });
+    assert.equal(ctrl.popupMedia(42).length, 0);
+
+    const privacyBefore = inst.privacyHits.length;
+    const tokBefore = fx.counts.randomToken;
+    // Exclude coercion entry from successful path — first register valid pair.
+    const rows = ctrl.registerVariants(pendingId, [entry0, entry1]);
+    assert.equal(getterHits.id, 0, "unknown getter must not run");
+    assert.equal(getterHits.variantId, 0, "unknown item getter must not run");
+    assert.equal(fx.counts.randomToken - tokBefore, 2);
+    assert.equal(variantTokenCalls, 2);
+    assert.equal(inst.privacyHits.length - privacyBefore, 2);
+    // Base capture also creates one ephemeral; variant ones are the last two.
+    const vEph = inst.privacyHits.slice(-2);
+    assert.equal(vEph[0].url, url1);
+    assert.equal(vEph[0].headers, null);
+    assert.equal(vEph[1].url, url2);
+    assert.equal(vEph[1].headers, null);
+
+    assert.equal(rows.length, 2);
+    assertDeepFrozen(rows, "registerVariants return");
+    assert.notEqual(rows, ctrl.registerVariants(pendingId, [entry0])); // replay fresh
+    // First successful set: IDs
+    assert.ok(isSafeOpaqueId(rows[0].id));
+    assert.ok(isSafeOpaqueId(rows[1].id));
+    assert.notEqual(rows[0].id, rows[1].id);
+    assert.notEqual(rows[0].id, pendingId);
+    assert.match(rows[0].id, /^variant:tok-repeat:1$/);
+    assert.match(rows[1].id, /^variant:tok-repeat:2$/);
+    // Key order / allowlist
+    assert.deepEqual(variantSafeKeys(rows[0]), [
+      "id",
+      "label",
+      "width",
+      "height",
+      "bandwidth",
+      "mime",
+    ]);
+    assert.equal(rows[0].label, "1080p clean");
+    assert.equal(rows[0].width, 1920);
+    assert.equal(rows[0].height, 1080);
+    assert.equal(rows[0].bandwidth, 5000000);
+    assert.equal(rows[0].mime, "video/mp4");
+    assert.deepEqual(variantSafeKeys(rows[1]), ["id", "label", "height"]);
+    assert.equal(rows[1].label, "720p");
+    assert.equal(rows[1].height, 720);
+    // No URL / override leakage
+    const raw = JSON.stringify(rows);
+    assert.equal(raw.includes(VARIANT_URL_SENTINEL), false);
+    assert.equal(raw.includes(VARIANT_USERINFO_SENTINEL), false);
+    assert.equal(raw.includes(VARIANT_OVERRIDE_SENTINEL), false);
+    assert.equal(raw.includes("url"), false);
+    assert.equal(raw.includes("variantUrl"), false);
+
+    // Private handles retain exact spelling
+    const privRows = inst.variantPrivateRows();
+    assert.ok(privRows.length >= 2);
+    const handles = privRows.map((r) => r.sourceHandle);
+    const boundUrls = handles.map((h) => h.mediaUrl).filter(Boolean);
+    assert.ok(boundUrls.includes(url1));
+    assert.ok(boundUrls.includes(url2));
+    for (const h of handles) {
+      if (h && h.mediaUrl === url1) {
+        assert.equal(h.mediaUrl, url1);
+        assert.equal(h.requestHeaders, null);
+      }
+    }
+
+    // Pending still invisible
+    assert.equal(ctrl.popupMedia(42).length, 0);
+
+    // Finalize — variants attach to popup
+    ctrl.acceptPageSnapshot(florenSnapshot({ documentId: "doc-var-1" }));
+    const popup = ctrl.popupMedia(42);
+    assert.equal(popup.length, 1);
+    assert.equal(popup[0].id, pendingId);
+    assert.equal(popup[0].variants.length, 2);
+    assert.equal(popup[0].variants[0].id, rows[0].id);
+    assert.equal(popup[0].variants[1].id, rows[1].id);
+    assertDeepFrozen(popup, "popup with variants");
+    assert.notEqual(popup[0].variants, rows);
+    assert.notEqual(popup[0].variants[0], rows[0]);
+
+    // Coercion hook entry rejects without running valueOf/toString as URL accept
+    assert.throws(
+      () => ctrl.registerVariants(pendingId, [coercion]),
+      (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+    );
+    // Replay already bound — coercion not reached; getterHits.toString still 0
+    assert.equal(getterHits.toString, 0);
+
+    assert.equal(fx.counts.publishJobs, 0);
+    assert.equal(fx.counts.persistHistory, 0);
+    assert.equal(fx.counts.postNative, 0);
+    assert.equal(inst.registryHits.observe, 0);
+  });
+
+  await t.test("replay after bind reads nothing; same-media reentry fails; cross-media isolates", () => {
+    const inst = loadInstrumentedClassicVariants();
+    const fx = makeEffects();
+    const ctrl = inst.api.createBackgroundAdapters(fx.options());
+
+    const idA = captureFinalizedMedia(ctrl, fx, {
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: "https://cdn.example/a.mp4",
+        documentId: "doc-re-a",
+      }),
+    });
+    // Need distinct media — second capture + snapshot
+    const idB = ctrl.captureNetwork(
+      validNetworkCapture({
+        details: Object.assign({}, florenNetworkInput().details, {
+          url: "https://cdn.example/b.mp4",
+          documentId: "doc-re-b",
+          timeStamp: 1_000_100,
+        }),
+      })
+    );
+    ctrl.acceptPageSnapshot(
+      florenSnapshot({
+        documentId: "doc-re-b",
+        candidates: [{ kind: "visible-filename", value: "b.mp4" }],
+      })
+    );
+
+    const urlA1 = "https://cdn.example/va1.mp4?s=1";
+    const urlA2 = "https://cdn.example/va2.mp4?s=2";
+    let reenterErr = null;
+    let nestedVariantsRead = 0;
+    const nestedProxy = new Proxy(
+      [{ url: "https://evil.example/nested.mp4" }],
+      {
+        get(t, p, r) {
+          nestedVariantsRead += 1;
+          return Reflect.get(t, p, r);
+        },
+        getOwnPropertyDescriptor(t, p) {
+          nestedVariantsRead += 1;
+          return Reflect.getOwnPropertyDescriptor(t, p);
+        },
+        ownKeys(t) {
+          nestedVariantsRead += 1;
+          return Reflect.ownKeys(t);
+        },
+      }
+    );
+
+    const ctrl2inst = loadInstrumentedClassicVariants();
+    const fx2 = makeEffects();
+    let variantTokens = 0;
+    let idA2 = null;
+    const ctrl2 = ctrl2inst.api.createBackgroundAdapters(
+      fx2.options({
+        randomToken(ns) {
+          fx2.counts.randomToken += 1;
+          if (ns === "variant") {
+            variantTokens += 1;
+            if (variantTokens === 1 && idA2) {
+              try {
+                ctrl2.registerVariants(idA2, nestedProxy);
+              } catch (e) {
+                reenterErr = e;
+              }
+            }
+          }
+          return "tok-r";
+        },
+      })
+    );
+    idA2 = captureFinalizedMedia(ctrl2, fx2, {
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: "https://cdn.example/a2.mp4",
+        documentId: "doc-re-a2",
+      }),
+    });
+    const idB2 = ctrl2.captureNetwork(
+      validNetworkCapture({
+        details: Object.assign({}, florenNetworkInput().details, {
+          url: "https://cdn.example/b2.mp4",
+          documentId: "doc-re-b2",
+          timeStamp: 1_000_200,
+        }),
+      })
+    );
+    ctrl2.acceptPageSnapshot(
+      florenSnapshot({
+        documentId: "doc-re-b2",
+        candidates: [{ kind: "visible-filename", value: "b2.mp4" }],
+      })
+    );
+
+    reenterErr = null;
+    nestedVariantsRead = 0;
+    variantTokens = 0;
+    const outer = ctrl2.registerVariants(idA2, [
+      { url: urlA1, label: "A1" },
+      { url: urlA2, label: "A2" },
+    ]);
+    assertVariantTypeError(reenterErr);
+    assert.equal(nestedVariantsRead, 0, "reentrant call must not read nested variants");
+    assert.equal(outer.length, 2);
+
+    // Cross-media registration during / after
+    const other = ctrl2.registerVariants(idB2, [
+      { url: "https://cdn.example/vb1.mp4", label: "B1" },
+    ]);
+    assert.equal(other.length, 1);
+    assert.notEqual(other[0].id, outer[0].id);
+    assert.notEqual(other[0].id, outer[1].id);
+
+    // Replay with revoked proxy — zero traps
+    let trapHits = 0;
+    const target = [{ url: "https://cdn.example/nope.mp4" }];
+    const revocable = Proxy.revocable(target, {
+      get() {
+        trapHits += 1;
+        return undefined;
+      },
+      getOwnPropertyDescriptor() {
+        trapHits += 1;
+        return undefined;
+      },
+      ownKeys() {
+        trapHits += 1;
+        return [];
+      },
+    });
+    revocable.revoke();
+    const replay = ctrl2.registerVariants(idA2, revocable.proxy);
+    assert.equal(trapHits, 0);
+    assert.equal(replay.length, 2);
+    assert.equal(replay[0].id, outer[0].id);
+    assert.equal(replay[1].id, outer[1].id);
+    assert.deepEqual(Object.keys(replay[0]), Object.keys(outer[0]));
+
+    // Completed-set replay returns fresh frozen copies without reading second arg
+    const replay2 = ctrl2.registerVariants(idA2, nestedProxy);
+    assert.equal(nestedVariantsRead, 0);
+    assert.notEqual(replay2, replay);
+    assert.equal(replay2[0].id, outer[0].id);
+
+    void idA;
+    void idB;
+  });
+
+  await t.test("validation failures are atomic; Privacy prepare failure leaves zero IDs", () => {
+    const inst = loadInstrumentedClassicVariants();
+    const fx = makeEffects();
+    let failPrivacy = false;
+    const RealLoad = loadInstrumentedClassicVariants;
+    // custom privacy fail via option not available — use wrapper by patching after load
+    const abs = path.join(mediaCatcherRoot, "lib", "background-adapters.js");
+    const code = fs.readFileSync(abs, "utf8");
+    const root = Object.create(null);
+    const sandbox = classicVmBuiltins(root);
+    const trackedMaps = [];
+    class TrackingMap extends Map {
+      constructor() {
+        super();
+        this._sets = [];
+        trackedMaps.push(this);
+      }
+      set(key, value) {
+        this._sets.push({ key, value });
+        return super.set(key, value);
+      }
+    }
+    sandbox.Map = TrackingMap;
+    loadClassicDependencies(sandbox, root);
+    const privacyHits = [];
+    const realEph = root.McPrivacy.createEphemeral;
+    root.McPrivacy = Object.assign({}, root.McPrivacy, {
+      createEphemeral(url, headers) {
+        privacyHits.push(url);
+        if (failPrivacy) {
+          const err = new Error("PRIVACY_PREPARE_FAIL_SENTINEL");
+          err.code = "PRIVACY_FAIL";
+          throw err;
+        }
+        return realEph.call(root.McPrivacy, url, headers);
+      },
+    });
+    // Fix: realEph needs RealPrivacy
+    const RealPrivacy = root.McPrivacy;
+    // re-read - we overwrote. Reload privacy properly:
+    // Actually createEphemeral on assigned object - realEph already bound from before assign... 
+    // Let's reload deps cleanly
+    void RealLoad;
+    void RealPrivacy;
+
+    // Simpler path: use inst and monkeypatch via second controller built with throwing randomToken first
+    const inst2 = loadInstrumentedClassicVariants();
+    const fx2 = makeEffects();
+    const tokenErr = new Error("TOKEN_VARIANT_FAIL");
+    let throwToken = false;
+    const ctrl = inst2.api.createBackgroundAdapters(
+      fx2.options({
+        randomToken(ns) {
+          fx2.counts.randomToken += 1;
+          if (throwToken && ns === "variant") throw tokenErr;
+          return "tok-v";
+        },
+      })
+    );
+    const mediaId = captureFinalizedMedia(ctrl, fx2, {
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: "https://cdn.example/atomic.mp4",
+        documentId: "doc-atomic",
+      }),
+    });
+    const tokBefore = fx2.counts.randomToken;
+    const base = snapshotEffectBaseline(fx2);
+
+    // Invalid structures — zero token
+    const invalids = [
+      null,
+      undefined,
+      "nope",
+      { 0: { url: "https://x.com/a" }, length: 1 },
+      [{ url: "ftp://x.com/a" }],
+      [{ url: "blob:https://x.com/a" }],
+      [{ url: "  https://x.com/a" }],
+      [{ url: "https://x.com/a\n" }],
+      [{ url: "" }],
+      [{ url: "   " }],
+      [{ label: "only" }],
+      [null],
+      [[ { url: "https://x.com/a" } ]],
+      [function () { return { url: "https://x.com/a" }; }],
+      [new Date()],
+      [new Map()],
+      [new Set()],
+      [new Uint8Array(2)],
+    ];
+    for (const bad of invalids) {
+      assert.throws(
+        () => ctrl.registerVariants(mediaId, bad),
+        (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+      );
+    }
+    assert.equal(fx2.counts.randomToken, tokBefore);
+    assertEffectBaseline(fx2, base, "invalid variants");
+
+    // Sparse array
+    const sparse = [];
+    sparse[0] = { url: "https://cdn.example/s.mp4" };
+    sparse[2] = { url: "https://cdn.example/s2.mp4" };
+    sparse.length = 3;
+    assert.throws(
+      () => ctrl.registerVariants(mediaId, sparse),
+      (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+    );
+
+    // Token failure — no partial set; dependency identity preserved
+    throwToken = true;
+    let threw = null;
+    try {
+      ctrl.registerVariants(mediaId, [{ url: "https://cdn.example/t.mp4", label: "t" }]);
+    } catch (e) {
+      threw = e;
+    }
+    assert.equal(threw, tokenErr);
+    assert.equal(ctrl.popupMedia(42)[0].variants.length, 0);
+    throwToken = false;
+
+    // Privacy prepare failure via instrumented load with throwing createEphemeral
+    {
+      const root3 = Object.create(null);
+      const sandbox3 = classicVmBuiltins(root3);
+      const maps3 = [];
+      class TM3 extends Map {
+        constructor() {
+          super();
+          this._sets = [];
+          maps3.push(this);
+        }
+        set(k, v) {
+          this._sets.push({ key: k, value: v });
+          return super.set(k, v);
+        }
+      }
+      sandbox3.Map = TM3;
+      loadClassicDependencies(sandbox3, root3);
+      const RealP = root3.McPrivacy;
+      const realCreate = RealP.createEphemeral.bind(RealP);
+      let ephCalls = 0;
+      let failAt = -1;
+      const privErr = new Error("PRIVACY_PREPARE_FAIL_SENTINEL");
+      root3.McPrivacy = {
+        createEphemeral(url, headers) {
+          ephCalls += 1;
+          if (failAt >= 0 && ephCalls === failAt) throw privErr;
+          return realCreate(url, headers);
+        },
+      };
+      const RealDF = root3.McDetectionFinalizer;
+      const realFin = RealDF.createDetectionFinalizer;
+      root3.McDetectionFinalizer = {
+        CONTEXT_WAIT_MS: RealDF.CONTEXT_WAIT_MS,
+        mapWebRequestDetails: RealDF.mapWebRequestDetails,
+        createDetectionFinalizer(deps) {
+          return realFin.call(RealDF, deps);
+        },
+      };
+      vm.runInNewContext(code, sandbox3, { filename: abs });
+      const fx3 = makeEffects();
+      const c3 = root3.McBackgroundAdapters.createBackgroundAdapters(
+        fx3.options({
+          randomToken(ns) {
+            fx3.counts.randomToken += 1;
+            return "tok-p";
+          },
+        })
+      );
+      const mid = c3.captureNetwork(
+        validNetworkCapture({
+          details: Object.assign({}, florenNetworkInput().details, {
+            url: "https://cdn.example/priv.mp4",
+            documentId: "doc-priv",
+          }),
+        })
+      );
+      c3.acceptPageSnapshot(florenSnapshot({ documentId: "doc-priv" }));
+      // base capture used ephCalls; reset fail gate for variants only
+      const ephAtReady = ephCalls;
+      failAt = ephAtReady + 2; // fail on second variant ephemeral
+      const tokAt = fx3.counts.randomToken;
+      let pErr = null;
+      try {
+        c3.registerVariants(mid, [
+          { url: "https://cdn.example/p1.mp4" },
+          { url: "https://cdn.example/p2.mp4" },
+        ]);
+      } catch (e) {
+        pErr = e;
+      }
+      assert.equal(pErr, privErr, "preserve Privacy exception identity");
+      assert.equal(c3.popupMedia(42)[0].variants.length, 0);
+      // Failed attempt must consume no issued variant ID / namespace counter
+      failAt = -1;
+      const ok = c3.registerVariants(mid, [
+        { url: "https://cdn.example/p1.mp4" },
+        { url: "https://cdn.example/p2.mp4" },
+      ]);
+      assert.equal(ok.length, 2);
+      assert.match(ok[0].id, /^variant:tok-p:1$/);
+      assert.match(ok[1].id, /^variant:tok-p:2$/);
+      // tokens: 2 for failed attempt + 2 for success
+      assert.equal(fx3.counts.randomToken - tokAt, 4);
+    }
+
+    // Valid retry after token failure
+    const ok2 = ctrl.registerVariants(mediaId, [
+      { url: "https://cdn.example/ok.mp4", label: "ok" },
+    ]);
+    assert.equal(ok2.length, 1);
+    assert.match(ok2[0].id, /^variant:tok-v:1$/);
+  });
+
+  await t.test("cross-realm accept; realm-neutral reject; hostile reflection fresh errors", () => {
+    const inst = loadInstrumentedClassicVariants();
+    const fx = makeEffects();
+    const ctrl = inst.api.createBackgroundAdapters(fx.options());
+    const mediaId = captureFinalizedMedia(ctrl, fx, {
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: "https://cdn.example/realm.mp4",
+        documentId: "doc-realm",
+      }),
+    });
+
+    const u1 = "https://cdn.example/foreign1.mp4?sig=abc";
+    const u2 = "https://cdn.example/foreign2.mp4?sig=def";
+    const foreign = foreignRealmVariantArray([
+      { nullProto: false, fields: { url: u1, label: "f1", width: 100 } },
+      { nullProto: true, fields: { url: u2, label: "f2", height: 200 } },
+    ]);
+    const accepted = ctrl.registerVariants(mediaId, foreign);
+    assert.equal(accepted.length, 2);
+    assert.equal(accepted[0].label, "f1");
+    assert.equal(accepted[0].width, 100);
+    assert.equal(accepted[1].label, "f2");
+    assert.equal(accepted[1].height, 200);
+    const priv = inst.variantPrivateRows();
+    const urls = priv.map((r) => r.sourceHandle && r.sourceHandle.mediaUrl);
+    assert.ok(urls.includes(u1));
+    assert.ok(urls.includes(u2));
+
+    // New media for rejection matrix (set already bound on mediaId)
+    const media2 = ctrl.captureNetwork(
+      validNetworkCapture({
+        details: Object.assign({}, florenNetworkInput().details, {
+          url: "https://cdn.example/realm2.mp4",
+          documentId: "doc-realm2",
+          timeStamp: 1_000_300,
+        }),
+      })
+    );
+    ctrl.acceptPageSnapshot(
+      florenSnapshot({
+        documentId: "doc-realm2",
+        candidates: [{ kind: "visible-filename", value: "realm2.mp4" }],
+      })
+    );
+
+    class CustomCls {
+      constructor() {
+        this.url = "https://cdn.example/cls.mp4";
+      }
+    }
+    const enumProto = { marker: "ENUM_PROTO_MARKER" };
+    const customEnum = Object.create(enumProto);
+    customEnum.url = "https://cdn.example/enum.mp4";
+
+    const nullProtoProto = Object.create(null);
+    const customNullProto = Object.create(nullProtoProto);
+    customNullProto.url = "https://cdn.example/np.mp4";
+
+    // foreign array as entry (not outer) must reject
+    const foreignArrayAsEntry = vm.runInNewContext("[1,2,3]");
+    // foreign ordinary record as entry must accept (separate media)
+    const foreignOrdinaryEntry = vm.runInNewContext(
+      '({url:"https://cdn.example/fx-ordinary.mp4",label:"fo"})'
+    );
+    assert.notEqual(Object.getPrototypeOf(foreignOrdinaryEntry), Object.prototype);
+
+    const rejectEntries = [
+      foreignArrayAsEntry,
+      [1],
+      function fn() {},
+      new Date(),
+      new Map(),
+      new Set(),
+      new Uint8Array([1]),
+      new CustomCls(),
+      customEnum,
+      customNullProto,
+      [{ url: "https://cdn.example/nested.mp4" }],
+    ];
+
+    for (const ent of rejectEntries) {
+      assert.throws(
+        () => ctrl.registerVariants(media2, [ent]),
+        (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG,
+        "must reject entry " + String(ent && ent.constructor && ent.constructor.name)
+      );
+    }
+    // Also reject local Array instance as sole entry via Array subclass-like
+    assert.throws(
+      () => ctrl.registerVariants(media2, [[]]),
+      (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+    );
+    // Foreign ordinary object entry is accepted (realm-neutral plain record).
+    const foreignOk = ctrl.registerVariants(media2, [foreignOrdinaryEntry]);
+    assert.equal(foreignOk.length, 1);
+    assert.equal(foreignOk[0].label, "fo");
+
+    // Hostile proxies — fresh generic errors, no sentinel leak
+    function makeTrap(trapName) {
+      const hostile = new TypeError(VARIANT_REG_MSG);
+      hostile.cause = { secret: VARIANT_TRAP_SENTINEL };
+      try {
+        hostile.stack = VARIANT_TRAP_SENTINEL + "\n" + String(hostile.stack || "");
+      } catch (_e) {
+        /* ignore */
+      }
+      Object.defineProperty(hostile, "message", {
+        get() {
+          throw new Error("message-getter-" + VARIANT_TRAP_SENTINEL);
+        },
+        configurable: true,
+      });
+      // Re-define message as data for the throw identity, but public path must not read it
+      // Contract: trap throws TypeError whose message is exactly the generic text.
+      // Use a data message for the thrown object; separate test ensures we don't read .message
+      const thrown = new TypeError(VARIANT_REG_MSG);
+      thrown.cause = VARIANT_TRAP_SENTINEL;
+      thrown[VARIANT_TRAP_SENTINEL] = true;
+      try {
+        thrown.stack = "TypeError: " + VARIANT_REG_MSG + "\n    at " + VARIANT_TRAP_SENTINEL;
+      } catch (_e2) {
+        /* ignore */
+      }
+      const handler = {};
+      handler[trapName] = function () {
+        throw thrown;
+      };
+      // Ensure other traps don't accidentally succeed
+      if (trapName !== "getOwnPropertyDescriptor") {
+        handler.getOwnPropertyDescriptor = function () {
+          throw thrown;
+        };
+      }
+      return { proxy: new Proxy([], handler), thrown: thrown };
+    }
+
+    for (const trapName of ["getOwnPropertyDescriptor", "getPrototypeOf", "ownKeys"]) {
+      const { proxy, thrown } = makeTrap(trapName);
+      let err = null;
+      try {
+        ctrl.registerVariants(media2, proxy);
+      } catch (e) {
+        err = e;
+      }
+      assertVariantTypeError(err, {
+        notSameAs: thrown,
+        forbidden: [VARIANT_TRAP_SENTINEL, "message-getter"],
+      });
+    }
+
+    // Entry-level hostile proxy
+    const entryThrown = new TypeError(VARIANT_REG_MSG);
+    entryThrown.cause = VARIANT_TRAP_SENTINEL;
+    entryThrown.stack = VARIANT_TRAP_SENTINEL;
+    const badEntry = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw entryThrown;
+        },
+        getPrototypeOf() {
+          throw entryThrown;
+        },
+        ownKeys() {
+          throw entryThrown;
+        },
+      }
+    );
+    let e2 = null;
+    try {
+      ctrl.registerVariants(media2, [{ url: "https://cdn.example/ok.mp4" }, badEntry]);
+    } catch (e) {
+      e2 = e;
+    }
+    assertVariantTypeError(e2, { notSameAs: entryThrown, forbidden: [VARIANT_TRAP_SENTINEL] });
+
+    // Unknown media / wrong types do not touch variants
+    let touch = 0;
+    const watched = new Proxy([], {
+      get() {
+        touch += 1;
+        return undefined;
+      },
+      getOwnPropertyDescriptor() {
+        touch += 1;
+        return undefined;
+      },
+      ownKeys() {
+        touch += 1;
+        return [];
+      },
+    });
+    assert.throws(
+      () => ctrl.registerVariants("media-unknown", watched),
+      (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+    );
+    assert.equal(touch, 0);
+    assert.throws(
+      () => ctrl.registerVariants(null, watched),
+      (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+    );
+    assert.equal(touch, 0);
+
+    // futureTransport.variants alone never activates
+    const src = productionSource();
+    assert.match(src, /futureTransport/);
+    // capture with transport variants — no variant IDs until explicit register
+    const inst3 = loadInstrumentedClassicVariants();
+    const fx3 = makeEffects();
+    const c3 = inst3.api.createBackgroundAdapters(fx3.options());
+    const mid3 = c3.captureNetwork(
+      validNetworkCapture({
+        details: Object.assign({}, florenNetworkInput().details, {
+          url: "https://cdn.example/ft.mp4",
+          documentId: "doc-ft",
+        }),
+        transport: {
+          mediaKind: "direct",
+          requestHeaders: null,
+          variants: [
+            { url: "https://cdn.example/from-transport.mp4?secret=NOPE" },
+          ],
+        },
+      })
+    );
+    c3.acceptPageSnapshot(florenSnapshot({ documentId: "doc-ft" }));
+    assert.equal(c3.popupMedia(42)[0].variants.length, 0);
+    assert.equal(
+      inst3.variantPrivateRows().filter((r) => {
+        try {
+          return (
+            r.sourceHandle &&
+            r.sourceHandle.mediaUrl &&
+            String(r.sourceHandle.mediaUrl).includes("from-transport")
+          );
+        } catch (_e) {
+          return false;
+        }
+      }).length,
+      0
+    );
+    // explicit wins without reading retained snapshot
+    const exp = c3.registerVariants(mid3, [
+      { url: "https://cdn.example/explicit.mp4", label: "ex" },
+    ]);
+    assert.equal(exp.length, 1);
+    assert.equal(exp[0].label, "ex");
+
+    // enqueueDownload still Lease-1 stub — no getter/effect
+    let gHits = 0;
+    const msg = {};
+    Object.defineProperty(msg, "item", {
+      get() {
+        gHits += 1;
+        return {
+          get url() {
+            gHits += 1;
+            return "https://evil";
+          },
+          get providerKey() {
+            gHits += 1;
+            return "evil";
+          },
+          get variantUrl() {
+            gHits += 1;
+            return "https://evil/v";
+          },
+          get variantId() {
+            gHits += 1;
+            return accepted[0].id;
+          },
+        };
+      },
+    });
+    const p = c3.enqueueDownload(msg, {});
+    assert.ok(p && typeof p.then === "function");
+    // rejection checked async below in same sync test via then — use deasync pattern
+    // node:test allows returning promise
+  });
+
+  await t.test("enqueueDownload remains Lease-1 stub; no selection resolver in source", async () => {
+    const inst = loadInstrumentedClassicVariants();
+    const fx = makeEffects();
+    const ctrl = inst.api.createBackgroundAdapters(fx.options());
+    const mediaId = captureFinalizedMedia(ctrl, fx);
+    const rows = ctrl.registerVariants(mediaId, [
+      { url: "https://cdn.example/enq.mp4", label: "e" },
+    ]);
+    let gHits = 0;
+    const message = {
+      get item() {
+        gHits += 1;
+        return {
+          url: "https://evil.example/" + VARIANT_OVERRIDE_SENTINEL,
+          providerKey: "evil",
+          variantUrl: "https://evil.example/v",
+          variantId: rows[0].id,
+        };
+      },
+      get variantId() {
+        gHits += 1;
+        return rows[0].id;
+      },
+    };
+    const sender = {
+      get tab() {
+        gHits += 1;
+        return {};
+      },
+    };
+    const baseline = snapshotEffectBaseline(fx);
+    let p;
+    assert.doesNotThrow(() => {
+      p = ctrl.enqueueDownload(message, sender);
+    });
+    assert.equal(gHits, 0);
+    let rejected = null;
+    await p.then(
+      () => {
+        throw new Error("expected reject");
+      },
+      (err) => {
+        rejected = err;
+      }
+    );
+    assert.ok(rejected instanceof Error);
+    assert.equal(rejected.message, LEASE1_MSG);
+    assert.equal(gHits, 0);
+    assertEffectBaseline(fx, baseline, "enqueueDownload");
+    assert.equal(ctrl.popupMedia(42)[0].variants[0].id, rows[0].id);
+
+    const src = productionSource();
+    assert.equal(
+      /\bresolve(Selection|Variant|Source)\b/.test(src),
+      false,
+      "no selection resolver"
+    );
+    assert.equal(/\bselectVariant\b/.test(src), false);
+    assert.equal(/\bgetVariantUrl\b/.test(src), false);
+    // Ownership maps present after implementation (names may vary — structural via TrackingMap only)
+    assert.ok(inst.variantPrivateRows().length >= 1);
+  });
+
+  await t.test("empty registration keeps set open; optional label full-string safety", () => {
+    const inst = loadInstrumentedClassicVariants();
+    const fx = makeEffects();
+    const ctrl = inst.api.createBackgroundAdapters(fx.options());
+    const mediaId = captureFinalizedMedia(ctrl, fx, {
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: "https://cdn.example/lab.mp4",
+        documentId: "doc-lab",
+      }),
+    });
+    const empty = ctrl.registerVariants(mediaId, []);
+    assert.deepEqual(empty, []);
+    assertDeepFrozen(empty, "empty variants");
+    // still open — nonempty can bind
+    const unsafeLabels = [
+      "xCookie: " + VARIANT_LABEL_SENTINEL,
+      "xAuthorization: " + VARIANT_LABEL_SENTINEL,
+      "prefix Set-Cookie: " + VARIANT_LABEL_SENTINEL,
+      "Proxy-Authorization: " + VARIANT_LABEL_SENTINEL,
+      "has Bearer " + VARIANT_LABEL_SENTINEL,
+      "see cookie in text",
+      "my token value",
+      "https://example.com/x",
+      "//cdn.example/x",
+      "good\u0001bad",
+      "sig=1",
+    ];
+    const entries = unsafeLabels.map((label, i) => ({
+      url: "https://cdn.example/l" + i + ".mp4",
+      label: label,
+    }));
+    // also one safe label
+    entries.push({
+      url: "https://cdn.example/safe.mp4",
+      label: "  Safe Quality  ",
+      mime: "VIDEO/mp4",
+    });
+    // mime must match conservative token — VIDEO/mp4 has uppercase which is allowed [A-Za-z]
+    const out = ctrl.registerVariants(mediaId, entries);
+    assert.equal(out.length, unsafeLabels.length + 1);
+    for (let i = 0; i < unsafeLabels.length; i++) {
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(out[i], "label"),
+        false,
+        "unsafe label omitted at " + i
+      );
+      const js = JSON.stringify(out[i]);
+      assert.equal(js.includes(VARIANT_LABEL_SENTINEL), false);
+    }
+    const last = out[out.length - 1];
+    assert.equal(last.label, "Safe Quality");
+    assert.equal(last.mime, "VIDEO/mp4");
+  });
+});
+
+test("BA06 — public outputs and callbacks exclude every private URL/header/override sentinel", async () => {
+  const inst = loadInstrumentedClassicVariants();
+  const fx = makeEffects();
+  const ctrl = inst.api.createBackgroundAdapters(fx.options());
+
+  const baseUrl =
+    "https://user:" +
+    VARIANT_USERINFO_SENTINEL +
+    "@s40.example-cdn.invalid/file.mp4?token=SECRET_SIGNED_QUERY_XYZ&exp=99#" +
+    VARIANT_URL_SENTINEL;
+  const mediaId = ctrl.captureNetwork(
+    validNetworkCapture({
+      details: Object.assign({}, florenNetworkInput().details, {
+        url: baseUrl,
+        documentId: "doc-ba06",
+        originUrl: florenPageUrl() + "?ref=SECRET_REFERER_PATH",
+      }),
+      transport: {
+        mediaKind: "direct",
+        requestHeaders: {
+          Cookie: "session=SECRET_COOKIE_ABC",
+          Authorization: "Bearer SECRET_AUTH_BEARER_TOKEN",
+          Referer: florenPageUrl() + "?ref=SECRET_REFERER_PATH",
+        },
+      },
+    })
+  );
+
+  const vUrl =
+    "https://" +
+    VARIANT_USERINFO_SENTINEL +
+    "@cdn.example/v.mp4?sig=" +
+    VARIANT_URL_SENTINEL +
+    "&token=" +
+    VARIANT_OVERRIDE_SENTINEL;
+  const hostileLabel = {
+    url: "https://cdn.example/hostile-label.mp4",
+    get label() {
+      throw new Error("HOSTILE_LABEL_" + VARIANT_TRAP_SENTINEL);
+    },
+  };
+  // Known-field accessors reject the whole registration.
+  assert.throws(
+    () => ctrl.registerVariants(mediaId, [hostileLabel]),
+    (err) => err instanceof TypeError && err.message === VARIANT_REG_MSG
+  );
+
+  // pending register with mixed safe/unsafe optionals
+  const pendingRows = ctrl.registerVariants(mediaId, [
+    {
+      url: vUrl,
+      label: "xCookie: " + VARIANT_LABEL_SENTINEL,
+      width: 1280,
+      height: 720,
+      mime: "video/mp4",
+      id: VARIANT_OVERRIDE_SENTINEL,
+      variantId: VARIANT_OVERRIDE_SENTINEL,
+      variantUrl: "https://evil/" + VARIANT_OVERRIDE_SENTINEL,
+      Cookie: VARIANT_OVERRIDE_SENTINEL,
+      Authorization: VARIANT_OVERRIDE_SENTINEL,
+    },
+    {
+      url: "https://cdn.example/v2.mp4?x=" + VARIANT_URL_SENTINEL,
+      mime: "video/mp4; secret=" + VARIANT_OVERRIDE_SENTINEL,
+      width: "1280",
+      height: 720.5,
+    },
+  ]);
+  assert.equal(pendingRows.length, 2);
+  assert.equal(Object.prototype.hasOwnProperty.call(pendingRows[0], "label"), false);
+
+  ctrl.acceptPageSnapshot(
+    florenSnapshot({
+      documentId: "doc-ba06",
+      pageUrl: florenPageUrl() + "/SECRET_PAGE_PATH",
+      topLevelPageUrl: florenPageUrl() + "/SECRET_PAGE_PATH",
+    })
+  );
+
+  const pub = fx.publishDetections.slice();
+  assert.equal(pub.length, 1);
+  assert.deepEqual(Object.keys(pub[0]), [
+    "id",
+    "proposedFilename",
+    "kind",
+    "providerKey",
+  ]);
+  assertNoSentinels(pub[0], "publishDetection");
+  assert.equal(JSON.stringify(pub[0]).includes(VARIANT_URL_SENTINEL), false);
+  assert.equal(JSON.stringify(pub[0]).includes(VARIANT_USERINFO_SENTINEL), false);
+  assert.equal(JSON.stringify(pub[0]).includes(VARIANT_OVERRIDE_SENTINEL), false);
+
+  const popup = ctrl.popupMedia(42);
+  assert.equal(popup.length, 1);
+  assert.deepEqual(Object.keys(popup[0]), [
+    "id",
+    "proposedFilename",
+    "kind",
+    "variants",
+  ]);
+  assert.equal(popup[0].variants.length, 2);
+  assert.deepEqual(Object.keys(popup[0].variants[0]).sort(), [
+    "height",
+    "id",
+    "mime",
+    "width",
+  ].sort());
+  assert.equal(popup[0].variants[1].height, undefined);
+  assert.ok(!("height" in popup[0].variants[1]) || popup[0].variants[1].height === undefined);
+  // second row: only id (unsafe/omitted optionals)
+  assert.deepEqual(Object.keys(popup[0].variants[1]), ["id"]);
+
+  const surfaces = [
+    pendingRows,
+    popup,
+    pub,
+    ctrl.popupJobs(),
+    fx.diagnostics,
+  ];
+  for (const s of surfaces) {
+    const raw = JSON.stringify(s);
+    for (const sent of [
+      ...SECRET_SENTINELS,
+      VARIANT_URL_SENTINEL,
+      VARIANT_USERINFO_SENTINEL,
+      VARIANT_LABEL_SENTINEL,
+      VARIANT_OVERRIDE_SENTINEL,
+      VARIANT_TRAP_SENTINEL,
+    ]) {
+      assert.equal(raw.includes(sent), false, "surface must not contain " + sent);
+    }
+    assert.equal(raw.includes("mediaUrl"), false);
+    assert.equal(raw.includes("sourceContext"), false);
+    assert.equal(raw.includes("requestHeaders"), false);
+  }
+
+  // invalid registration error text
+  let inv = null;
+  try {
+    ctrl.registerVariants("not-owned", [{ url: "https://x.com/" + VARIANT_URL_SENTINEL }]);
+  } catch (e) {
+    inv = e;
+  }
+  assertVariantTypeError(inv, {
+    forbidden: [VARIANT_URL_SENTINEL, VARIANT_TRAP_SENTINEL],
+  });
+
+  // replay
+  const replay = ctrl.registerVariants(mediaId, [
+    {
+      get url() {
+        throw new Error(VARIANT_TRAP_SENTINEL);
+      },
+    },
+  ]);
+  assert.equal(replay[0].id, pendingRows[0].id);
+
+  // future stubs
+  for (const call of [
+    () => ctrl.enqueueDownload({ url: VARIANT_URL_SENTINEL }, {}),
+    () => ctrl.handleNativeMessage({ x: VARIANT_URL_SENTINEL }),
+    () => ctrl.pump(),
+  ]) {
+    const p = call();
+    let rej = null;
+    await p.then(
+      () => {
+        throw new Error("expected reject");
+      },
+      (e) => {
+        rej = e;
+      }
+    );
+    assert.equal(rej.message, LEASE1_MSG);
+    assert.equal(String(rej.message).includes(VARIANT_URL_SENTINEL), false);
+  }
+
+  assert.equal(fx.counts.publishJobs, 0);
+  assert.equal(fx.counts.persistHistory, 0);
+  assert.equal(fx.counts.postNative, 0);
+  assert.equal(fx.counts.downloadsDownload, 0);
+  assert.equal(fx.counts.fetchArrayBuffer, 0);
+  assert.equal(fx.counts.assembleMedia, 0);
+  assert.equal(fx.counts.createObjectURL, 0);
+  assert.equal(fx.counts.revokeObjectURL, 0);
+  assert.equal(inst.registryHits.observe, 0);
+  assert.equal(inst.registryHits.lookup, 0);
 });
