@@ -3412,3 +3412,341 @@ def test_safe_ascii_filename_exactly_150_preserved_multi_and_single(tmp_path, mo
         assert res2.get("bytes") == len(payload)
     finally:
         shutdown_server(httpd2)
+
+
+# ---------------------------------------------------------------------------
+# Fix-round: explicit-null token fencing on legacy ops + nonnegative size meta
+# ---------------------------------------------------------------------------
+
+def test_legacy_tokenless_op_explicit_null_token_fencing(tmp_path, monkeypatch):
+    """Legacy stored token None: omitted key acts; present null/empty/typed no-ops.
+
+    Contract: ONLY absence of attemptToken enables id-only compatibility.
+    When the key is present its value must be a nonblank primitive string
+    exactly equal to the stored active token. Present None/empty/whitespace/
+    bool/number/object/different string is a no-op (set-limit: no ack;
+    cancel: no cancel/stop).
+    """
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"L" * (256 * 1024)
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:2048])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=15.0)
+            try:
+                self.wfile.write(payload[2048:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    jid = "jobLegacyNullFence"
+    try:
+        # No attemptToken on start → stored token is None (legacy tokenless op).
+        mc.handle_pget_single({
+            "id": jid,
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        op = d._PGET.get(jid)
+        assert op is not None
+        assert op.get("attemptToken") is None
+        assert op.get("cancel_requested") is False
+
+        acks_before = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+
+        # Present null/None must NOT match stored None — no mutate, no ack.
+        for bad_tok in (None, "", "   ", True, False, 0, 1, 3.14, {"k": "v"}, ["x"]):
+            mc.handle_pget_set_limit({
+                "id": jid,
+                "attemptToken": bad_tok,
+                "maxConnections": 0,
+                "providerGeneration": 1,
+            })
+            time.sleep(0.03)
+            assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before, (
+                "set-limit with present invalid token %r must not ack" % (bad_tok,)
+            )
+            assert op["providerGeneration"] == 0
+            assert op["maxConnections"] == 1
+            assert op.get("cancel_requested") is False
+
+        # Wrong nonblank string also no-ops against stored None.
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": "some-token",
+            "maxConnections": 0,
+            "providerGeneration": 1,
+        })
+        time.sleep(0.03)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+
+        # Omitted attemptToken preserves legacy id-only set-limit.
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "maxConnections": 0,
+            "providerGeneration": 1,
+        })
+        ack = _wait_ack(sent, jid, timeout=5)
+        assert ack["providerGeneration"] == 1
+        assert ack["maxConnections"] == 0
+        assert ack.get("attemptToken") is None
+        assert op["providerGeneration"] == 1
+        assert op["maxConnections"] == 0
+
+        # Present invalid tokens must not cancel a legacy-tokenless op.
+        for bad_tok in (None, "", "  ", True, 0, 7, {"a": 1}, "stale"):
+            mc._pget_cancel({"id": jid, "attemptToken": bad_tok})
+            time.sleep(0.02)
+            assert op.get("cancel_requested") is False, (
+                "cancel with present invalid token %r must not set cancel" % (bad_tok,)
+            )
+            assert not (op.get("stop") and op["stop"].is_set())
+
+        # Omitted attemptToken cancel still works (legacy id-only).
+        mc._pget_cancel({"id": jid})
+        assert op.get("cancel_requested") is True
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert res.get("attemptToken") is None
+        assert d._PGET.get(jid) is None
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_tokened_op_present_null_does_not_match_and_matching_acts(tmp_path, monkeypatch):
+    """Sanity: tokened op rejects present None; matching nonblank string acts."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    body_started = threading.Event()
+    payload = b"T" * (128 * 1024)
+
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[:1024])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=15.0)
+            try:
+                self.wfile.write(payload[1024:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    jid = "jobTokSanity"
+    tok = "atk-sanity"
+    try:
+        mc.handle_pget_single({
+            "id": jid,
+            "attemptToken": tok,
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 1,
+            "providerGeneration": 0,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        op = d._PGET[jid]
+        acks_before = len([m for m in sent if m.get("type") == "pget-limit-ack"])
+
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": None,
+            "maxConnections": 0,
+            "providerGeneration": 1,
+        })
+        time.sleep(0.05)
+        assert len([m for m in sent if m.get("type") == "pget-limit-ack"]) == acks_before
+        assert op["providerGeneration"] == 0
+
+        for bad in ("", "  ", True, 1, {}):
+            mc._pget_cancel({"id": jid, "attemptToken": bad})
+            time.sleep(0.02)
+            assert op.get("cancel_requested") is False
+
+        mc.handle_pget_set_limit({
+            "id": jid,
+            "attemptToken": tok,
+            "maxConnections": 0,
+            "providerGeneration": 2,
+        })
+        ack = _wait_ack(sent, jid, timeout=5)
+        assert ack["providerGeneration"] == 2
+        assert ack.get("attemptToken") == tok
+
+        mc._pget_cancel({"id": jid, "attemptToken": tok})
+        assert op.get("cancel_requested") is True
+        hold.set()
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "cancelled"
+        assert res["attemptToken"] == tok
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_committed_metadata_rejects_invalid_sizes_keeps_zero_and_positive(tmp_path, monkeypatch):
+    """Committed success omits metadata for invalid sizes; zero/positive emit both.
+
+    os.path.getsize is normally a nonnegative int; hostile/monkeypatched values
+    (negative, bool, non-integral) must fail closed without one-sided pairs and
+    without revoking completed/committed.
+    """
+    import mchost.downloads as d
+
+    # Unit-style: terminal helper + send_result shape (injectable sizes).
+    final = tmp_path / "meta.mp4"
+    final.write_bytes(b"")  # zero-byte committed file exists
+    op = {"final_path": str(final)}
+
+    orig_getsize = d.os.path.getsize
+    orig_isfile = d.os.path.isfile
+
+    def install_size(val):
+        monkeypatch.setattr(d.os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(d.os.path, "getsize", lambda p: val)
+
+    # Negative → omit pair, success retained via send_result path.
+    install_size(-1)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    install_size(True)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    install_size(False)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    install_size(1.5)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    install_size(3.0)  # lossy float even if integral-valued
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    install_size("100")
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    install_size(None)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path is None and sz is None
+
+    # Valid zero and positive integers include the pair.
+    install_size(0)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path == str(final) and sz == 0
+
+    install_size(42)
+    path, sz = d._pget_terminal_file_bytes(op)
+    assert path == str(final) and sz == 42
+
+    # send_result must never emit one-sided or negative bytes on completed/committed.
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    def emit(file=None, bytes=None):
+        sent.clear()
+        d._pget_send_result(
+            "jobMeta", "atk-meta", "completed", "multi-range", None, "committed",
+            file=file, bytes=bytes,
+        )
+        return sent[-1]
+
+    bad_msg = emit(file=str(final), bytes=-1)
+    assert bad_msg["status"] == "completed"
+    assert bad_msg["partState"] == "committed"
+    assert "file" not in bad_msg and "bytes" not in bad_msg
+
+    bad_msg = emit(file=str(final), bytes=True)
+    assert "file" not in bad_msg and "bytes" not in bad_msg
+
+    bad_msg = emit(file=str(final), bytes=1.5)
+    assert "file" not in bad_msg and "bytes" not in bad_msg
+
+    # file without usable bytes → no one-sided pair
+    bad_msg = emit(file=str(final), bytes=None)
+    assert "file" not in bad_msg and "bytes" not in bad_msg
+
+    ok0 = emit(file=str(final), bytes=0)
+    assert ok0.get("file") == str(final)
+    assert ok0.get("bytes") == 0
+
+    okp = emit(file=str(final), bytes=7)
+    assert okp.get("file") == str(final)
+    assert okp.get("bytes") == 7
+
+    # Integration: hostile getsize=-1 after commit still completed/committed, no pair.
+    monkeypatch.setattr(d.os.path, "isfile", orig_isfile)
+    monkeypatch.setattr(d.os.path, "getsize", orig_getsize)
+    sent.clear()
+
+    def neg_getsize(path):
+        p = str(path)
+        if p.endswith("clip.mp4") and not p.endswith(".part") and os.path.isfile(path):
+            return -1
+        return orig_getsize(path)
+
+    monkeypatch.setattr(d.os.path, "getsize", neg_getsize)
+    httpd, _state = run_server("range")
+    try:
+        mc.handle_pget({
+            "id": "jobNegBytes",
+            "attemptToken": "atk-neg-bytes",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=10)
+        assert res["status"] == "completed"
+        assert res["partState"] == "committed"
+        assert res["failureCategory"] is None
+        assert (tmp_path / "clip.mp4").is_file()
+        assert "file" not in res
+        assert "bytes" not in res
+    finally:
+        shutdown_server(httpd)
+        monkeypatch.setattr(d.os.path, "getsize", orig_getsize)
+        monkeypatch.setattr(d.os.path, "isfile", orig_isfile)

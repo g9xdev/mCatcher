@@ -1153,12 +1153,40 @@ class _PgetError(Exception):
         super().__init__(category)
 
 
+def _pget_valid_committed_bytes(val):
+    """Return a nonnegative int size, or None if unusable.
+
+    Rejects bool (subclass of int), floats (no lossy coercion), negatives,
+    strings, and other non-integral values. Valid zero and positive ints pass.
+    """
+    if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+        return None
+    return val
+
+
+def _pget_attempt_token_allows(req, stored):
+    """True when cancel/set-limit may act under attempt-token fencing.
+
+    ONLY absence of the attemptToken key enables legacy id-only compatibility.
+    When the key is present, its value must be a nonblank primitive string
+    exactly equal to the stored active token. Present null/None, empty,
+    whitespace-only, bool, number, object, or different string is a no-op.
+    """
+    if not isinstance(req, dict) or "attemptToken" not in req:
+        return True
+    token = req.get("attemptToken")
+    if not isinstance(token, str) or not token.strip():
+        return False
+    return token == stored
+
+
 def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState,
                       file=None, bytes=None):
     """Emit exactly one structured terminal pget-result (caller enforces once).
 
     file/bytes are an optional pair only on completed/committed terminals.
-    Failed/cancelled keep the exact seven-field base shape.
+    Failed/cancelled keep the exact seven-field base shape. Never emit a
+    one-sided pair; invalid sizes omit both keys without revoking success.
     """
     msg = {
         "type": "pget-result",
@@ -1169,20 +1197,11 @@ def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState
         "failureCategory": failureCategory,
         "partState": partState,
     }
-    if (
-        status == "completed"
-        and partState == "committed"
-        and file is not None
-        and bytes is not None
-        and not isinstance(bytes, bool)
-    ):
-        try:
+    if status == "completed" and partState == "committed" and file is not None:
+        size = _pget_valid_committed_bytes(bytes)
+        if size is not None:
             msg["file"] = file
-            msg["bytes"] = int(bytes)
-        except (TypeError, ValueError, OverflowError):
-            # Metadata pair is best-effort; never alter the terminal status.
-            msg.pop("file", None)
-            msg.pop("bytes", None)
+            msg["bytes"] = size
     _h().send(msg)
 
 
@@ -1217,8 +1236,9 @@ def _pget_terminal_file_bytes(op):
     """Best-effort (file, bytes) for a committed op final path. Never raises.
 
     Returns (None, None) when the path is missing, unreadable, or size is not a
-    valid integer (bool is treated as invalid). Metadata failure never revokes
-    an already-committed success — callers still emit completed/committed.
+    nonnegative integral value (bool/float/negative/string fail closed; no lossy
+    coercion). Metadata failure never revokes an already-committed success —
+    callers still emit completed/committed.
     """
     if not isinstance(op, dict):
         return None, None
@@ -1228,10 +1248,10 @@ def _pget_terminal_file_bytes(op):
     try:
         if not os.path.isfile(path):
             return None, None
-        sz = os.path.getsize(path)
-        if isinstance(sz, bool):
+        sz = _pget_valid_committed_bytes(os.path.getsize(path))
+        if sz is None:
             return None, None
-        return path, int(sz)
+        return path, sz
     except Exception:
         return None, None
 
@@ -1691,12 +1711,10 @@ def _pget_cancel(req):
     j = _pget_registry_get(req.get("id"))
     if not j:
         return
-    # When attemptToken is present on the command, require exact equality to the
-    # stored start token. Stale / null / different tokens are no-ops. Omitted
-    # property preserves legacy id-only cancel.
-    if isinstance(req, dict) and "attemptToken" in req:
-        if req.get("attemptToken") != j.get("attemptToken"):
-            return
+    # Token fence: omitted key → legacy id-only; present key requires a nonblank
+    # string exactly equal to the stored active token (null/empty/typed no-op).
+    if not _pget_attempt_token_allows(req, j.get("attemptToken")):
+        return
     j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
@@ -1824,12 +1842,11 @@ def handle_pget_set_limit(req):
     if not op or op.get("lease_cv") is None:
         return
 
-    # Attempt-token fence: when the property is present, require exact equality
-    # to the stored start token. Stale / null / different → no mutate, no ack.
-    # Omitted property preserves legacy id-only set-limit.
-    if isinstance(req, dict) and "attemptToken" in req:
-        if req.get("attemptToken") != op.get("attemptToken"):
-            return
+    # Token fence: omitted key → legacy id-only; present key requires a nonblank
+    # string exactly equal to the stored active token (null/empty/typed → no
+    # mutate, no ack). Stored None never matches a present null/None.
+    if not _pget_attempt_token_allows(req, op.get("attemptToken")):
+        return
 
     ack_lock = op.get("ack_lock")
     if ack_lock is None:
@@ -1848,9 +1865,8 @@ def handle_pget_set_limit(req):
                 if _PGET.get(jid) is not op:
                     return
                 # Re-check token under identity fence in case of same-id replace.
-                if isinstance(req, dict) and "attemptToken" in req:
-                    if req.get("attemptToken") != op.get("attemptToken"):
-                        return
+                if not _pget_attempt_token_allows(req, op.get("attemptToken")):
+                    return
                 _pget_apply_limit_locked(op, gen, lim)
 
         # Re-entered from an in-flight outer send: apply only; outer drains ack.
