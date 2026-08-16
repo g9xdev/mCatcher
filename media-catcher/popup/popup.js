@@ -106,10 +106,66 @@ function hostOf(url) {
 }
 
 function baseFilename(item) {
+  // Prefer immutable smart proposal, then compatibility name; page title is last-resort only.
+  const p = (item.proposedFilename || "").trim();
+  if (p) return p.replace(/\.(m3u8|mpd)$/i, "");
+  const n = (item.name || "").trim();
+  if (n) return n.replace(/\.(m3u8|mpd)$/i, "");
   const t = (item.pageTitle || pageTitle || "").trim();
   if (t) return t;
-  return (item.name || "video").replace(/\.(m3u8|mpd)$/i, "");
+  return "video";
 }
+
+function displayItemName(item) {
+  const p = (item.proposedFilename || "").trim();
+  if (p) return p;
+  const n = (item.name || "").trim();
+  if (n) return n;
+  return item.url || "video";
+}
+
+function knownExtOf(item) {
+  const name = displayItemName(item);
+  const m = String(name).match(/\.(mp4|m4v|webm|mkv|mov|mp3|m4a|aac|flac|ogg|opus|ts|m2ts|mpeg|mpg)$/i);
+  return m ? m[0] : "";
+}
+
+// Fresh nonblank proof token for Download / Save-As confirm / Use-Firefox only.
+// Web Crypto only — never Math.random, storage, timers, or media values.
+function mintUserActionToken() {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  if (c && typeof c.getRandomValues === "function") {
+    const buf = new Uint8Array(16);
+    c.getRandomValues(buf);
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    let hex = "";
+    for (let i = 0; i < buf.length; i++) hex += buf[i].toString(16).padStart(2, "0");
+    return (
+      hex.slice(0, 8) + "-" +
+      hex.slice(8, 12) + "-" +
+      hex.slice(12, 16) + "-" +
+      hex.slice(16, 20) + "-" +
+      hex.slice(20)
+    );
+  }
+  throw new Error("Web Crypto is required to mint a user-action token");
+}
+
+function popupUi() {
+  const ui = globalThis.McPopupDownloadUi;
+  if (!ui) throw new Error("McPopupDownloadUi is required");
+  return ui;
+}
+
+function popupIntent() {
+  const intent = globalThis.McDownloadIntent;
+  if (!intent) throw new Error("McDownloadIntent is required");
+  return intent;
+}
+
+let saFormSeq = 0;
 
 function send(msg) {
   return new Promise((resolve) => {
@@ -307,8 +363,8 @@ function renderItem(item) {
   const actions = h("div", { class: "actions" });
   const slot = h("div", { class: "slot" });
 
-  // Prefer the page/stream title over the (often random) playlist filename.
-  const displayName = (item.pageTitle || "").trim() || item.name || item.url;
+  // Prefer immutable smart proposal, then compatibility name — never mutable pageTitle.
+  const displayName = displayItemName(item);
 
   // Thumbnail: captured frame if we have one, else a tinted placeholder.
   const camish = kind === "hls" || kind === "dash" || item.isLive;
@@ -355,11 +411,19 @@ function renderItem(item) {
     showLabel(el, "DRM-protected — can't be saved. Copy URL / command for reference only.", "error");
   } else if ((kind === "hls" || kind === "dash") && item.variants && item.variants.length) {
     // Qualities shown inline (works for HLS masters and DASH).
+    appendDownloadAndSaveAs(actions, item, el, {
+      downloadLabel: "Download",
+      onDownload: () => startDownload(item, el, {}),
+    });
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
     slot.appendChild(renderQualities(item, el, item.variants));
     if (item.hasAudio) appendNote(slot, "Has separate audio — saved as 2 files; a merge command is provided on completion.");
   } else if ((kind === "hls" || kind === "dash") && item.enrichState === "loading") {
+    appendDownloadAndSaveAs(actions, item, el, {
+      downloadLabel: "Download",
+      onDownload: () => handleDownload(item, el),
+    });
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
     showLabel(el, "Reading qualities…", "");
@@ -369,31 +433,35 @@ function renderItem(item) {
         title: "Record this live stream; press Stop, then Save to keep it",
         onClick: () => startRecording(item, el, {}) }, [h("i"), "Record"]));
     } else {
-      actions.appendChild(h("button", { class: "btn amber", text: "Download",
-        onClick: () => handleDownload(item, el) }));
+      appendDownloadAndSaveAs(actions, item, el, {
+        downloadLabel: "Download",
+        onDownload: () => handleDownload(item, el),
+      });
     }
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
   } else if (kind === "dash") {
-    actions.appendChild(h("button", { class: "btn amber", text: "Download",
-      onClick: () => startDownload(item, el, {}) }));
+    appendDownloadAndSaveAs(actions, item, el, {
+      downloadLabel: "Download",
+      onDownload: () => startDownload(item, el, {}),
+    });
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
   } else if (kind === "youtube") {
-    actions.appendChild(h("button", { class: "btn amber",
-      text: item.height ? "Download " + item.height + "p" : "Download highest quality",
-      onClick: () => startDownload(item, el, {}) }));
+    appendDownloadAndSaveAs(actions, item, el, {
+      downloadLabel: item.height ? "Download " + item.height + "p" : "Download highest quality",
+      onDownload: () => startDownload(item, el, {}),
+    });
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
     if (item.enrichState === "loading") appendNote(slot, "Reading formats…");
     else if (item.ytFormats && item.ytFormats.length) slot.appendChild(renderYtQualities(item, el));
     else if (item.enrichState === "error") appendNote(slot, "Couldn't read formats — the highest-quality download still works.");
   } else {
-    actions.appendChild(h("button", {
-      class: "btn amber",
-      text: kind === "hls" ? "Download…" : "Download",
-      onClick: () => handleDownload(item, el),
-    }));
+    appendDownloadAndSaveAs(actions, item, el, {
+      downloadLabel: kind === "hls" ? "Download…" : "Download",
+      onDownload: () => handleDownload(item, el),
+    });
     actions.appendChild(cmdBtn);
     actions.appendChild(copyBtn);
   }
@@ -417,6 +485,210 @@ function renderItem(item) {
 
 function appendNote(slot, text) {
   slot.appendChild(h("div", { class: "note", text: text }));
+}
+
+// Primary Download + distinct Save As… for non-DRM downloadable rows.
+function appendDownloadAndSaveAs(actions, item, el, opts) {
+  opts = opts || {};
+  actions.appendChild(h("button", {
+    class: "btn amber",
+    type: "button",
+    text: opts.downloadLabel || "Download",
+    onClick: () => {
+      if (typeof opts.onDownload === "function") opts.onDownload();
+      else startDownload(item, el, opts.selection || {});
+    },
+  }));
+  actions.appendChild(h("button", {
+    class: "btn ghost sm",
+    type: "button",
+    text: "Save As…",
+    title: "Edit filename and optional folder, then confirm",
+    onClick: () => openSaveAsForm(item, el, opts.selection || {}),
+  }));
+}
+
+// Re-render slot content after Save As cancel (qualities/notes) without a full list rebuild.
+function restoreItemSlot(item, el) {
+  const slot = el.querySelector(".slot");
+  if (!slot) return;
+  slot.replaceChildren();
+  const kind = item.kind || "direct";
+  if ((kind === "hls" || kind === "dash") && item.variants && item.variants.length) {
+    slot.appendChild(renderQualities(item, el, item.variants));
+    if (item.hasAudio) {
+      appendNote(slot, "Has separate audio — saved as 2 files; a merge command is provided on completion.");
+    }
+  } else if (kind === "youtube") {
+    if (item.enrichState === "loading") appendNote(slot, "Reading formats…");
+    else if (item.ytFormats && item.ytFormats.length) slot.appendChild(renderYtQualities(item, el));
+    else if (item.enrichState === "error") {
+      appendNote(slot, "Couldn't read formats — the highest-quality download still works.");
+    }
+  }
+  const existingId = itemDownloadId.get(item.url);
+  if (existingId && downloadState.has(existingId)) {
+    renderProgress(el, downloadState.get(existingId));
+  }
+}
+
+function openSaveAsForm(item, el, selection) {
+  selection = selection || {};
+  const slot = el.querySelector(".slot");
+  if (!slot) return;
+  const formId = "sa-" + (++saFormSeq);
+  const prefill = (item.proposedFilename || item.name || "").trim();
+  let destDir = null;
+
+  const input = h("input", {
+    class: "sa-input",
+    type: "text",
+    id: formId + "-fn",
+    "aria-label": "Filename",
+    autocomplete: "off",
+    spellcheck: "false",
+  });
+  input.value = prefill;
+
+  const destEl = h("div", { class: "sa-dest", text: "Folder: default" });
+  const warnEl = h("div", { class: "sa-warn", role: "status" });
+  const errEl = h("div", { class: "sa-error", role: "alert" });
+
+  function setDest(dir) {
+    destDir = dir || null;
+    if (destDir) {
+      destEl.textContent = destDir;
+      destEl.title = destDir;
+      destEl.classList.add("has-path");
+    } else {
+      destEl.textContent = "Folder: default";
+      destEl.title = "";
+      destEl.classList.remove("has-path");
+    }
+  }
+
+  const chooseBtn = h("button", {
+    class: "btn ghost sm",
+    type: "button",
+    text: "Choose folder…",
+    onClick: async () => {
+      if (!helperOn()) {
+        errEl.textContent = "Native helper is required to choose a folder. You can still edit the filename and confirm with the default folder.";
+        return;
+      }
+      chooseBtn.disabled = true;
+      const r = await send({ type: "pick-folder", dir: destDir || "" });
+      chooseBtn.disabled = false;
+      if (r && r.ok && r.dir) {
+        setDest(r.dir);
+        errEl.textContent = "";
+      } else if (r && r.ok === false) {
+        errEl.textContent = r.error || "Couldn't pick a folder.";
+      }
+      // Folder cancellation is not download confirmation — leave the form open.
+    },
+  });
+
+  const cancelBtn = h("button", {
+    class: "btn ghost sm",
+    type: "button",
+    text: "Cancel",
+    onClick: () => {
+      // Cancel must not send download/pick/firefox; pure policy returns null.
+      popupUi().decideSaveAsForm({ action: "cancel" });
+      restoreItemSlot(item, el);
+    },
+  });
+
+  const confirmBtn = h("button", {
+    class: "btn amber sm",
+    type: "button",
+    text: "Confirm",
+    onClick: async () => {
+      errEl.textContent = "";
+      warnEl.textContent = "";
+      const known = knownExtOf(item);
+      const pre = popupUi().validateSaveAsFilename(input.value, known);
+      if (!pre.ok) {
+        errEl.textContent = "Enter a valid filename.";
+        input.focus();
+        return;
+      }
+      if (pre.warning) warnEl.textContent = pre.warning;
+
+      let decision;
+      try {
+        const token = mintUserActionToken();
+        decision = popupUi().decideSaveAsForm({
+          action: "confirm",
+          proposedFilename: prefill || pre.filename,
+          editedFilename: input.value,
+          knownExtension: known,
+          destinationDirectory: destDir,
+          userActionToken: token,
+        });
+      } catch (e) {
+        errEl.textContent = (e && e.message) || "Invalid Save As form.";
+        input.focus();
+        return;
+      }
+      if (!decision || decision.enqueue !== true) {
+        errEl.textContent = (decision && decision.error) || "Enter a valid filename.";
+        input.focus();
+        return;
+      }
+      if (decision.warning) warnEl.textContent = decision.warning;
+
+      confirmBtn.disabled = true;
+      chooseBtn.disabled = true;
+      cancelBtn.disabled = true;
+      input.disabled = true;
+
+      let msg;
+      try {
+        msg = popupUi().buildDownloadMessage({
+          item,
+          tabId: item.tabId || currentTabId,
+          intent: decision.intent,
+          selection,
+        });
+      } catch (e) {
+        confirmBtn.disabled = false;
+        chooseBtn.disabled = false;
+        cancelBtn.disabled = false;
+        input.disabled = false;
+        errEl.textContent = (e && e.message) || "Couldn't build download.";
+        input.focus();
+        return;
+      }
+
+      const resp = await send(msg);
+      if (resp && resp.ok === false) {
+        confirmBtn.disabled = false;
+        chooseBtn.disabled = false;
+        cancelBtn.disabled = false;
+        input.disabled = false;
+        errEl.textContent = resp.error || "Download failed.";
+        input.focus();
+        return;
+      }
+      showLabel(el, item.kind === "direct" ? "Saving…" : "Starting…", "");
+    },
+  });
+
+  const form = h("div", { class: "sa-form" }, [
+    h("div", { class: "sa-field" }, [
+      h("label", { class: "sa-label", text: "Filename", for: formId + "-fn" }),
+      input,
+    ]),
+    destEl,
+    h("div", { class: "sa-actions" }, [chooseBtn, confirmBtn, cancelBtn]),
+    warnEl,
+    errEl,
+  ]);
+  slot.replaceChildren(form);
+  input.focus();
+  input.select();
 }
 
 // Inline quality chooser — works for HLS (variant.uri) and DASH (variant.id).
@@ -519,15 +791,22 @@ async function handleDownload(item, el) {
 
 async function startDownload(item, el, selection) {
   selection = selection || {};
-  const filename = baseFilename(item);
   showLabel(el, item.kind === "direct" ? "Saving…" : "Starting…", "");
-  const resp = await send({
-    type: "download", item, tabId: item.tabId || currentTabId, filename,
-    variantUrl: selection.variantUrl || null,
-    variantId: selection.variantId || null,
-    ytHeight: selection.ytHeight || null,
-    ytAudioOnly: !!selection.ytAudioOnly,
-  });
+  let msg;
+  try {
+    // Mint proof only on actual Download click, before pure helper.
+    const token = mintUserActionToken();
+    msg = popupUi().buildDownloadMessage({
+      item,
+      tabId: item.tabId || currentTabId,
+      userActionToken: token,
+      selection,
+    });
+  } catch (e) {
+    showLabel(el, (e && e.message) || "Couldn't start download.", "error");
+    return;
+  }
+  const resp = await send(msg);
   if (resp && resp.ok === false) {
     showLabel(el, resp.error || "Download failed.", "error");
   }
@@ -690,7 +969,13 @@ function renderProgress(el, dl) {
     ? Math.round((dl.progress.done / dl.progress.total) * 100) : 0;
 
   let statusText, cls = "";
-  if (dl.status === "error") { statusText = dl.error || "Error"; cls = "error"; }
+  // Scheduler `state` uses exact formatter; legacy `status` kept until Task 20 replaces producer.
+  if (dl.state) {
+    statusText = popupUi().formatJobStatus(dl);
+    if (dl.state === "failed") cls = "error";
+    else if (dl.state === "completed" || dl.state === "handed_to_firefox") cls = "done";
+    else if (dl.state === "cancelled") cls = "error";
+  } else if (dl.status === "error") { statusText = dl.error || "Error"; cls = "error"; }
   else if (dl.status === "done") { statusText = "Saved ✓"; cls = "done"; }
   else if (dl.status === "audio") statusText = "Downloading audio track…";
   else if (dl.status === "saving") statusText = "Assembling file…";
@@ -760,10 +1045,64 @@ function showLabel(el, text, cls) {
 
 // Rank groups a download for ordering: active first, then held, done, failed.
 function queueRank(dl) {
+  if (dl.state) {
+    if (["queued", "waiting_provider", "running", "retry_backoff", "pausing_provider",
+         "needs_user", "handing_off_firefox"].includes(dl.state)) return 0;
+    if (dl.state === "completed" || dl.state === "handed_to_firefox") return 2;
+    return 3; // failed / cancelled
+  }
   if (["downloading", "audio", "parsing", "saving", "converting", "recording"].includes(dl.status)) return 0;
   if (dl.status === "stopped") return 1;
   if (dl.status === "done") return 2;
   return 3; // error / cancelled / discarded
+}
+
+function needsUserActions(dl) {
+  const row = h("div", { class: "dl-actions sa-needs" });
+  row.appendChild(h("button", {
+    class: "btn ghost sm",
+    type: "button",
+    text: "Retry",
+    onClick: () => send({ type: "retry-download", id: dl.id }),
+  }));
+  row.appendChild(h("button", {
+    class: "btn ghost sm",
+    type: "button",
+    text: "Use Firefox instead",
+    onClick: () => {
+      // Explicit user action only — never auto-trigger Firefox downloads API.
+      let intent;
+      try {
+        const token = mintUserActionToken();
+        const base = dl.intent || {};
+        const requested =
+          (typeof base.requestedFilename === "string" && base.requestedFilename.trim()) ||
+          (typeof dl.requestedFilename === "string" && dl.requestedFilename.trim()) ||
+          (typeof dl.name === "string" && dl.name.trim()) ||
+          "download";
+        intent = popupIntent().createFirefoxIntent({
+          baseIntent: {
+            requestedFilename: requested,
+            destinationDirectory: base.destinationDirectory == null ? null : base.destinationDirectory,
+            saveMode: base.saveMode === "save-as" ? "save-as" : "default",
+            userSelectedFirefox: false,
+            userActionToken: token,
+            createdAt: base.createdAt != null ? String(base.createdAt) : new Date().toISOString(),
+          },
+        });
+      } catch (e) {
+        return;
+      }
+      send({ type: "use-firefox", id: dl.id, intent });
+    },
+  }));
+  row.appendChild(h("button", {
+    class: "btn ghost sm",
+    type: "button",
+    text: "Cancel",
+    onClick: () => send({ type: "cancel", id: dl.id }),
+  }));
+  return row;
 }
 
 // The queue mirrors background's activeDownloads (global — every tab), which the
@@ -837,6 +1176,87 @@ function fileActionRow(dl, opts) {
 function renderQueueItem(dl) {
   const p = dl.progress || {};
   const card = h("div", { class: "rail-card dl", dataset: { id: String(dl.id) } });
+  const displayName = (dl.intent && dl.intent.requestedFilename) || dl.name || "download";
+
+  // Scheduler-driven terminal / attention states (Task 18 visible labels; Task 20 wires producer).
+  if (dl.state === "completed" || dl.state === "handed_to_firefox") {
+    const size = dl.recorded && dl.recorded.bytes ? humanSize(dl.recorded.bytes)
+      : (p.total && p.unit === "bytes" ? humanSize(p.total) : "");
+    const name = h("div", { class: "dl-name openable", title: (dl.savedPath || displayName) + " — click to open",
+      text: displayName, onClick: () => openDlFile(dl) });
+    card.appendChild(h("div", { class: "dl-done-row" }, [
+      h("span", { class: "dl-check", text: "✓" }),
+      name,
+    ]));
+    card.appendChild(h("div", { class: "progress-label done",
+      text: popupUi().formatJobStatus(dl) + (size ? " · " + size : "") }));
+    if (dl.convert) card.appendChild(h("div", { class: "note", text: h265Note(dl.convert) }));
+    const acts = fileActionRow(dl, { dismiss: true });
+    if (acts) card.appendChild(acts);
+    return card;
+  }
+
+  if (dl.state === "failed" || dl.state === "cancelled") {
+    card.appendChild(h("div", { class: "dl-done-row" }, [
+      h("span", { class: "dl-x", text: dl.state === "failed" ? "✕" : "—" }),
+      h("div", { class: "dl-name", title: displayName, text: displayName }),
+    ]));
+    card.appendChild(h("div", { class: "progress-label error",
+      text: dl.error || popupUi().formatJobStatus(dl) }));
+    card.appendChild(h("div", { class: "dl-actions" }, [
+      h("button", { class: "btn ghost sm", type: "button", text: "Dismiss",
+        onClick: () => { downloadState.delete(dl.id); renderQueue(); } }),
+    ]));
+    return card;
+  }
+
+  if (dl.state === "needs_user") {
+    card.appendChild(h("div", { class: "dl-top" }, [
+      h("div", { class: "dl-name", title: displayName, text: displayName }),
+    ]));
+    const spec = queueSpec(dl);
+    if (spec) card.appendChild(h("div", { class: "dl-spec", text: spec }));
+    card.appendChild(h("div", { class: "progress-label error",
+      text: dl.error || popupUi().formatJobStatus(dl) }));
+    card.appendChild(needsUserActions(dl));
+    return card;
+  }
+
+  if (dl.state && ["queued", "waiting_provider", "running", "retry_backoff",
+      "pausing_provider", "handing_off_firefox"].includes(dl.state)) {
+    const top = h("div", { class: "dl-top" }, [
+      h("div", { class: "dl-name", title: displayName, text: displayName }),
+    ]);
+    if (dl.state !== "handing_off_firefox") {
+      top.appendChild(h("button", { class: "dl-ic", type: "button", title: "Cancel download", text: "✕",
+        onClick: () => send({ type: "cancel", id: dl.id }) }));
+    }
+    card.appendChild(top);
+    const spec = queueSpec(dl);
+    if (spec) card.appendChild(h("div", { class: "dl-spec", text: spec }));
+
+    const statusLabel = popupUi().formatJobStatus(dl);
+    if (dl.state === "running" && p.total) {
+      const pct = Math.min(100, Math.round((p.done / p.total) * 100));
+      const fill = h("div", { class: "fill" });
+      fill.style.width = pct + "%";
+      card.appendChild(h("div", { class: "track" }, [fill]));
+      let left;
+      if (p.unit === "bytes" && p.total) left = pct + "% of " + humanSize(p.total);
+      else if (p.unit === "pct") left = pct + "%";
+      else left = p.done + "/" + p.total + " seg";
+      const right = p.bps > 0 ? humanSize(p.bps) + "/s" : "";
+      card.appendChild(h("div", { class: "progress-label" }, [
+        h("span", { text: statusLabel + " · " + left }),
+        h("span", { text: right }),
+      ]));
+    } else {
+      card.appendChild(h("div", { class: "progress-label" }, [
+        h("span", { text: statusLabel }),
+      ]));
+    }
+    return card;
+  }
 
   if (dl.status === "done") {
     const size = dl.recorded && dl.recorded.bytes ? humanSize(dl.recorded.bytes)
@@ -863,7 +1283,7 @@ function renderQueueItem(dl) {
     card.appendChild(h("div", { class: "progress-label error",
       text: dl.error || (dl.status === "cancelled" ? "Cancelled" : "Discarded") }));
     card.appendChild(h("div", { class: "dl-actions" }, [
-      h("button", { class: "btn ghost sm", text: "Dismiss",
+      h("button", { class: "btn ghost sm", type: "button", text: "Dismiss",
         onClick: () => { downloadState.delete(dl.id); renderQueue(); } }),
     ]));
     return card;
@@ -880,7 +1300,7 @@ function renderQueueItem(dl) {
     // downloads-API id) — segment fetchers and native yt-dlp/pget jobs have no
     // pause mechanism, so no button is shown rather than a dead one.
     if (dl.downloadId != null && dl.status === "downloading") {
-      const pb = h("button", { class: "dl-ic", title: "Pause download", text: "⏸" });
+      const pb = h("button", { class: "dl-ic", type: "button", title: "Pause download", text: "⏸" });
       pb.onclick = async () => {
         try {
           if (pb.textContent === "⏸") { await api.downloads.pause(dl.downloadId); pb.textContent = "⏵"; pb.title = "Resume download"; }
@@ -889,7 +1309,7 @@ function renderQueueItem(dl) {
       };
       top.appendChild(pb);
     }
-    top.appendChild(h("button", { class: "dl-ic", title: "Cancel download", text: "✕",
+    top.appendChild(h("button", { class: "dl-ic", type: "button", title: "Cancel download", text: "✕",
       onClick: () => send({ type: "cancel", id: dl.id }) }));
   }
   card.appendChild(top);
