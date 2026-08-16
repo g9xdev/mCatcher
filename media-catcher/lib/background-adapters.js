@@ -105,14 +105,25 @@
     }
 
     var GENERIC_INPUT_MSG = "invalid background adapter input";
+    var VARIANT_REG_MSG = "invalid media variant registration";
     var MAX_HEADER_ENTRIES = 64;
     var MAX_CANDIDATE_ENTRIES = 64;
     var MAX_TRANSPORT_ENTRIES = 64;
     var MAX_TRANSPORT_FIELDS = 16;
+    var MAX_VARIANT_ENTRIES = 64;
+    var MAX_VARIANT_LABEL_UNITS = 128;
+    var MAX_VARIANT_MIME_LEN = 127;
     var DATE_RANGE_ABS_MS = 8.64e15;
+    var VARIANT_MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
+    var VARIANT_SENSITIVE_WORD_RE =
+      /(?:^|[^A-Za-z0-9])(?:cookie|authorization|bearer|token|signature|sig|expires)(?![A-Za-z0-9])/i;
 
     function genericTypeError() {
       return new TypeError(GENERIC_INPUT_MSG);
+    }
+
+    function variantTypeError() {
+      return new TypeError(VARIANT_REG_MSG);
     }
 
     /** Array.isArray behind a genericizing boundary (revoked Proxy safe). */
@@ -410,6 +421,348 @@
         if (!eState.present || !eState.data) throw genericTypeError();
       }
       return len;
+    }
+
+    /** Variant-registration reflection helpers — always throw VARIANT_REG_MSG. */
+    function safeIsArrayVariant(v) {
+      try {
+        return Array.isArray(v);
+      } catch (e) {
+        throw variantTypeError();
+      }
+    }
+
+    function safeGetPrototypeOfVariant(v) {
+      try {
+        return Object.getPrototypeOf(v);
+      } catch (e) {
+        throw variantTypeError();
+      }
+    }
+
+    function safeOwnPropertyNamesVariant(v) {
+      try {
+        return Object.getOwnPropertyNames(v);
+      } catch (e) {
+        throw variantTypeError();
+      }
+    }
+
+    function safeOwnPropertySymbolsVariant(v) {
+      try {
+        return Object.getOwnPropertySymbols(v);
+      } catch (e) {
+        throw variantTypeError();
+      }
+    }
+
+    function ownKeyStateVariant(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { present: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc) return { present: false };
+        if (desc.get || desc.set || !("value" in desc)) {
+          return { present: true, data: false };
+        }
+        return { present: true, data: true, value: desc.value };
+      } catch (e) {
+        throw variantTypeError();
+      }
+    }
+
+    function safeGetOwnPropertyDescriptorVariant(obj, key) {
+      try {
+        return Object.getOwnPropertyDescriptor(obj, key);
+      } catch (e) {
+        throw variantTypeError();
+      }
+    }
+
+    /**
+     * Exact ordered own string names of a realm's intrinsic Object.prototype.
+     * Used only as a guarded descriptor fingerprint — never as session state.
+     */
+    var FOREIGN_OBJECT_PROTOTYPE_OWN_NAMES = Object.freeze([
+      "constructor",
+      "__defineGetter__",
+      "__defineSetter__",
+      "hasOwnProperty",
+      "__lookupGetter__",
+      "__lookupSetter__",
+      "isPrototypeOf",
+      "propertyIsEnumerable",
+      "toString",
+      "valueOf",
+      "__proto__",
+      "toLocaleString",
+    ]);
+
+    function isExactObjectPrototypeDataMethodDesc(desc) {
+      if (!desc) return false;
+      if (
+        !Object.prototype.hasOwnProperty.call(desc, "value") ||
+        !Object.prototype.hasOwnProperty.call(desc, "writable") ||
+        !Object.prototype.hasOwnProperty.call(desc, "enumerable") ||
+        !Object.prototype.hasOwnProperty.call(desc, "configurable")
+      ) {
+        return false;
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(desc, "get") ||
+        Object.prototype.hasOwnProperty.call(desc, "set")
+      ) {
+        return false;
+      }
+      return (
+        desc.writable === true &&
+        desc.enumerable === false &&
+        desc.configurable === true &&
+        typeof desc.value === "function"
+      );
+    }
+
+    function isExactObjectPrototypeProtoAccessorDesc(desc) {
+      if (!desc) return false;
+      if (
+        !Object.prototype.hasOwnProperty.call(desc, "get") ||
+        !Object.prototype.hasOwnProperty.call(desc, "set") ||
+        !Object.prototype.hasOwnProperty.call(desc, "enumerable") ||
+        !Object.prototype.hasOwnProperty.call(desc, "configurable")
+      ) {
+        return false;
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(desc, "value") ||
+        Object.prototype.hasOwnProperty.call(desc, "writable")
+      ) {
+        return false;
+      }
+      return (
+        desc.enumerable === false &&
+        desc.configurable === true &&
+        typeof desc.get === "function" &&
+        typeof desc.set === "function"
+      );
+    }
+
+    /**
+     * Guarded descriptor fingerprint of a foreign realm's intrinsic Object.prototype.
+     * Does not invoke any descriptor value/get/set and never compares function identity.
+     */
+    function isForeignIntrinsicObjectPrototype(proto) {
+      var names = safeOwnPropertyNamesVariant(proto);
+      if (names.length !== FOREIGN_OBJECT_PROTOTYPE_OWN_NAMES.length) return false;
+      for (var i = 0; i < FOREIGN_OBJECT_PROTOTYPE_OWN_NAMES.length; i++) {
+        if (names[i] !== FOREIGN_OBJECT_PROTOTYPE_OWN_NAMES[i]) return false;
+      }
+      var symbols = safeOwnPropertySymbolsVariant(proto);
+      if (symbols.length !== 0) return false;
+      for (var j = 0; j < FOREIGN_OBJECT_PROTOTYPE_OWN_NAMES.length; j++) {
+        var name = FOREIGN_OBJECT_PROTOTYPE_OWN_NAMES[j];
+        var desc = safeGetOwnPropertyDescriptorVariant(proto, name);
+        if (name === "__proto__") {
+          if (!isExactObjectPrototypeProtoAccessorDesc(desc)) return false;
+        } else if (!isExactObjectPrototypeDataMethodDesc(desc)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * Realm-neutral plain entry: direct null-prototype, local Object.prototype,
+     * or a foreign ordinary entry whose immediate prototype fingerprints as that
+     * realm's intrinsic Object.prototype. Rejects arrays, views, functions, host
+     * objects with longer chains, and null-root custom/stealth prototypes.
+     */
+    function isRealmNeutralPlainVariantEntry(v) {
+      if (v === null || typeof v !== "object") return false;
+      if (safeIsArrayVariant(v)) return false;
+      try {
+        if (
+          typeof ArrayBuffer === "function" &&
+          typeof ArrayBuffer.isView === "function" &&
+          ArrayBuffer.isView(v)
+        ) {
+          return false;
+        }
+      } catch (e) {
+        throw variantTypeError();
+      }
+      var proto = safeGetPrototypeOfVariant(v);
+      if (proto === null) return true;
+      if (proto === Object.prototype) return true;
+      var grand = safeGetPrototypeOfVariant(proto);
+      if (grand !== null) return false;
+      return isForeignIntrinsicObjectPrototype(proto);
+    }
+
+    /**
+     * Dense built-in Array shell for registerVariants. Same rules as denseArrayLength
+     * but every reflection failure is a variant registration TypeError.
+     */
+    function denseVariantArrayLength(raw) {
+      if (!safeIsArrayVariant(raw)) throw variantTypeError();
+      var symbols = safeOwnPropertySymbolsVariant(raw);
+      if (symbols.length > 0) throw variantTypeError();
+      var names = safeOwnPropertyNamesVariant(raw);
+      var lenState = ownKeyStateVariant(raw, "length");
+      if (
+        !lenState.present ||
+        !lenState.data ||
+        !isNonnegSafeInt(lenState.value)
+      ) {
+        throw variantTypeError();
+      }
+      var len = lenState.value;
+      if (len > MAX_VARIANT_ENTRIES) throw variantTypeError();
+      var allowed = Object.create(null);
+      allowed.length = true;
+      for (var i = 0; i < len; i++) {
+        allowed[String(i)] = true;
+      }
+      for (var n = 0; n < names.length; n++) {
+        if (allowed[names[n]] !== true) throw variantTypeError();
+      }
+      for (var j = 0; j < len; j++) {
+        var eState = ownKeyStateVariant(raw, String(j));
+        if (!eState.present || !eState.data) throw variantTypeError();
+      }
+      return len;
+    }
+
+    /**
+     * Required variant URL: primitive, nonblank (not all-whitespace), C0/DEL/C1-free,
+     * absolute http(s). Preserves exact original spelling (leading spaces allowed).
+     */
+    function requireVariantHttpUrl(value) {
+      if (typeof value !== "string") throw variantTypeError();
+      if (value.trim().length === 0) throw variantTypeError();
+      if (hasControlChars(value)) throw variantTypeError();
+      var parsed;
+      try {
+        parsed = new URL(value);
+      } catch (e) {
+        throw variantTypeError();
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw variantTypeError();
+      }
+      return value;
+    }
+
+    function isUnsafeVariantLabel(trimmed) {
+      if (hasControlChars(trimmed)) return true;
+      if (trimmed.indexOf("://") !== -1) return true;
+      if (trimmed.length >= 2 && trimmed.charAt(0) === "/" && trimmed.charAt(1) === "/") {
+        return true;
+      }
+      if (/cookie\s*:/i.test(trimmed)) return true;
+      if (/set-cookie\s*:/i.test(trimmed)) return true;
+      if (/proxy-authorization\s*:/i.test(trimmed)) return true;
+      if (/authorization\s*:/i.test(trimmed)) return true;
+      if (/bearer\s/i.test(trimmed)) return true;
+      if (VARIANT_SENSITIVE_WORD_RE.test(trimmed)) return true;
+      return false;
+    }
+
+    /**
+     * Optional own-data label → safe truncated string or undefined (omit).
+     * Known-field accessors reject. Non-string/null/undefined omit without coercion.
+     */
+    function readOptionalVariantLabel(entry) {
+      var st = ownKeyStateVariant(entry, "label");
+      if (!st.present) return undefined;
+      if (!st.data) throw variantTypeError();
+      if (st.value === undefined || st.value === null) return undefined;
+      if (typeof st.value !== "string") return undefined;
+      var trimmed = st.value.trim();
+      if (trimmed.length === 0) return undefined;
+      if (isUnsafeVariantLabel(trimmed)) return undefined;
+      if (trimmed.length > MAX_VARIANT_LABEL_UNITS) {
+        return trimmed.slice(0, MAX_VARIANT_LABEL_UNITS);
+      }
+      return trimmed;
+    }
+
+    function readOptionalVariantPositiveInt(entry, key) {
+      var st = ownKeyStateVariant(entry, key);
+      if (!st.present) return undefined;
+      if (!st.data) throw variantTypeError();
+      if (isPositiveSafeInteger(st.value)) return st.value;
+      return undefined;
+    }
+
+    function readOptionalVariantMime(entry) {
+      var st = ownKeyStateVariant(entry, "mime");
+      if (!st.present) return undefined;
+      if (!st.data) throw variantTypeError();
+      if (st.value === undefined || st.value === null) return undefined;
+      if (typeof st.value !== "string") return undefined;
+      var trimmed = st.value.trim();
+      if (trimmed.length === 0 || trimmed.length > MAX_VARIANT_MIME_LEN) {
+        return undefined;
+      }
+      if (!VARIANT_MIME_RE.test(trimmed)) return undefined;
+      return trimmed;
+    }
+
+    /**
+     * Validate complete variants input into plain snapshots before any token/Privacy.
+     * Inspects only the six known entry fields; unknown names are ignored unread.
+     */
+    function validateVariantRegistrationInput(variants) {
+      var len = denseVariantArrayLength(variants);
+      var out = [];
+      for (var i = 0; i < len; i++) {
+        var eState = ownKeyStateVariant(variants, String(i));
+        // denseVariantArrayLength already proved present own-data indices.
+        var entry = eState.value;
+        if (!isRealmNeutralPlainVariantEntry(entry)) throw variantTypeError();
+
+        var urlState = ownKeyStateVariant(entry, "url");
+        if (!urlState.present || !urlState.data) throw variantTypeError();
+        var url = requireVariantHttpUrl(urlState.value);
+
+        var snap = { url: url };
+        var label = readOptionalVariantLabel(entry);
+        if (label !== undefined) snap.label = label;
+        var width = readOptionalVariantPositiveInt(entry, "width");
+        if (width !== undefined) snap.width = width;
+        var height = readOptionalVariantPositiveInt(entry, "height");
+        if (height !== undefined) snap.height = height;
+        var bandwidth = readOptionalVariantPositiveInt(entry, "bandwidth");
+        if (bandwidth !== undefined) snap.bandwidth = bandwidth;
+        var mime = readOptionalVariantMime(entry);
+        if (mime !== undefined) snap.mime = mime;
+        out.push(snap);
+      }
+      return out;
+    }
+
+    function buildSafeVariantProjection(id, snap) {
+      var row = { id: id };
+      if (Object.prototype.hasOwnProperty.call(snap, "label")) row.label = snap.label;
+      if (Object.prototype.hasOwnProperty.call(snap, "width")) row.width = snap.width;
+      if (Object.prototype.hasOwnProperty.call(snap, "height")) row.height = snap.height;
+      if (Object.prototype.hasOwnProperty.call(snap, "bandwidth")) {
+        row.bandwidth = snap.bandwidth;
+      }
+      if (Object.prototype.hasOwnProperty.call(snap, "mime")) row.mime = snap.mime;
+      return deepFreeze(row);
+    }
+
+    function projectSafeVariantRows(orderedRecords) {
+      // new Array() uses the active global Array binding (host Array under the
+      // classic-script test harness) so strict deepEqual against host [] works.
+      var out = new Array();
+      if (!orderedRecords) return deepFreeze(out);
+      for (var i = 0; i < orderedRecords.length; i++) {
+        out.push(freezeClone(orderedRecords[i].safeProjection));
+      }
+      return deepFreeze(out);
     }
 
     /**
@@ -907,6 +1260,8 @@
 
       var providerRegistry = ProviderRegistryApi.createProviderRegistry();
       void providerRegistry;
+      // Capture-path factory alias for variant URL handles (keeps BA04 site count).
+      var createEphemeralHandle = Privacy.createEphemeral;
 
       function createDisposableFinalizer() {
         return DetectionFinalizer.createDetectionFinalizer({
@@ -948,6 +1303,19 @@
       void sinkSessions;
       void proofTokens;
       void historyEntries;
+
+      // Lease-2 variant ownership (Batch 1). Provider observation stays dormant empty.
+      /** @type {Map<string, object[]>} media ID → ordered private variant records */
+      var variantsOrderedByMediaId = new Map();
+      /** @type {Map<string, Map<string, object>>} media ID → variant ID → private record */
+      var variantsByIdByMediaId = new Map();
+      /** @type {Map<string, string>} opaque variant ID → owning media ID */
+      var variantOwnerById = new Map();
+      /** @type {Map<string, boolean>} media ID → registration in-flight marker */
+      var variantRegInFlight = new Map();
+      /** @type {Map<string, object>} media ID → provider-observation evidence (Batch 2) */
+      var providerObservationByMediaId = new Map();
+      void providerObservationByMediaId;
 
       /**
        * Prepare public ID: invoke randomToken and validate base only.
@@ -1044,8 +1412,14 @@
           id: record.mediaId,
           proposedFilename: record.proposedFilename,
           kind: record.mediaKind,
-          variants: Object.freeze([]),
+          variants: projectSafeVariantRows(
+            variantsOrderedByMediaId.get(record.mediaId)
+          ),
         });
+      }
+
+      function mediaOwnsId(mediaId) {
+        return pendingByMediaId.has(mediaId) || sourcesByMediaId.has(mediaId);
       }
 
       function bindDetectionId(detectionId, mediaId) {
@@ -1356,8 +1730,77 @@
         return mediaId;
       }
 
-      function registerVariants(/* mediaId, variants */) {
-        throw new Error(LEASE1_MSG);
+      function registerVariants(mediaId, variants) {
+        // 1. Owned primitive media ID before any variants inspection.
+        if (typeof mediaId !== "string" || !mediaOwnsId(mediaId)) {
+          throw variantTypeError();
+        }
+
+        // 2. Completed nonempty set: fresh frozen safe copies, no second-arg read.
+        var existingOrdered = variantsOrderedByMediaId.get(mediaId);
+        if (existingOrdered && existingOrdered.length > 0) {
+          return projectSafeVariantRows(existingOrdered);
+        }
+
+        // 3. Same-media in-flight reentry fails without reading variants.
+        if (variantRegInFlight.get(mediaId) === true) {
+          throw variantTypeError();
+        }
+
+        // 4. Full structural validation/snapshot before token, Privacy, or commit.
+        var snapshot = validateVariantRegistrationInput(variants);
+
+        // 5. Post-validation same-media recheck: a nested registration may have
+        // completed or marked in-flight during caller-controlled reflection.
+        // There must be no caller-controlled operation between this recheck and
+        // setting the in-flight marker for a nonempty new transaction.
+        var completedDuringValidation = variantsOrderedByMediaId.get(mediaId);
+        if (completedDuringValidation && completedDuringValidation.length > 0) {
+          return projectSafeVariantRows(completedDuringValidation);
+        }
+        if (variantRegInFlight.get(mediaId) === true) {
+          throw variantTypeError();
+        }
+
+        if (snapshot.length === 0) {
+          return projectSafeVariantRows(existingOrdered);
+        }
+
+        variantRegInFlight.set(mediaId, true);
+        try {
+          // Prepare every token/ID candidate first (no counter/issued commit).
+          var preps = [];
+          for (var i = 0; i < snapshot.length; i++) {
+            preps.push(preparePublicId("variant"));
+          }
+
+          // Then every Privacy handle with exact original URL and null headers.
+          var handles = [];
+          for (var j = 0; j < snapshot.length; j++) {
+            handles.push(createEphemeralHandle(snapshot[j].url, null));
+          }
+
+          // Callback-free critical section: commit IDs and ownership maps.
+          var ordered = [];
+          var byId = new Map();
+          for (var k = 0; k < snapshot.length; k++) {
+            var vid = commitPublicId(preps[k]);
+            var safe = buildSafeVariantProjection(vid, snapshot[k]);
+            var rec = Object.freeze({
+              safeProjection: safe,
+              sourceHandle: handles[k],
+            });
+            ordered.push(rec);
+            byId.set(vid, rec);
+            variantOwnerById.set(vid, mediaId);
+          }
+          Object.freeze(ordered);
+          variantsOrderedByMediaId.set(mediaId, ordered);
+          variantsByIdByMediaId.set(mediaId, byId);
+          return projectSafeVariantRows(ordered);
+        } finally {
+          variantRegInFlight.delete(mediaId);
+        }
       }
 
       function popupMedia(tabId) {
