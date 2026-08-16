@@ -162,6 +162,7 @@ let logRing = [];
 let updateEvents = [];
 let _logSaveTimer = null;
 const pendingReports = new Map();   // reqId -> resolver, settled by a host "report"
+const pendingProbes = new Map();    // reqId -> resolver, settled by a host "probe-result"
 const pendingYtMeta = new Map();    // reqId -> resolver, settled by a host "ytmeta"
 
 // ---- casting (DLNA via the helper) ----
@@ -480,6 +481,13 @@ function onLegacyNativeMessage(msg) {
   if (msg.type === "report") {
     const res = pendingReports.get(msg.reqId);
     if (res) { pendingReports.delete(msg.reqId); res(msg); }
+    return;
+  }
+  if (msg.type === "probe-result") {
+    // The per-check narration already arrived as {type:"log", src:"probe"} lines;
+    // this is the single summary the card renders from.
+    const res = pendingProbes.get(msg.reqId);
+    if (res) { pendingProbes.delete(msg.reqId); res(msg); }
     return;
   }
   if (msg.type === "ytmeta") {
@@ -2856,6 +2864,21 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         sendResponse({ ok: true, extVersion, helper: helperStatus(), report,
           events: updateEvents.slice(-EVENT_CAP), logs: logRing.slice(-LOG_CAP) });
+      } else if (msg.type === "run-probe") {
+        // The probe times a real yt-dlp launch, so it is slower than the old
+        // diagnostics call — allow for that rather than resolving null early and
+        // reporting "no result" for a probe that is still working.
+        let result = null;
+        if (nativePort) {
+          result = await new Promise((resolve) => {
+            const reqId = "prb-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
+            pendingProbes.set(reqId, resolve);
+            try { nativePort.postMessage({ cmd: "probe", reqId }); }
+            catch (e) { pendingProbes.delete(reqId); resolve(null); }
+            setTimeout(() => { if (pendingProbes.has(reqId)) { pendingProbes.delete(reqId); resolve(null); } }, 120000);
+          });
+        }
+        sendResponse({ ok: !!result, result, helper: helperStatus() });
       } else if (msg.type === "get-variants") {
         const info = await getVariants(msg.item, msg.tabId);
         sendResponse({ ok: true, info });

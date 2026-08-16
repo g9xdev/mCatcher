@@ -313,14 +313,56 @@ function flashBtn(btnId, text) {
 }
 
 get("refreshDiag").addEventListener("click", () => loadDiagnostics(true));
-get("runDiag").addEventListener("click", async () => {
-  const resp = await loadDiagnostics(false);   // helper streams its env line into the console
-  const tail = resp && resp.report && resp.report.guardianTail;
-  if (tail && tail.trim()) {
-    appendLog({ ts: Date.now(), level: "info", src: "guardian", msg: "— guardian.log tail —" });
-    for (const ln of tail.split(/\r?\n/)) {
-      if (ln.trim()) appendLog({ ts: Date.now(), level: /fail|fatal|error/i.test(ln) ? "error" : "info", src: "guardian", msg: ln });
+// Verdict chips above the console. The per-check detail already streamed in as
+// src="probe" log lines; this is the glanceable answer.
+function renderProbeSummary(result) {
+  const el = get("probeSummary");
+  if (!el) return;
+  if (!result) {
+    el.hidden = false;
+    el.className = "probe-summary bad";
+    el.replaceChildren(Object.assign(document.createElement("span"),
+      { className: "ps-head", textContent: "Probe did not complete — the helper did not answer." }));
+    return;
+  }
+  const s = result.summary || {};
+  const failed = (result.items || []).filter((i) => i.status === "fail" || i.status === "warn");
+  el.hidden = false;
+  el.className = "probe-summary " + (s.ok ? "good" : "bad");
+  const head = document.createElement("span");
+  head.className = "ps-head";
+  head.textContent = s.ok ? "All checks passed" : (s.failed + " problem" + (s.failed === 1 ? "" : "s") + " found");
+  const counts = document.createElement("span");
+  counts.className = "ps-counts";
+  counts.textContent = [s.passed + " passed", s.failed + " failed",
+                        s.fixed ? s.fixed + " fixed" : null,
+                        s.warned ? s.warned + " warned" : null].filter(Boolean).join(" · ");
+  el.replaceChildren(head, counts);
+  for (const item of failed) {
+    const row = document.createElement("div");
+    row.className = "ps-item";
+    const l = document.createElement("span"); l.className = "ps-label"; l.textContent = item.label;
+    const d = document.createElement("span"); d.className = "ps-detail"; d.textContent = item.detail;
+    row.append(l, d);
+    if (item.fix) {
+      const f = document.createElement("code"); f.className = "ps-fix"; f.textContent = item.fix;
+      row.append(f);
     }
+    el.appendChild(row);
+  }
+}
+
+get("runProbe").addEventListener("click", async () => {
+  const btn = get("runProbe");
+  btn.disabled = true;
+  const was = btn.textContent;
+  btn.textContent = "Probing…";
+  try {
+    const resp = await send({ type: "run-probe" });
+    renderProbeSummary(resp && resp.result);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = was;
   }
 });
 get("copyLog").addEventListener("click", async () => {

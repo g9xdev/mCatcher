@@ -168,9 +168,50 @@ details.advanced[open] > summary { margin-bottom: 10px; }
 /* Log console */
 .log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .log-filter { color: var(--text-tertiary); font-family: var(--font-mono); font-size: 11px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+/* The log console is the one panel that wants width: lines are timestamp + src +
+   a long message, and at the 620px form column they wrap constantly. Let its card
+   break out of that column without stretching the label/input rows, which read
+   worse wide. Centred via 50% + translate so it stays put at any viewport. */
+.card.wide {
+  width: min(1180px, 94vw);
+  max-width: none;
+  margin-left: 50%;
+  transform: translateX(-50%);
+}
+
+/* Probe verdict, above the console. The per-check detail is in the console as
+   src="probe" lines; this is the glanceable answer, so it stays compact. */
+.probe-summary {
+  border: 1px solid var(--stroke); border-radius: var(--radius-md);
+  padding: 8px 10px; margin-bottom: 8px; font-size: 12px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.probe-summary.good { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.probe-summary.bad  { border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
+.probe-summary .ps-head { font-weight: 600; }
+.probe-summary.good .ps-head { color: var(--accent); }
+.probe-summary.bad  .ps-head { color: var(--danger); }
+.probe-summary .ps-counts { color: var(--text-tertiary); font-size: 11px; }
+.probe-summary .ps-item {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline;
+  padding-top: 4px; border-top: 1px solid var(--stroke);
+}
+.probe-summary .ps-label { color: var(--text); font-weight: 600; flex: 0 0 auto; }
+.probe-summary .ps-detail { color: var(--text-secondary); flex: 1; min-width: 0; }
+.probe-summary .ps-fix {
+  flex: 1 0 100%; font-family: var(--font-mono); font-size: 11px;
+  color: var(--warning); background: rgba(0, 0, 0, 0.28);
+  border-radius: 4px; padding: 3px 6px; user-select: all; word-break: break-all;
+}
+
 .log-console {
   background: rgba(0, 0, 0, 0.32); border: 1px solid var(--stroke); border-radius: var(--radius-md); padding: 8px 10px;
-  height: 240px; overflow-y: auto; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  /* resize needs a non-visible overflow; height (not min-height) so the drag
+     handle has something to change, with bounds so it cannot be dragged to
+     nothing or past the viewport. */
+  height: 320px; min-height: 140px; max-height: 85vh;
+  resize: vertical; overflow: auto;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
   scrollbar-color: rgba(255, 255, 255, 0.2) transparent; scrollbar-width: thin;
 }
 .log-console::-webkit-scrollbar, .histwrap::-webkit-scrollbar, .history::-webkit-scrollbar { width: 7px; }

@@ -1,0 +1,197 @@
+"""Settings probe: per-check verdicts over injected state, and the orchestration.
+
+Design: docs/superpowers/specs/2026-08-16-settings-probe-design.md
+
+Every check is a pure function over state someone else collected, so none of this
+needs a real antivirus, real binaries, or real processes.
+"""
+from conftest import load_host, wait_for
+
+mc = load_host()
+import mchost.probe as probe   # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# The launch-time check IS the antivirus verdict
+#
+# During the incident real-time protection was OFF and the fault persisted:
+# disabling real-time monitoring does not unload the WdFilter minifilter. Only a
+# timed launch separated "AV is intercepting this" from "the network is broken",
+# so this check leads and the settings only corroborate.
+# ---------------------------------------------------------------------------
+
+def test_fast_launch_passes():
+    v = probe.check_launch_time(0.37)
+    assert v["status"] == "pass", v
+    assert "0.37" in v["detail"]
+
+
+def test_slow_launch_fails_and_names_interception():
+    v = probe.check_launch_time(21.4)
+    assert v["status"] == "fail", v
+    assert "intercept" in v["detail"].lower(), \
+        "a slow launch must name interception, not blame the network"
+
+
+def test_launch_verdict_does_not_flip_on_a_borderline_value():
+    """One threshold, no dead zone: everything is pass or fail."""
+    lo = probe.check_launch_time(probe.LAUNCH_SLOW_SECONDS - 0.01)
+    hi = probe.check_launch_time(probe.LAUNCH_SLOW_SECONDS + 0.01)
+    assert lo["status"] == "pass" and hi["status"] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# Antivirus reporting
+# ---------------------------------------------------------------------------
+
+def test_av_check_reports_what_is_readable_unelevated():
+    v = probe.check_av({"realtime": True, "cloudLevel": 2, "tamper": False},
+                       cloud_events=6, host_dir=r"C:\X\Host")
+    assert "real-time" in v["detail"].lower()
+    assert "2" in v["detail"], "cloud level is corroborating evidence"
+    assert "6" in v["detail"], "recent cloud-lookup count belongs in the detail"
+
+
+def test_av_check_states_exclusions_are_unreadable_rather_than_guessing():
+    """Get-MpPreference returns 'N/A: Must be an administrator to view
+    exclusions' when unelevated. Saying 'no exclusions found' would be a lie."""
+    v = probe.check_av({"realtime": True, "cloudLevel": 2, "tamper": False,
+                        "exclusions": probe.EXCLUSIONS_UNREADABLE},
+                       cloud_events=0, host_dir=r"C:\X\Host")
+    assert "admin" in v["detail"].lower()
+    assert "no exclusions" not in v["detail"].lower()
+
+
+def test_av_check_offers_the_command_as_text_and_never_runs_it():
+    """A diagnostics button that silently punches AV holes is shaped exactly like
+    malware, and it needs admin anyway. The probe hands over the command."""
+    v = probe.check_av({"realtime": True, "cloudLevel": 2, "tamper": False},
+                       cloud_events=9, host_dir=r"C:\X\Host")
+    assert "Add-MpPreference" in (v.get("fix") or ""), "command is offered as text"
+    assert v.get("autofix") is not True, "the AV check must never self-apply"
+
+
+# ---------------------------------------------------------------------------
+# yt-dlp packaging: the onefile build re-extracts ~145 files per launch, which is
+# what AV kept rescanning.
+# ---------------------------------------------------------------------------
+
+def test_directory_build_passes_and_onefile_is_fixable():
+    ok = probe.check_ytdlp_build(has_internal=True, exe_bytes=7_700_000)
+    assert ok["status"] == "pass"
+    bad = probe.check_ytdlp_build(has_internal=False, exe_bytes=18_000_000)
+    assert bad["status"] == "fail" and bad["autofix"] is True
+    assert "onefile" in bad["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Debris the incident produced
+# ---------------------------------------------------------------------------
+
+def test_orphans_are_reported_with_their_pids_and_are_fixable():
+    v = probe.check_orphans([{"pid": 40052, "name": "yt-dlp.exe", "orphan": True},
+                             {"pid": 111, "name": "yt-dlp.exe", "orphan": False}])
+    assert v["status"] == "fail" and v["autofix"] is True
+    assert "40052" in v["detail"]
+    assert "111" not in v["detail"], "a live, parented process is not an orphan"
+
+
+def test_no_orphans_passes():
+    assert probe.check_orphans([])["status"] == "pass"
+
+
+def test_stale_extraction_dirs_are_fixable_and_sized():
+    v = probe.check_stale_mei([{"name": "_MEI1", "bytes": 30_000_000},
+                               {"name": "_MEI2", "bytes": 30_000_000}])
+    assert v["status"] == "fail" and v["autofix"] is True
+    assert "2" in v["detail"]
+
+
+def test_missing_binaries_are_named_individually():
+    v = probe.check_binaries({"ffmpeg": True, "yt-dlp": True, "deno": False})
+    assert v["status"] == "fail"
+    assert "deno" in v["detail"] and "ffmpeg" not in v["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Summary shape driving the card above the console
+# ---------------------------------------------------------------------------
+
+def test_summary_counts_pass_fail_and_fixed():
+    items = [{"status": "pass"}, {"status": "fail"}, {"status": "fixed"},
+             {"status": "fail"}, {"status": "warn"}]
+    s = probe.summarize(items)
+    assert s["passed"] == 1 and s["failed"] == 2 and s["fixed"] == 1 and s["warned"] == 1
+
+
+def test_summary_is_ok_only_when_nothing_failed():
+    assert probe.summarize([{"status": "pass"}, {"status": "fixed"}])["ok"] is True
+    assert probe.summarize([{"status": "pass"}, {"status": "fail"}])["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Orchestration: narrate to the console, then one structured result
+# ---------------------------------------------------------------------------
+
+def test_handle_probe_narrates_each_check_then_sends_one_result(monkeypatch):
+    sent, logs = [], []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(mc, "_hlog", lambda level, msg, src="host": logs.append((level, msg, src)))
+    monkeypatch.setattr(probe, "_h", lambda: mc)
+    monkeypatch.setattr(probe, "collect_state", lambda: {
+        "launchSeconds": 0.37,
+        "av": {"realtime": True, "cloudLevel": 2, "tamper": False},
+        "cloudEvents": 0,
+        "hostDir": r"C:\X\Host",
+        "binaries": {"ffmpeg": True, "yt-dlp": True, "deno": True},
+        "hasInternal": True,
+        "exeBytes": 7_700_000,
+        "orphans": [],
+        "staleMei": [],
+    })
+
+    probe.handle_probe({"reqId": "p1"})
+
+    assert wait_for(lambda: any(m.get("type") == "probe-result" for m in sent)), \
+        "the probe must always settle with one structured result"
+    results = [m for m in sent if m.get("type") == "probe-result"]
+    assert len(results) == 1, "exactly one result frame, not one per check"
+    r = results[0]
+    assert r["reqId"] == "p1"
+    assert r["summary"]["ok"] is True
+    assert len(r["items"]) >= 5, "every check reports an item"
+    assert all(l[2] == "probe" for l in logs), \
+        "console lines are tagged src=probe so they read as one run"
+
+
+def test_handle_probe_still_reports_when_a_check_raises(monkeypatch):
+    """A probe that dies mid-run is worse than useless: it looks like the hang it
+    was meant to diagnose."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(probe, "_h", lambda: mc)
+
+    def boom():
+        raise RuntimeError("collection failed")
+    monkeypatch.setattr(probe, "collect_state", boom)
+
+    probe.handle_probe({"reqId": "p2"})
+    assert wait_for(lambda: any(m.get("type") == "probe-result" for m in sent)), \
+        "a failed collection still settles the row"
+    r = [m for m in sent if m.get("type") == "probe-result"][-1]
+    assert r["summary"]["ok"] is False
+
+
+def test_internal_dir_is_derived_from_the_exe_not_the_host_dir(tmp_path):
+    """find_ytdlp() falls back to shutil.which(), so the exe is not always inside
+    HERE. Looking for _internal next to HERE then reports a directory build as
+    onefile — caught by running the probe for real against a checkout."""
+    elsewhere = tmp_path / "somewhere"
+    (elsewhere / "_internal").mkdir(parents=True)
+    exe = elsewhere / "yt-dlp.exe"
+    exe.write_bytes(b"x")
+    assert probe.internal_dir_for(str(exe)) == str(elsewhere / "_internal")
+    assert probe.has_internal_for(str(exe)) is True
+    assert probe.has_internal_for(str(tmp_path / "nope" / "yt-dlp.exe")) is False
+    assert probe.has_internal_for(None) is False

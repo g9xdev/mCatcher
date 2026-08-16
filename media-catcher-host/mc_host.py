@@ -898,6 +898,11 @@ from mchost.cast.legacy import (_PYLIBS, _CAST, _PYATV_SRC, ensure_pyatv,   # no
 # DLNA/AirPlay functions still in this file until Task C4 step 2 moves them.
 from mchost.cast import handle_cast   # noqa: E402,F401
 
+# ---- Settings probe -------------------------------------------------------
+# The checks that isolated the Defender-scanning incident, in their own module:
+# downloads.py is already past 4000 lines and this is not downloads.
+from mchost.probe import handle_probe   # noqa: E402,F401
+
 
 def main():
     init_io()
@@ -976,6 +981,8 @@ def main():
                     handle_pget_set_limit(msg)
                 elif cmd == "getReport":
                     handle_get_report(msg)
+                elif cmd == "probe":
+                    handle_probe(msg)
                 elif cmd == "pget-cancel":
                     _pget_cancel(msg)
                 elif cmd == "file-open":
