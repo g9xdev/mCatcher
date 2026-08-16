@@ -221,44 +221,83 @@ def plan_summary(plan):
     return " · ".join(parts)
 
 
+_DOS_DEVICES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+})
+
+
+def _win32_component_key(part):
+    """Case/trailing-dot-space key used to detect Win32-normalized collisions."""
+    s = part.casefold()
+    while s.endswith(".") or s.endswith(" "):
+        s = s[:-1]
+    return s
+
+
+def _validate_host_path_component(part, *, name):
+    if part == "":
+        raise ValueError("host archive member has empty path component: %r" % name)
+    if part in (".", ".."):
+        raise ValueError("host archive member has dot path component: %r" % name)
+    if ":" in part:
+        raise ValueError("host archive member has colon/ADS component: %r" % name)
+    for ch in part:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7F or 0x80 <= o <= 0x9F:
+            raise ValueError("host archive member has control character: %r" % name)
+    if part.endswith(".") or part.endswith(" "):
+        raise ValueError("host archive member has trailing dot/space: %r" % name)
+    stem = part.split(".", 1)[0].upper()
+    if stem in _DOS_DEVICES:
+        raise ValueError("host archive member uses DOS device name: %r" % name)
+
+
 def _validate_host_archive_member(name):
     """Validate one host-zip member name before any write.
 
-    Returns (relative_path, is_directory). A single terminal separator may mark
-    a directory member; those are skipped only after the rest of the name
-    passes validation. Rejects absolute, drive-qualified, UNC, '.'/'..',
-    empty-name or interior-empty-component, NUL, mixed/backslash traversal,
-    and otherwise escaping names.
+    Returns (relative_path_parts_tuple, is_directory). A single terminal
+    separator may mark a directory member; those are skipped only after the
+    rest of the name passes validation. Rejects absolute/drive/UNC/device,
+    '.'/'..', empty components, NUL/C0/DEL/C1, colon/ADS, DOS devices,
+    trailing dot/space, and mixed traversal forms.
     """
     if name is None or name == "":
         raise ValueError("host archive member name is empty")
     if "\x00" in name:
         raise ValueError("host archive member name contains NUL")
+    for ch in name:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7F or 0x80 <= o <= 0x9F:
+            raise ValueError("host archive member has control character: %r" % name)
     is_dir = name.endswith("/") or name.endswith("\\")
     core = name[:-1] if is_dir else name
     if core == "":
         raise ValueError("host archive member name is empty")
-    # Absolute / UNC / drive-qualified (before separator normalization).
     if core[0] in "/\\" or core.startswith("//") or core.startswith("\\\\"):
         raise ValueError("host archive member is absolute or UNC: %r" % name)
     if len(core) >= 2 and core[1] == ":":
         raise ValueError("host archive member is drive-qualified: %r" % name)
-    # Component checks on a unified separator view; empty segments catch
-    # interior empties (mchost//x) and reject '.' / '..' traversal.
+    if ":" in core:
+        raise ValueError("host archive member has colon/ADS: %r" % name)
     unified = core.replace("\\", "/")
     if unified.startswith("/") or unified.startswith("//"):
         raise ValueError("host archive member is absolute or UNC: %r" % name)
     parts = unified.split("/")
-    if any(p == "" for p in parts):
-        raise ValueError("host archive member has empty path component: %r" % name)
-    if any(p in (".", "..") for p in parts):
-        raise ValueError("host archive member has dot path component: %r" % name)
-    rel = os.path.join(*parts)
-    return rel, is_dir
+    for p in parts:
+        _validate_host_path_component(p, name=name)
+    return tuple(parts), is_dir
+
+
+def _host_member_norm_key(parts):
+    return tuple(_win32_component_key(p) for p in parts)
 
 
 def _host_member_destination(host_dir, rel):
-    """Resolve rel under host_dir; raise if it escapes the destination root."""
+    """Lexical join only — not filesystem authority. Prefer handle writers."""
+    if isinstance(rel, (tuple, list)):
+        rel = os.path.join(*rel) if rel else ""
     host_abs = os.path.abspath(host_dir)
     dest_abs = os.path.abspath(os.path.join(host_dir, rel))
     if dest_abs != host_abs and not dest_abs.startswith(host_abs + os.sep):
@@ -266,60 +305,405 @@ def _host_member_destination(host_dir, rel):
     return dest_abs
 
 
-def _reject_reparse_components(path):
-    """Reject a pre-existing symlink/junction anywhere in an absolute path.
+# ---- Windows handle-authority destination containment --------------------
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
 
-    Walk the lexical path from its drive/share root so a junction above the
-    configured host directory is inspected before it can redirect updater I/O.
-    Missing tail components are allowed; the updater may create them later.
-    """
-    if os.name != "nt":
-        return
-    full = os.path.abspath(os.fspath(path))
-    drive, tail = os.path.splitdrive(full)
-    if not drive or not tail.startswith((os.sep, "/", "\\")):
-        raise ValueError("host update path must be absolute")
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
 
-    current = drive + os.sep
-    parts = [part for part in tail.replace("\\", "/").split("/") if part]
-    for part in parts:
-        current = os.path.join(current, part)
+    _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    # FILE_INFO_BY_HANDLE_CLASS values (winbase.h)
+    _FileStandardInfo = 1
+    _FileAttributeTagInfo = 9
+    _FileIdInfo = 18
+    _FILE_OPEN = 0x00000001
+    _FILE_CREATE = 0x00000002
+    _FILE_OPEN_IF = 0x00000003
+    _FILE_OVERWRITE_IF = 0x00000005
+    _FILE_DIRECTORY_FILE = 0x00000001
+    _FILE_NON_DIRECTORY_FILE = 0x00000040
+    _FILE_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+    _FILE_OPEN_FOR_BACKUP_INTENT = 0x00004000
+    _OBJ_CASE_INSENSITIVE = 0x00000040
+    _DELETE = 0x00010000
+    _SYNCHRONIZE = 0x00100000
+    _FILE_READ_ATTRIBUTES = 0x0080
+    _FILE_WRITE_DATA = 0x0002
+    _FILE_READ_DATA = 0x0001
+    _FILE_APPEND_DATA = 0x0004
+    _STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+    _STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A
+    _STATUS_DELETE_PENDING = 0xC0000056
+
+    class _FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD),
+                    ("ReparseTag", wintypes.DWORD)]
+
+    class _FILE_STANDARD_INFO(ctypes.Structure):
+        _fields_ = [("AllocationSize", ctypes.c_longlong),
+                    ("EndOfFile", ctypes.c_longlong),
+                    ("NumberOfLinks", wintypes.DWORD),
+                    ("DeletePending", wintypes.BOOLEAN),
+                    ("Directory", wintypes.BOOLEAN)]
+
+    class _IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_long),
+                    ("Information", ctypes.c_void_p)]
+
+    class _UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT),
+                    ("MaximumLength", wintypes.USHORT),
+                    ("Buffer", wintypes.LPWSTR)]
+
+    class _OBJECT_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Length", wintypes.ULONG),
+                    ("RootDirectory", wintypes.HANDLE),
+                    ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+                    ("Attributes", wintypes.ULONG),
+                    ("SecurityDescriptor", ctypes.c_void_p),
+                    ("SecurityQualityOfService", ctypes.c_void_p)]
+
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                 ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                 wintypes.HANDLE]
+    _k32.CreateFileW.restype = wintypes.HANDLE
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _k32.CloseHandle.restype = wintypes.BOOL
+    _k32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    _k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _k32.WriteFile.restype = wintypes.BOOL
+    _k32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+    _k32.SetEndOfFile.restype = wintypes.BOOL
+    _k32.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD]
+    _k32.SetFilePointerEx.restype = wintypes.BOOL
+
+    _ntdll.NtCreateFile.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG,
+        ctypes.POINTER(_OBJECT_ATTRIBUTES), ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG,
+        wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG]
+    _ntdll.NtCreateFile.restype = ctypes.c_long
+
+    def _close_handle(h):
+        if h and h != _INVALID_HANDLE_VALUE:
+            _k32.CloseHandle(h)
+
+    def _query_attr_tag(h):
+        info = _FILE_ATTRIBUTE_TAG_INFO()
+        if not _k32.GetFileInformationByHandleEx(
+                h, _FileAttributeTagInfo, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), "FileAttributeTagInfo failed")
+        return info
+
+    def _query_standard(h):
+        info = _FILE_STANDARD_INFO()
+        if not _k32.GetFileInformationByHandleEx(
+                h, _FileStandardInfo, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), "FileStandardInfo failed")
+        return info
+
+    def _open_path_reparse(path, access=_GENERIC_READ | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE):
+        flags = _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS
+        h = _k32.CreateFileW(
+            path, access, _FILE_SHARE_READ | _FILE_SHARE_WRITE, None,
+            _OPEN_EXISTING, flags, None)
+        if h == _INVALID_HANDLE_VALUE or h is None:
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed for %r" % path)
+        return h
+
+    def _nt_open_relative(root, name, *, directory, create=False, write=False):
+        """Open/create name relative to root handle; never follows reparse."""
+        buf = ctypes.create_unicode_buffer(name)
+        us = _UNICODE_STRING()
+        us.Length = len(name) * 2
+        us.MaximumLength = (len(name) + 1) * 2
+        us.Buffer = ctypes.cast(buf, wintypes.LPWSTR)
+        oa = _OBJECT_ATTRIBUTES()
+        oa.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
+        oa.RootDirectory = root
+        oa.ObjectName = ctypes.pointer(us)
+        oa.Attributes = _OBJ_CASE_INSENSITIVE
+        oa.SecurityDescriptor = None
+        oa.SecurityQualityOfService = None
+        iosb = _IO_STATUS_BLOCK()
+        handle = wintypes.HANDLE()
+        access = _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
+        if write:
+            access |= _GENERIC_WRITE | _FILE_WRITE_DATA | _FILE_APPEND_DATA | _FILE_READ_DATA
+        else:
+            access |= _GENERIC_READ
+        if directory:
+            access |= _FILE_READ_DATA  # enumeration
+        options = _FILE_OPEN_REPARSE_POINT | _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_FOR_BACKUP_INTENT
+        if directory:
+            options |= _FILE_DIRECTORY_FILE
+        else:
+            options |= _FILE_NON_DIRECTORY_FILE
+        if create:
+            disposition = _FILE_OPEN_IF if directory else _FILE_OVERWRITE_IF
+        else:
+            disposition = _FILE_OPEN
+        # Never share DELETE so components cannot be swapped mid-operation.
+        share = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+        status = _ntdll.NtCreateFile(
+            ctypes.byref(handle), access, ctypes.byref(oa), ctypes.byref(iosb),
+            None, _FILE_ATTRIBUTE_DIRECTORY if directory else 0,
+            share, disposition, options, None, 0)
+        status_u = status & 0xFFFFFFFF
+        if status_u == _STATUS_OBJECT_NAME_NOT_FOUND or status_u == _STATUS_OBJECT_PATH_NOT_FOUND:
+            return None
+        if status_u == _STATUS_DELETE_PENDING:
+            raise ValueError("host destination is delete-pending: %r" % name)
+        if status < 0:
+            raise OSError(status_u, "NtCreateFile failed for %r (0x%08X)" % (name, status_u))
+        return handle.value
+
+    def _validate_handle_no_reparse(h, *, expect_dir, allow_missing_nlink=False, final_file=False):
+        tag = _query_attr_tag(h)
+        attrs = tag.FileAttributes
+        if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("host destination path contains a reparse point")
+        if tag.ReparseTag not in (0, None):
+            # Some volumes report tag only with reparse attribute; treat non-zero as reparse.
+            if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ValueError("host destination path contains a reparse point")
+        is_dir = bool(attrs & _FILE_ATTRIBUTE_DIRECTORY)
+        if expect_dir and not is_dir:
+            raise ValueError("host destination component is not a directory")
+        if not expect_dir and is_dir:
+            raise ValueError("host destination final component is a directory")
+        std = _query_standard(h)
+        if std.DeletePending:
+            raise ValueError("host destination is delete-pending")
+        if final_file:
+            if std.NumberOfLinks != 1:
+                raise ValueError("host destination is a hard-link alias (nlink=%s)" % std.NumberOfLinks)
+        return tag, std
+
+    def _open_host_root(host_dir):
+        # Absolute path for the initial open only; authority is the retained handle.
+        path = os.path.abspath(host_dir)
+        if not path:
+            raise ValueError("host directory is empty")
+        h = _open_path_reparse(path)
         try:
-            info = os.lstat(current)
-        except FileNotFoundError:
-            break
-        attrs = getattr(info, "st_file_attributes", 0)
-        if attrs & 0x400 or os.path.islink(current):  # FILE_ATTRIBUTE_REPARSE_POINT
-            raise RuntimeError("host update path contains a reparse point")
+            _validate_handle_no_reparse(h, expect_dir=True)
+        except Exception:
+            _close_handle(h)
+            raise
+        return h
+
+    def _preflight_member_chain(root_h, parts):
+        """Walk existing chain under root; reject reparse/hardlink; return missing suffix idx."""
+        cur = root_h
+        owned = []
+        try:
+            for i, part in enumerate(parts):
+                is_final = i == len(parts) - 1
+                h = _nt_open_relative(cur, part, directory=not is_final, create=False, write=False)
+                if h is None:
+                    # Remaining components must be created later; none may exist as reparse.
+                    return i
+                owned.append(h)
+                if is_final:
+                    _validate_handle_no_reparse(h, expect_dir=False, final_file=True)
+                else:
+                    _validate_handle_no_reparse(h, expect_dir=True)
+                cur = h
+            return len(parts)
+        finally:
+            for h in owned:
+                _close_handle(h)
+
+    def _nt_create_relative(root, name, *, directory, write=False, disposition=None):
+        """NtCreateFile relative open/create with explicit disposition."""
+        buf = ctypes.create_unicode_buffer(name)
+        us = _UNICODE_STRING()
+        us.Length = len(name) * 2
+        us.MaximumLength = (len(name) + 1) * 2
+        us.Buffer = ctypes.cast(buf, wintypes.LPWSTR)
+        oa = _OBJECT_ATTRIBUTES()
+        oa.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
+        oa.RootDirectory = root
+        oa.ObjectName = ctypes.pointer(us)
+        oa.Attributes = _OBJ_CASE_INSENSITIVE
+        oa.SecurityDescriptor = None
+        oa.SecurityQualityOfService = None
+        iosb = _IO_STATUS_BLOCK()
+        handle = wintypes.HANDLE()
+        access = _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
+        if write:
+            access |= _GENERIC_WRITE | _FILE_WRITE_DATA | _FILE_APPEND_DATA | _FILE_READ_DATA
+        else:
+            access |= _GENERIC_READ
+        if directory:
+            access |= _FILE_READ_DATA
+        options = (_FILE_OPEN_REPARSE_POINT | _FILE_SYNCHRONOUS_IO_NONALERT
+                   | _FILE_OPEN_FOR_BACKUP_INTENT)
+        if directory:
+            options |= _FILE_DIRECTORY_FILE
+        else:
+            options |= _FILE_NON_DIRECTORY_FILE
+        if disposition is None:
+            disposition = _FILE_OPEN
+        share = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+        status = _ntdll.NtCreateFile(
+            ctypes.byref(handle), access, ctypes.byref(oa), ctypes.byref(iosb),
+            None, _FILE_ATTRIBUTE_DIRECTORY if directory else 0,
+            share, disposition, options, None, 0)
+        status_u = status & 0xFFFFFFFF
+        if status_u in (_STATUS_OBJECT_NAME_NOT_FOUND, _STATUS_OBJECT_PATH_NOT_FOUND):
+            return None, status_u
+        if status_u == _STATUS_DELETE_PENDING:
+            raise ValueError("host destination is delete-pending: %r" % name)
+        if status < 0:
+            return None, status_u
+        return handle.value, status_u
+
+    def _write_member_handle(root_h, parts, data_iter):
+        """Create intermediate dirs and write final file relative to retained root."""
+        cur = root_h
+        owned = []
+        file_h = None
+        try:
+            for part in parts[:-1]:
+                h, st = _nt_create_relative(
+                    cur, part, directory=True, write=False, disposition=_FILE_OPEN_IF)
+                if h is None:
+                    raise ValueError(
+                        "failed to open/create host directory component: %r (0x%08X)" % (part, st or 0))
+                owned.append(h)
+                _validate_handle_no_reparse(h, expect_dir=True)
+                cur = h
+            final = parts[-1]
+            # Open existing without truncate; reject reparse/hardlink before any write.
+            existing, _ = _nt_create_relative(
+                cur, final, directory=False, write=False, disposition=_FILE_OPEN)
+            if existing is not None:
+                try:
+                    _validate_handle_no_reparse(existing, expect_dir=False, final_file=True)
+                finally:
+                    _close_handle(existing)
+                file_h, st = _nt_create_relative(
+                    cur, final, directory=False, write=True, disposition=_FILE_OPEN)
+                if file_h is None:
+                    raise ValueError("failed to reopen host file for write: %r" % final)
+            else:
+                # Create new only — never OPEN_IF/OVERWRITE_IF (those can touch aliases).
+                file_h, st = _nt_create_relative(
+                    cur, final, directory=False, write=True, disposition=_FILE_CREATE)
+                if file_h is None:
+                    raise ValueError(
+                        "failed to create host file: %r (0x%08X)" % (final, st or 0))
+            _validate_handle_no_reparse(file_h, expect_dir=False, final_file=True)
+            if not _k32.SetFilePointerEx(file_h, 0, None, 0):
+                raise OSError(ctypes.get_last_error(), "SetFilePointerEx failed")
+            if not _k32.SetEndOfFile(file_h):
+                raise OSError(ctypes.get_last_error(), "SetEndOfFile failed")
+            for chunk in data_iter:
+                if not chunk:
+                    continue
+                written = wintypes.DWORD(0)
+                buf = ctypes.create_string_buffer(chunk)
+                if not _k32.WriteFile(file_h, buf, len(chunk), ctypes.byref(written), None):
+                    raise OSError(ctypes.get_last_error(), "WriteFile failed")
+                if written.value != len(chunk):
+                    raise OSError(0, "short WriteFile")
+        finally:
+            if file_h is not None:
+                _close_handle(file_h)
+            for h in owned:
+                _close_handle(h)
+
+    def _apply_host_zip_windows(z, host_dir):
+        accepted = []
+        seen = {}
+        for n in z.namelist():
+            parts, is_dir = _validate_host_archive_member(n)
+            key = _host_member_norm_key(parts)
+            if key in seen:
+                raise ValueError(
+                    "host archive has duplicate destination %r / %r" % (seen[key], n))
+            seen[key] = n
+            if is_dir:
+                continue
+            accepted.append((n, parts))
+        root = _open_host_root(host_dir)
+        try:
+            for n, parts in accepted:
+                _preflight_member_chain(root, parts)
+            for n, parts in accepted:
+                def _chunks(member=n):
+                    with z.open(member) as src:
+                        while True:
+                            b = src.read(1024 * 1024)
+                            if not b:
+                                break
+                            yield b
+                _write_member_handle(root, parts, _chunks())
+        finally:
+            _close_handle(root)
+
+else:
+    def _apply_host_zip_windows(z, host_dir):
+        raise RuntimeError("Windows handle-authority apply is unavailable")
 
 
-def _reject_multiply_linked(dest):
-    """Reject a payload destination that is a hard link to another path.
-
-    A hard link carries no FILE_ATTRIBUTE_REPARSE_POINT, so the ancestor walk in
-    _reject_reparse_components cannot see it, and writing the payload onto the
-    existing path follows the link and overwrites whatever else points at that
-    inode. Mirrors the NumberOfLinks != 1 refusal the yt-dlp staging path in
-    mchost/downloads.py already makes. A missing destination is fine: there is
-    no existing inode to write through.
-    """
-    try:
-        links = os.stat(dest).st_nlink
-    except (FileNotFoundError, NotADirectoryError):
+def _apply_host_zip(z, host_dir):
+    """Validate every member, then write with filesystem-handle authority on Windows."""
+    if sys.platform == "win32":
+        _apply_host_zip_windows(z, host_dir)
         return
-    except OSError as e:
-        raise RuntimeError("host update destination is unreadable: %s" % e)
-    if links > 1:
-        raise RuntimeError("host update destination is a hard link: %r" % dest)
+    # Non-Windows: lexical validation + realpath containment (symlink-safe).
+    accepted = []
+    seen = {}
+    host_real = os.path.realpath(host_dir)
+    if not os.path.isdir(host_real):
+        raise ValueError("host directory is not a directory")
+    for n in z.namelist():
+        parts, is_dir = _validate_host_archive_member(n)
+        key = _host_member_norm_key(parts)
+        if key in seen:
+            raise ValueError("host archive has duplicate destination %r / %r" % (seen[key], n))
+        seen[key] = n
+        if is_dir:
+            continue
+        accepted.append((n, parts))
+    for n, parts in accepted:
+        dest = os.path.realpath(os.path.join(host_real, *parts))
+        if dest != host_real and not dest.startswith(host_real + os.sep):
+            raise ValueError("host archive member escapes destination: %r" % (parts,))
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Refuse to write through a symlink final leaf.
+        if os.path.lexists(dest) and os.path.islink(dest):
+            raise ValueError("host destination is a symlink: %r" % (parts,))
+        with z.open(n) as src, open(dest, "wb") as dst:
+            shutil.copyfileobj(src, dst)
 
 
 def apply_update(plan, ext_dir, host_dir):
     """Apply only the parts that are newer. Returns {staged: bool}."""
-    if plan["host_newer"]:
-        # Preflight before extension staging, host directory creation, or any
-        # payload write. A junction above host_dir otherwise redirects every
-        # later abspath/open call outside the configured lexical destination.
-        _reject_reparse_components(host_dir)
+    # No lexical preflight here any more: _apply_host_zip validates by HANDLE as
+    # it walks, which closes the check-then-open race the pathname walk left open.
     staged = False
     if plan["ext_newer"]:
         if not _await_zip(plan["ext_zip"]):
@@ -339,25 +723,7 @@ def apply_update(plan, ext_dir, host_dir):
                 staged = False
     if plan["host_newer"] and _await_zip(plan["host_zip"]):
         with zipfile.ZipFile(plan["host_zip"]) as z:
-            # Validate every member before the first directory creation or write.
-            accepted = []
-            for n in z.namelist():
-                rel, is_dir = _validate_host_archive_member(n)
-                dest = _host_member_destination(host_dir, rel)
-                if is_dir:
-                    continue
-                # Vet every destination BEFORE the first payload write, so a
-                # linked member late in the archive cannot leave earlier ones
-                # half-applied.
-                _reject_multiply_linked(dest)
-                accepted.append((n, rel))
-            for n, rel in accepted:
-                dest = _host_member_destination(host_dir, rel)
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with z.open(n) as src, open(dest, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+            _apply_host_zip(z, host_dir)
     return {"staged": staged}
 
 
