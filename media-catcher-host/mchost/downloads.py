@@ -3036,6 +3036,13 @@ def _handle_ytdl_structured(req):
                     p = subprocess.Popen(
                         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                        # yt-dlp emits UTF-8. A bare text=True decodes as the
+                        # locale codepage (cp1252 here), which mojibakes any
+                        # non-ASCII @@FILE@@ path -- yt-dlp substitutes fullwidth
+                        # quotes (U+FF02) for '"' -- so os.path.isfile missed a
+                        # file that was really there and a finished download was
+                        # reported as a generic failure.
+                        encoding="utf-8", errors="replace",
                     )
                 except Exception:
                     if cancelled():
@@ -3312,7 +3319,11 @@ def _handle_ytdl_legacy(req):
         cf, si = _no_window()
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 creationflags=cf, startupinfo=si, text=True, bufsize=1)
+                                 creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                                 # See the structured path: yt-dlp emits UTF-8, and
+                                 # decoding it as the locale codepage mojibakes the
+                                 # @@FILE@@ path, failing an already-finished job.
+                                 encoding="utf-8", errors="replace")
         except Exception as e:
             _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return

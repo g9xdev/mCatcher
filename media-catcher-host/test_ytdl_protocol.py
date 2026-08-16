@@ -3,6 +3,7 @@
 Deterministic fakes only: no network and no real yt-dlp process.
 """
 import os
+import sys
 import threading
 import time
 
@@ -4509,3 +4510,41 @@ def test_auto_fetch_installs_the_directory_build_not_the_onefile(tmp_path, monke
     assert os.path.isfile(str(tmp_path / "yt-dlp.exe")), "exe extracted"
     assert os.path.isfile(str(tmp_path / "_internal" / "base_library.zip")), \
         "_internal must be extracted alongside it or the exe cannot start"
+
+
+def test_utf8_filepath_from_ytdlp_is_not_mojibaked(tmp_path, monkeypatch):
+    """yt-dlp emits @@FILE@@ as UTF-8 and substitutes fullwidth quotes (U+FF02)
+    for '"' in filenames. Reading its stdout with a bare text=True decodes as the
+    locale codepage (cp1252 here), so the path came back mojibaked, os.path.isfile
+    said no, and a download that had fully succeeded on disk was reported as a
+    generic failure. Uses a REAL subprocess: the decode is the thing under test,
+    so a fake proc yielding str would prove nothing."""
+    import mchost.downloads as d
+
+    name = "\uff02Quoted\uff02 \u2014 Title.mp4"
+    target = tmp_path / name
+    # Built line-by-line with bytes([10]) for the newline: nesting a "\n" escape
+    # inside generated source is one collapse away from a syntax error in the
+    # child, which then writes nothing and looks exactly like the bug.
+    child = "\n".join([
+        "import sys",
+        "p = %r" % str(target),
+        "open(p, 'wb').write(b'DATA')",
+        "sys.stdout.buffer.write(('@@FILE@@ ' + p).encode('utf-8'))",
+        "sys.stdout.buffer.write(bytes([10]))",
+        "sys.stdout.flush()",
+    ])
+
+    sent = []
+    _patch_ytdl_base(monkeypatch, d, mc, sent)          # leaves the real Popen
+    monkeypatch.setattr(d, "_ytdl_build_cmd",
+                        lambda *a, **k: [sys.executable, "-c", child])
+
+    d.handle_ytdl({"id": "utf8job", "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
+    term = _wait_terminal(sent, "utf8job", timeout=20)
+
+    assert term["type"] == "ytdl-done", \
+        "a UTF-8 filename must not turn a finished download into a failure (got %r)" % term
+    assert term.get("file") == str(target), \
+        "the reported path must survive the decode intact"
