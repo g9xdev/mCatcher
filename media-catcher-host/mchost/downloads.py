@@ -873,24 +873,45 @@ def ytdlp_update():
 def ensure_ytdlp():
     """Return a path to yt-dlp, fetching the official release into HERE if it's missing.
     Lets auto-updated installs (which don't ship the binary) get YouTube without a
-    manual installer re-run."""
+    manual installer re-run.
+
+    Fetches the DIRECTORY build (yt-dlp_win.zip: yt-dlp.exe + _internal/), never
+    the onefile exe. The onefile launcher re-extracts ~145 files to %TEMP% on
+    EVERY launch; under a browser-descended process each extraction is rescanned,
+    which stalled host-spawned yt-dlp for ~90s during DLL load while the same
+    command from a shell started in about a second. The directory build extracts
+    nothing and starts in ~0.4s.
+    """
     global YTDLP
     if YTDLP:
         return YTDLP
     if os.name != "nt":
         return None
-    dest = os.path.join(_h().HERE, "yt-dlp.exe")
+    here = _h().HERE
+    dest = os.path.join(here, "yt-dlp.exe")
     try:
-        import urllib.request
+        import urllib.request, zipfile, io
         _h()._hlog("info", "fetching yt-dlp (first YouTube use)…")
-        tmp = dest + ".part"
-        req = urllib.request.Request("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
-                                     headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
-        with urllib.request.urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
-            shutil.copyfileobj(r, f)
-        os.replace(tmp, dest)
+        req = urllib.request.Request(
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip",
+            headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            blob = r.read()
+        with zipfile.ZipFile(io.BytesIO(blob)) as z:
+            for name in z.namelist():
+                rel = name.replace("\\", "/").lstrip("/")
+                # Refuse absolute/traversing members: this unpacks into the host
+                # directory, so a crafted archive must not reach outside it.
+                if not rel or rel.endswith("/") or ".." in rel.split("/"):
+                    continue
+                out = os.path.join(here, *rel.split("/"))
+                os.makedirs(os.path.dirname(out) or here, exist_ok=True)
+                with z.open(name) as src, open(out, "wb") as f:
+                    shutil.copyfileobj(src, f)
+        if not os.path.isfile(dest):
+            raise RuntimeError("yt-dlp.exe missing from archive")
         YTDLP = dest
-        _h()._hlog("info", "yt-dlp installed")
+        _h()._hlog("info", "yt-dlp installed (directory build)")
         return YTDLP
     except Exception as e:
         _h()._hlog("error", "yt-dlp download failed: %s" % e)

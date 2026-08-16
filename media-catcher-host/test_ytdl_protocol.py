@@ -4462,3 +4462,50 @@ def test_stall_watchdog_disarms_once_bytes_flow(tmp_path, monkeypatch):
     assert term["type"] == "ytdl-done", "a progressing download completes normally"
     assert procs and not procs[0].killed, \
         "a download that produced bytes is never killed by the stall watchdog"
+
+
+# ---------------------------------------------------------------------------
+# Auto-fetch must land the DIRECTORY build
+#
+# The onefile build re-extracts ~145 files to %TEMP% on EVERY launch. Under a
+# browser-descended process those get rescanned each time, which is what made
+# host-spawned yt-dlp block during DLL load for ~90s while the identical shell
+# command ran in about a second. The directory build extracts nothing.
+# ---------------------------------------------------------------------------
+
+def test_auto_fetch_installs_the_directory_build_not_the_onefile(tmp_path, monkeypatch):
+    import io as _io
+    import zipfile as _zip
+    import mchost.downloads as d
+
+    # A stand-in for the official yt-dlp_win.zip layout.
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as z:
+        z.writestr("yt-dlp.exe", b"EXE")
+        z.writestr("_internal/base_library.zip", b"LIB")
+        z.writestr("_internal/certifi/cacert.pem", b"PEM")
+    payload = buf.getvalue()
+
+    asked = {}
+
+    def fake_urlopen(req, timeout=None):
+        asked["url"] = getattr(req, "full_url", str(req))
+        # BytesIO, not a hand-rolled fake: a read() that keeps returning the same
+        # bytes makes shutil.copyfileobj loop forever writing an unbounded file.
+        return _io.BytesIO(payload)
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "YTDLP", None)
+
+    got = d.ensure_ytdlp()
+
+    assert asked.get("url", "").endswith("yt-dlp_win.zip"), \
+        "must fetch the directory build, not the bare onefile exe (got %r)" % asked.get("url")
+    assert got == str(tmp_path / "yt-dlp.exe"), "returns the extracted exe path"
+    assert os.path.isfile(str(tmp_path / "yt-dlp.exe")), "exe extracted"
+    assert os.path.isfile(str(tmp_path / "_internal" / "base_library.zip")), \
+        "_internal must be extracted alongside it or the exe cannot start"
