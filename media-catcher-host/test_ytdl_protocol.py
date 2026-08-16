@@ -4626,3 +4626,18 @@ def test_ytmeta_probe_that_never_answers_replies_and_kills_the_tree(tmp_path, mo
 
     assert wait_for(lambda: not alive(gc), timeout=20), \
         "the probe's descendants must be killed too, not orphaned holding the pipe"
+
+
+def test_ytdl_cmd_restricts_filenames_to_ascii():
+    """Saved names are ASCII-only by choice: portable across filesystems and
+    tooling, and free of the fullwidth quotes yt-dlp substitutes for '"'.
+
+    Not a substitute for --encoding: that fixes the CORRUPTION of the path yt-dlp
+    reports back, which would still bite any title this happens not to flatten.
+    Both are required."""
+    import mchost.downloads as d
+
+    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b", "out.%(ext)s",
+                            "https://example.test/v", None, False)
+    assert "--restrict-filenames" in cmd, "saved names are ASCII-only"
+    assert "--encoding" in cmd, "still tells yt-dlp which encoding to emit"

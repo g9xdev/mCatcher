@@ -2759,6 +2759,12 @@ def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
            # os.path.isfile missed a finished download and reported failure.
            # Must stay paired with the encoding="utf-8" read below.
            "--encoding", "utf-8",
+           # ASCII-only saved names: portable across filesystems and tooling, and
+           # free of the fullwidth quotes yt-dlp substitutes for '"'. NOT a
+           # substitute for --encoding above — that fixes the corruption of the
+           # path yt-dlp reports back, which would still bite any title this
+           # happens not to flatten. Both are required.
+           "--restrict-filenames",
            # --print puts yt-dlp in QUIET mode, which suppresses the very status
            # lines _yt_stage_note parses (so the bar sat on "Preparing" all the
            # way through). --no-quiet keeps them; --print still emits @@FILE@@.
