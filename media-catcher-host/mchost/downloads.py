@@ -3124,9 +3124,15 @@ def _handle_ytdl_structured(req):
                     emit_error("cancelled", "Cancelled.")
                     return
                 if watch.stalled.is_set():
+                    # Report what was observed, not a guessed cause. This has had
+                    # several: a firewall dropping packets, two jobs racing on one
+                    # output path, and per-launch re-extraction being rescanned.
+                    # Naming one of them sent people to check a firewall that was
+                    # switched off.
                     emit_error("stalled",
-                               "No response while preparing the download. The connection is "
-                               "being blocked (check your firewall/VPN) or the network is down.")
+                               "yt-dlp stopped responding while preparing the download "
+                               "(no output for %ds) and was stopped. Its last output is "
+                               "in the log console." % _YTDL_RESOLVE_STALL)
                     return
 
                 if p.returncode == 0:
@@ -3247,7 +3253,9 @@ def _handle_ytdl_structured(req):
                 reason, msg = _map_yt_error("\n".join(errbuf))
                 _h()._hlog(
                     "error",
-                    "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]),
+                    # 500 chars cut the output mid-line and hid the real error
+                    # during diagnosis; still bounded, but wide enough to carry it.
+                    "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-12:]))[:2000]),
                 )
                 emit_error(reason, msg)
             except Exception:
@@ -3390,12 +3398,17 @@ def _handle_ytdl_legacy(req):
                 _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled",
                            "error": "Cancelled."})
             elif watch.stalled.is_set():
-                _h()._hlog("error", "yt-dlp: no response for %ds while resolving %s — killed"
-                           % (_YTDL_RESOLVE_STALL, url))
+                # Log whatever it DID say before going quiet — the user-facing
+                # message points here, so the tail has to actually be present.
+                _h()._hlog("error", "yt-dlp: no response for %ds while resolving %s — killed%s"
+                           % (_YTDL_RESOLVE_STALL, url,
+                              ("; last output:\n" + "\n".join(errbuf[-12:])[:2000])
+                              if errbuf else " (it produced no output at all)"))
+                # Observation, not a guessed cause — see the structured path.
                 _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
-                           "error": "No response while preparing the download. The connection "
-                                    "is being blocked (check your firewall/VPN) or the network "
-                                    "is down."})
+                           "error": "yt-dlp stopped responding while preparing the download "
+                                    "(no output for %ds) and was stopped. Its last output is "
+                                    "in the log console." % _YTDL_RESOLVE_STALL})
             elif p.returncode == 0 and filepath and os.path.isfile(filepath):
                 try:
                     size = os.path.getsize(filepath)
@@ -3409,7 +3422,8 @@ def _handle_ytdl_legacy(req):
                     _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             else:
                 reason, msg = _map_yt_error("\n".join(errbuf))
-                _h()._hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
+                _h()._hlog("error", "yt-dlp failed (%s): %s"
+                           % (reason, ("\n".join(errbuf[-12:]))[:2000]))
                 _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         finally:
             watch.finish()          # idempotent; also covers the exception path
