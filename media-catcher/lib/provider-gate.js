@@ -18,6 +18,24 @@
     return Object.freeze(o);
   }
 
+  /**
+   * Encode Map entries as own enumerable data properties without assignment
+   * hazards. Plain `obj[id] = n` drops or mutates via "__proto__" and other
+   * Object.prototype names; defineProperty always installs an own data key.
+   */
+  function mapToOwnDataRecord(map) {
+    var out = {};
+    map.forEach(function (n, id) {
+      Object.defineProperty(out, id, {
+        value: n,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    });
+    return out;
+  }
+
   function isNonblankString(v) {
     return typeof v === "string" && v.trim().length > 0;
   }
@@ -359,14 +377,6 @@
     }
 
     function snapshot() {
-      var open = {};
-      nativeOpen.forEach(function (n, id) {
-        open[id] = n;
-      });
-      var limits = {};
-      jobLimits.forEach(function (n, id) {
-        limits[id] = n;
-      });
       return deepFreeze({
         providerKey: providerKey,
         state: state,
@@ -375,8 +385,8 @@
         ownerJobId: ownerJobId,
         reducedConcurrency: reducedConcurrency,
         parkedProbeIds: Array.from(parkedProbes).sort(),
-        nativeOpen: open,
-        jobLimits: limits,
+        nativeOpen: mapToOwnDataRecord(nativeOpen),
+        jobLimits: mapToOwnDataRecord(jobLimits),
       });
     }
 

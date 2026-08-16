@@ -781,6 +781,58 @@ test("snapshot is deep-frozen deterministic and reflects state transitions", () 
   assert.deepEqual(snap1.parkedProbeIds, ["a-probe", "z-probe"]);
 });
 
+test("snapshot losslessly represents hostile Object-prototype job ids as own data keys", () => {
+  // Mutation: open[id] = n / limits[id] = n drops __proto__ (and pollutes via assignment).
+  const hostileIds = [
+    "__proto__",
+    "constructor",
+    "prototype",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+  ];
+  const g = gate();
+  hostileIds.forEach(function (id, i) {
+    g.noteNativeOpen(id, i + 1);
+    g.registerJobLimit(id, i + 2);
+  });
+
+  const snap = g.snapshot();
+  assert.ok(Object.isFrozen(snap.nativeOpen));
+  assert.ok(Object.isFrozen(snap.jobLimits));
+  // Snapshot maps must not mutate Object.prototype.
+  assert.equal(Object.prototype.polluted, undefined);
+  assert.equal({}.polluted, undefined);
+
+  hostileIds.forEach(function (id, i) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(snap.nativeOpen, id),
+      true,
+      "nativeOpen must have own key " + id
+    );
+    assert.equal(snap.nativeOpen[id], i + 1);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(snap.jobLimits, id),
+      true,
+      "jobLimits must have own key " + id
+    );
+    assert.equal(snap.jobLimits[id], i + 2);
+  });
+
+  // Zeroing __proto__ remains visible as an own data property (confirmation path).
+  g.noteNativeOpen("__proto__", 0);
+  const zeroSnap = g.snapshot();
+  assert.equal(Object.prototype.hasOwnProperty.call(zeroSnap.nativeOpen, "__proto__"), true);
+  assert.equal(zeroSnap.nativeOpen["__proto__"], 0);
+
+  // Frozen maps reject mutation; Object.prototype stays clean.
+  assert.throws(() => {
+    zeroSnap.nativeOpen["__proto__"] = 99;
+  });
+  assert.equal(zeroSnap.nativeOpen["__proto__"], 0);
+  assert.equal(Object.getPrototypeOf({}).polluted, undefined);
+});
+
 test("provider-gate dual-export assigns locked McProviderGate global with identity", () => {
   // Mutation: else-branch only assigns one side, or creates two distinct objects.
   const abs = path.join(mediaCatcherRoot, "lib", "provider-gate.js");

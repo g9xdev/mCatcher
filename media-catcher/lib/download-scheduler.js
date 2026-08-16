@@ -322,8 +322,6 @@
             wakeGeneration: gs ? gs.wakeGeneration : 0,
             ownerJobId: gs ? gs.ownerJobId : null,
             reducedConcurrency: gs ? gs.reducedConcurrency : null,
-            // Safe plain map of jobId → observed native open count (no live refs).
-            nativeOpen: gs && gs.nativeOpen ? Object.assign({}, gs.nativeOpen) : {},
           }),
         });
       }

@@ -193,59 +193,77 @@ test("1 running job parks needs_user, releases slot once, retains ephemeral, adm
 // ---------------------------------------------------------------------------
 
 test("2 pausing_provider with native opens parks needs_user and zeros native opens", () => {
+  const path = require("node:path");
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  let gateRef = null;
   let firefoxCalls = 0;
-  const s = createDownloadScheduler({
-    maxConcurrent: 2,
-    now: () => 0,
-    firefoxDownload: () => {
-      firefoxCalls++;
-    },
-  });
-  s.createJob({
-    id: "owner",
-    providerKey: "p.com",
-    intent: intent("o.mp4"),
-    segmentConcurrency: 4,
-    retries: 3,
-  });
-  s.createJob({
-    id: "sib",
-    providerKey: "p.com",
-    intent: intent("s.mp4"),
-    segmentConcurrency: 4,
-    retries: 3,
-  });
-  s.enqueue("owner");
-  s.enqueue("sib");
-  s.notePermitAcquired("owner");
-  s.notePermitAcquired("sib");
-  s.noteNativeOpen("sib", 3);
-  assert.equal(s.getJob("sib").nativeOpenConnections, 3);
-  s.onTransportResult("sib", s.getJob("sib").attemptToken, {
-    status: "failed",
-    failureCategory: "short_read",
-  });
-  assert.equal(s.getJob("sib").state, "pausing_provider");
-  assert.equal(s.getJob("sib").holdsGlobalSlot, true);
-  assert.ok(s.getJob("sib").nativeOpenConnections >= 1);
-  const verBefore = s.getJob("sib").stateVersion;
-  const globalBefore = s.getSnapshot().globalRunning;
+  try {
+    installHostileGate(realGate, gatePath, {
+      onGate: function (g) {
+        gateRef = g;
+      },
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    const s = createS({
+      maxConcurrent: 2,
+      now: () => 0,
+      firefoxDownload: () => {
+        firefoxCalls++;
+      },
+    });
+    s.createJob({
+      id: "owner",
+      providerKey: "p.com",
+      intent: intent("o.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.createJob({
+      id: "sib",
+      providerKey: "p.com",
+      intent: intent("s.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue("owner");
+    s.enqueue("sib");
+    s.notePermitAcquired("owner");
+    s.notePermitAcquired("sib");
+    s.noteNativeOpen("sib", 3);
+    assert.equal(s.getJob("sib").nativeOpenConnections, 3);
+    s.onTransportResult("sib", s.getJob("sib").attemptToken, {
+      status: "failed",
+      failureCategory: "short_read",
+    });
+    assert.equal(s.getJob("sib").state, "pausing_provider");
+    assert.equal(s.getJob("sib").holdsGlobalSlot, true);
+    assert.ok(s.getJob("sib").nativeOpenConnections >= 1);
+    const verBefore = s.getJob("sib").stateVersion;
+    const globalBefore = s.getSnapshot().globalRunning;
 
-  const ok = s.onTransportUnavailable("sib");
-  assert.equal(ok, true);
-  assert.equal(s.getJob("sib").state, "needs_user");
-  assert.equal(s.getJob("sib").stateVersion, verBefore + 1);
-  assert.equal(s.getJob("sib").holdsGlobalSlot, false);
-  assert.equal(s.getJob("sib").nativeOpenConnections, 0);
-  // Real gate nativeOpen must match projected zero (not merely nonnegative).
-  assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen.sib, 0);
-  assert.equal(s.getJob("sib").attemptToken, null);
-  assert.equal(s.getSnapshot().globalRunning, globalBefore - 1);
-  // still waiting_provider members must not include sib
-  assert.equal(s.getSnapshot().providers["p.com"].waiting.indexOf("sib"), -1);
-  assert.equal(firefoxCalls, 0);
-  assertSlotInvariant(s);
-  assertPermitAndOwnerInvariants(s);
+    const ok = s.onTransportUnavailable("sib");
+    assert.equal(ok, true);
+    assert.equal(s.getJob("sib").state, "needs_user");
+    assert.equal(s.getJob("sib").stateVersion, verBefore + 1);
+    assert.equal(s.getJob("sib").holdsGlobalSlot, false);
+    assert.equal(s.getJob("sib").nativeOpenConnections, 0);
+    // Inspect injected gate snapshot — public provider projection does not expose nativeOpen.
+    assert.equal(gateRef.snapshot().nativeOpen.sib, 0);
+    assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen, undefined);
+    assert.equal(s.getJob("sib").attemptToken, null);
+    assert.equal(s.getSnapshot().globalRunning, globalBefore - 1);
+    // still waiting_provider members must not include sib
+    assert.equal(s.getSnapshot().providers["p.com"].waiting.indexOf("sib"), -1);
+    assert.equal(firefoxCalls, 0);
+    assertSlotInvariant(s);
+    assertPermitAndOwnerInvariants(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1035,7 +1053,8 @@ test("13 noteNativeOpen throw before mutation does not park or project zero whil
     s.noteNativeOpen("run", 3);
     assert.equal(s.getJob("run").nativeOpenConnections, 3);
     assert.equal(gateRef.snapshot().nativeOpen.run, 3);
-    assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen.run, 3);
+    // Public provider projection does not expose nativeOpen; use gateRef.
+    assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen, undefined);
     const opensBefore = s.getJob("run").nativeOpenConnections;
     const gateOpensBefore = gateRef.snapshot().nativeOpen.run;
     const stateBefore = s.getJob("run").state;
@@ -1053,7 +1072,6 @@ test("13 noteNativeOpen throw before mutation does not park or project zero whil
     assert.equal(s.getJob("run").nativeOpenConnections, opensBefore);
     assert.equal(gateRef.snapshot().nativeOpen.run, gateOpensBefore);
     assert.ok(gateRef.snapshot().nativeOpen.run > 0);
-    assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen.run, gateOpensBefore);
     assert.equal(s.getJob("run").holdsGlobalSlot, slotBefore);
     assert.equal(s.getJob("run").attemptToken, tokBefore);
     assert.equal(s.getJob("run").stateVersion, verBefore);
@@ -1265,6 +1283,159 @@ test("16 completeOwner advances then throws — park needs_user, no same-provide
     assert.equal(s.getJob("wait").autoWakeCount, waitWake);
     assert.equal(s.getJob("wait").retryRemaining, waitRetries);
     assert.ok(s.getSnapshot().providers["p.com"].waiting.indexOf("wait") !== -1);
+    assert.equal(firefoxCalls, 0);
+    assertSlotInvariant(s);
+    assertPermitAndOwnerInvariants(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 17. Hostile __proto__ jobId: throw-before leaves coherent prior opens / running
+// ---------------------------------------------------------------------------
+
+test("17 hostile __proto__ jobId throw-before leaves coherent prior opens and running", () => {
+  const path = require("node:path");
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  const hostileId = "__proto__";
+  let gateRef = null;
+  let mode = "pass";
+  let firefoxCalls = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      onGate: function (g) {
+        gateRef = g;
+      },
+      noteNativeOpen: function (g, jobId, n) {
+        if (mode === "throw-before") {
+          throw new Error("simulated noteNativeOpen throw before mutation");
+        }
+        return g.noteNativeOpen(jobId, n);
+      },
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    const s = createS({
+      maxConcurrent: 1,
+      now: () => 0,
+      firefoxDownload: () => {
+        firefoxCalls++;
+      },
+    });
+    s.createJob({
+      id: hostileId,
+      providerKey: "p.com",
+      intent: intent("hostile.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue(hostileId);
+    assert.equal(s.getJob(hostileId).state, "running");
+    s.noteNativeOpen(hostileId, 2);
+    assert.equal(s.getJob(hostileId).nativeOpenConnections, 2);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(gateRef.snapshot().nativeOpen, hostileId),
+      true
+    );
+    assert.equal(gateRef.snapshot().nativeOpen[hostileId], 2);
+    const opensBefore = s.getJob(hostileId).nativeOpenConnections;
+    const gateOpensBefore = gateRef.snapshot().nativeOpen[hostileId];
+    const stateBefore = s.getJob(hostileId).state;
+    const tokBefore = s.getJob(hostileId).attemptToken;
+    const verBefore = s.getJob(hostileId).stateVersion;
+    const slotBefore = s.getJob(hostileId).holdsGlobalSlot;
+    const retriesBefore = s.getJob(hostileId).retryRemaining;
+
+    mode = "throw-before";
+    callUnavailableNoSuccess(s, hostileId);
+
+    assert.equal(s.getJob(hostileId).state, stateBefore);
+    assert.equal(s.getJob(hostileId).nativeOpenConnections, opensBefore);
+    assert.equal(gateRef.snapshot().nativeOpen[hostileId], gateOpensBefore);
+    assert.ok(gateRef.snapshot().nativeOpen[hostileId] > 0);
+    assert.equal(s.getJob(hostileId).holdsGlobalSlot, slotBefore);
+    assert.equal(s.getJob(hostileId).attemptToken, tokBefore);
+    assert.equal(s.getJob(hostileId).stateVersion, verBefore);
+    assert.equal(s.getJob(hostileId).retryRemaining, retriesBefore);
+    assert.equal(firefoxCalls, 0);
+    assertSlotInvariant(s);
+    assertPermitAndOwnerInvariants(s);
+  } finally {
+    restoreModuleCache(gatePath, schedPath, prevGate, prevSched);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 18. Hostile __proto__ jobId: mutate-then-throw confirms 0/0 and parks needs_user
+// ---------------------------------------------------------------------------
+
+test("18 hostile __proto__ jobId mutate-then-throw confirms 0/0 and parks needs_user", () => {
+  const path = require("node:path");
+  const gatePath = path.resolve(__dirname, "..", "lib", "provider-gate.js");
+  const schedPath = path.resolve(__dirname, "..", "lib", "download-scheduler.js");
+  const realGate = require(gatePath);
+  const prevGate = require.cache[require.resolve(gatePath)];
+  const prevSched = require.cache[require.resolve(schedPath)];
+  const hostileId = "__proto__";
+  let gateRef = null;
+  let mode = "pass";
+  let firefoxCalls = 0;
+  try {
+    installHostileGate(realGate, gatePath, {
+      onGate: function (g) {
+        gateRef = g;
+      },
+      noteNativeOpen: function (g, jobId, n) {
+        if (mode === "throw-after") {
+          g.noteNativeOpen(jobId, n);
+          throw new Error("simulated noteNativeOpen throw after mutation");
+        }
+        return g.noteNativeOpen(jobId, n);
+      },
+    });
+    const createS = loadSchedulerFresh(schedPath);
+    const s = createS({
+      maxConcurrent: 1,
+      now: () => 0,
+      firefoxDownload: () => {
+        firefoxCalls++;
+      },
+    });
+    s.createJob({
+      id: hostileId,
+      providerKey: "p.com",
+      intent: intent("hostile.mp4"),
+      segmentConcurrency: 4,
+      retries: 3,
+    });
+    s.enqueue(hostileId);
+    assert.equal(s.getJob(hostileId).state, "running");
+    s.noteNativeOpen(hostileId, 2);
+    assert.equal(s.getJob(hostileId).nativeOpenConnections, 2);
+    assert.equal(gateRef.snapshot().nativeOpen[hostileId], 2);
+    const verBefore = s.getJob(hostileId).stateVersion;
+    const retriesBefore = s.getJob(hostileId).retryRemaining;
+
+    mode = "throw-after";
+    const ok = s.onTransportUnavailable(hostileId);
+    assert.equal(ok, true);
+    // Confirmation must see own-key zero (not missing __proto__ representation).
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(gateRef.snapshot().nativeOpen, hostileId),
+      true
+    );
+    assert.equal(gateRef.snapshot().nativeOpen[hostileId], 0);
+    assert.equal(s.getJob(hostileId).nativeOpenConnections, 0);
+    assert.equal(s.getJob(hostileId).state, "needs_user");
+    assert.equal(s.getJob(hostileId).stateVersion, verBefore + 1);
+    assert.equal(s.getJob(hostileId).holdsGlobalSlot, false);
+    assert.equal(s.getJob(hostileId).attemptToken, null);
+    assert.equal(s.getJob(hostileId).retryRemaining, retriesBefore);
+    assert.equal(s.getSnapshot().providers["p.com"].gate.nativeOpen, undefined);
     assert.equal(firefoxCalls, 0);
     assertSlotInvariant(s);
     assertPermitAndOwnerInvariants(s);
