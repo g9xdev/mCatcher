@@ -1206,3 +1206,563 @@ def test_guardian_rejects_reparse_and_hardlink_destinations_without_restart(tmp_
         violations.append("dup_norm: guardian returned 0")
 
     assert not violations, "guardian alias violations:\n- " + "\n- ".join(violations)
+
+
+# ---------------------------------------------------------------------------
+# Root-to-host retained identity chain hardening (appended tests only)
+# ---------------------------------------------------------------------------
+
+_FILE_ID_INFO_CLASS = 18  # FILE_INFO_BY_HANDLE_CLASS.FileIdInfo
+
+
+def _make_identity_attack_zip(path: Path) -> None:
+    """Valid release-shaped host zip plus one attack member."""
+    _make_attack_zip(path, "identity_attack.txt", host_body='VERSION = "2.0.0"\nEVIL\n')
+
+
+def _tree_identity_snapshot(root: Path) -> dict:
+    """Path -> (kind, bytes, mtime_ns, ino, nlink, mode) via lstat (no follow)."""
+    out = {}
+    if not root.exists():
+        return out
+    for p in sorted(root.rglob("*"), key=lambda x: str(x).lower()):
+        rel = p.relative_to(root).as_posix()
+        try:
+            st = p.lstat()
+        except OSError:
+            out[rel] = ("missing", None, None, None, None, None)
+            continue
+        is_dir = p.is_dir() and not p.is_symlink()
+        data = None
+        if p.is_file() and not p.is_symlink():
+            try:
+                data = p.read_bytes()
+            except OSError:
+                data = None
+        out[rel] = (
+            "dir" if is_dir else ("link" if p.is_symlink() else "file"),
+            data,
+            getattr(st, "st_mtime_ns", None),
+            getattr(st, "st_ino", None),
+            getattr(st, "st_nlink", None),
+            getattr(st, "st_mode", None),
+        )
+    return out
+
+
+def _host_bytes_map(host_dir: Path) -> dict:
+    out = {}
+    if not host_dir.exists():
+        return out
+    try:
+        for p in host_dir.rglob("*"):
+            if p.is_file() and not p.is_symlink():
+                try:
+                    out[str(p)] = p.read_bytes()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def _record_identity_reject_state(
+    violations: list,
+    label: str,
+    *,
+    raised_or_nonzero: bool,
+    before_host: dict,
+    after_host: dict,
+    before_outside: dict,
+    after_outside: dict,
+    host_dir: Path,
+    outside: Path,
+    fileid_calls: int | None = None,
+    require_fileid: bool = False,
+):
+    if not raised_or_nonzero:
+        violations.append(f"{label}: unsafe acceptance (no rejection)")
+    if require_fileid and (fileid_calls is None or fileid_calls < 1):
+        violations.append(
+            f"{label}: FileIdInfo query not exercised (calls={fileid_calls!r})"
+        )
+    if after_outside != before_outside:
+        violations.append(f"{label}: outside tree mutated")
+    if after_host != before_host:
+        violations.append(f"{label}: destination tree mutated")
+    if _outside_has_attack(outside) or _outside_has_attack(host_dir):
+        violations.append(f"{label}: attack payload or partial member present")
+    # Partial new member under host
+    for p in list(host_dir.rglob("*")) if host_dir.exists() else []:
+        if p.is_file() and "identity_attack" in p.name.lower():
+            violations.append(f"{label}: attack member created at {p}")
+
+
+def _install_py_fileid_injector(mc, mode: str, call_counter: list):
+    """Inject at runtime GetFileInformationByHandleEx(FileIdInfo) boundary only.
+
+    mode:
+      fail  - first FileIdInfo query fails
+      dup   - after first success, later queries return the first 128-bit FileId
+      cross - after first success, later queries flip VolumeSerialNumber
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    orig = mc._k32.GetFileInformationByHandleEx
+    file_id_class = int(getattr(mc, "_FileIdInfo", _FILE_ID_INFO_CLASS))
+    state = {"first_vol": None, "first_id": None}
+
+    def _hook(h, info_class, buf, size):
+        ic = int(info_class)
+        if ic == file_id_class:
+            call_counter.append(1)
+            if mode == "fail":
+                try:
+                    ctypes.set_last_error(87)  # ERROR_INVALID_PARAMETER
+                except Exception:
+                    pass
+                return 0
+            ok = orig(h, info_class, buf, size)
+            if not ok:
+                return ok
+            # FILE_ID_INFO: ULONGLONG VolumeSerialNumber + 16-byte FileId
+            raw = ctypes.string_at(buf, 24)
+            vol = int.from_bytes(raw[0:8], "little")
+            fid = raw[8:24]
+            if state["first_id"] is None:
+                state["first_vol"] = vol
+                state["first_id"] = fid
+                return ok
+            if mode == "dup":
+                # Same volume, duplicate 128-bit FileId
+                patched = (
+                    int(state["first_vol"]).to_bytes(8, "little") + state["first_id"]
+                )
+                ctypes.memmove(buf, patched, 24)
+            elif mode == "cross":
+                # Different VolumeSerialNumber, keep FileId bytes
+                new_vol = (int(state["first_vol"]) ^ 0xA5A5A5A5A5A5A5A5) & 0xFFFFFFFFFFFFFFFF
+                if new_vol == state["first_vol"]:
+                    new_vol = (state["first_vol"] + 1) & 0xFFFFFFFFFFFFFFFF
+                patched = new_vol.to_bytes(8, "little") + fid
+                ctypes.memmove(buf, patched, 24)
+            return ok
+        return orig(h, info_class, buf, size)
+
+    # Preserve ctypes prototype if present
+    _hook.argtypes = getattr(orig, "argtypes", None)
+    _hook.restype = getattr(orig, "restype", wintypes.BOOL)
+    mc._k32.GetFileInformationByHandleEx = _hook
+    return state
+
+
+def _guardian_fileid_hook_script(
+    guardian_path: Path,
+    confpath: Path,
+    mode: str,
+    marker_path: Path,
+) -> str:
+    """Temp-only PowerShell: inline-hook FileIdInfo, then run real guardian.ps1."""
+    # mode: fail | dup | cross
+    mode_i = {"fail": 1, "dup": 2, "cross": 3}[mode]
+    g = str(guardian_path).replace("'", "''")
+    c = str(confpath).replace("'", "''")
+    m = str(marker_path).replace("'", "''")
+    return f"""
+$ErrorActionPreference = 'Stop'
+$mode = {mode_i}
+$marker = '{m}'
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public static class McFileIdInjector {{
+  public const int FileIdInfo = 18;
+  public static int Mode = 0;
+  public static int Calls = 0;
+  static byte[] firstId = null;
+  static ulong firstVol = 0;
+  static IntPtr patchTarget;   // kernel32 export stub (DllImport path)
+  static IntPtr realOrig;      // kernelbase implementation
+  static byte[] stolen = new byte[12];
+  static GFIH del;
+  static GFIH origDel;
+  static bool installed = false;
+  static GCHandle delPin;
+
+  [UnmanagedFunctionPointer(CallingConvention.StdCall, SetLastError = true)]
+  delegate bool GFIH(IntPtr h, int cls, IntPtr buf, uint size);
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+  static extern IntPtr GetModuleHandleA(string name);
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+  static extern IntPtr GetProcAddress(IntPtr h, string name);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool FlushInstructionCache(IntPtr hProcess, IntPtr lpBaseAddress, UIntPtr dwSize);
+  [DllImport("kernel32.dll")]
+  static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll")]
+  static extern void SetLastError(uint dwErrCode);
+
+  const uint PAGE_EXECUTE_READWRITE = 0x40;
+
+  public static void Install(int mode) {{
+    if (installed) return;
+    Mode = mode;
+    IntPtr hK32 = GetModuleHandleA("kernel32.dll");
+    IntPtr hKb = GetModuleHandleA("kernelbase.dll");
+    patchTarget = GetProcAddress(hK32, "GetFileInformationByHandleEx");
+    realOrig = GetProcAddress(hKb, "GetFileInformationByHandleEx");
+    if (patchTarget == IntPtr.Zero || realOrig == IntPtr.Zero)
+      throw new InvalidOperationException("GetFileInformationByHandleEx not found");
+    // Preserve original 12 bytes of the kernel32 forwarder stub (jmp + int3 pad).
+    Marshal.Copy(patchTarget, stolen, 0, 12);
+    origDel = (GFIH)Marshal.GetDelegateForFunctionPointer(realOrig, typeof(GFIH));
+    del = Hooked;
+    delPin = GCHandle.Alloc(del);
+    IntPtr hookPtr = Marshal.GetFunctionPointerForDelegate(del);
+    byte[] patch = new byte[12];
+    patch[0] = 0x48; patch[1] = 0xB8; // mov rax, imm64
+    byte[] hp = BitConverter.GetBytes(hookPtr.ToInt64());
+    Buffer.BlockCopy(hp, 0, patch, 2, 8);
+    patch[10] = 0xFF; patch[11] = 0xE0; // jmp rax
+    uint old;
+    if (!VirtualProtect(patchTarget, (UIntPtr)12, PAGE_EXECUTE_READWRITE, out old))
+      throw new InvalidOperationException("VirtualProtect failed");
+    Marshal.Copy(patch, 0, patchTarget, 12);
+    VirtualProtect(patchTarget, (UIntPtr)12, old, out old);
+    FlushInstructionCache(GetCurrentProcess(), patchTarget, (UIntPtr)12);
+    installed = true;
+  }}
+
+  static bool CallOrig(IntPtr h, int cls, IntPtr buf, uint size) {{
+    return origDel(h, cls, buf, size);
+  }}
+
+  static bool Hooked(IntPtr h, int cls, IntPtr buf, uint size) {{
+    if (cls != FileIdInfo) return CallOrig(h, cls, buf, size);
+    Calls++;
+    if (Mode == 1) {{ // fail closed at FileIdInfo boundary
+      SetLastError(87);
+      return false;
+    }}
+    bool ok = CallOrig(h, cls, buf, size);
+    if (!ok || buf == IntPtr.Zero) return ok;
+    byte[] raw = new byte[24];
+    Marshal.Copy(buf, raw, 0, 24);
+    ulong vol = BitConverter.ToUInt64(raw, 0);
+    byte[] fid = new byte[16];
+    Buffer.BlockCopy(raw, 8, fid, 0, 16);
+    if (firstId == null) {{
+      firstId = fid;
+      firstVol = vol;
+      return ok;
+    }}
+    if (Mode == 2) {{ // duplicate full 128-bit FileId on same volume
+      byte[] patched = new byte[24];
+      Buffer.BlockCopy(BitConverter.GetBytes(firstVol), 0, patched, 0, 8);
+      Buffer.BlockCopy(firstId, 0, patched, 8, 16);
+      Marshal.Copy(patched, 0, buf, 24);
+    }} else if (Mode == 3) {{ // different VolumeSerialNumber
+      ulong nv = firstVol ^ 0xA5A5A5A5A5A5A5A5UL;
+      if (nv == firstVol) nv = firstVol + 1;
+      byte[] patched = new byte[24];
+      Buffer.BlockCopy(BitConverter.GetBytes(nv), 0, patched, 0, 8);
+      Buffer.BlockCopy(fid, 0, patched, 8, 16);
+      Marshal.Copy(patched, 0, buf, 24);
+    }}
+    return ok;
+  }}
+
+  public static void WriteMarker(string path) {{
+    File.WriteAllText(path, Calls.ToString());
+  }}
+}}
+'@
+[McFileIdInjector]::Install($mode)
+& '{g}' -Config '{c}' -NoUi -NoRestart
+$code = $LASTEXITCODE
+try {{ [McFileIdInjector]::WriteMarker($marker) }} catch {{ Set-Content -LiteralPath $marker -Value '0' }}
+exit $code
+"""
+
+
+def _run_guardian_with_fileid_injector(
+    host_dir: Path, zpath: Path, work: Path, mode: str, marker_path: Path
+) -> subprocess.CompletedProcess:
+    work.mkdir(parents=True, exist_ok=True)
+    py = sys.executable
+    cand = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.exists(cand):
+        py = cand
+    cfg = {
+        "applyExt": False,
+        "applyHost": True,
+        "extZip": None,
+        "hostZip": str(zpath),
+        "extDir": str(work / "ext"),
+        "hostDir": str(host_dir),
+        "profileDir": "",
+        "extId": "{id}",
+        "expectExtVersion": None,
+        "expectHostVersion": "2.0.0",
+        "python": py,
+        "firefox": "",
+        "restart": False,
+        "backupRoot": str(work / "backups"),
+        "keep": 3,
+    }
+    confpath = work / "config.json"
+    confpath.write_text(json.dumps(cfg), encoding="utf-8")
+    script = _guardian_fileid_hook_script(GUARDIAN, confpath, mode, marker_path)
+    # Keep script under OS temp only
+    import tempfile
+
+    fd, sp = tempfile.mkstemp(prefix="mc_fileid_hook_", suffix=".ps1")
+    os.close(fd)
+    try:
+        Path(sp).write_text(script, encoding="utf-8")
+        return subprocess.run(
+            [
+                PS,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                sp,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        try:
+            os.remove(sp)
+        except OSError:
+            pass
+
+
+def _setup_ancestor_junction_host(case: Path) -> tuple[Path, Path, Path]:
+    """Ordinary hostDir under a junction ancestor strictly above hostDir.
+
+    Returns (host_dir_lexical, real_host_dir, outside_root).
+    """
+    outside = case / "outside_real"
+    real_parent = outside / "real_parent"
+    real_host = real_parent / "host"
+    _seed_plain_host(real_host)
+    (outside / "marker.txt").write_bytes(_SAFE_OUTSIDE)
+
+    lexical = case / "lexical"
+    junc = lexical / "junc_ancestor"
+    lexical.mkdir(parents=True, exist_ok=True)
+    _new_junction(junc, real_parent)
+    host_dir = junc / "host"
+    return host_dir, real_host, outside
+
+
+def test_apply_update_rejects_unsafe_host_root_identity_chain(tmp_path, monkeypatch):
+    """apply_update must retain a root-to-host identity chain and reject unsafe cases."""
+    mc = load_host()
+    monkeypatch.setattr(mc, "find_profile", lambda: None)
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(mc, "_await_zip", lambda path, tries=10, delay=0.5: True)
+
+    violations: list[str] = []
+    base = tmp_path / "apply_identity"
+    base.mkdir()
+
+    # --- ancestor junction strictly above ordinary hostDir ---
+    case = base / "ancestor_junc"
+    case.mkdir()
+    host_dir, real_host, outside = _setup_ancestor_junction_host(case)
+    zpath = case / "atk.zip"
+    _make_identity_attack_zip(zpath)
+    before_host = _tree_identity_snapshot(real_host)
+    before_out = _tree_identity_snapshot(outside)
+    before_bytes = _host_bytes_map(real_host)
+    raised = False
+    try:
+        _apply_update_or_exc(mc, host_dir, zpath, case / "ext")
+    except Exception:
+        raised = True
+    after_host = _tree_identity_snapshot(real_host)
+    after_out = _tree_identity_snapshot(outside)
+    _record_identity_reject_state(
+        violations,
+        "ancestor_junc",
+        raised_or_nonzero=raised,
+        before_host=before_host,
+        after_host=after_host,
+        before_outside=before_out,
+        after_outside=after_out,
+        host_dir=real_host,
+        outside=outside,
+    )
+    if _host_bytes_map(real_host) != before_bytes:
+        violations.append("ancestor_junc: host file bytes changed")
+
+    # --- FileIdInfo query failure / duplicate FileId / cross-volume ---
+    for mode, label in (
+        ("fail", "fileid_fail"),
+        ("dup", "fileid_dup"),
+        ("cross", "fileid_cross_vol"),
+    ):
+        case = base / label
+        case.mkdir()
+        host_dir = case / "host"
+        outside = case / "outside"
+        outside.mkdir()
+        (outside / "marker.txt").write_bytes(_SAFE_OUTSIDE)
+        _seed_plain_host(host_dir)
+        zpath = case / "atk.zip"
+        _make_identity_attack_zip(zpath)
+        before_host = _tree_identity_snapshot(host_dir)
+        before_out = _tree_identity_snapshot(outside)
+        before_bytes = _host_bytes_map(host_dir)
+        calls: list[int] = []
+        # Re-bind injector for each mode on current module entry points
+        _install_py_fileid_injector(mc, mode, calls)
+        raised = False
+        try:
+            _apply_update_or_exc(mc, host_dir, zpath, case / "ext")
+        except Exception:
+            raised = True
+        after_host = _tree_identity_snapshot(host_dir)
+        after_out = _tree_identity_snapshot(outside)
+        _record_identity_reject_state(
+            violations,
+            label,
+            raised_or_nonzero=raised,
+            before_host=before_host,
+            after_host=after_host,
+            before_outside=before_out,
+            after_outside=after_out,
+            host_dir=host_dir,
+            outside=outside,
+            fileid_calls=len(calls),
+            require_fileid=True,
+        )
+        if _host_bytes_map(host_dir) != before_bytes:
+            violations.append(f"{label}: host file bytes changed")
+        # restore pristine GetFileInformationByHandleEx for subsequent modes
+        # by reloading host module bindings from a fresh load is heavy; re-read orig via load
+        # Re-load module attributes from a clean import path:
+        mc2 = load_host()
+        if hasattr(mc2, "_k32"):
+            mc._k32.GetFileInformationByHandleEx = mc2._k32.GetFileInformationByHandleEx
+
+    assert not violations, (
+        "apply_update root identity-chain violations (unsafe acceptance, "
+        "missing identity validation, or state mutation):\n- "
+        + "\n- ".join(violations)
+    )
+
+
+def test_guardian_rejects_unsafe_host_root_identity_chain_without_restart(tmp_path):
+    """Guardian must reject unsafe root identity chains without restart or mutation."""
+    violations: list[str] = []
+    base = tmp_path / "guard_identity"
+    base.mkdir()
+
+    # --- ancestor junction strictly above ordinary hostDir ---
+    case = base / "ancestor_junc"
+    case.mkdir()
+    host_dir, real_host, outside = _setup_ancestor_junction_host(case)
+    zpath = case / "atk.zip"
+    _make_identity_attack_zip(zpath)
+    before_host = _tree_identity_snapshot(real_host)
+    before_out = _tree_identity_snapshot(outside)
+    before_bytes = _host_bytes_map(real_host)
+    r = _run_guardian_host(host_dir, zpath, case / "work")
+    after_host = _tree_identity_snapshot(real_host)
+    after_out = _tree_identity_snapshot(outside)
+    _record_identity_reject_state(
+        violations,
+        "ancestor_junc",
+        raised_or_nonzero=(r.returncode != 0),
+        before_host=before_host,
+        after_host=after_host,
+        before_outside=before_out,
+        after_outside=after_out,
+        host_dir=real_host,
+        outside=outside,
+    )
+    if _host_bytes_map(real_host) != before_bytes:
+        violations.append("ancestor_junc: host file bytes changed")
+    if r.returncode == 0:
+        violations.append(
+            f"ancestor_junc: guardian returned 0 (stdout={r.stdout!r} stderr={r.stderr!r})"
+        )
+
+    # --- FileIdInfo query failure / duplicate FileId / cross-volume via native injector ---
+    import tempfile
+
+    for mode, label in (
+        ("fail", "fileid_fail"),
+        ("dup", "fileid_dup"),
+        ("cross", "fileid_cross_vol"),
+    ):
+        case = base / label
+        case.mkdir()
+        host_dir = case / "host"
+        outside = case / "outside"
+        outside.mkdir()
+        (outside / "marker.txt").write_bytes(_SAFE_OUTSIDE)
+        _seed_plain_host(host_dir)
+        zpath = case / "atk.zip"
+        _make_identity_attack_zip(zpath)
+        before_host = _tree_identity_snapshot(host_dir)
+        before_out = _tree_identity_snapshot(outside)
+        before_bytes = _host_bytes_map(host_dir)
+        fd, marker_p = tempfile.mkstemp(prefix="mc_fid_calls_", suffix=".txt")
+        os.close(fd)
+        marker_path = Path(marker_p)
+        try:
+            if marker_path.exists():
+                marker_path.unlink()
+            r = _run_guardian_with_fileid_injector(
+                host_dir, zpath, case / "work", mode, marker_path
+            )
+            fileid_calls = 0
+            if marker_path.exists():
+                try:
+                    fileid_calls = int(marker_path.read_text(encoding="utf-8").strip() or "0")
+                except ValueError:
+                    fileid_calls = 0
+            after_host = _tree_identity_snapshot(host_dir)
+            after_out = _tree_identity_snapshot(outside)
+            _record_identity_reject_state(
+                violations,
+                label,
+                raised_or_nonzero=(r.returncode != 0),
+                before_host=before_host,
+                after_host=after_host,
+                before_outside=before_out,
+                after_outside=after_out,
+                host_dir=host_dir,
+                outside=outside,
+                fileid_calls=fileid_calls,
+                require_fileid=True,
+            )
+            if _host_bytes_map(host_dir) != before_bytes:
+                violations.append(f"{label}: host file bytes changed")
+            if r.returncode == 0:
+                violations.append(
+                    f"{label}: guardian returned 0 (stdout={r.stdout!r} stderr={r.stderr!r})"
+                )
+        finally:
+            try:
+                if marker_path.exists():
+                    marker_path.unlink()
+            except OSError:
+                pass
+
+    assert not violations, (
+        "guardian root identity-chain violations (unsafe acceptance, "
+        "missing identity validation, or state mutation):\n- "
+        + "\n- ".join(violations)
+    )

@@ -354,6 +354,11 @@ if sys.platform == "win32":
                     ("DeletePending", wintypes.BOOLEAN),
                     ("Directory", wintypes.BOOLEAN)]
 
+    class _FILE_ID_INFO(ctypes.Structure):
+        # FILE_ID_INFO: 64-bit VolumeSerialNumber + opaque 128-bit FileId.
+        _fields_ = [("VolumeSerialNumber", ctypes.c_uint64),
+                    ("FileId", ctypes.c_ubyte * 16)]
+
     class _IO_STATUS_BLOCK(ctypes.Structure):
         _fields_ = [("Status", ctypes.c_long),
                     ("Information", ctypes.c_void_p)]
@@ -415,17 +420,74 @@ if sys.platform == "win32":
             raise OSError(ctypes.get_last_error(), "FileStandardInfo failed")
         return info
 
-    def _open_path_reparse(path, access=_GENERIC_READ | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE):
+    def _query_file_id(h):
+        info = _FILE_ID_INFO()
+        sz = ctypes.sizeof(info)
+        if sz < 24:
+            raise ValueError("FILE_ID_INFO structure too small")
+        if not _k32.GetFileInformationByHandleEx(
+                h, _FileIdInfo, ctypes.byref(info), sz):
+            raise OSError(ctypes.get_last_error(), "FileIdInfo failed")
+        fid = bytes(bytearray(info.FileId))
+        if len(fid) != 16:
+            raise ValueError("invalid FileId width")
+        return int(info.VolumeSerialNumber), fid
+
+    def _decompose_host_path(host_dir):
+        """Select drive/UNC share root plus relative components. Not authority."""
+        if host_dir is None:
+            raise ValueError("host directory is empty")
+        raw = str(host_dir).strip()
+        if not raw:
+            raise ValueError("host directory is empty")
+        if raw.startswith("\\\\?\\") or raw.startswith("//?/") or raw.startswith("\\??\\"):
+            raise ValueError("host directory uses device/global-root prefix")
+        if raw.startswith("\\\\.\\") or raw.startswith("//./"):
+            raise ValueError("host directory uses device namespace prefix")
+        norm = raw.replace("/", "\\")
+        if norm.startswith("\\\\"):
+            body = norm[2:]
+            if not body or body.startswith("\\"):
+                raise ValueError("malformed UNC host directory")
+            parts = body.split("\\")
+            while parts and parts[-1] == "":
+                parts.pop()
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                raise ValueError("incomplete UNC host directory")
+            for p in parts:
+                if p in ("", ".", "..") or ":" in p:
+                    raise ValueError("invalid UNC host component: %r" % p)
+            root = "\\\\%s\\%s\\" % (parts[0], parts[1])
+            return root, parts[2:]
+        # Drive path: normalize only to pick X:\ and components.
+        abs_p = os.path.abspath(norm).replace("/", "\\")
+        if len(abs_p) < 3 or abs_p[1] != ":" or abs_p[2] != "\\":
+            raise ValueError("malformed drive host directory")
+        if abs_p[0] == "\\" or abs_p.startswith("\\\\"):
+            raise ValueError("ambiguous host directory root")
+        drive = abs_p[0].upper() + ":\\"
+        rest = abs_p[3:]
+        components = [c for c in rest.split("\\") if c != ""]
+        for c in components:
+            if c in (".", "..") or ":" in c:
+                raise ValueError("invalid host path component: %r" % c)
+        return drive, components
+
+    def _open_volume_root(root_path, access=_GENERIC_READ | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE):
+        """Pathname open of the selected volume/share root only (not hostDir)."""
         flags = _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS
+        # No FILE_SHARE_DELETE: root cannot be replaced while retained.
         h = _k32.CreateFileW(
-            path, access, _FILE_SHARE_READ | _FILE_SHARE_WRITE, None,
+            root_path, access, _FILE_SHARE_READ | _FILE_SHARE_WRITE, None,
             _OPEN_EXISTING, flags, None)
         if h == _INVALID_HANDLE_VALUE or h is None:
-            raise OSError(ctypes.get_last_error(), "CreateFileW failed for %r" % path)
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed for root %r" % root_path)
         return h
 
-    def _nt_open_relative(root, name, *, directory, create=False, write=False):
-        """Open/create name relative to root handle; never follows reparse."""
+    def _nt_open_relative(root, name, *, directory, write=False, disposition=None):
+        """Open/create name relative to retained parent; never follows reparse."""
+        if not name or name in (".", "..") or "\\" in name or "/" in name or ":" in name:
+            raise ValueError("invalid relative component: %r" % name)
         buf = ctypes.create_unicode_buffer(name)
         us = _UNICODE_STRING()
         us.Length = len(name) * 2
@@ -447,110 +509,6 @@ if sys.platform == "win32":
             access |= _GENERIC_READ
         if directory:
             access |= _FILE_READ_DATA  # enumeration
-        options = _FILE_OPEN_REPARSE_POINT | _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_FOR_BACKUP_INTENT
-        if directory:
-            options |= _FILE_DIRECTORY_FILE
-        else:
-            options |= _FILE_NON_DIRECTORY_FILE
-        if create:
-            disposition = _FILE_OPEN_IF if directory else _FILE_OVERWRITE_IF
-        else:
-            disposition = _FILE_OPEN
-        # Never share DELETE so components cannot be swapped mid-operation.
-        share = _FILE_SHARE_READ | _FILE_SHARE_WRITE
-        status = _ntdll.NtCreateFile(
-            ctypes.byref(handle), access, ctypes.byref(oa), ctypes.byref(iosb),
-            None, _FILE_ATTRIBUTE_DIRECTORY if directory else 0,
-            share, disposition, options, None, 0)
-        status_u = status & 0xFFFFFFFF
-        if status_u == _STATUS_OBJECT_NAME_NOT_FOUND or status_u == _STATUS_OBJECT_PATH_NOT_FOUND:
-            return None
-        if status_u == _STATUS_DELETE_PENDING:
-            raise ValueError("host destination is delete-pending: %r" % name)
-        if status < 0:
-            raise OSError(status_u, "NtCreateFile failed for %r (0x%08X)" % (name, status_u))
-        return handle.value
-
-    def _validate_handle_no_reparse(h, *, expect_dir, allow_missing_nlink=False, final_file=False):
-        tag = _query_attr_tag(h)
-        attrs = tag.FileAttributes
-        if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
-            raise ValueError("host destination path contains a reparse point")
-        if tag.ReparseTag not in (0, None):
-            # Some volumes report tag only with reparse attribute; treat non-zero as reparse.
-            if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
-                raise ValueError("host destination path contains a reparse point")
-        is_dir = bool(attrs & _FILE_ATTRIBUTE_DIRECTORY)
-        if expect_dir and not is_dir:
-            raise ValueError("host destination component is not a directory")
-        if not expect_dir and is_dir:
-            raise ValueError("host destination final component is a directory")
-        std = _query_standard(h)
-        if std.DeletePending:
-            raise ValueError("host destination is delete-pending")
-        if final_file:
-            if std.NumberOfLinks != 1:
-                raise ValueError("host destination is a hard-link alias (nlink=%s)" % std.NumberOfLinks)
-        return tag, std
-
-    def _open_host_root(host_dir):
-        # Absolute path for the initial open only; authority is the retained handle.
-        path = os.path.abspath(host_dir)
-        if not path:
-            raise ValueError("host directory is empty")
-        h = _open_path_reparse(path)
-        try:
-            _validate_handle_no_reparse(h, expect_dir=True)
-        except Exception:
-            _close_handle(h)
-            raise
-        return h
-
-    def _preflight_member_chain(root_h, parts):
-        """Walk existing chain under root; reject reparse/hardlink; return missing suffix idx."""
-        cur = root_h
-        owned = []
-        try:
-            for i, part in enumerate(parts):
-                is_final = i == len(parts) - 1
-                h = _nt_open_relative(cur, part, directory=not is_final, create=False, write=False)
-                if h is None:
-                    # Remaining components must be created later; none may exist as reparse.
-                    return i
-                owned.append(h)
-                if is_final:
-                    _validate_handle_no_reparse(h, expect_dir=False, final_file=True)
-                else:
-                    _validate_handle_no_reparse(h, expect_dir=True)
-                cur = h
-            return len(parts)
-        finally:
-            for h in owned:
-                _close_handle(h)
-
-    def _nt_create_relative(root, name, *, directory, write=False, disposition=None):
-        """NtCreateFile relative open/create with explicit disposition."""
-        buf = ctypes.create_unicode_buffer(name)
-        us = _UNICODE_STRING()
-        us.Length = len(name) * 2
-        us.MaximumLength = (len(name) + 1) * 2
-        us.Buffer = ctypes.cast(buf, wintypes.LPWSTR)
-        oa = _OBJECT_ATTRIBUTES()
-        oa.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
-        oa.RootDirectory = root
-        oa.ObjectName = ctypes.pointer(us)
-        oa.Attributes = _OBJ_CASE_INSENSITIVE
-        oa.SecurityDescriptor = None
-        oa.SecurityQualityOfService = None
-        iosb = _IO_STATUS_BLOCK()
-        handle = wintypes.HANDLE()
-        access = _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
-        if write:
-            access |= _GENERIC_WRITE | _FILE_WRITE_DATA | _FILE_APPEND_DATA | _FILE_READ_DATA
-        else:
-            access |= _GENERIC_READ
-        if directory:
-            access |= _FILE_READ_DATA
         options = (_FILE_OPEN_REPARSE_POINT | _FILE_SYNCHRONOUS_IO_NONALERT
                    | _FILE_OPEN_FOR_BACKUP_INTENT)
         if directory:
@@ -559,6 +517,7 @@ if sys.platform == "win32":
             options |= _FILE_NON_DIRECTORY_FILE
         if disposition is None:
             disposition = _FILE_OPEN
+        # Never share DELETE so components cannot be swapped mid-operation.
         share = _FILE_SHARE_READ | _FILE_SHARE_WRITE
         status = _ntdll.NtCreateFile(
             ctypes.byref(handle), access, ctypes.byref(oa), ctypes.byref(iosb),
@@ -573,42 +532,123 @@ if sys.platform == "win32":
             return None, status_u
         return handle.value, status_u
 
-    def _write_member_handle(root_h, parts, data_iter):
-        """Create intermediate dirs and write final file relative to retained root."""
-        cur = root_h
-        owned = []
-        file_h = None
+    def _validate_handle_identity(h, *, expect_dir, final_file=False, root_vol=None, seen_ids=None):
+        """Fail-closed AttributeTag + Standard + full FileIdInfo identity checks."""
+        tag = _query_attr_tag(h)
+        attrs = int(tag.FileAttributes)
+        if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("host destination path contains a reparse point")
+        if int(tag.ReparseTag or 0) != 0 and (attrs & _FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError("host destination path contains a reparse point")
+        is_dir = bool(attrs & _FILE_ATTRIBUTE_DIRECTORY)
+        if expect_dir and not is_dir:
+            raise ValueError("host destination component is not a directory")
+        if not expect_dir and is_dir:
+            raise ValueError("host destination final component is a directory")
+        std = _query_standard(h)
+        if std.DeletePending:
+            raise ValueError("host destination is delete-pending")
+        if final_file and int(std.NumberOfLinks) != 1:
+            raise ValueError(
+                "host destination is a hard-link alias (nlink=%s)" % std.NumberOfLinks)
+        vol, fid = _query_file_id(h)
+        if root_vol is not None and vol != root_vol:
+            raise ValueError("host identity chain crosses volumes")
+        if seen_ids is not None:
+            if fid in seen_ids:
+                raise ValueError("host identity chain has duplicate FileId")
+            seen_ids.add(fid)
+        return tag, std, vol, fid
+
+    def _open_host_identity_chain(host_dir):
+        """Retain volume/UNC root through hostDir via handle-relative opens."""
+        root_path, components = _decompose_host_path(host_dir)
+        handles = []
+        seen_ids = set()
+        root_h = _open_volume_root(root_path)
+        handles.append(root_h)
         try:
-            for part in parts[:-1]:
-                h, st = _nt_create_relative(
-                    cur, part, directory=True, write=False, disposition=_FILE_OPEN_IF)
+            _, _, root_vol, _fid = _validate_handle_identity(
+                root_h, expect_dir=True, root_vol=None, seen_ids=seen_ids)
+            cur = root_h
+            for comp in components:
+                h, st = _nt_open_relative(
+                    cur, comp, directory=True, write=False, disposition=_FILE_OPEN)
                 if h is None:
                     raise ValueError(
-                        "failed to open/create host directory component: %r (0x%08X)" % (part, st or 0))
+                        "host directory component missing: %r (0x%08X)" % (comp, st or 0))
+                handles.append(h)
+                _validate_handle_identity(
+                    h, expect_dir=True, root_vol=root_vol, seen_ids=seen_ids)
+                cur = h
+            return handles, cur, root_vol, seen_ids
+        except Exception:
+            for h in reversed(handles):
+                _close_handle(h)
+            raise
+
+    def _close_handles(handles):
+        for h in reversed(handles or ()):
+            _close_handle(h)
+
+    def _preflight_member_chain(host_h, parts, root_vol, chain_ids):
+        """Walk existing members under retained hostDir; identity-check each handle."""
+        cur = host_h
+        owned = []
+        local_seen = set(chain_ids)
+        try:
+            for i, part in enumerate(parts):
+                is_final = i == len(parts) - 1
+                h, _st = _nt_open_relative(
+                    cur, part, directory=not is_final, write=False, disposition=_FILE_OPEN)
+                if h is None:
+                    return i
                 owned.append(h)
-                _validate_handle_no_reparse(h, expect_dir=True)
+                _validate_handle_identity(
+                    h, expect_dir=not is_final, final_file=is_final,
+                    root_vol=root_vol, seen_ids=local_seen)
+                cur = h
+            return len(parts)
+        finally:
+            for h in owned:
+                _close_handle(h)
+
+    def _write_member_handle(host_h, parts, data_iter, root_vol, chain_ids):
+        """Create intermediate dirs and write final file on one validated handle."""
+        cur = host_h
+        owned = []
+        file_h = None
+        local_seen = set(chain_ids)
+        try:
+            for part in parts[:-1]:
+                # Open existing first; create only when absent. Validate before trust.
+                h, st = _nt_open_relative(
+                    cur, part, directory=True, write=False, disposition=_FILE_OPEN)
+                if h is None:
+                    h, st = _nt_open_relative(
+                        cur, part, directory=True, write=False, disposition=_FILE_CREATE)
+                if h is None:
+                    raise ValueError(
+                        "failed to open/create host directory component: %r (0x%08X)"
+                        % (part, st or 0))
+                owned.append(h)
+                _validate_handle_identity(
+                    h, expect_dir=True, root_vol=root_vol, seen_ids=local_seen)
                 cur = h
             final = parts[-1]
-            # Open existing without truncate; reject reparse/hardlink before any write.
-            existing, _ = _nt_create_relative(
-                cur, final, directory=False, write=False, disposition=_FILE_OPEN)
-            if existing is not None:
-                try:
-                    _validate_handle_no_reparse(existing, expect_dir=False, final_file=True)
-                finally:
-                    _close_handle(existing)
-                file_h, st = _nt_create_relative(
-                    cur, final, directory=False, write=True, disposition=_FILE_OPEN)
-                if file_h is None:
-                    raise ValueError("failed to reopen host file for write: %r" % final)
-            else:
-                # Create new only — never OPEN_IF/OVERWRITE_IF (those can touch aliases).
-                file_h, st = _nt_create_relative(
+            # Existing final: open once with write access, validate, then write.
+            # Missing final: create once, validate, then write. No close/reopen.
+            file_h, st = _nt_open_relative(
+                cur, final, directory=False, write=True, disposition=_FILE_OPEN)
+            if file_h is None:
+                file_h, st = _nt_open_relative(
                     cur, final, directory=False, write=True, disposition=_FILE_CREATE)
                 if file_h is None:
                     raise ValueError(
                         "failed to create host file: %r (0x%08X)" % (final, st or 0))
-            _validate_handle_no_reparse(file_h, expect_dir=False, final_file=True)
+            _validate_handle_identity(
+                file_h, expect_dir=False, final_file=True,
+                root_vol=root_vol, seen_ids=local_seen)
             if not _k32.SetFilePointerEx(file_h, 0, None, 0):
                 raise OSError(ctypes.get_last_error(), "SetFilePointerEx failed")
             if not _k32.SetEndOfFile(file_h):
@@ -641,10 +681,11 @@ if sys.platform == "win32":
             if is_dir:
                 continue
             accepted.append((n, parts))
-        root = _open_host_root(host_dir)
+        # Complete archive grammar/duplicate preflight before any destination write.
+        handles, host_h, root_vol, chain_ids = _open_host_identity_chain(host_dir)
         try:
             for n, parts in accepted:
-                _preflight_member_chain(root, parts)
+                _preflight_member_chain(host_h, parts, root_vol, chain_ids)
             for n, parts in accepted:
                 def _chunks(member=n):
                     with z.open(member) as src:
@@ -653,9 +694,9 @@ if sys.platform == "win32":
                             if not b:
                                 break
                             yield b
-                _write_member_handle(root, parts, _chunks())
+                _write_member_handle(host_h, parts, _chunks(), root_vol, chain_ids)
         finally:
-            _close_handle(root)
+            _close_handles(handles)
 
 else:
     def _apply_host_zip_windows(z, host_dir):
