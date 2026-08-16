@@ -16,6 +16,11 @@
     "use strict";
 
     var LEASE1_MSG = "background adapter behavior not implemented in Lease 1";
+    var VARIANT_REG_MSG = "invalid media variant registration";
+    var MAX_VARIANT_ENTRIES = 64;
+    var VARIANT_LABEL_MAX = 128;
+    var VARIANT_MIME_MAX = 127;
+    var VARIANT_MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
     var CONTROLLER_KEYS = [
       "captureNetwork",
       "acceptPageSnapshot",
@@ -115,12 +120,24 @@
       return new TypeError(GENERIC_INPUT_MSG);
     }
 
+    function variantRegTypeError() {
+      return new TypeError(VARIANT_REG_MSG);
+    }
+
     /** Array.isArray behind a genericizing boundary (revoked Proxy safe). */
     function safeIsArray(v) {
       try {
         return Array.isArray(v);
       } catch (e) {
         throw genericTypeError();
+      }
+    }
+
+    function variantSafeIsArray(v) {
+      try {
+        return Array.isArray(v);
+      } catch (e) {
+        throw variantRegTypeError();
       }
     }
 
@@ -132,6 +149,14 @@
       }
     }
 
+    function variantSafeGetPrototypeOf(v) {
+      try {
+        return Object.getPrototypeOf(v);
+      } catch (e) {
+        throw variantRegTypeError();
+      }
+    }
+
     function safeOwnPropertyNames(v) {
       try {
         return Object.getOwnPropertyNames(v);
@@ -140,11 +165,27 @@
       }
     }
 
+    function variantSafeOwnPropertyNames(v) {
+      try {
+        return Object.getOwnPropertyNames(v);
+      } catch (e) {
+        throw variantRegTypeError();
+      }
+    }
+
     function safeOwnPropertySymbols(v) {
       try {
         return Object.getOwnPropertySymbols(v);
       } catch (e) {
         throw genericTypeError();
+      }
+    }
+
+    function variantSafeOwnPropertySymbols(v) {
+      try {
+        return Object.getOwnPropertySymbols(v);
+      } catch (e) {
+        throw variantRegTypeError();
       }
     }
 
@@ -191,6 +232,213 @@
       } catch (e) {
         throw genericTypeError();
       }
+    }
+
+    /**
+     * Realm-neutral ordinary Object or null-prototype record.
+     * Accepts plain records from foreign realms; rejects arrays, exotic
+     * built-ins, class instances, and custom prototypes (including a
+     * null-prototype custom prototype). Never uses instanceof, constructor,
+     * caller toString, or iteration. Reflection faults → variant TypeError.
+     */
+    function isOrdinaryOrNullPrototypeRecord(v) {
+      if (v === null || typeof v !== "object") return false;
+      if (variantSafeIsArray(v)) return false;
+      var tag;
+      try {
+        tag = Object.prototype.toString.call(v);
+      } catch (e) {
+        throw variantRegTypeError();
+      }
+      if (tag !== "[object Object]") return false;
+      var proto = variantSafeGetPrototypeOf(v);
+      if (proto === null) return true;
+      // Ordinary Object.prototype is one hop from null and owns hasOwnProperty.
+      if (variantSafeGetPrototypeOf(proto) !== null) return false;
+      try {
+        var hop = Object.getOwnPropertyDescriptor(proto, "hasOwnProperty");
+        if (!hop || typeof hop.value !== "function") return false;
+        var names = Object.getOwnPropertyNames(proto);
+        for (var i = 0; i < names.length; i++) {
+          var d = Object.getOwnPropertyDescriptor(proto, names[i]);
+          if (d && d.enumerable) return false;
+        }
+        return true;
+      } catch (e2) {
+        throw variantRegTypeError();
+      }
+    }
+
+    function variantOwnKeyState(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { present: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc) return { present: false };
+        if (desc.get || desc.set || !("value" in desc)) {
+          return { present: true, data: false };
+        }
+        return { present: true, data: true, value: desc.value };
+      } catch (e) {
+        throw variantRegTypeError();
+      }
+    }
+
+    /**
+     * Variant URL: exact primitive nonblank C0/DEL/C1-free absolute HTTP(S).
+     * Parsing is validation only — retain exact original spelling (no trim).
+     */
+    function requireVariantUrl(value) {
+      if (typeof value !== "string") throw variantRegTypeError();
+      if (value.trim().length === 0) throw variantRegTypeError();
+      if (hasControlChars(value)) throw variantRegTypeError();
+      var parsed;
+      try {
+        parsed = new URL(value);
+      } catch (e) {
+        throw variantRegTypeError();
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw variantRegTypeError();
+      }
+      return value;
+    }
+
+    function sanitizeVariantLabel(raw) {
+      if (typeof raw !== "string") return undefined;
+      var trimmed = raw.trim();
+      if (trimmed.length === 0) return undefined;
+      if (hasControlChars(trimmed)) return undefined;
+      // Full-string safety checks before any truncation.
+      if (trimmed.indexOf("://") !== -1) return undefined;
+      if (trimmed.length >= 2 && trimmed.charAt(0) === "/" && trimmed.charAt(1) === "/") {
+        return undefined;
+      }
+      if (/cookie\s*:/i.test(trimmed)) return undefined;
+      if (/set-cookie\s*:/i.test(trimmed)) return undefined;
+      if (/authorization\s*:/i.test(trimmed)) return undefined;
+      if (/proxy-authorization\s*:/i.test(trimmed)) return undefined;
+      if (/bearer\s/i.test(trimmed)) return undefined;
+      // Sensitive tokens as case-insensitive ASCII words.
+      if (
+        /(^|[^A-Za-z0-9])(cookie|authorization|bearer|token|signature|sig|expires)([^A-Za-z0-9]|$)/i.test(
+          trimmed
+        )
+      ) {
+        return undefined;
+      }
+      if (trimmed.length > VARIANT_LABEL_MAX) {
+        trimmed = trimmed.slice(0, VARIANT_LABEL_MAX);
+      }
+      return trimmed;
+    }
+
+    function sanitizeVariantMime(raw) {
+      if (typeof raw !== "string") return undefined;
+      var trimmed = raw.trim();
+      if (trimmed.length === 0 || trimmed.length > VARIANT_MIME_MAX) return undefined;
+      if (!VARIANT_MIME_RE.test(trimmed)) return undefined;
+      return trimmed;
+    }
+
+    function sanitizeVariantPositiveInt(raw) {
+      if (
+        typeof raw === "number" &&
+        Number.isFinite(raw) &&
+        Number.isSafeInteger(raw) &&
+        raw >= 1
+      ) {
+        return raw;
+      }
+      return undefined;
+    }
+
+    /**
+     * Dense real-Array shell for variant registration (cross-realm Arrays ok).
+     * Reflection faults become the generic variant TypeError.
+     */
+    function variantDenseArrayLength(raw) {
+      if (!variantSafeIsArray(raw)) throw variantRegTypeError();
+      var symbols = variantSafeOwnPropertySymbols(raw);
+      if (symbols.length > 0) throw variantRegTypeError();
+      var names = variantSafeOwnPropertyNames(raw);
+      var lenState = variantOwnKeyState(raw, "length");
+      if (!lenState.present || !lenState.data || !isNonnegInt(lenState.value)) {
+        throw variantRegTypeError();
+      }
+      var len = lenState.value;
+      if (len > MAX_VARIANT_ENTRIES) throw variantRegTypeError();
+      var allowed = Object.create(null);
+      allowed.length = true;
+      for (var i = 0; i < len; i++) {
+        allowed[String(i)] = true;
+      }
+      for (var n = 0; n < names.length; n++) {
+        if (allowed[names[n]] !== true) throw variantRegTypeError();
+      }
+      for (var j = 0; j < len; j++) {
+        var eState = variantOwnKeyState(raw, String(j));
+        if (!eState.present || !eState.data) throw variantRegTypeError();
+      }
+      return len;
+    }
+
+    /**
+     * Snapshot one variant entry via own descriptors only. Returns
+     * {url, label?, width?, height?, bandwidth?, mime?} or throws.
+     */
+    function snapshotVariantEntry(entry) {
+      if (!isOrdinaryOrNullPrototypeRecord(entry)) throw variantRegTypeError();
+      // Known-field accessors reject; unknown fields ignored by name without reading values.
+      var known = ["url", "label", "width", "height", "bandwidth", "mime"];
+      var urlState = variantOwnKeyState(entry, "url");
+      if (!urlState.present || !urlState.data) throw variantRegTypeError();
+      var url = requireVariantUrl(urlState.value);
+
+      var out = { url: url };
+
+      var labelState = variantOwnKeyState(entry, "label");
+      if (labelState.present) {
+        if (!labelState.data) throw variantRegTypeError();
+        if (labelState.value !== undefined && labelState.value !== null) {
+          var label = sanitizeVariantLabel(labelState.value);
+          if (label !== undefined) out.label = label;
+        }
+      }
+
+      var widthState = variantOwnKeyState(entry, "width");
+      if (widthState.present) {
+        if (!widthState.data) throw variantRegTypeError();
+        var width = sanitizeVariantPositiveInt(widthState.value);
+        if (width !== undefined) out.width = width;
+      }
+
+      var heightState = variantOwnKeyState(entry, "height");
+      if (heightState.present) {
+        if (!heightState.data) throw variantRegTypeError();
+        var height = sanitizeVariantPositiveInt(heightState.value);
+        if (height !== undefined) out.height = height;
+      }
+
+      var bwState = variantOwnKeyState(entry, "bandwidth");
+      if (bwState.present) {
+        if (!bwState.data) throw variantRegTypeError();
+        var bandwidth = sanitizeVariantPositiveInt(bwState.value);
+        if (bandwidth !== undefined) out.bandwidth = bandwidth;
+      }
+
+      var mimeState = variantOwnKeyState(entry, "mime");
+      if (mimeState.present) {
+        if (!mimeState.data) throw variantRegTypeError();
+        if (mimeState.value !== undefined && mimeState.value !== null) {
+          var mime = sanitizeVariantMime(mimeState.value);
+          if (mime !== undefined) out.mime = mime;
+        }
+      }
+
+      void known;
+      return out;
     }
 
     function isPositiveSafeInteger(value) {
