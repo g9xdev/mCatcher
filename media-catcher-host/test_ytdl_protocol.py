@@ -3,7 +3,10 @@
 Deterministic fakes only: no network and no real yt-dlp process.
 """
 import os
+import subprocess
+import sys
 import threading
+import time
 
 from conftest import load_host, wait_for
 
@@ -4330,3 +4333,311 @@ def test_ytdl_adopt_committed_pin_close_accounting_matrix(monkeypatch):
         got = d._ytdl_adopt_committed_pin(original)
         assert got is not None, mode
         assert got in (original, pin), mode
+
+
+# ---------------------------------------------------------------------------
+# Pre-download feedback + stall detection
+#
+# The resolution phase used to be a dead "Preparing": --print puts yt-dlp in
+# quiet mode, which suppressed the very status lines _yt_stage_note reads, and
+# nothing bounded a yt-dlp that went silent (a firewall dropping packets leaves
+# it blocked in a socket read with no output, so the row hung indefinitely).
+# ---------------------------------------------------------------------------
+
+class KillableProc(LiveProc):
+    """LiveProc that honours _safe_kill — the base fake defines no kill()."""
+
+    def kill(self):
+        with self._lock:
+            self.killed = True
+        if self._hold is not None:
+            self._hold.set()          # release a blocked reader / wait
+
+
+class ProgressThenSilentProc:
+    """Emits one real progress line, then goes quiet for longer than the stall
+    deadline before finishing — i.e. a slow merge. Must NOT be killed."""
+
+    def __init__(self, quiet_for, final_line):
+        self._lines = ["[download]   1.0% of  100.00MiB at 1.00MiB/s ETA 00:10",
+                       final_line]
+        self._i = 0
+        self._quiet = quiet_for
+        self.killed = False
+        self.returncode = None
+
+    @property
+    def stdout(self):
+        return self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._i >= len(self._lines):
+            raise StopIteration
+        if self._i == 1:
+            time.sleep(self._quiet)   # silent stretch AFTER real bytes flowed
+        line = self._lines[self._i]
+        self._i += 1
+        return line
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = -9 if self.killed else 0
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+
+def test_ytdl_cmd_keeps_status_lines_and_bounds_socket_reads():
+    import mchost.downloads as d
+
+    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b", "out.%(ext)s",
+                            "https://example.test/v", None, False)
+    assert "--print" in cmd, "still uses --print to learn the saved path"
+    assert "--no-quiet" in cmd, \
+        "--no-quiet keeps the status lines --print would otherwise suppress"
+    assert "--socket-timeout" in cmd, \
+        "socket reads are bounded so a dropped connection cannot block forever"
+
+
+def test_stage_note_reads_capitalised_destination_and_cookies():
+    import mchost.downloads as d
+
+    # yt-dlp capitalises "Destination", so a case-SENSITIVE prefix test silently
+    # never matched and this stage was unreachable.
+    assert d._yt_stage_note("[download] Destination: out.mp4") == "Starting download"
+    assert d._yt_stage_note("Extracting cookies from firefox") == "Reading cookies"
+
+
+def test_silent_ytdlp_is_killed_and_reported_as_stalled(tmp_path, monkeypatch):
+    import mchost.downloads as d
+
+    sent = []
+    hold = threading.Event()          # never set: yt-dlp emits nothing at all
+    procs = []
+
+    def fake_popen(*a, **k):
+        p = KillableProc(lines=[], returncode=0, hold=hold)
+        procs.append(p)
+        return p
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.1)   # trip on the first poll
+
+    d.handle_ytdl({"id": "jobStall", "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
+    term = _wait_terminal(sent, "jobStall", timeout=10)
+    assert term["type"] == "ytdl-error", "a silent yt-dlp still settles the row"
+    assert term.get("reason") == "stalled", \
+        "reported as a stall, not a generic failure"
+    assert procs and procs[0].killed, \
+        "the stuck process is killed rather than left running forever"
+
+
+def test_stall_watchdog_disarms_once_bytes_flow(tmp_path, monkeypatch):
+    """A slow-but-healthy download (or a long merge) must never be killed."""
+    import mchost.downloads as d
+
+    sent = []
+    procs = []
+    final = tmp_path / "T [id].mp4"
+
+    def fake_popen(*a, **k):
+        final.write_bytes(b"OK")
+        # Quiet for 3s — well past the 0.1s deadline and spanning a watchdog poll.
+        p = ProgressThenSilentProc(3.0, "@@FILE@@ %s" % final)
+        procs.append(p)
+        return p
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.1)
+
+    d.handle_ytdl({"id": "jobLive", "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
+    term = _wait_terminal(sent, "jobLive", timeout=15)
+    assert term["type"] == "ytdl-done", "a progressing download completes normally"
+    assert procs and not procs[0].killed, \
+        "a download that produced bytes is never killed by the stall watchdog"
+
+
+# ---------------------------------------------------------------------------
+# Auto-fetch must land the DIRECTORY build
+#
+# The onefile build re-extracts ~145 files to %TEMP% on EVERY launch. Under a
+# browser-descended process those get rescanned each time, which is what made
+# host-spawned yt-dlp block during DLL load for ~90s while the identical shell
+# command ran in about a second. The directory build extracts nothing.
+# ---------------------------------------------------------------------------
+
+def test_auto_fetch_installs_the_directory_build_not_the_onefile(tmp_path, monkeypatch):
+    import io as _io
+    import zipfile as _zip
+    import mchost.downloads as d
+
+    # A stand-in for the official yt-dlp_win.zip layout.
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as z:
+        z.writestr("yt-dlp.exe", b"EXE")
+        z.writestr("_internal/base_library.zip", b"LIB")
+        z.writestr("_internal/certifi/cacert.pem", b"PEM")
+    payload = buf.getvalue()
+
+    asked = {}
+
+    def fake_urlopen(req, timeout=None):
+        asked["url"] = getattr(req, "full_url", str(req))
+        # BytesIO, not a hand-rolled fake: a read() that keeps returning the same
+        # bytes makes shutil.copyfileobj loop forever writing an unbounded file.
+        return _io.BytesIO(payload)
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "YTDLP", None)
+
+    got = d.ensure_ytdlp()
+
+    assert asked.get("url", "").endswith("yt-dlp_win.zip"), \
+        "must fetch the directory build, not the bare onefile exe (got %r)" % asked.get("url")
+    assert got == str(tmp_path / "yt-dlp.exe"), "returns the extracted exe path"
+    assert os.path.isfile(str(tmp_path / "yt-dlp.exe")), "exe extracted"
+    assert os.path.isfile(str(tmp_path / "_internal" / "base_library.zip")), \
+        "_internal must be extracted alongside it or the exe cannot start"
+
+
+def test_utf8_filepath_from_ytdlp_is_not_mojibaked(tmp_path, monkeypatch):
+    """yt-dlp emits @@FILE@@ as UTF-8 and substitutes fullwidth quotes (U+FF02)
+    for '"' in filenames. Reading its stdout with a bare text=True decodes as the
+    locale codepage (cp1252 here), so the path came back mojibaked, os.path.isfile
+    said no, and a download that had fully succeeded on disk was reported as a
+    generic failure. Uses a REAL subprocess: the decode is the thing under test,
+    so a fake proc yielding str would prove nothing."""
+    import mchost.downloads as d
+
+    name = "\uff02Quoted\uff02 \u2014 Title.mp4"
+    target = tmp_path / name
+    # Built line-by-line with bytes([10]) for the newline: nesting a "\n" escape
+    # inside generated source is one collapse away from a syntax error in the
+    # child, which then writes nothing and looks exactly like the bug.
+    child = "\n".join([
+        "import sys",
+        "p = %r" % str(target),
+        "open(p, 'wb').write(b'DATA')",
+        "sys.stdout.buffer.write(('@@FILE@@ ' + p).encode('utf-8'))",
+        "sys.stdout.buffer.write(bytes([10]))",
+        "sys.stdout.flush()",
+    ])
+
+    sent = []
+    _patch_ytdl_base(monkeypatch, d, mc, sent)          # leaves the real Popen
+    monkeypatch.setattr(d, "_ytdl_build_cmd",
+                        lambda *a, **k: [sys.executable, "-c", child])
+
+    d.handle_ytdl({"id": "utf8job", "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
+    term = _wait_terminal(sent, "utf8job", timeout=20)
+
+    assert term["type"] == "ytdl-done", \
+        "a UTF-8 filename must not turn a finished download into a failure (got %r)" % term
+    assert term.get("file") == str(target), \
+        "the reported path must survive the decode intact"
+
+
+def test_ytdl_cmd_forces_utf8_output_encoding():
+    """yt-dlp picks its OWN stdout encoding from the locale (cp1252 here) and
+    writes the @@FILE@@ path through it, so characters outside that codepage were
+    destroyed before we ever read them -- the fullwidth quotes it substitutes for
+    '"' vanished and the em dash became '?'. Reading as UTF-8 cannot recover what
+    was never written; yt-dlp has to be told to emit UTF-8 in the first place."""
+    import mchost.downloads as d
+
+    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b", "out.%(ext)s",
+                            "https://example.test/v", None, False)
+    assert "--encoding" in cmd, "yt-dlp must be told which encoding to emit"
+    assert cmd[cmd.index("--encoding") + 1].lower() in ("utf-8", "utf8"), \
+        "the emitted encoding must be UTF-8 to match how we decode it"
+
+
+# ---------------------------------------------------------------------------
+# The -J metadata probe needs the same bound as the download
+# ---------------------------------------------------------------------------
+
+def test_ytmeta_probe_that_never_answers_replies_and_kills_the_tree(tmp_path, monkeypatch):
+    """subprocess.run(timeout=...) is not a bound here. yt-dlp's onefile launcher
+    re-execs the real program as a child that inherits these pipes, so run()'s
+    timeout path kills only the launcher and then blocks in its cleanup
+    communicate(), waiting on a pipe the surviving grandchild still holds. The
+    popup then sits on "Reading formats..." and the grandchild is orphaned --
+    exactly the stray probes found running with a dead parent."""
+    import mchost.downloads as d
+
+    pidfile = tmp_path / "grandchild.pid"
+    child = "\n".join([
+        "import subprocess, sys, time",
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])",
+        "open(%r, 'w').write(str(c.pid))" % str(pidfile),
+        "time.sleep(120)",
+    ])
+
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, **kw):
+        # Swap ONLY the probe argv, keeping REAL process semantics: the pipe and
+        # the process tree are what is under test. Everything else must pass
+        # through -- d.subprocess is the global module, so blanket-replacing
+        # Popen would also break the taskkill that _safe_kill shells out to.
+        if cmd and cmd[0] == "yt-dlp-fake":
+            return real_popen([sys.executable, "-c", child], **kw)
+        return real_popen(cmd, **kw)
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "find_ytdlp", lambda: "yt-dlp-fake")
+    monkeypatch.setattr(d, "find_deno", lambda: None)
+    monkeypatch.setattr(d, "DENO", None)
+    monkeypatch.setattr(d, "_no_window", lambda: (0, None))
+    monkeypatch.setattr(d, "_YTMETA_TIMEOUT", 2, raising=False)
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+
+    d.handle_ytmeta({"reqId": "meta1", "url": "https://example.test/v"})
+
+    assert wait_for(lambda: any(m.get("type") == "ytmeta" and m.get("reqId") == "meta1"
+                                for m in sent), timeout=30), \
+        "a probe that never answers must still settle the row, not hang on 'Reading formats'"
+    reply = [m for m in sent if m.get("type") == "ytmeta" and m.get("reqId") == "meta1"][-1]
+    assert reply.get("ok") is False, "a timed-out probe reports failure"
+
+    gc = int(pidfile.read_text().strip())
+
+    def alive(pid):
+        r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                           capture_output=True, text=True)
+        return str(pid) in (r.stdout or "")
+
+    assert wait_for(lambda: not alive(gc), timeout=20), \
+        "the probe's descendants must be killed too, not orphaned holding the pipe"
+
+
+def test_ytdl_cmd_restricts_filenames_to_ascii():
+    """Saved names are ASCII-only by choice: portable across filesystems and
+    tooling, and free of the fullwidth quotes yt-dlp substitutes for '"'.
+
+    Not a substitute for --encoding: that fixes the CORRUPTION of the path yt-dlp
+    reports back, which would still bite any title this happens not to flatten.
+    Both are required."""
+    import mchost.downloads as d
+
+    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b", "out.%(ext)s",
+                            "https://example.test/v", None, False)
+    assert "--restrict-filenames" in cmd, "saved names are ASCII-only"
+    assert "--encoding" in cmd, "still tells yt-dlp which encoding to emit"

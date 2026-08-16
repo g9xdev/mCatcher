@@ -1435,8 +1435,15 @@ def test_pget_single_cancel_and_thread_start_failure(tmp_path, monkeypatch):
         )
         wait_for(lambda: body_started.is_set(), timeout=5)
         mc._pget_cancel({"id": "sCan"})
-        res = wait_result(sent, timeout=10)
+        # Release the stalled body IMMEDIATELY after cancelling. The worker is
+        # parked inside resp.read(), and the cancel flag is only observed at the
+        # top of the read loop — so the terminal cannot arrive until this read
+        # returns. Leaving the server stalled here made the terminal land at
+        # ~9.8s against a 10s budget: two equal timers racing, ~50% flaky.
+        # cancel_requested is already set, so the next loop-top check still sees
+        # it and the cancel remains midstream.
         hold.set()
+        res = wait_result(sent, timeout=10)
         results = [m for m in sent if m.get("type") == "pget-result"]
         assert len(results) == 1
         assert res["status"] == "cancelled"
@@ -3824,3 +3831,176 @@ def test_hostile_int_subclass_bytes_omits_metadata_pair(tmp_path, monkeypatch):
 
     good = d._pget_nonneg_int_bytes(7)
     assert good == 7 and type(good) is int
+
+
+def _stalling_server(hold, body_started, stall):
+    """Serves 4096 bytes, then stalls mid-body until released."""
+    class SlowFull(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        payload = b"Z" * (512 * 1024)
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(self.payload)))
+            self.end_headers()
+            self.wfile.write(self.payload[:4096])
+            self.wfile.flush()
+            body_started.set()
+            hold.wait(timeout=stall)
+            try:
+                self.wfile.write(self.payload[4096:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), SlowFull)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+def test_single_cancel_is_prompt_while_the_body_is_stalled(tmp_path, monkeypatch):
+    """Cancel must not wait for a stalled server to resume.
+
+    The worker parks inside a body read; if cancellation is only observed
+    between reads, the terminal cannot arrive until the server sends more.
+    """
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    stall = 8.0
+    hold = threading.Event()
+    body_started = threading.Event()
+    httpd = _stalling_server(hold, body_started, stall)
+    try:
+        mc.handle_pget_single({
+            "id": "sPrompt", "attemptToken": "tPrompt",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4", "dir": str(tmp_path), "maxConnections": 1,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: body_started.is_set(), timeout=5)
+        time.sleep(0.3)                      # let the worker park inside the read
+
+        started = time.monotonic()
+        mc._pget_cancel({"id": "sPrompt"})
+        assert wait_for(
+            lambda: any(m.get("type") == "pget-result" for m in sent),
+            timeout=stall - 2.0,
+        ), "no terminal before the server resumed"
+        latency = time.monotonic() - started
+        assert latency < 2.0, \
+            "cancel took %.2fs while the server was stalled" % latency
+
+        res = last_result(sent)
+        assert res["status"] == "cancelled"
+        assert res["failureCategory"] == "cancelled"
+        assert res["mode"] == "single-connection"
+        assert len([m for m in sent if m.get("type") == "pget-result"]) == 1
+        assert not (tmp_path / "clip.mp4").exists()
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_stalled_body_without_cancel_still_completes(tmp_path, monkeypatch):
+    """Polling for cancellation must not break a merely-slow server."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    hold = threading.Event()
+    body_started = threading.Event()
+    httpd = _stalling_server(hold, body_started, 3.0)
+    try:
+        mc.handle_pget_single({
+            "id": "sSlow", "attemptToken": "tSlow",
+            "urls": [server_url(httpd)],
+            "name": "slow.mp4", "dir": str(tmp_path), "maxConnections": 1,
+            "userAgent": "t",
+        })
+        res = wait_result(sent, timeout=30)
+        assert res["status"] == "completed", res
+        assert res["partState"] == "committed"
+        out = tmp_path / "slow.mp4"
+        assert out.exists()
+        assert out.stat().st_size == 512 * 1024
+    finally:
+        hold.set()
+        shutdown_server(httpd)
+
+
+def test_multi_range_cancel_is_prompt_while_a_segment_is_stalled(tmp_path, monkeypatch):
+    """The segmented path must observe cancel without waiting out a stalled peer."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+
+    total = 4 * 1024 * 1024
+    payload = b"S" * total
+    stall = 8.0
+    hold = threading.Event()
+    segment_started = threading.Event()
+
+    class Ranged(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range") or ""
+            if not rng.startswith("bytes="):
+                self.send_response(200)
+                self.send_header("Content-Length", str(total))
+                self.end_headers()
+                return
+            spec = rng.split("=", 1)[1]
+            first, last = spec.split("-")
+            start, end = int(first), int(last)
+            chunk = payload[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            if end - start + 1 <= 1:
+                self.wfile.write(chunk)          # the 0-0 capability probe
+                return
+            self.wfile.write(chunk[:4096])
+            self.wfile.flush()
+            segment_started.set()
+            hold.wait(timeout=stall)
+            try:
+                self.wfile.write(chunk[4096:])
+            except Exception:
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Ranged)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        mc.handle_pget({
+            "id": "mCan", "attemptToken": "tmCan",
+            "urls": [server_url(httpd)],
+            "name": "multi.mp4", "dir": str(tmp_path), "maxConnections": 2,
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: segment_started.is_set(), timeout=10)
+        time.sleep(0.3)                       # let a worker park inside its read
+
+        started = time.monotonic()
+        mc._pget_cancel({"id": "mCan"})
+        assert wait_for(
+            lambda: any(m.get("type") == "pget-result" for m in sent),
+            timeout=stall - 2.0,
+        ), "no terminal before the stalled segment resumed"
+        latency = time.monotonic() - started
+        assert latency < 3.0, \
+            "segmented cancel took %.2fs while a segment was stalled" % latency
+
+        res = last_result(sent)
+        assert res["status"] == "cancelled"
+        assert res["failureCategory"] == "cancelled"
+        assert len([m for m in sent if m.get("type") == "pget-result"]) == 1
+        assert not (tmp_path / "multi.mp4").exists()
+    finally:
+        hold.set()
+        shutdown_server(httpd)

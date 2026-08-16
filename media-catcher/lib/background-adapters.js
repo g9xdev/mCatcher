@@ -15,7 +15,6 @@
   function (root) {
     "use strict";
 
-    var LEASE1_MSG = "background adapter behavior not implemented in Lease 1";
     var CONTROLLER_KEYS = [
       "captureNetwork",
       "acceptPageSnapshot",
@@ -95,6 +94,18 @@
       if (isCommonJsActive()) return require("./native-result-adapter.js");
       if (root && root.McNativeResultAdapter) return root.McNativeResultAdapter;
       throw new Error("McNativeResultAdapter is required for BackgroundAdapters");
+    }
+
+    function resolveFileSinkProtocol() {
+      if (isCommonJsActive()) return require("./file-sink-protocol.js");
+      if (root && root.McFileSinkProtocol) return root.McFileSinkProtocol;
+      throw new Error("McFileSinkProtocol is required for BackgroundAdapters");
+    }
+
+    function resolveFailureClassify() {
+      if (isCommonJsActive()) return require("./failure-classify.js");
+      if (root && root.McFailureClassify) return root.McFailureClassify;
+      throw new Error("McFailureClassify is required for BackgroundAdapters");
     }
 
     function deepClone(value) {
@@ -1217,8 +1228,6 @@
       };
       void createObjectURL;
       void revokeObjectURL;
-      void fetchArrayBuffer;
-      void assembleMedia;
       void persistHistory;
 
       /** Transactional now sample used during a capture finalizer call. */
@@ -1267,6 +1276,8 @@
       var scheduler = null;
       var MessageRouter = null;
       var NativeResultAdapter = null;
+      var FileSinkProtocol = null;
+      var FailureClassify = null;
       // Authoritative popup proof is bound to one direct job and consumed only
       // by the scheduler. It is never projected or returned to popup callers.
       var popupTokenStore = new Map();
@@ -1282,6 +1293,16 @@
         return NativeResultAdapter;
       }
 
+      function getFileSinkProtocol() {
+        if (!FileSinkProtocol) FileSinkProtocol = resolveFileSinkProtocol();
+        return FileSinkProtocol;
+      }
+
+      function getFailureClassify() {
+        if (!FailureClassify) FailureClassify = resolveFailureClassify();
+        return FailureClassify;
+      }
+
       function getScheduler() {
         if (!scheduler) {
           scheduler = resolveDownloadScheduler().createDownloadScheduler({
@@ -1290,17 +1311,34 @@
             randomToken: randomTokenFn,
             popupTokenStore: popupTokenStore,
             firefoxDownload: function (adapterInput) {
+              var binding = jobBindings.get(adapterInput.jobId);
+              if (!binding) throw genericTypeError();
               var tokenStore = new Set([adapterInput.intent.userActionToken]);
-              return firefoxGuard.downloadWithFirefox({
+              var guardInput = {
                 intent: adapterInput.intent,
                 tokenStore: tokenStore,
-                source: {
+              };
+              if (binding.mediaKind === "direct") {
+                guardInput.source = {
                   type: "url",
                   getUrl: function () {
                     return readEphemeralUrl(adapterInput.sourceHandle);
                   },
-                },
-              });
+                };
+              } else if (isAssembledKind(binding.mediaKind) && binding.assembled) {
+                guardInput.filename = assembledFilename(
+                  binding.intent.requestedFilename,
+                  binding.assembled.extension
+                );
+                guardInput.source = {
+                  type: "bytes",
+                  bytes: binding.assembled.bytes,
+                  mime: binding.assembled.mime,
+                };
+              } else {
+                throw genericTypeError();
+              }
+              return firefoxGuard.downloadWithFirefox(guardInput);
             },
           });
         }
@@ -1352,10 +1390,10 @@
       // Empty holders for later leases (no behavior yet).
       var jobsById = new Map();
       var sinkSessions = new Map();
+      var sinkTransfersById = new Map();
       var proofTokens = new Set();
       var historyEntries = [];
       void jobsById;
-      void sinkSessions;
       void proofTokens;
       void historyEntries;
 
@@ -1376,6 +1414,166 @@
       var startedAttempts = new Set();
       /** @type {Set<string>} jobId\0attemptToken already switched to pget-single */
       var singleStartedAttempts = new Set();
+      /** @type {Set<string>} direct running jobs with a cancel command in flight */
+      var pendingDirectCancels = new Set();
+
+      function isAssembledKind(kind) {
+        return kind === "hls" || kind === "dash";
+      }
+
+      function releaseLocalOnce(transfer) {
+        if (!transfer) return false;
+        if (transfer.localReleased) return true;
+        var released = transfer.localLease.release();
+        if (released === true) transfer.localReleased = true;
+        return released;
+      }
+
+      function clearAssembledBytes(binding) {
+        if (binding) delete binding.assembled;
+      }
+
+      function clearSinkTransfer(transfer, clearBytes) {
+        if (!transfer) return;
+        transfer.settled = true;
+        if (sinkSessions.get(transfer.jobId) === transfer) {
+          sinkSessions.delete(transfer.jobId);
+        }
+        if (
+          transfer.session &&
+          transfer.session.sinkId &&
+          sinkTransfersById.get(transfer.session.sinkId) === transfer
+        ) {
+          sinkTransfersById.delete(transfer.session.sinkId);
+        }
+        if (clearBytes) clearAssembledBytes(transfer.binding);
+        transfer.bytes = null;
+        transfer.session = null;
+      }
+
+      function copyAssemblyResult(result) {
+        if (!result || typeof result !== "object") return null;
+        var bytes = ownData(result, "bytes");
+        var mime = ownData(result, "mime");
+        var extension = ownData(result, "extension");
+        if (!(bytes instanceof Uint8Array)) return null;
+        if (typeof mime !== "string" || mime.trim().length === 0 || hasControlChars(mime)) {
+          return null;
+        }
+        if (
+          typeof extension !== "string" ||
+          !/^[A-Za-z0-9]{1,8}$/.test(extension)
+        ) {
+          return null;
+        }
+        var copy = new Uint8Array(bytes.length);
+        copy.set(bytes);
+        return Object.freeze({ bytes: copy, mime: mime, extension: extension });
+      }
+
+      function assembledFilename(requestedFilename, extension) {
+        if (/\.(?:m3u8|mpd)$/i.test(requestedFilename)) {
+          return requestedFilename.replace(/\.(?:m3u8|mpd)$/i, "." + extension);
+        }
+        if (requestedFilename.lastIndexOf(".") <= 0) {
+          return requestedFilename + "." + extension;
+        }
+        return requestedFilename;
+      }
+
+      function updateAssemblyProgress(transfer, progress) {
+        if (!transfer || transfer.settled || !progress || typeof progress !== "object") {
+          return;
+        }
+        var done = ownData(progress, "done");
+        if (done === undefined) done = ownData(progress, "bytes");
+        var total = ownData(progress, "total");
+        if (!isNonnegInt(done) || !isNonnegInt(total) || done > total) return;
+        var old = transfer.binding.progress;
+        if (old && (done < old.done || total < old.total)) return;
+        var beforeSig = jobAdmissionSig();
+        transfer.binding.progress = Object.freeze({ done: done, total: total });
+        publishJobsIfChanged(beforeSig);
+      }
+
+      function waitForAssemblyFetches(transfer) {
+        var pending = Array.from(transfer.fetches);
+        return Promise.all(
+          pending.map(function (promise) {
+            return Promise.resolve(promise).then(
+              function () {},
+              function () {}
+            );
+          })
+        );
+      }
+
+      function guardedAssemblyFetch(transfer, args) {
+        if (
+          transfer.assemblySettled ||
+          transfer.settled ||
+          !getScheduler().isAttemptActive(transfer.jobId, transfer.attemptToken)
+        ) {
+          return Promise.reject(Object.freeze({ cancelled: true }));
+        }
+        var permit = getScheduler().acquireProviderPermit(
+          transfer.jobId,
+          "assembly-fetch"
+        );
+        if (!permit) {
+          return Promise.reject(Object.freeze({ failureCategory: "permanent" }));
+        }
+        var effect;
+        try {
+          effect = fetchArrayBuffer(
+            transfer.binding.tabId,
+            args[0],
+            args[1]
+          );
+        } catch (errSync) {
+          effect = Promise.reject(errSync);
+        }
+        var tracked = Promise.resolve(effect).then(
+          function (value) {
+            var beforeSig = jobAdmissionSig();
+            permit.release();
+            var afterRelease = getScheduler().getJob(transfer.jobId);
+            if (
+              transfer.cancelRequested &&
+              afterRelease &&
+              afterRelease.state === "cancelled"
+            ) {
+              clearAssembledBytes(transfer.binding);
+              popupTokenStore.delete(transfer.jobId);
+            }
+            publishJobsIfChanged(beforeSig);
+            pump();
+            return value;
+          },
+          function (err) {
+            var beforeSig = jobAdmissionSig();
+            permit.release();
+            var afterRelease = getScheduler().getJob(transfer.jobId);
+            if (
+              transfer.cancelRequested &&
+              afterRelease &&
+              afterRelease.state === "cancelled"
+            ) {
+              clearAssembledBytes(transfer.binding);
+              popupTokenStore.delete(transfer.jobId);
+            }
+            publishJobsIfChanged(beforeSig);
+            pump();
+            throw err;
+          }
+        );
+        transfer.fetches.add(tracked);
+        tracked.then(
+          function () { transfer.fetches.delete(tracked); },
+          function () { transfer.fetches.delete(tracked); }
+        );
+        return tracked;
+      }
 
       /**
        * Prepare public ID: invoke randomToken and validate base only.
@@ -1979,10 +2177,6 @@
         return deepFreeze(rows);
       }
 
-      function lease1Reject() {
-        return Promise.reject(new Error(LEASE1_MSG));
-      }
-
       function readEphemeralUrl(handle) {
         if (!handle || typeof handle !== "object") throw genericTypeError();
         var url;
@@ -2008,6 +2202,7 @@
           var input = deepClone(jobs[i]);
           var binding = jobBindings.get(jobs[i].id);
           if (binding && binding.progress) input.progress = binding.progress;
+          if (binding && binding.mediaId) input.mediaId = binding.mediaId;
           out.push(freezeClone(Privacy.projectPopupJob(input)));
         }
         return deepFreeze(out);
@@ -2024,7 +2219,10 @@
       }
 
       function projectReturnedJob(jobId) {
-        return freezeClone(Privacy.projectPopupJob(getScheduler().getJob(jobId)));
+        var input = deepClone(getScheduler().getJob(jobId));
+        var binding = jobBindings.get(jobId);
+        if (binding && binding.mediaId) input.mediaId = binding.mediaId;
+        return freezeClone(Privacy.projectPopupJob(input));
       }
 
       function requirePopupSender(sender) {
@@ -2059,18 +2257,24 @@
         var record = sourcesByMediaId.get(mediaId);
         if (!record) throw genericTypeError();
         if (record.tabId !== tabId) throw genericTypeError();
-        if (record.mediaKind !== "direct") throw genericTypeError();
+        if (
+          record.mediaKind !== "direct" &&
+          record.mediaKind !== "hls" &&
+          record.mediaKind !== "dash"
+        ) {
+          throw genericTypeError();
+        }
         return record;
       }
 
       function selectSourceHandle(message, record) {
         var vidState = ownKeyState(message, "variantId");
         if (!vidState.present) {
-          return record.ephemeral;
+          return { handle: record.ephemeral, selection: null };
         }
         if (!vidState.data) throw genericTypeError();
         if (vidState.value === null || vidState.value === undefined) {
-          return record.ephemeral;
+          return { handle: record.ephemeral, selection: null };
         }
         if (typeof vidState.value !== "string" && typeof vidState.value !== "number") {
           throw genericTypeError();
@@ -2079,7 +2283,10 @@
         var byId = variantsByIdByMediaId.get(record.mediaId);
         var rec = byId ? byId.get(variantId) : null;
         if (!rec) throw genericTypeError();
-        return rec.sourceHandle;
+        return {
+          handle: rec.sourceHandle,
+          selection: freezeClone(rec.safeProjection),
+        };
       }
 
       function buildSanitizedDownloadMessage(message, record) {
@@ -2135,11 +2342,276 @@
         return looked;
       }
 
+      function settleAssembledTransport(transfer, result, clearBytes) {
+        if (!transfer || transfer.settled) return false;
+        if (!transfer.pendingSettlement) {
+          transfer.pendingSettlement = {
+            kind: "transport",
+            result: result,
+            clearBytes: clearBytes === true,
+          };
+        }
+        var pendingSettlement = transfer.pendingSettlement;
+        var beforeSig = jobAdmissionSig();
+        if (!releaseLocalOnce(transfer)) return false;
+        transfer.pendingSettlement = null;
+        clearSinkTransfer(transfer, pendingSettlement.clearBytes);
+        getScheduler().onTransportResult(
+          transfer.jobId,
+          transfer.attemptToken,
+          pendingSettlement.result
+        );
+        var settled = getScheduler().getJob(transfer.jobId);
+        if (
+          settled &&
+          (settled.state === "completed" ||
+            settled.state === "failed" ||
+            settled.state === "cancelled")
+        ) {
+          popupTokenStore.delete(transfer.jobId);
+        }
+        publishJobsIfChanged(beforeSig);
+        pump();
+        return true;
+      }
+
+      function settleAssembledUnavailable(transfer) {
+        if (!transfer || transfer.settled) return false;
+        if (!transfer.pendingSettlement) {
+          transfer.pendingSettlement = { kind: "unavailable" };
+        }
+        var beforeSig = jobAdmissionSig();
+        if (!releaseLocalOnce(transfer)) return false;
+        transfer.pendingSettlement = null;
+        clearSinkTransfer(transfer, false);
+        getScheduler().onTransportUnavailable(transfer.jobId);
+        var after = getScheduler().getJob(transfer.jobId);
+        if (after && after.state === "cancelled") {
+          clearAssembledBytes(transfer.binding);
+          popupTokenStore.delete(transfer.jobId);
+        }
+        publishJobsIfChanged(beforeSig);
+        pump();
+        return true;
+      }
+
+      function retryPendingAssembledSettlements() {
+        var transfers = Array.from(sinkSessions.values());
+        for (var i = 0; i < transfers.length; i++) {
+          var transfer = transfers[i];
+          if (!transfer || transfer.settled || !transfer.pendingSettlement) continue;
+          if (transfer.pendingSettlement.kind === "unavailable") {
+            settleAssembledUnavailable(transfer);
+          } else {
+            settleAssembledTransport(
+              transfer,
+              transfer.pendingSettlement.result,
+              transfer.pendingSettlement.clearBytes
+            );
+          }
+        }
+      }
+
+      function postSinkCommands(transfer, commands) {
+        if (!transfer || transfer.settled || !commands || commands.length === 0) {
+          return Promise.resolve(true);
+        }
+        var effects = [];
+        try {
+          for (var i = 0; i < commands.length; i++) {
+            effects.push(Promise.resolve(postNative(commands[i])));
+          }
+        } catch (errSync) {
+          settleAssembledUnavailable(transfer);
+          return Promise.reject(errSync);
+        }
+        return Promise.all(effects).then(
+          function () { return true; },
+          function (errAsync) {
+            settleAssembledUnavailable(transfer);
+            throw errAsync;
+          }
+        );
+      }
+
+      function nextSinkCommands(transfer) {
+        var commands = [];
+        if (!transfer || transfer.settled || !transfer.session) return commands;
+        if (transfer.abortPosted || transfer.cancelRequested) return commands;
+        var protocol = getFileSinkProtocol();
+        while (
+          transfer.offset < transfer.bytes.length &&
+          transfer.session.outstandingCount < protocol.MAX_UNACKED
+        ) {
+          var end = Math.min(
+            transfer.offset + protocol.MAX_CHUNK_BYTES,
+            transfer.bytes.length
+          );
+          var cmd = transfer.session.nextChunkCmd(
+            transfer.bytes.subarray(transfer.offset, end)
+          );
+          if (!cmd) break;
+          transfer.offset = end;
+          commands.push(cmd);
+        }
+        if (
+          transfer.offset === transfer.bytes.length &&
+          transfer.session.outstandingCount === 0 &&
+          !transfer.commitPosted &&
+          !transfer.abortPosted
+        ) {
+          var commit = transfer.session.commitCmd();
+          if (commit) {
+            transfer.commitPosted = true;
+            transfer.phase = "committing";
+            commands.push(commit);
+          }
+        }
+        return commands;
+      }
+
+      function openAssembledSink(transfer) {
+        if (
+          !transfer ||
+          transfer.settled ||
+          !getScheduler().isAttemptActive(transfer.jobId, transfer.attemptToken)
+        ) {
+          return false;
+        }
+        var retained = transfer.binding.assembled;
+        if (!retained) return false;
+        transfer.bytes = retained.bytes;
+        transfer.session = getFileSinkProtocol().createFileSinkSession({
+          jobId: transfer.jobId,
+          attemptToken: transfer.attemptToken,
+          requestedFilename: assembledFilename(
+            transfer.binding.intent.requestedFilename,
+            retained.extension
+          ),
+          destinationDirectory: transfer.binding.intent.destinationDirectory,
+          effectiveDestinationDirectory: transfer.binding.effectiveDir,
+        });
+        transfer.phase = "opening";
+        sinkSessions.set(transfer.jobId, transfer);
+        postSinkCommands(transfer, [transfer.session.openCmd()]).catch(function () {});
+        return true;
+      }
+
+      function settleAssemblyOutcome(transfer, result, rejected) {
+        transfer.assemblySettled = true;
+        return waitForAssemblyFetches(transfer).then(function () {
+          if (transfer.settled) return;
+          if (transfer.cancelRequested === true) {
+            settleAssembledTransport(
+              transfer,
+              { status: "cancelled" },
+              true
+            );
+            return;
+          }
+          if (!getScheduler().isAttemptActive(transfer.jobId, transfer.attemptToken)) {
+            clearSinkTransfer(transfer, false);
+            releaseLocalOnce(transfer);
+            return;
+          }
+          if (rejected) {
+            var classified = getFailureClassify().normalizeBrowserError(result);
+            settleAssembledTransport(
+              transfer,
+              { status: "failed", failureCategory: classified.category },
+              false
+            );
+            return;
+          }
+          var assembled = copyAssemblyResult(result);
+          if (!assembled) {
+            settleAssembledTransport(
+              transfer,
+              { status: "failed", failureCategory: "permanent" },
+              false
+            );
+            return;
+          }
+          transfer.binding.assembled = assembled;
+          openAssembledSink(transfer);
+        });
+      }
+
+      function startAssembledAttempt(job, binding) {
+        var localLease = getScheduler().acquireLocalActivity(
+          job.id,
+          "assembly-sink"
+        );
+        if (!localLease) return false;
+        var transfer = {
+          jobId: job.id,
+          attemptToken: job.attemptToken,
+          binding: binding,
+          localLease: localLease,
+          localReleased: false,
+          fetches: new Set(),
+          assemblySettled: false,
+          settled: false,
+          phase: "assembly",
+          bytes: null,
+          session: null,
+          offset: 0,
+          commitPosted: false,
+          abortPosted: false,
+          cancelRequested: false,
+          pendingSettlement: null,
+        };
+        sinkSessions.set(job.id, transfer);
+
+        var task;
+        if (binding.assembled) {
+          transfer.assemblySettled = true;
+          task = Promise.resolve().then(function () {
+            openAssembledSink(transfer);
+          });
+        } else {
+          var assemblyEffect;
+          try {
+            assemblyEffect = assembleMedia({
+              kind: binding.mediaKind,
+              sourceUrl: binding.url,
+              selection: binding.selection,
+              segmentConcurrency: job.effectiveConcurrency,
+              fetchArrayBuffer: function () {
+                return guardedAssemblyFetch(transfer, arguments);
+              },
+              shouldAbort: function () {
+                return !getScheduler().isAttemptActive(
+                  transfer.jobId,
+                  transfer.attemptToken
+                );
+              },
+              onProgress: function (progress) {
+                updateAssemblyProgress(transfer, progress);
+              },
+            });
+          } catch (errSync) {
+            assemblyEffect = Promise.reject(errSync);
+          }
+          task = Promise.resolve(assemblyEffect).then(
+            function (result) {
+              return settleAssemblyOutcome(transfer, result, false);
+            },
+            function (err) {
+              return settleAssemblyOutcome(transfer, err, true);
+            }
+          );
+        }
+        transfer.task = Promise.resolve(task).catch(function () {});
+        return true;
+      }
+
       function enqueueDownload(message, sender) {
         return Promise.resolve().then(function () {
           requirePopupSender(sender);
           var record = readOwnedMediaRecord(message);
-          var sourceHandle = selectSourceHandle(message, record);
+          var selected = selectSourceHandle(message, record);
+          var sourceHandle = selected.handle;
           var primaryUrl = readEphemeralUrl(sourceHandle);
           var sanitized = buildSanitizedDownloadMessage(message, record);
           var normalized = getMessageRouter().normalizeDownloadRequest(sanitized);
@@ -2157,6 +2629,9 @@
             intent: intent,
             effectiveDir: effectiveDir,
             mediaKind: record.mediaKind,
+            tabId: record.tabId,
+            mediaId: record.mediaId,
+            selection: selected.selection,
             mirrors: future.mirrors,
             referer: future.referer,
             userAgent: future.userAgent,
@@ -2186,12 +2661,135 @@
         });
       }
 
+      function findSinkTransfer(message) {
+        if (!message || typeof message !== "object") return null;
+        var sinkId = ownData(message, "sinkId");
+        if (typeof sinkId === "string" && sinkId.trim().length > 0) {
+          var bySink = sinkTransfersById.get(sinkId);
+          if (
+            bySink &&
+            !bySink.settled &&
+            bySink.session &&
+            bySink.session.sinkId === sinkId
+          ) {
+            return bySink;
+          }
+        }
+        var jobId = ownData(message, "jobId");
+        var attemptToken = ownData(message, "attemptToken");
+        if (typeof jobId !== "string" || typeof attemptToken !== "string") {
+          return null;
+        }
+        var transfer = sinkSessions.get(jobId);
+        if (
+          !transfer ||
+          transfer.settled ||
+          transfer.jobId !== jobId ||
+          transfer.attemptToken !== attemptToken
+        ) {
+          return null;
+        }
+        return transfer;
+      }
+
+      function postSinkAbort(transfer) {
+        if (!transfer || transfer.settled || transfer.abortPosted || !transfer.session) {
+          return Promise.resolve(false);
+        }
+        var command = transfer.session.abortCmd();
+        if (!command) return Promise.resolve(false);
+        transfer.abortPosted = true;
+        transfer.phase = "aborting";
+        return postSinkCommands(transfer, [command]);
+      }
+
+      function handleFileSinkMessage(message) {
+        var transfer = findSinkTransfer(message);
+        if (!transfer || !transfer.session) return Promise.resolve(false);
+        var type = ownData(message, "type");
+
+        if (type === "file-opened") {
+          var assignedSinkId = ownData(message, "sinkId");
+          var existing = sinkTransfersById.get(assignedSinkId);
+          if (existing && existing !== transfer && !existing.settled) {
+            return Promise.resolve(false);
+          }
+          if (!transfer.session.onOpened(message)) return Promise.resolve(false);
+          sinkTransfersById.set(assignedSinkId, transfer);
+          transfer.phase = "streaming";
+          if (transfer.cancelRequested === true) {
+            return postSinkAbort(transfer).then(
+              function () { return true; },
+              function () { return true; }
+            );
+          }
+          return postSinkCommands(transfer, nextSinkCommands(transfer)).then(
+            function () { return true; },
+            function () { return true; }
+          );
+        }
+
+        if (type === "file-chunk-ack") {
+          if (!transfer.session.onAck(message)) return Promise.resolve(false);
+          return postSinkCommands(transfer, nextSinkCommands(transfer)).then(
+            function () { return true; },
+            function () { return true; }
+          );
+        }
+
+        if (type === "file-committed") {
+          if (transfer.abortPosted || transfer.cancelRequested === true) {
+            return Promise.resolve(false);
+          }
+          var committed = transfer.session.onCommitted(message);
+          if (!committed) return Promise.resolve(false);
+          if (committed.bytes !== transfer.bytes.length) {
+            settleAssembledTransport(
+              transfer,
+              { status: "failed", failureCategory: "local_io" },
+              false
+            );
+            return Promise.resolve(true);
+          }
+          transfer.binding.savedPath = committed.file;
+          settleAssembledTransport(transfer, { status: "completed" }, true);
+          return Promise.resolve(true);
+        }
+
+        if (type === "file-aborted") {
+          if (!transfer.session.onAborted(message)) return Promise.resolve(false);
+          settleAssembledTransport(transfer, { status: "cancelled" }, true);
+          return Promise.resolve(true);
+        }
+
+        if (type === "file-error") {
+          var failed = transfer.session.onHostError(message);
+          if (!failed) return Promise.resolve(false);
+          var cancelled = transfer.cancelRequested === true;
+          settleAssembledTransport(
+            transfer,
+            {
+              status: "failed",
+              failureCategory: failed.failureCategory,
+            },
+            cancelled
+          );
+          return Promise.resolve(true);
+        }
+
+        return Promise.resolve(false);
+      }
+
       function handleNativeMessage(message) {
         return Promise.resolve().then(function () {
           if (!message || typeof message !== "object" || ownData(message, "type") === undefined) return false;
           var beforeSig = jobAdmissionSig();
           var decision = getMessageRouter().routeNativeMessage(message);
           if (!decision || typeof decision !== "object") return false;
+
+          if (decision.action === "file-sink-message") {
+            return handleFileSinkMessage(decision.message);
+          }
 
           if (decision.action === "transport-progress") {
             var progressJob = getScheduler().getJob(decision.jobId);
@@ -2282,6 +2880,7 @@
               settledDirect.state === "cancelled")
           ) {
             popupTokenStore.delete(decision.jobId);
+            pendingDirectCancels.delete(decision.jobId);
           }
           return Promise.all(switchEffects).then(function () { return pump(); }).then(function () {
             publishJobsIfChanged(beforeSig);
@@ -2301,10 +2900,15 @@
 
           var job = getScheduler().getJob(decision.jobId);
           var binding = jobBindings.get(decision.jobId);
+          var hasEligibleSource =
+            job &&
+            binding &&
+            (job.mediaKind === "direct" ||
+              (isAssembledKind(job.mediaKind) && binding.assembled));
           if (
             !job ||
             !binding ||
-            job.mediaKind !== "direct" ||
+            !hasEligibleSource ||
             job.state !== "needs_user" ||
             !popupTokenStore.has(decision.jobId) ||
             popupTokenStore.get(decision.jobId) !== decision.intent.userActionToken ||
@@ -2344,6 +2948,9 @@
               ) {
                 popupTokenStore.delete(decision.jobId);
               }
+              if (settled && settled.state === "handed_to_firefox") {
+                clearAssembledBytes(binding);
+              }
               publishJobsIfChanged(beforeSig);
               return projectReturnedJob(decision.jobId);
             },
@@ -2369,16 +2976,197 @@
         }
       }
 
-      function cancel(/* jobId */) {
-        return lease1Reject();
+      function cancel(jobId) {
+        return Promise.resolve().then(function () {
+          if (typeof jobId !== "string" || jobId.trim().length === 0) return false;
+          var binding = jobBindings.get(jobId);
+          if (!binding) return false;
+          var activeScheduler = getScheduler();
+          var job = activeScheduler.getJob(jobId);
+          if (
+            job &&
+            isAssembledKind(job.mediaKind) &&
+            job.state !== "completed" &&
+            job.state !== "failed" &&
+            job.state !== "cancelled"
+          ) {
+            var assembledBeforeSig = jobAdmissionSig();
+            activeScheduler.cancel(jobId);
+            var transfer = sinkSessions.get(jobId);
+            if (transfer) transfer.cancelRequested = true;
+            var afterCancel = activeScheduler.getJob(jobId);
+            if (afterCancel && afterCancel.state === "cancelled") {
+              clearAssembledBytes(binding);
+              popupTokenStore.delete(jobId);
+              if (transfer) {
+                releaseLocalOnce(transfer);
+                clearSinkTransfer(transfer, true);
+              }
+            }
+            if (
+              transfer &&
+              !transfer.settled &&
+              transfer.session &&
+              transfer.session.sinkId
+            ) {
+              return postSinkAbort(transfer).then(
+                function () {
+                  publishJobsIfChanged(assembledBeforeSig);
+                  return projectReturnedJob(jobId);
+                },
+                function (errAbort) {
+                  publishJobsIfChanged(assembledBeforeSig);
+                  throw errAbort;
+                }
+              );
+            }
+            publishJobsIfChanged(assembledBeforeSig);
+            return projectReturnedJob(jobId);
+          }
+          if (
+            !job ||
+            job.mediaKind !== "direct" ||
+            job.state === "completed" ||
+            job.state === "failed" ||
+            job.state === "cancelled" ||
+            pendingDirectCancels.has(jobId)
+          ) {
+            return false;
+          }
+          var beforeSig = jobAdmissionSig();
+          var runningToken =
+            job.state === "running" &&
+            typeof job.attemptToken === "string" &&
+            job.attemptToken.trim().length > 0
+              ? job.attemptToken
+              : null;
+          activeScheduler.cancel(jobId);
+          if (!runningToken) {
+            publishJobsIfChanged(beforeSig);
+            return projectReturnedJob(jobId);
+          }
+          pendingDirectCancels.add(jobId);
+          var command = getMessageRouter().buildNativeStartPayload({
+            kind: "pget-cancel",
+            jobId: jobId,
+            attemptToken: runningToken,
+          });
+          var effect;
+          try {
+            effect = postNative(command);
+          } catch (errSync) {
+            activeScheduler.onTransportUnavailable(jobId);
+            publishJobsIfChanged(beforeSig);
+            throw errSync;
+          }
+          return Promise.resolve(effect).then(
+            function () {
+              publishJobsIfChanged(beforeSig);
+              return projectReturnedJob(jobId);
+            },
+            function (errAsync) {
+              activeScheduler.onTransportUnavailable(jobId);
+              publishJobsIfChanged(beforeSig);
+              throw errAsync;
+            }
+          );
+        });
       }
 
-      function manualRetry(/* jobId */) {
-        return lease1Reject();
+      function manualRetry(jobId) {
+        return Promise.resolve().then(function () {
+          if (typeof jobId !== "string" || jobId.trim().length === 0) return false;
+          var binding = jobBindings.get(jobId);
+          if (!binding) return false;
+          var activeScheduler = getScheduler();
+          var job = activeScheduler.getJob(jobId);
+          if (
+            !job ||
+            (job.mediaKind !== "direct" && !isAssembledKind(job.mediaKind)) ||
+            job.state !== "needs_user"
+          ) {
+            return false;
+          }
+          var beforeSig = jobAdmissionSig();
+          var oldTransfer = sinkSessions.get(jobId);
+          if (oldTransfer) {
+            releaseLocalOnce(oldTransfer);
+            clearSinkTransfer(oldTransfer, false);
+          }
+          activeScheduler.manualRetry(jobId);
+          pendingDirectCancels.delete(jobId);
+          return pump().then(
+            function () {
+              publishJobsIfChanged(beforeSig);
+              return projectReturnedJob(jobId);
+            },
+            function (err) {
+              activeScheduler.onTransportUnavailable(jobId);
+              publishJobsIfChanged(beforeSig);
+              throw err;
+            }
+          );
+        });
       }
 
       function helperDisconnected() {
-        return lease1Reject();
+        return Promise.resolve().then(function () {
+          if (!scheduler) return deepFreeze(new Array());
+          var beforeSig = jobAdmissionSig();
+          var processed = new Set();
+          var changedIds = [];
+          var found = true;
+          while (found) {
+            found = false;
+            var jobs = scheduler.getSnapshot().jobs || [];
+            for (var i = 0; i < jobs.length; i++) {
+              var job = jobs[i];
+              if (
+                !job ||
+                processed.has(job.id) ||
+                !jobBindings.has(job.id) ||
+                (job.mediaKind !== "direct" && !isAssembledKind(job.mediaKind)) ||
+                (job.state !== "running" &&
+                  job.state !== "pausing_provider" &&
+                  job.state !== "waiting_provider")
+              ) {
+                continue;
+              }
+              found = true;
+              processed.add(job.id);
+              if (isAssembledKind(job.mediaKind)) {
+                var transfer = sinkSessions.get(job.id);
+                if (transfer) {
+                  var beforeState = scheduler.getJob(job.id);
+                  settleAssembledUnavailable(transfer);
+                  var afterState = scheduler.getJob(job.id);
+                  if (
+                    beforeState &&
+                    afterState &&
+                    beforeState.state !== afterState.state
+                  ) {
+                    changedIds.push(job.id);
+                  }
+                  continue;
+                }
+              }
+              if (scheduler.onTransportUnavailable(job.id) === true) {
+                changedIds.push(job.id);
+              }
+              var afterUnavailable = scheduler.getJob(job.id);
+              if (afterUnavailable && afterUnavailable.state === "cancelled") {
+                clearAssembledBytes(jobBindings.get(job.id));
+                popupTokenStore.delete(job.id);
+              }
+            }
+          }
+          publishJobsIfChanged(beforeSig);
+          var changed = new Array();
+          for (var j = 0; j < changedIds.length; j++) {
+            changed.push(projectReturnedJob(changedIds[j]));
+          }
+          return deepFreeze(changed);
+        });
       }
 
       function setMaxConcurrent(value) {
@@ -2406,19 +3194,22 @@
           }
           finalizer.tick(nowMs);
           reconcile();
+          if (scheduler) scheduler.tick(nowMs);
+          retryPendingAssembledSettlements();
+          return pump();
         });
       }
 
       function pump() {
         return Promise.resolve().then(function () {
           if (!scheduler) return;
+          retryPendingAssembledSettlements();
           var snap = scheduler.getSnapshot();
           var jobs = snap.jobs || [];
           var pending = [];
           for (var i = 0; i < jobs.length; i++) {
             var job = jobs[i];
             if (!job || job.state !== "running") continue;
-            if (job.mediaKind !== "direct") continue;
             if (typeof job.attemptToken !== "string" || job.attemptToken.length === 0) {
               continue;
             }
@@ -2426,6 +3217,13 @@
             if (startedAttempts.has(key)) continue;
             var binding = jobBindings.get(job.id);
             if (!binding) continue;
+            if (isAssembledKind(job.mediaKind)) {
+              if (startAssembledAttempt(job, binding)) {
+                startedAttempts.add(key);
+              }
+              continue;
+            }
+            if (job.mediaKind !== "direct") continue;
             startedAttempts.add(key);
             delete binding.progress;
             delete binding.limitAck;

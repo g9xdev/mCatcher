@@ -22,7 +22,7 @@
 - Ranker runs once at finalization; retries/engine changes reuse frozen `proposedFilename` / `requestedFilename`.
 - Keep existing settings keys (`maxConcurrentDownloads`, `concurrency`, `retries`, `filenameTemplate`, `saveFolder`); no settings migration.
 - PowerShell is the shell. Prefer `Set-Location` + `python -m pytest` / `node --test` forms that work from the repo root.
-- Project containment is absolute: all mCatcher worktrees, prompts, briefs, reports, test artifacts, packages, and installation inputs must live under `C:\Code\mCatcher`. `C:\Code\GrokOrchestration` was never a valid mCatcher project root and must not be used as a source, destination, recovery input, or verification path.
+- Project containment is absolute: `C:\Code\mCatcher` is the sole project boundary, and all mCatcher worktrees, prompts, briefs, reports, test artifacts, packages, recovery inputs, verification inputs, and installation inputs must live below it.
 - Quarantined BA07/BA08 and native-host harness attempts are outside this goal. They are not requirements, source material, test evidence, or completion criteria; only accepted code and behavior-focused tests in the contained mCatcher worktree count.
 - Do not rewrite unrelated cast/update/recording code. Touch only the files listed per task.
 - Commits are required at the end of each task. Do not amend published history.

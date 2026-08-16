@@ -7,8 +7,59 @@ let currentTabId = null;
 let pageTitle = "";
 let allTabs = false;
 const downloadState = new Map();   // id -> download
-const itemDownloadId = new Map();  // item.url -> download id (progress binding)
-const itemElements = new Map();    // item.url -> rendered element
+const itemDownloadId = new Map();  // item identity -> download id (progress binding)
+const itemElements = new Map();    // item identity -> rendered element
+
+function isSafeOpaqueId(value) {
+  return typeof value === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function itemIdentity(item) {
+  if (item && isSafeOpaqueId(item.id)) return "id:" + item.id;
+  return "url:" + (item && typeof item.url === "string" ? item.url : "");
+}
+
+function downloadItemIdentity(download) {
+  if (download && isSafeOpaqueId(download.mediaId)) return "id:" + download.mediaId;
+  if (download && typeof download.url === "string" && download.url) return "url:" + download.url;
+  return null;
+}
+
+function applyLiveJobsUpdate(msg) {
+  if (!msg || !Array.isArray(msg.jobs)) return;
+
+  const valid = [];
+  for (const job of msg.jobs) {
+    try {
+      if (!job || typeof job !== "object" ||
+          !isSafeOpaqueId(job.id) || !isSafeOpaqueId(job.mediaId)) continue;
+      valid.push({ job, id: job.id, identity: "id:" + job.mediaId });
+    } catch (e) {
+      // Ignore malformed/hostile entries without disturbing the valid snapshot.
+    }
+  }
+
+  // This message is a full controller snapshot. Remove only controller jobs;
+  // legacy URL-backed downloads continue to be owned by download-update.
+  for (const [id, existing] of downloadState) {
+    let identity = null;
+    try {
+      if (existing && isSafeOpaqueId(existing.mediaId)) identity = "id:" + existing.mediaId;
+    } catch (e) {}
+    if (!identity) continue;
+    downloadState.delete(id);
+    if (itemDownloadId.get(identity) === id) itemDownloadId.delete(identity);
+  }
+
+  for (const entry of valid) {
+    downloadState.set(entry.id, entry.job);
+    itemDownloadId.set(entry.identity, entry.id);
+    const el = itemElements.get(entry.identity);
+    if (el) renderProgress(el, entry.job);
+  }
+  renderQueue();
+}
 
 // Web Crypto user-action token — minted only on Download / Save-As Confirm / Use Firefox click.
 function mintUserActionToken() {
@@ -88,14 +139,10 @@ let castUiReady = false;
     if (!raw) return;
     const hint = JSON.parse(raw);
     if (hint.cast) document.documentElement.classList.add("cast");
-    if (hint.rail) {
-      document.documentElement.classList.add("rail");
-      // Start at a safe narrow width that fits virtually any window; applyLayout then
-      // GROWS it to the measured fit. A Firefox popup grows to its content reliably but
-      // often will NOT shrink after first paint — so we must never start wider than the
-      // window, or the overflow is clipped (taking the Settings button with it).
-      document.documentElement.style.width = "560px";
-    }
+    // Only the mode is primed. This document is an extension window now, so
+    // the window owns the size and CSS fills it; imposing a pixel width here
+    // is what produced a clipped rail (and, when made `auto`, a collapsed one).
+    if (hint.rail) document.documentElement.classList.add("rail");
   } catch (e) {}
 })();
 
@@ -133,6 +180,21 @@ function humanSize(bytes) {
   let i = 0, n = bytes;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
+}
+
+// Managed opaque rows state their size from validated metadata only — an
+// unvalidated item.size must never be relabelled as an exact total. Legacy
+// rows keep their existing exact transfer size.
+function mediaSizeLabel(item) {
+  const sizeApi = (typeof McMediaSize !== "undefined") ? McMediaSize : null;
+  if (item && typeof item.id === "string") {
+    if (!sizeApi) return "Size unknown";
+    return sizeApi.sizeLabel(
+      { sizeBytes: item.sizeBytes, sizeConfidence: item.sizeConfidence },
+      humanSize
+    );
+  }
+  return item && item.size ? humanSize(item.size) : "";
 }
 
 // H.265 conversion outcome: before/after sizes, percent, and which version kept.
@@ -200,16 +262,31 @@ function send(msg) {
   });
 }
 
+// This document runs as an extension window, so `currentWindow` is the window
+// itself and would match no browsing tab. Ask the background, which tracks the
+// active browsing tab, and only fall back to a direct query.
+async function resolveActiveTab() {
+  const answer = await send({ type: "get-active-tab" });
+  if (answer && answer.ok && Number.isInteger(answer.tabId)) {
+    return { id: answer.tabId, title: answer.title || "" };
+  }
+  try {
+    const tabs = await api.tabs.query({ active: true, currentWindow: true });
+    if (tabs.length) return { id: tabs[0].id, title: tabs[0].title || "" };
+  } catch (e) {}
+  return null;
+}
+
 async function init() {
-  const [tabs, sresp] = await Promise.all([
-    api.tabs.query({ active: true, currentWindow: true }),
+  const [tab, sresp] = await Promise.all([
+    resolveActiveTab(),
     send({ type: "get-settings" }),
   ]);
   if (sresp && sresp.settings) uiSettings = Object.assign(uiSettings, sresp.settings);
   await applyLayout();
-  if (!tabs.length) return;
-  currentTabId = tabs[0].id;
-  pageTitle = tabs[0].title || "";
+  if (!tab) return;
+  currentTabId = tab.id;
+  pageTitle = tab.title || "";
   await refresh();
 }
 
@@ -219,32 +296,23 @@ async function init() {
 async function applyLayout() {
   const wantRail = !!uiSettings.showRail && (!!uiSettings.showQueue || !!uiSettings.enableCasting);
 
-  // A browser-action popup can't exceed the window width — Firefox clips the
-  // overflow rather than shrinking. Measure the real window and size to it; fall
-  // back to the classic single column when there isn't room for two panes.
-  let winW = 0;
-  try { const w = await api.windows.getCurrent(); winW = (w && w.width) || 0; } catch (e) {}
-  const avail = winW ? winW - 44 : 0;        // margin so the popup never touches the window edge
-  const WIDE_MAX = 640, TWO_PANE_MIN = 560;  // 640 fits a narrow window; below MIN → classic column
-
-  let railOn = false, width = 0;
-  if (wantRail) {
-    if (avail >= TWO_PANE_MIN) { railOn = true; width = Math.min(WIDE_MAX, avail); }
-    else if (!winW) { railOn = true; width = 560; }  // window API unavailable → safe narrow width
-    // else: window too narrow for two panes → classic single column, nothing clips
-  }
+  // This document is an extension window. The window supplies a real viewport,
+  // so CSS fills it and nothing here imposes a width — the previous measure-
+  // and-set logic existed only because a browser-action popup sizes itself from
+  // its content, which is what clipped the rail.
+  const railOn = wantRail;
 
   // Casting is only offered when the panel is visible — a session started with
   // the rail hidden would have no transport (no pause/stop) anywhere in the UI.
   castUiReady = railOn && !!uiSettings.enableCasting;
   document.documentElement.classList.toggle("rail", railOn);
-  document.documentElement.style.width = railOn ? width + "px" : "";  // "" → CSS classic 420
+  document.documentElement.style.width = "";
   document.documentElement.classList.toggle("cast", castUiReady);
   showEl(castTitleEl, castUiReady);
   showEl(castSlotEl, castUiReady);
   showEl(queueTitleEl, uiSettings.showQueue);
   showEl(queueEl, uiSettings.showQueue);
-  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, w: width, cast: castUiReady })); } catch (e) {}
+  try { localStorage.setItem("mc-layout", JSON.stringify({ rail: railOn, cast: castUiReady })); } catch (e) {}
   if (castUiReady) renderCastSlot();
   renderQueue();
 }
@@ -259,7 +327,8 @@ async function refresh() {
   if (resp && resp.downloads) {
     for (const d of resp.downloads) {
       downloadState.set(d.id, d);
-      if (d.url) itemDownloadId.set(d.url, d.id); // rebind so in-flight jobs re-render
+      const identity = downloadItemIdentity(d);
+      if (identity) itemDownloadId.set(identity, d.id); // rebind so in-flight jobs re-render
     }
   }
   render(items);
@@ -287,7 +356,7 @@ function render(items) {
   }
   // Promote any item with an active recording to the top; dim the idle rest.
   const isHot = (item) => {
-    const id = itemDownloadId.get(item.url);
+    const id = itemDownloadId.get(itemIdentity(item));
     const dl = id != null && downloadState.get(id);
     return dl && dl.live && (dl.status === "recording" || dl.status === "stopped" || dl.status === "saving" || dl.status === "converting" || dl.status === "downloading");
   };
@@ -302,7 +371,7 @@ function render(items) {
   for (const item of ordered) {
     const el = renderItem(item);
     if (anyHot && !isHot(item)) el.classList.add("dim");
-    itemElements.set(item.url, el);
+    itemElements.set(itemIdentity(item), el);
     listEl.appendChild(el);
   }
 }
@@ -312,7 +381,7 @@ const HELPER_UI = {
   ready:        { cls: "ok",   label: "helper on",     tip: "Native helper active — recordings use ffmpeg (one muxed file)." },
   "no-ffmpeg":  { cls: "warn", label: "helper: no ffmpeg", tip: "Helper is installed but ffmpeg wasn't found. Re-run the installer or drop ffmpeg.exe next to it." },
   connecting:   { cls: "warn", label: "helper…",       tip: "Connecting to the native helper…" },
-  disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not detected — recording runs in-browser. Click to install it." },
+  disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not connected — recording runs in-browser. Click to reconnect (offers the installer if that fails)." },
 };
 
 function renderHelperBadge() {
@@ -326,15 +395,19 @@ function renderHelperBadge() {
   badge.title = (helperStatus.error ? helperStatus.error + "  ·  " : "") + ui.tip +
     (helperStatus.ffmpegPath ? "\nffmpeg: " + helperStatus.ffmpegPath : "");
   badge.onclick = async () => {
-    if (helperStatus.state === "disconnected") {
-      send({ type: "open-helper-setup" });   // no helper yet — open the install page
-      return;
-    }
+    // Always attempt a live re-check FIRST. Sending a "disconnected" badge
+    // straight to the installer skipped the one call that reconnects, so a
+    // dropped port — routine, since the helper exits with Firefox and is
+    // replaced by every host update — looked like missing software.
     badge.title = "Re-checking…";
     const r = await send({ type: "recheck-helper" });
     if (r && r.helper) helperStatus = r.helper;
-    setTimeout(refresh, 400); // give a fresh ping time to answer
     renderHelperBadge();
+    setTimeout(async () => {
+      await refresh();                      // give a fresh ping time to answer
+      // Offer the installer only once a live re-check has actually failed.
+      if (helperStatus.state === "disconnected") send({ type: "open-helper-setup" });
+    }, 600);
   };
 }
 
@@ -364,12 +437,14 @@ function bitrateLabel(item) {
 function renderItem(item) {
   const kind = item.kind || "direct";
   const kindLabel = kind === "youtube" ? "YouTube" : kind.toUpperCase();
+  const hasUrl = typeof item.url === "string" && item.url.length > 0;
+  const identity = itemIdentity(item);
 
   // Amber data readout: KIND · quality · bitrate · duration.
   const quality = item.height ? item.height + "p" : (item.resolution || "");
   const metaLine = [kindLabel, quality, bitrateLabel(item), item.duration ? fmtDuration(item.duration) : ""]
     .filter(Boolean).join(" · ");
-  const hostLine = [hostOf(item.url), item.size ? humanSize(item.size) : "",
+  const hostLine = [hostOf(item.url), mediaSizeLabel(item),
     item.renditionsHidden ? "top of " + (item.renditionsHidden + 1) : ""].filter(Boolean).join("  ·  ");
 
   const chips = h("div", { class: "chips" });
@@ -408,13 +483,15 @@ function renderItem(item) {
     chips,
   ]);
 
-  const el = h("div", { class: "item" + (item.junk ? " junk" : ""), dataset: { url: item.url } }, [
+  const itemDataset = { identity };
+  if (hasUrl) itemDataset.url = item.url;
+  const el = h("div", { class: "item" + (item.junk ? " junk" : ""), dataset: itemDataset }, [
     h("div", { class: "item-head" }, [thumb, info]),
     actions,
     slot,
   ]);
 
-  const copyBtn = h("button", {
+  const copyBtn = hasUrl ? h("button", {
     class: "btn ghost sm",
     text: "Copy URL",
     onClick: () => {
@@ -423,43 +500,65 @@ function renderItem(item) {
         setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
       });
     },
-  });
+  }) : null;
 
-  const cmdBtn = h("button", {
+  const cmdBtn = hasUrl ? h("button", {
     class: "btn ghost sm",
     title: "Copy a yt-dlp / ffmpeg / streamlink command",
     onClick: () => toggleCommandMenu(item, el),
-  }, [h("span", { class: "cmd", text: "⌘ cmd" })]);
+  }, [h("span", { class: "cmd", text: "⌘ cmd" })]) : null;
+
+  function appendUrlActions() {
+    if (!hasUrl) return;
+    actions.appendChild(cmdBtn);
+    actions.appendChild(copyBtn);
+  }
 
   function appendSaveAs(selection) {
+    // Managed rows open a persistent extension window: a toolbar popup is
+    // destroyed the moment the native folder dialog takes focus. Only opaque
+    // IDs cross — never a media or variant URL. Legacy rows keep the inline
+    // form, which this repair deliberately leaves alone.
+    const managed = typeof item.id === "string";
     actions.appendChild(h("button", {
       class: "btn ghost sm",
       text: "Save As…",
       title: "Edit filename and choose folder before downloading",
-      onClick: () => openSaveAsForm(item, el, selection || {}),
+      onClick: () => {
+        if (!managed) {
+          openSaveAsForm(item, el, selection || {});
+          return;
+        }
+        const chosen = selection || {};
+        send({
+          type: "open-save-as",
+          tabId: Number.isInteger(item.tabId) ? item.tabId : currentTabId,
+          mediaId: item.id,
+          variantId: typeof chosen.variantId === "string" ? chosen.variantId : null,
+        });
+      },
     }));
   }
 
   if (item.drm) {
     // DRM can't be saved by any downloader; be explicit and offer command/URL.
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
-    showLabel(el, "DRM-protected — can't be saved. Copy URL / command for reference only.", "error");
+    appendUrlActions();
+    showLabel(el, hasUrl
+      ? "DRM-protected — can't be saved. Copy URL / command for reference only."
+      : "DRM-protected — can't be saved.", "error");
   } else if ((kind === "hls" || kind === "dash") && item.variants && item.variants.length) {
     // Qualities shown inline (works for HLS masters and DASH).
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
       onClick: () => startDownload(item, el, {}) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
     slot.appendChild(renderQualities(item, el, item.variants));
     if (item.hasAudio) appendNote(slot, "Has separate audio — saved as 2 files; a merge command is provided on completion.");
   } else if ((kind === "hls" || kind === "dash") && item.enrichState === "loading") {
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
       onClick: () => handleDownload(item, el) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
     showLabel(el, "Reading qualities…", "");
   } else if (kind === "hls" && item.isMaster === false) {
     if (item.isLive) {
@@ -471,21 +570,18 @@ function renderItem(item) {
         onClick: () => handleDownload(item, el) }));
       appendSaveAs({});
     }
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
   } else if (kind === "dash") {
     actions.appendChild(h("button", { class: "btn amber", text: "Download",
       onClick: () => startDownload(item, el, {}) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
   } else if (kind === "youtube") {
     actions.appendChild(h("button", { class: "btn amber",
       text: item.height ? "Download " + item.height + "p" : "Download highest quality",
       onClick: () => startDownload(item, el, {}) }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
     if (item.enrichState === "loading") appendNote(slot, "Reading formats…");
     else if (item.ytFormats && item.ytFormats.length) slot.appendChild(renderYtQualities(item, el));
     else if (item.enrichState === "error") appendNote(slot, "Couldn't read formats — the highest-quality download still works.");
@@ -496,13 +592,12 @@ function renderItem(item) {
       onClick: () => handleDownload(item, el),
     }));
     appendSaveAs({});
-    actions.appendChild(cmdBtn);
-    actions.appendChild(copyBtn);
+    appendUrlActions();
   }
 
   // Cast: direct video files only for now — DLNA renderers play a plain URL,
   // while HLS/DASH manifests and YouTube pages need a remux/serve step (future).
-  if (castUiReady && kind === "direct" && !item.drm && !item.junk) {
+  if (hasUrl && castUiReady && kind === "direct" && !item.drm && !item.junk) {
     actions.appendChild(h("button", {
       class: "btn cast-btn",
       title: "Cast to a TV on your network",
@@ -510,7 +605,7 @@ function renderItem(item) {
     }, "Cast"));
   }
 
-  const existingId = itemDownloadId.get(item.url);
+  const existingId = itemDownloadId.get(identity);
   if (existingId && downloadState.has(existingId)) {
     renderProgress(el, downloadState.get(existingId));
   }
@@ -525,11 +620,14 @@ function appendNote(slot, text) {
 function renderQualities(item, el, variants) {
   const wrap = h("div", { class: "qualities" });
   for (const v of variants) {
+    const selection = typeof item.url === "string" && item.url
+      ? (v.uri ? { variantUrl: v.uri } : { variantId: v.id })
+      : { variantId: v.id };
     wrap.appendChild(
       h("button", {
         class: "q-btn",
         text: v.label,
-        onClick: () => startDownload(item, el, v.uri ? { variantUrl: v.uri } : { variantId: v.id }),
+        onClick: () => startDownload(item, el, selection),
       })
     );
   }
@@ -721,7 +819,9 @@ function openSaveAsForm(item, el, selection) {
         folderText.textContent = "Folder: " + resp.dir;
         setFeedback("", "");
       } else if (resp && resp.ok === false) {
-        setFeedback(resp.error || "Couldn't pick a folder.", "error");
+        setFeedback(resp.error === "folder_picker_timeout"
+          ? "The folder dialog timed out."
+          : "Couldn't pick a folder.", "error");
       }
       // Cancel / no-response: leave form and prior destination intact.
     } finally {
@@ -1601,11 +1701,14 @@ api.runtime.onMessage.addListener((msg) => {
   if (msg.type === "helper-status") {
     if (msg.helper) helperStatus = msg.helper;
     renderHelperBadge();
+  } else if (msg.type === "live-jobs-updated") {
+    applyLiveJobsUpdate(msg);
   } else if (msg.type === "download-update") {
     const dl = msg.download;
     downloadState.set(dl.id, dl);
-    if (dl.url) itemDownloadId.set(dl.url, dl.id);
-    const el = itemElements.get(dl.url);
+    const identity = downloadItemIdentity(dl);
+    if (identity) itemDownloadId.set(identity, dl.id);
+    const el = identity ? itemElements.get(identity) : null;
     if (el) renderProgress(el, dl);
     renderQueue();
   } else if (msg.type === "cast-update") {

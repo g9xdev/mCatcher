@@ -140,6 +140,14 @@
         var intent = input.intent;
         var source = input.source;
         var tokenStore = input.tokenStore;
+        var filenameOverride = input.filename;
+
+        if (
+          filenameOverride !== undefined &&
+          !isNonblankPrimitiveString(filenameOverride)
+        ) {
+          throw new TypeError("filename must be absent or a nonblank primitive string");
+        }
 
         // Structural source/effect checks before any proof consumption.
         var validated = validateSourceBeforeProof(
@@ -151,7 +159,10 @@
         // Consume one-time proof synchronously before any await or materialization.
         assertUserFirefoxIntent(intent, tokenStore);
 
-        var filename = intent.requestedFilename;
+        var filename =
+          filenameOverride === undefined
+            ? intent.requestedFilename
+            : filenameOverride;
         var url;
         var objectUrl = null;
         var shouldRevoke = false;

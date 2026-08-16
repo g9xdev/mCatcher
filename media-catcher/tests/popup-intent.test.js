@@ -495,6 +495,283 @@ function extractNamedFunction(source, name) {
   throw new Error("unbalanced braces for " + name);
 }
 
+function fakeClassList() {
+  const values = new Set();
+  return {
+    toggle(name, on) {
+      if (on) values.add(name);
+      else values.delete(name);
+    },
+    add(name) { values.add(name); },
+    contains(name) { return values.has(name); },
+    values() { return Array.from(values); },
+  };
+}
+
+test("popup layout mode never shares a class with the inner scroll container", () => {
+  const root = { classList: fakeClassList(), style: { width: "" } };
+  const sandbox = {
+    document: { documentElement: root },
+    localStorage: {
+      getItem(key) {
+        assert.equal(key, "mc-layout");
+        return JSON.stringify({ rail: true, w: 640, cast: false });
+      },
+    },
+    JSON,
+  };
+  const source = readPopupSource();
+  vm.runInNewContext(
+    extractNamedFunction(source, "primeLayout") + "\nthis.primeLayout = primeLayout;",
+    sandbox
+  );
+
+  sandbox.primeLayout();
+
+  const popupHtml = fs.readFileSync(path.join(mediaCatcherRoot, "popup", "popup.html"), "utf8");
+  const scrollTag = popupHtml.match(/<[^>]*\bid=["']rail["'][^>]*>/i);
+  assert.ok(scrollTag, "inner rail element exists");
+  const classAttr = scrollTag[0].match(/\bclass=["']([^"']*)["']/i);
+  assert.ok(classAttr, "inner rail element has a class");
+  const scrollClasses = new Set(classAttr[1].trim().split(/\s+/).filter(Boolean));
+  for (const modeClass of root.classList.values()) {
+    assert.equal(
+      scrollClasses.has(modeClass),
+      false,
+      "root layout mode must not turn the document into the inner scroll container"
+    );
+  }
+});
+
+function loadPopupRenderHarness() {
+  const source = readPopupSource();
+  const starts = [];
+  const progress = [];
+  function h(tag, props, children) {
+    const node = {
+      tag,
+      props: props || {},
+      children: [],
+      classList: { add() {} },
+      appendChild(child) { this.children.push(child); return child; },
+    };
+    const list = children == null ? [] : (Array.isArray(children) ? children : [children]);
+    for (const child of list) if (child != null) node.appendChild(child);
+    return node;
+  }
+  const listEl = {
+    children: [],
+    replaceChildren() { this.children = Array.from(arguments); },
+    appendChild(child) { this.children.push(child); return child; },
+  };
+  const sentMessages = [];
+  const sandbox = {
+    URL,
+    console,
+    send: (message) => { sentMessages.push(JSON.parse(JSON.stringify(message))); return Promise.resolve({ ok: true }); },
+    pageTitle: "",
+    currentTabId: 7,
+    castUiReady: true,
+    h,
+    humanSize: () => "",
+    showLabel: () => {},
+    appendNote: () => {},
+    handleDownload: () => {},
+    startRecording: () => {},
+    openSaveAsForm: () => {},
+    toggleCommandMenu: () => {},
+    openCastPicker: () => {},
+    startDownload: (item, el, selection) => starts.push({ item, el, selection }),
+    renderProgress: (el, download) => progress.push({ el, download }),
+    itemDownloadId: new Map(),
+    itemElements: new Map(),
+    downloadState: new Map(),
+    listEl,
+    footCount: { textContent: "" },
+    leftCountEl: { textContent: "" },
+    statusEl: { textContent: "" },
+    renderHelperBadge: () => {},
+  };
+  const pieces = [
+    "isSafeOpaqueId", "itemIdentity", "hostOf", "proposedFilenameOf", "displayNameOf", "fmtDuration",
+    "bitrateLabel", "mediaSizeLabel", "renderQualities", "renderItem", "render",
+  ].map((name) => extractNamedFunction(source, name));
+  vm.runInNewContext(pieces.join("\n") + "\nthis.render = render;", sandbox);
+  return { sandbox, starts, progress, listEl, sentMessages };
+}
+
+function popupNodes(root, predicate, out) {
+  out = out || [];
+  if (root && typeof root === "object") {
+    if (predicate(root)) out.push(root);
+    for (const child of root.children || []) popupNodes(child, predicate, out);
+  }
+  return out;
+}
+
+test("URL-free controller media renders by opaque identity without URL-only actions", () => {
+  const h = loadPopupRenderHarness();
+  const item = {
+    id: "media:m1:1",
+    kind: "hls",
+    proposedFilename: "episode.mp4",
+    variants: [{
+      id: "variant:v1:1",
+      label: "720p",
+      height: 720,
+      uri: "https://must-not-cross.example/playlist.m3u8",
+    }],
+  };
+
+  h.sandbox.render([item]);
+
+  const row = h.listEl.children[0];
+  assert.equal(h.sandbox.itemElements.get("id:media:m1:1"), row);
+  assert.equal(popupNodes(row, (node) => node.props.class === "name" && node.props.text === "episode.mp4").length, 1);
+  assert.equal(popupNodes(row, (node) => node.props.class === "chip type" && node.props.text === "HLS").length, 1);
+  const buttons = popupNodes(row, (node) => node.tag === "button");
+  const labels = buttons.map((button) => button.props.text || "");
+  assert.ok(labels.includes("Download"));
+  assert.ok(labels.includes("Save As…"));
+  assert.ok(labels.includes("720p"));
+  assert.equal(labels.includes("Copy URL"), false);
+  assert.equal(popupNodes(h.listEl.children[0], (node) => node.props.class === "cmd").length, 0);
+  assert.equal(popupNodes(h.listEl.children[0], (node) => /(?:^|\s)cast-btn(?:\s|$)/.test(node.props.class || "")).length, 0);
+
+  buttons.find((button) => button.props.text === "720p").props.onClick();
+  assert.equal(h.starts.length, 1);
+  assert.deepEqual(Object.keys(h.starts[0].selection), ["variantId"]);
+  assert.equal(h.starts[0].selection.variantId, "variant:v1:1");
+});
+
+test("download correlation prefers mediaId and preserves legacy URL fallback", () => {
+  const source = readPopupSource();
+  const sandbox = {};
+  vm.runInNewContext(
+    ["isSafeOpaqueId", "downloadItemIdentity"]
+      .map((name) => extractNamedFunction(source, name)).join("\n") +
+      "\nthis.downloadItemIdentity = downloadItemIdentity;",
+    sandbox
+  );
+  assert.equal(
+    sandbox.downloadItemIdentity({ mediaId: "media:m4:1", url: "https://secret.example/a" }),
+    "id:media:m4:1"
+  );
+  assert.equal(
+    sandbox.downloadItemIdentity({ url: "https://cdn.example/legacy.mp4" }),
+    "url:https://cdn.example/legacy.mp4"
+  );
+  assert.equal(sandbox.downloadItemIdentity({}), null);
+});
+
+test("URL-free direct controller media never offers cast or URL-derived actions", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:m2:1",
+    kind: "direct",
+    proposedFilename: "clip.mp4",
+  }]);
+
+  const row = h.listEl.children[0];
+  const buttonText = popupNodes(row, (node) => node.tag === "button")
+    .map((button) => button.props.text || "");
+  assert.ok(buttonText.includes("Download"));
+  assert.ok(buttonText.includes("Save As…"));
+  assert.equal(buttonText.includes("Copy URL"), false);
+  assert.equal(popupNodes(row, (node) => node.props.class === "cmd").length, 0);
+  assert.equal(popupNodes(row, (node) => /(?:^|\s)cast-btn(?:\s|$)/.test(node.props.class || "")).length, 0);
+});
+
+test("legacy URL media keeps URL identity and URL-derived controls", () => {
+  const h = loadPopupRenderHarness();
+  const url = "https://cdn.example/legacy.mp4";
+  h.sandbox.render([{
+    id: "https://not-an-opaque-id.example/",
+    url,
+    kind: "direct",
+    proposedFilename: "legacy.mp4",
+  }]);
+
+  const row = h.listEl.children[0];
+  assert.equal(h.sandbox.itemElements.get("url:" + url), row);
+  const buttonText = popupNodes(row, (node) => node.tag === "button")
+    .map((button) => button.props.text || "");
+  assert.ok(buttonText.includes("Download"));
+  assert.ok(buttonText.includes("Save As…"));
+  assert.ok(buttonText.includes("Copy URL"));
+  assert.equal(popupNodes(row, (node) => node.props.class === "cmd").length, 1);
+  assert.equal(popupNodes(row, (node) => /(?:^|\s)cast-btn(?:\s|$)/.test(node.props.class || "")).length, 1);
+});
+
+test("controller media progress binds by mediaId identity", () => {
+  const h = loadPopupRenderHarness();
+  const download = { id: "job:j1:1", mediaId: "media:m3:1", state: "running" };
+  h.sandbox.itemDownloadId.set("id:" + download.mediaId, download.id);
+  h.sandbox.downloadState.set(download.id, download);
+
+  h.sandbox.render([{
+    id: download.mediaId,
+    kind: "direct",
+    proposedFilename: "bound.mp4",
+  }]);
+
+  assert.equal(h.progress.length, 1);
+  assert.equal(h.progress[0].download, download);
+  assert.equal(h.progress[0].el, h.listEl.children[0]);
+});
+
+test("live-jobs-updated refreshes opaque queue and row progress while ignoring malformed jobs", () => {
+  const source = readPopupSource();
+  const row = { id: "url-free-row" };
+  const progress = [];
+  let queueRenders = 0;
+  const sandbox = {
+    downloadState: new Map([
+      ["job:old:1", { id: "job:old:1", mediaId: "media:old:1", state: "running" }],
+      [77, { id: 77, url: "https://cdn.example/legacy.mp4", status: "downloading" }],
+    ]),
+    itemDownloadId: new Map([["id:media:old:1", "job:old:1"]]),
+    itemElements: new Map([["id:media:m5:1", row]]),
+    renderProgress: (el, download) => progress.push({ el, download }),
+    renderQueue: () => { queueRenders += 1; },
+  };
+  const pieces = ["isSafeOpaqueId", "applyLiveJobsUpdate"]
+    .map((name) => extractNamedFunction(source, name));
+  vm.runInNewContext(
+    pieces.join("\n") + "\nthis.applyLiveJobsUpdate = applyLiveJobsUpdate;",
+    sandbox
+  );
+  const hostile = {};
+  Object.defineProperty(hostile, "id", { get() { throw new Error("hostile getter"); } });
+  const liveJob = {
+    id: "job:j5:1",
+    mediaId: "media:m5:1",
+    state: "running",
+    requestedFilename: "episode.mp4",
+  };
+
+  assert.doesNotThrow(() => sandbox.applyLiveJobsUpdate({
+    type: "live-jobs-updated",
+    jobs: [
+      null,
+      42,
+      {},
+      { id: "https://unsafe.example/job", mediaId: "media:m5:1" },
+      { id: "job:missing-media:1" },
+      hostile,
+      liveJob,
+    ],
+  }));
+
+  assert.equal(sandbox.downloadState.has("job:old:1"), false);
+  assert.equal(sandbox.downloadState.get(77).status, "downloading", "legacy queue entry stays intact");
+  assert.equal(sandbox.downloadState.get(liveJob.id), liveJob);
+  assert.equal(sandbox.itemDownloadId.has("id:media:old:1"), false);
+  assert.equal(sandbox.itemDownloadId.get("id:media:m5:1"), liveJob.id);
+  assert.deepEqual(progress, [{ el: row, download: liveJob }]);
+  assert.equal(queueRenders, 1);
+});
+
 function loadStartDownload(deps) {
   const src = extractNamedFunction(readPopupSource(), "startDownload");
   const sandbox = Object.assign(
@@ -883,4 +1160,154 @@ test("Use Firefox disables before send; two sync clicks produce one send/token; 
   const errEl = card2.children[1];
   assert.ok(errEl);
   assert.match(String(errEl.textContent), /handoff refused/);
+});
+
+// ---------------------------------------------------------------------------
+// Visible size text on opaque rows (Task 2)
+// ---------------------------------------------------------------------------
+
+function sizeRenderHarness() {
+  const h = loadPopupRenderHarness();
+  h.sandbox.McMediaSize = loadLib("lib/media-size.js");
+  h.sandbox.humanSize = function humanSize(bytes) {
+    if (!bytes) return "";
+    const u = ["B", "KB", "MB", "GB"];
+    let i = 0, n = bytes;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
+  };
+  const source = readPopupSource();
+  vm.runInContext(
+    extractNamedFunction(source, "mediaSizeLabel") + "\nthis.mediaSizeLabel = mediaSizeLabel;",
+    h.sandbox
+  );
+  return h;
+}
+
+function cardText(node) {
+  return popupNodes(node, () => true)
+    .map((child) => (child.props && typeof child.props.text === "string" ? child.props.text : ""))
+    .join(" ");
+}
+
+test("opaque rows visibly state exact, estimated, or unknown size", () => {
+  const h = sizeRenderHarness();
+  h.sandbox.render([
+    { id: "media:s1:1", kind: "direct", proposedFilename: "exact.mp4",
+      sizeBytes: 1395864371, sizeConfidence: "exact" },
+    { id: "media:s2:1", kind: "direct", proposedFilename: "estimated.mp4",
+      sizeBytes: 1395864371, sizeConfidence: "estimated" },
+    { id: "media:s3:1", kind: "direct", proposedFilename: "unknown.mp4" },
+  ]);
+
+  const [exactCard, estimatedCard, unknownCard] = h.listEl.children.map(cardText);
+  assert.match(exactCard, /1\.3 GB/);
+  assert.doesNotMatch(exactCard, /Est\./);
+  assert.match(estimatedCard, /Est\. 1\.3 GB/);
+  assert.match(unknownCard, /Size unknown/);
+});
+
+test("an unvalidated item.size can never relabel an opaque row as exact", () => {
+  const h = sizeRenderHarness();
+  // Hostile/legacy scalars on a managed row must not become a visible total.
+  h.sandbox.render([
+    { id: "media:s4:1", kind: "direct", proposedFilename: "spoof.mp4", size: 1395864371 },
+    { id: "media:s5:1", kind: "direct", proposedFilename: "junk.mp4",
+      size: 999, sizeBytes: "1395864371", sizeConfidence: "exact" },
+    { id: "media:s6:1", kind: "direct", proposedFilename: "bogus.mp4",
+      sizeBytes: 1024, sizeConfidence: "guessed" },
+  ]);
+
+  for (const text of h.listEl.children.map(cardText)) {
+    assert.match(text, /Size unknown/);
+    assert.doesNotMatch(text, /1\.3 GB/);
+  }
+});
+
+test("legacy non-opaque rows keep their existing exact transfer size text", () => {
+  const h = sizeRenderHarness();
+  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4", size: 1024 }), "1.0 KB");
+  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4" }), "");
+  assert.equal(h.sandbox.mediaSizeLabel({ id: "media:s7:1" }), "Size unknown");
+  assert.equal(
+    h.sandbox.mediaSizeLabel({ id: "media:s8:1", sizeBytes: 1024, sizeConfidence: "estimated" }),
+    "Est. 1.0 KB"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Managed Save As launches a persistent window (Task 3)
+// ---------------------------------------------------------------------------
+
+function clickSaveAs(h, row) {
+  const button = popupNodes(row, (node) => node.tag === "button" && node.props.text === "Save As…")[0];
+  assert.ok(button, "row must offer Save As…");
+  button.props.onClick();
+  return button;
+}
+
+test("managed Save As asks background to open a persistent opaque window", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:opaque:1",
+    tabId: 7,
+    kind: "direct",
+    proposedFilename: "11474-makemebi.net.mp4",
+  }]);
+  clickSaveAs(h, h.listEl.children[0]);
+
+  assert.deepEqual(h.sentMessages.at(-1), {
+    type: "open-save-as",
+    tabId: 7,
+    mediaId: "media:opaque:1",
+    variantId: null,
+  });
+  assert.equal(h.sentMessages.length, 1);
+});
+
+test("a managed variant selection travels as an opaque variant ID only", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:opaque:2",
+    tabId: 9,
+    kind: "hls",
+    proposedFilename: "episode.mp4",
+    variants: [{
+      id: "variant:opaque:1",
+      label: "1080p",
+      height: 1080,
+      uri: "https://must-not-cross.example/SIGNED_URL_SENTINEL.m3u8",
+    }],
+  }]);
+  clickSaveAs(h, h.listEl.children[0]);
+
+  const sent = h.sentMessages.at(-1);
+  assert.equal(sent.type, "open-save-as");
+  assert.equal(sent.mediaId, "media:opaque:2");
+  assert.equal(sent.tabId, 9);
+  assert.equal(Object.prototype.hasOwnProperty.call(sent, "variantUrl"), false);
+  assert.equal(JSON.stringify(h.sentMessages).includes("SIGNED_URL_SENTINEL"), false);
+});
+
+test("a managed row without its own tabId falls back to the current tab", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.currentTabId = 7;
+  h.sandbox.render([{ id: "media:opaque:3", kind: "direct", proposedFilename: "clip.mp4" }]);
+  clickSaveAs(h, h.listEl.children[0]);
+  assert.equal(h.sentMessages.at(-1).tabId, 7);
+});
+
+test("non-opaque legacy rows keep the inline form and never serialize a URL", () => {
+  const h = loadPopupRenderHarness();
+  const openings = [];
+  h.sandbox.openSaveAsForm = (item) => openings.push(item);
+  h.sandbox.render([{
+    url: "https://cdn.example/legacy.mp4?token=SIGNED_URL_SENTINEL",
+    kind: "direct",
+    name: "legacy.mp4",
+  }]);
+  clickSaveAs(h, h.listEl.children[0]);
+
+  assert.equal(openings.length, 1, "legacy rows keep their existing inline path");
+  assert.equal(h.sentMessages.length, 0, "no open-save-as message for a legacy row");
 });

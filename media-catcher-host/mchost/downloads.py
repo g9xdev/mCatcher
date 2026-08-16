@@ -280,9 +280,31 @@ def _codec_args(codec, encoder, quality):
     return ["-c:v", "libx265", "-crf", str(q), "-preset", "slow"]
 
 def _safe_kill(p):
+    """Kill p AND its descendants.
+
+    yt-dlp's PyInstaller onefile build is a launcher that re-execs the real
+    program as a CHILD, and that grandchild inherits our stdout pipe. Killing
+    only the launcher orphans it: the pipe never closes, so `for line in
+    p.stdout` never ends, p.wait() is never reached, and the job hangs on
+    "Preparing" forever with no terminal message — the stall watchdog fires and
+    is then unable to report. taskkill /T takes the whole tree; the direct
+    p.kill() below still covers the non-Windows and taskkill-unavailable cases.
+    """
     try:
-        if p and p.poll() is None:
-            p.kill()
+        if not p or p.poll() is not None:
+            return
+    except Exception:
+        return
+    if os.name == "nt":
+        try:
+            cf, si = _no_window()
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=cf, startupinfo=si, timeout=15)
+        except Exception:
+            pass
+    try:
+        p.kill()
     except Exception:
         pass
 
@@ -530,39 +552,117 @@ def _ask_save_path(default_dir, default_name):
     return ""
 
 
-def _ask_folder(default_dir):
-    """Native Win32 folder picker (shell32, no tkinter). Returns "" on cancel."""
-    try:
+class _WinFolderApi:
+    """Narrow Win32 shell adapter so picker policy stays testable off-Windows."""
+
+    def foreground_window(self):
+        import ctypes
+        return ctypes.windll.user32.GetForegroundWindow()
+
+    def browse(self, owner, initial_dir):
+        """Show the folder dialog owned by `owner`, opened at `initial_dir`.
+
+        Returns the selected path, or None when the user cancelled. Raises on a
+        genuine shell failure so the caller can tell the two apart.
+        """
         import ctypes
         from ctypes import wintypes
-        try: ctypes.windll.ole32.CoInitialize(None)
-        except Exception: pass
 
-        class BROWSEINFO(ctypes.Structure):
-            _fields_ = [
-                ("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
-                ("pszDisplayName", wintypes.LPWSTR), ("lpszTitle", wintypes.LPCWSTR),
-                ("ulFlags", wintypes.UINT), ("lpfn", ctypes.c_void_p),
-                ("lParam", ctypes.c_void_p), ("iImage", ctypes.c_int),
-            ]
-        disp = ctypes.create_unicode_buffer(260)
-        bi = BROWSEINFO()
-        bi.pszDisplayName = ctypes.cast(disp, wintypes.LPWSTR)
-        bi.lpszTitle = "Select a folder"
-        bi.ulFlags = 0x1 | 0x40   # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
-        shell32 = ctypes.windll.shell32
-        shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
-        pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
-        if not pidl:
-            return ""
-        path = ctypes.create_unicode_buffer(260)
-        shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), path)
-        try: ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
-        except Exception: pass
-        return path.value or ""
+        BFFM_INITIALIZED = 1
+        BFFM_SETSELECTIONW = 0x467
+        MAX_PATH = 260
+
+        co_ok = False
+        try:
+            ctypes.windll.ole32.CoInitialize(None)
+            co_ok = True
+        except Exception:
+            co_ok = False
+        try:
+            class BROWSEINFO(ctypes.Structure):
+                _fields_ = [
+                    ("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
+                    ("pszDisplayName", wintypes.LPWSTR), ("lpszTitle", wintypes.LPCWSTR),
+                    ("ulFlags", wintypes.UINT), ("lpfn", ctypes.c_void_p),
+                    ("lParam", ctypes.c_void_p), ("iImage", ctypes.c_int),
+                ]
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+
+            # Preselect the caller's directory and pull the dialog to the front
+            # once it exists — otherwise it can open behind the browser.
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.c_int, wintypes.HWND, wintypes.UINT,
+                ctypes.c_void_p, ctypes.c_void_p)
+            selection = ctypes.create_unicode_buffer(initial_dir or "")
+
+            def _on_message(hwnd, message, _lparam, _data):
+                if message == BFFM_INITIALIZED:
+                    try:
+                        user32.SendMessageW(hwnd, BFFM_SETSELECTIONW, 1,
+                                            ctypes.cast(selection, ctypes.c_void_p))
+                        user32.SetForegroundWindow(hwnd)
+                    except Exception:
+                        pass
+                return 0
+
+            # Keep the callback and buffers alive for the dialog's whole life.
+            callback = callback_type(_on_message)
+            display = ctypes.create_unicode_buffer(MAX_PATH)
+
+            info = BROWSEINFO()
+            info.hwndOwner = owner
+            info.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
+            info.lpszTitle = "Select a folder"
+            info.ulFlags = 0x1 | 0x40   # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+            info.lpfn = ctypes.cast(callback, ctypes.c_void_p)
+
+            shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+            pidl = shell32.SHBrowseForFolderW(ctypes.byref(info))
+            if not pidl:
+                return None                      # user cancelled
+            try:
+                path = ctypes.create_unicode_buffer(MAX_PATH)
+                if not shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), path):
+                    raise OSError("SHGetPathFromIDListW failed")
+                return path.value
+            finally:
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+                except Exception:
+                    pass
+        finally:
+            if co_ok:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+
+def _ask_folder(default_dir, api=None):
+    """Foreground-owned folder picker with three distinct outcomes.
+
+    Cancellation and failure used to be indistinguishable (both ""), so the
+    extension could not tell "user changed their mind" from "picker broke".
+    Never logs `default_dir` or the selected path.
+    """
+    api = api or _WinFolderApi()
+    try:
+        owner = api.foreground_window()
     except Exception:
-        pass
-    return ""
+        return {"status": "error", "code": "picker_unavailable"}
+    if not owner:
+        return {"status": "error", "code": "picker_unavailable"}
+    try:
+        selected = api.browse(owner, default_dir)
+    except Exception:
+        return {"status": "error", "code": "picker_unavailable"}
+    if selected is None:
+        return {"status": "cancelled"}
+    if not isinstance(selected, str) or not selected or not os.path.isdir(selected):
+        return {"status": "error", "code": "invalid_selection"}
+    return {"status": "selected", "directory": selected}
 
 
 def handle_save(req):
@@ -612,10 +712,34 @@ def handle_save_as(req):
 
 
 def handle_pick_folder(req):
-    """Native folder picker for the settings page. Replies {type:folder,dir}."""
+    """Native folder picker. Replies with exactly one terminal folder frame:
+    {type:folder,requestId,status:selected,directory} | {...,status:cancelled} |
+    {...,status:error,code:picker_unavailable|invalid_selection}.
+    """
+    request_id = req.get("requestId")
+    if request_id is None:
+        request_id = req.get("reqId")          # legacy settings-page callers
+    default_dir = req.get("dir") or _h().downloads_dir()
+
     def worker():
-        d = _ask_folder(req.get("dir") or _h().downloads_dir())
-        _h().send({"type": "folder", "reqId": req.get("reqId"), "dir": d or ""})
+        try:
+            outcome = _ask_folder(default_dir)
+        except Exception:
+            outcome = {"status": "error", "code": "picker_unavailable"}
+        # Allowlist-copy: never echo anything else the picker returned.
+        frame = {"type": "folder", "requestId": request_id}
+        status = outcome.get("status") if isinstance(outcome, dict) else None
+        if status == "selected":
+            frame["status"] = "selected"
+            frame["directory"] = outcome.get("directory")
+        elif status == "cancelled":
+            frame["status"] = "cancelled"
+        else:
+            frame["status"] = "error"
+            code = outcome.get("code") if isinstance(outcome, dict) else None
+            frame["code"] = code if code in ("picker_unavailable", "invalid_selection") \
+                else "picker_unavailable"
+        _h().send(frame)
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -749,24 +873,45 @@ def ytdlp_update():
 def ensure_ytdlp():
     """Return a path to yt-dlp, fetching the official release into HERE if it's missing.
     Lets auto-updated installs (which don't ship the binary) get YouTube without a
-    manual installer re-run."""
+    manual installer re-run.
+
+    Fetches the DIRECTORY build (yt-dlp_win.zip: yt-dlp.exe + _internal/), never
+    the onefile exe. The onefile launcher re-extracts ~145 files to %TEMP% on
+    EVERY launch; under a browser-descended process each extraction is rescanned,
+    which stalled host-spawned yt-dlp for ~90s during DLL load while the same
+    command from a shell started in about a second. The directory build extracts
+    nothing and starts in ~0.4s.
+    """
     global YTDLP
     if YTDLP:
         return YTDLP
     if os.name != "nt":
         return None
-    dest = os.path.join(_h().HERE, "yt-dlp.exe")
+    here = _h().HERE
+    dest = os.path.join(here, "yt-dlp.exe")
     try:
-        import urllib.request
+        import urllib.request, zipfile, io
         _h()._hlog("info", "fetching yt-dlp (first YouTube use)…")
-        tmp = dest + ".part"
-        req = urllib.request.Request("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
-                                     headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
-        with urllib.request.urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
-            shutil.copyfileobj(r, f)
-        os.replace(tmp, dest)
+        req = urllib.request.Request(
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip",
+            headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            blob = r.read()
+        with zipfile.ZipFile(io.BytesIO(blob)) as z:
+            for name in z.namelist():
+                rel = name.replace("\\", "/").lstrip("/")
+                # Refuse absolute/traversing members: this unpacks into the host
+                # directory, so a crafted archive must not reach outside it.
+                if not rel or rel.endswith("/") or ".." in rel.split("/"):
+                    continue
+                out = os.path.join(here, *rel.split("/"))
+                os.makedirs(os.path.dirname(out) or here, exist_ok=True)
+                with z.open(name) as src, open(out, "wb") as f:
+                    shutil.copyfileobj(src, f)
+        if not os.path.isfile(dest):
+            raise RuntimeError("yt-dlp.exe missing from archive")
         YTDLP = dest
-        _h()._hlog("info", "yt-dlp installed")
+        _h()._hlog("info", "yt-dlp installed (directory build)")
         return YTDLP
     except Exception as e:
         _h()._hlog("error", "yt-dlp download failed: %s" % e)
@@ -875,6 +1020,8 @@ def _yt_stage_note(s):
     """A yt-dlp status line → a short 'what it's doing now' label for the pre-download
     phase (cookies/player/n-challenge/format pick), so the bar isn't a dead 0%."""
     low = s.lower()
+    if "cookies from" in low:
+        return "Reading cookies"
     if "downloading webpage" in low:
         return "Reading page"
     if "player" in low and "download" in low:
@@ -885,7 +1032,7 @@ def _yt_stage_note(s):
         return "Solving JS challenge"
     if s.startswith("[info]") and "format" in low:
         return "Choosing format"
-    if s.startswith("[download] destination"):
+    if low.startswith("[download] destination"):   # yt-dlp capitalises "Destination"
         return "Starting download"
     if "m3u8" in low and "download" in low:
         return "Reading streams"
@@ -946,19 +1093,43 @@ def handle_ytmeta(req):
             cmd += ["--js-runtimes", "deno:%s" % deno]
         cmd += [url]
         cf, si = _no_window()
+        # Popen + explicit tree kill, NOT subprocess.run(timeout=...): yt-dlp's
+        # onefile launcher re-execs the real program as a child that inherits
+        # these pipes, so run()'s timeout path kills only the launcher and then
+        # blocks in its cleanup communicate(), waiting on a pipe the surviving
+        # grandchild still holds. The popup then sits on "Reading formats…"
+        # forever and the grandchild is orphaned. Kept under the extension's 60s
+        # wait so a completed probe is never orphaned the other way.
+        p = None
         try:
-            # Kept under the extension's 60s wait so a completed probe is never orphaned.
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               creationflags=cf, startupinfo=si, timeout=45)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=cf, startupinfo=si)
+            try:
+                out, err = p.communicate(timeout=_YTMETA_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _safe_kill(p)                      # whole tree, else the pipe stays open
+                try:
+                    out, err = p.communicate(timeout=15)
+                except Exception:
+                    out, err = b"", b""
+                _h()._hlog("warn", "yt-dlp -J: no answer in %ds for %s — stopped%s"
+                           % (_YTMETA_TIMEOUT, url,
+                              ("; last output:\n" + (err or b"").decode("utf-8", "replace")[-2000:])
+                              if err else ""))
+                _h().send({"type": "ytmeta", "reqId": reqid, "ok": False,
+                           "error": "Timed out reading formats after %ds. The log console "
+                                    "has yt-dlp's last output." % _YTMETA_TIMEOUT})
+                return
         except Exception as e:
+            _safe_kill(p)
             _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": str(e)})
             return
-        if r.returncode != 0 or not r.stdout:
-            _reason, emsg = _map_yt_error((r.stderr or b"").decode("utf-8", "replace"))
+        if p.returncode != 0 or not out:
+            _reason, emsg = _map_yt_error((err or b"").decode("utf-8", "replace"))
             _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": emsg})
             return
         try:
-            info = json.loads(r.stdout.decode("utf-8", "replace"))
+            info = json.loads(out.decode("utf-8", "replace"))
         except Exception as e:
             _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "parse: %s" % e})
             return
@@ -2522,13 +2693,82 @@ def _ytdl_cleanup_stage_tree(stage_handle):
 
 
 
+# Seconds of TOTAL silence from yt-dlp while still resolving before we call the
+# job stuck. Resolution normally takes 2-5s, so this is deliberately generous —
+# it only has to beat "forever", and it is disarmed once bytes start flowing.
+_YTDL_RESOLVE_STALL = 90
+
+# Bound on the -J metadata probe. Kept under the extension's 60s wait so a
+# completed probe is never orphaned by the caller giving up first.
+_YTMETA_TIMEOUT = 45
+
+
+class _StallWatch:
+    """Kills a yt-dlp that goes completely silent while still resolving.
+
+    A dropped (not refused) packet leaves yt-dlp blocked in a socket read that
+    never returns, emitting nothing — the row then sits on "Preparing" forever
+    with nothing to time out against. Armed only until the first real progress
+    line: once bytes flow, a long download or a slow merge is healthy and must
+    never be killed. Both yt-dlp reader loops share this.
+    """
+
+    def __init__(self, proc):
+        self.stalled = threading.Event()
+        self._proc = proc
+        self._downloading = threading.Event()
+        self._done = threading.Event()
+        self._ts = time.time()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def touch(self):
+        """Any output at all counts as liveness."""
+        self._ts = time.time()
+
+    def downloading(self):
+        """First parsed progress line — disarm for the rest of the job."""
+        self._downloading.set()
+
+    def finish(self):
+        """Reader loop is done; release the watchdog thread."""
+        self._done.set()
+
+    def _run(self):
+        while not self._done.wait(2.0):
+            if self._downloading.is_set():
+                return
+            if time.time() - self._ts > _YTDL_RESOLVE_STALL:
+                self.stalled.set()
+                _safe_kill(self._proc)      # unblocks the reader loop
+                return
+
+
 def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
     cmd = [ytdlp, "--no-playlist", "--no-mtime", "--newline", "--progress", "--no-warnings",
            "--force-overwrites",
            "-f", fmt, "--merge-output-format", "mp4",
            "--cookies-from-browser", "firefox",
            "-o", outtmpl,
-           # --print puts yt-dlp in quiet mode; --progress above forces the bar back on.
+           # A dropped (not refused) packet leaves a socket read blocked forever.
+           # Bound every read so yt-dlp surfaces an error instead of hanging.
+           "--socket-timeout", "30",
+           # yt-dlp otherwise picks its stdout encoding from the locale (cp1252
+           # here) and writes the @@FILE@@ path through it, destroying anything
+           # outside that codepage BEFORE we read it: the fullwidth quotes it
+           # substitutes for '"' vanished and the em dash became '?', so
+           # os.path.isfile missed a finished download and reported failure.
+           # Must stay paired with the encoding="utf-8" read below.
+           "--encoding", "utf-8",
+           # ASCII-only saved names: portable across filesystems and tooling, and
+           # free of the fullwidth quotes yt-dlp substitutes for '"'. NOT a
+           # substitute for --encoding above — that fixes the corruption of the
+           # path yt-dlp reports back, which would still bite any title this
+           # happens not to flatten. Both are required.
+           "--restrict-filenames",
+           # --print puts yt-dlp in QUIET mode, which suppresses the very status
+           # lines _yt_stage_note parses (so the bar sat on "Preparing" all the
+           # way through). --no-quiet keeps them; --print still emits @@FILE@@.
+           "--no-quiet",
            "--print", "after_move:@@FILE@@ %(filepath)s"]
     if _h().FFMPEG:
         cmd += ["--ffmpeg-location", os.path.dirname(_h().FFMPEG)]
@@ -2837,6 +3077,13 @@ def _handle_ytdl_structured(req):
                     p = subprocess.Popen(
                         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                        # yt-dlp emits UTF-8. A bare text=True decodes as the
+                        # locale codepage (cp1252 here), which mojibakes any
+                        # non-ASCII @@FILE@@ path -- yt-dlp substitutes fullwidth
+                        # quotes (U+FF02) for '"' -- so os.path.isfile missed a
+                        # file that was really there and a finished download was
+                        # reported as a generic failure.
+                        encoding="utf-8", errors="replace",
                     )
                 except Exception:
                     if cancelled():
@@ -2856,8 +3103,10 @@ def _handle_ytdl_structured(req):
                 last_pct = -1.0
                 last_note = ""
                 last_note_ts = 0.0
+                watch = _StallWatch(p)
                 try:
                     for line in p.stdout:
+                        watch.touch()
                         if cancelled():
                             break
                         raw = line if isinstance(line, str) else str(line)
@@ -2877,6 +3126,7 @@ def _handle_ytdl_structured(req):
                         if s.startswith("[download]"):
                             prog = _parse_yt_progress(s)
                             if prog:
+                                watch.downloading()
                                 pct = prog.get("pct", 0.0)
                                 if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
                                     last_pct = pct
@@ -2893,6 +3143,7 @@ def _handle_ytdl_structured(req):
                                 last_note = note
                                 last_note_ts = now
                                 progress_msg(pct=0, stage="resolving", note=note)
+                    watch.finish()
                     p.wait()
                 except Exception:
                     if cancelled():
@@ -2900,9 +3151,22 @@ def _handle_ytdl_structured(req):
                         return
                     emit_error("permanent", "Download failed.")
                     return
+                finally:
+                    watch.finish()      # idempotent; also covers the exception path
 
                 if cancelled():
                     emit_error("cancelled", "Cancelled.")
+                    return
+                if watch.stalled.is_set():
+                    # Report what was observed, not a guessed cause. This has had
+                    # several: a firewall dropping packets, two jobs racing on one
+                    # output path, and per-launch re-extraction being rescanned.
+                    # Naming one of them sent people to check a firewall that was
+                    # switched off.
+                    emit_error("stalled",
+                               "yt-dlp stopped responding while preparing the download "
+                               "(no output for %ds) and was stopped. Its last output is "
+                               "in the log console." % _YTDL_RESOLVE_STALL)
                     return
 
                 if p.returncode == 0:
@@ -3023,7 +3287,9 @@ def _handle_ytdl_structured(req):
                 reason, msg = _map_yt_error("\n".join(errbuf))
                 _h()._hlog(
                     "error",
-                    "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]),
+                    # 500 chars cut the output mid-line and hid the real error
+                    # during diagnosis; still bounded, but wide enough to carry it.
+                    "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-12:]))[:2000]),
                 )
                 emit_error(reason, msg)
             except Exception:
@@ -3102,7 +3368,11 @@ def _handle_ytdl_legacy(req):
         cf, si = _no_window()
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 creationflags=cf, startupinfo=si, text=True, bufsize=1)
+                                 creationflags=cf, startupinfo=si, text=True, bufsize=1,
+                                 # See the structured path: yt-dlp emits UTF-8, and
+                                 # decoding it as the locale codepage mojibakes the
+                                 # @@FILE@@ path, failing an already-finished job.
+                                 encoding="utf-8", errors="replace")
         except Exception as e:
             _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return
@@ -3124,8 +3394,10 @@ def _handle_ytdl_legacy(req):
         last_pct = -1.0
         last_note = ""
         last_note_ts = 0.0
+        watch = _StallWatch(p)
         try:
             for line in p.stdout:
+                watch.touch()
                 s = line.strip() if isinstance(line, str) else str(line).strip()
                 if not s:
                     continue
@@ -3135,6 +3407,7 @@ def _handle_ytdl_legacy(req):
                 if s.startswith("[download]"):
                     prog = _parse_yt_progress(s)
                     if prog:
+                        watch.downloading()
                         pct = prog.get("pct", 0.0)
                         # throttle to ~1% steps; resend on a reset (audio stream starts after video)
                         if pct < last_pct or pct - last_pct >= 1.0 or pct >= 100.0:
@@ -3153,10 +3426,23 @@ def _handle_ytdl_legacy(req):
                         last_note = note
                         last_note_ts = now
                         _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": note})
+            watch.finish()
             p.wait()
             if op.get("cancel_requested"):
                 _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled",
                            "error": "Cancelled."})
+            elif watch.stalled.is_set():
+                # Log whatever it DID say before going quiet — the user-facing
+                # message points here, so the tail has to actually be present.
+                _h()._hlog("error", "yt-dlp: no response for %ds while resolving %s — killed%s"
+                           % (_YTDL_RESOLVE_STALL, url,
+                              ("; last output:\n" + "\n".join(errbuf[-12:])[:2000])
+                              if errbuf else " (it produced no output at all)"))
+                # Observation, not a guessed cause — see the structured path.
+                _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                           "error": "yt-dlp stopped responding while preparing the download "
+                                    "(no output for %ds) and was stopped. Its last output is "
+                                    "in the log console." % _YTDL_RESOLVE_STALL})
             elif p.returncode == 0 and filepath and os.path.isfile(filepath):
                 try:
                     size = os.path.getsize(filepath)
@@ -3170,9 +3456,11 @@ def _handle_ytdl_legacy(req):
                     _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             else:
                 reason, msg = _map_yt_error("\n".join(errbuf))
-                _h()._hlog("error", "yt-dlp failed (%s): %s" % (reason, ("\n".join(errbuf[-6:]))[:500]))
+                _h()._hlog("error", "yt-dlp failed (%s): %s"
+                           % (reason, ("\n".join(errbuf[-12:]))[:2000]))
                 _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         finally:
+            watch.finish()          # idempotent; also covers the exception path
             _pget_unregister(jid, op)
     threading.Thread(target=worker, daemon=True).start()
 
@@ -3406,6 +3694,104 @@ def _pget_close_resp(resp):
             resp.close()
     except Exception:
         pass
+
+
+# How long a stalled body read waits before re-checking cancellation.
+_PGET_CANCEL_POLL = 0.25
+
+
+def _pget_response_socket(resp):
+    """The live socket behind an HTTPResponse, or None when unavailable.
+
+    Used ONLY to wait for readability. Never call settimeout() on it: SocketIO
+    latches _timeout_occurred on the first timeout and every later read raises
+    "cannot read from timed out object", which would break the transfer.
+    """
+    import socket as _socket
+    try:
+        raw = getattr(getattr(resp, "fp", None), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if not isinstance(sock, _socket.socket):
+            return None
+        if sock.fileno() < 0:
+            return None
+        return sock
+    except Exception:
+        return None
+
+
+def _pget_response_has_buffered(resp):
+    """True when the response already holds bytes select() cannot see.
+
+    Covers the BufferedReader's own buffer and any decrypted-but-unread TLS
+    bytes. Best-effort: a False here only costs one poll slice.
+    """
+    try:
+        fp = getattr(resp, "fp", None)
+        buf = getattr(fp, "_read_buf", None)
+        pos = getattr(fp, "_read_pos", None)
+        if buf is not None and pos is not None and (len(buf) - pos) > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+        pending = getattr(sock, "pending", None)
+        if callable(pending) and pending() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class _PgetReader:
+    """Chunk reader that lets a stalled transfer still observe cancellation.
+
+    A plain resp.read() parks inside recv until the server sends more, so a
+    cancel could go unnoticed for as long as the server stalled (bounded only
+    by the socket timeout). On Windows neither closing the response nor
+    shutting the socket down wakes that parked read, so instead of trying to
+    interrupt it we never enter it blind: wait for readability in short slices,
+    checking cancellation between them, and only read once data is there.
+
+    Falls back to a plain blocking read whenever the socket handle is
+    unavailable — notably at EOF, where http.client has already closed the
+    connection — so behaviour is never worse than before.
+    """
+
+    def __init__(self, resp, idle_budget):
+        self._resp = resp
+        self._sock = _pget_response_socket(resp)
+        self._idle = 0.0
+        self._budget = idle_budget if idle_budget and idle_budget > 0 else 30.0
+
+    def read(self, size, cancelled):
+        """Up to `size` bytes; b"" at EOF.
+
+        Raises _PgetError("cancelled") as soon as `cancelled()` turns true, and
+        _PgetError("timeout") once the idle budget is exhausted — matching the
+        category a socket timeout produced before.
+        """
+        import select as _select
+        while True:
+            if cancelled():
+                raise _PgetError("cancelled")
+            if self._sock is None:
+                return self._resp.read(size)
+            if not _pget_response_has_buffered(self._resp):
+                try:
+                    ready, _w, _x = _select.select([self._sock], [], [], _PGET_CANCEL_POLL)
+                except Exception:
+                    # Closed or otherwise unusable: degrade to a blocking read.
+                    self._sock = None
+                    continue
+                if not ready:
+                    self._idle += _PGET_CANCEL_POLL
+                    if self._idle >= self._budget:
+                        raise _PgetError("timeout")
+                    continue
+            self._idle = 0.0
+            return self._resp.read1(size)
 
 
 def _pget_safe_int(val, default=0):
@@ -3656,11 +4042,11 @@ def _pget_segment(part_path, urls, idx, start, end, total_size, referer, ua,
                 cr_start, cr_end, cr_total = int(m.group(1)), int(m.group(2)), int(m.group(3))
                 if cr_start != start or cr_end != end or cr_total != total_size:
                     raise _PgetError("permanent")
+                reader = _PgetReader(r, timeout)
+                cancelled = lambda: stop.is_set()
                 with open(part_path, "wb") as f:
                     while got < length:
-                        if stop.is_set():
-                            raise _PgetError("cancelled")
-                        chunk = r.read(min(65536, length - got))
+                        chunk = reader.read(min(65536, length - got), cancelled)
                         if not chunk:
                             break
                         f.write(chunk)
@@ -4422,11 +4808,11 @@ def handle_pget_single(req):
                         expected = None
 
                 # wb truncates any pre-existing stale .part (never append).
+                reader = _PgetReader(resp, 30)
+                cancelled = lambda: bool(op.get("cancel_requested") or stop.is_set())
                 with open(part_path, "wb") as f:
                     while True:
-                        if op.get("cancel_requested") or stop.is_set():
-                            raise _PgetError("cancelled")
-                        chunk = resp.read(65536)
+                        chunk = reader.read(65536, cancelled)
                         if not chunk:
                             break
                         f.write(chunk)

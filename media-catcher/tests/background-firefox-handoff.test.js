@@ -8,6 +8,8 @@ function makeEnv(overrides) {
   const starts = [];
   const downloads = [];
   const publications = [];
+  const createdObjectUrls = [];
+  const revokedObjectUrls = [];
   let resolveFirefoxDownload = null;
   const options = Object.assign({
     maxConcurrent: 1,
@@ -23,8 +25,8 @@ function makeEnv(overrides) {
       }
       return Promise.resolve(7);
     },
-    createObjectURL() { return "blob:unused"; },
-    revokeObjectURL() {},
+    createObjectURL(blob) { createdObjectUrls.push(blob); return "blob:assembled-1"; },
+    revokeObjectURL(url) { revokedObjectUrls.push(url); },
     fetchArrayBuffer() { return Promise.resolve(new ArrayBuffer(0)); },
     assembleMedia() { return Promise.resolve(null); },
     isPopupSender(sender) { return sender === "popup"; },
@@ -36,8 +38,17 @@ function makeEnv(overrides) {
   }, overrides || {});
   return {
     ctrl: createBackgroundAdapters(options), starts, downloads, publications,
+    createdObjectUrls, revokedObjectUrls,
     resolveFirefoxDownload(value) { resolveFirefoxDownload(value); },
   };
+}
+
+async function eventually(predicate, label) {
+  for (let i = 0; i < 40; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(label || "condition did not become true");
 }
 
 async function needsUser(env, suffix) {
@@ -99,6 +110,8 @@ test("explicit popup Firefox handoff consumes a direct needs_user proof exactly 
   assert.equal(result.state, "handed_to_firefox");
   assert.equal(env.downloads.length, 1);
   assert.deepEqual(env.downloads[0], { url: secretUrl, filename: "private-direct.mp4", saveAs: true });
+  assert.deepEqual(env.createdObjectUrls, []);
+  assert.deepEqual(env.revokedObjectUrls, []);
   assert.equal(await env.ctrl.requestFirefoxHandoff(message, "popup"), false);
   assert.equal(env.downloads.length, 1);
   const publicJson = JSON.stringify({ result, publications: env.publications, jobs: env.ctrl.popupJobs() });
@@ -179,4 +192,84 @@ test("running direct job preserves its proof until a real result reaches needs_u
   const pending = env.ctrl.popupJobs().find((row) => row.id === job.id);
   await env.ctrl.requestFirefoxHandoff(handoffMessage(pending, "proof-running"), "popup");
   assert.equal(env.downloads.length, 1);
+});
+
+test("explicit HLS Firefox handoff downloads retained assembled bytes and revokes its object URL", async () => {
+  const assembledBytes = new Uint8Array([1, 2, 3, 4]);
+  const env = makeEnv({
+    assembleMedia() {
+      return Promise.resolve({
+        bytes: assembledBytes,
+        mime: "video/mp4",
+        extension: "mp4",
+      });
+    },
+  });
+  const manifestUrl = "https://cdn.example/private/movie.m3u8?sig=PRIVATE_MANIFEST";
+  const mediaId = env.ctrl.captureDomMedia({
+    mediaUrl: manifestUrl,
+    mediaOrigin: "https://cdn.example",
+    contentDisposition: null,
+    referrerUrl: "https://site.example/watch",
+    frameOrigin: "https://site.example",
+    ts: 1_000_000,
+    snapshot: {
+      documentId: "doc-assembled",
+      tabId: 41,
+      frameId: 0,
+      pageUrl: "https://site.example/watch",
+      topLevelPageUrl: "https://site.example/watch",
+      documentNonce: "nonce-assembled",
+      candidates: [{ kind: "visible-filename", value: "movie.m3u8" }],
+      capturedAt: "2026-08-12T12:00:00.000Z",
+    },
+    transport: { mediaKind: "hls", requestHeaders: null },
+  });
+  const initialIntent = {
+    requestedFilename: "movie.m3u8",
+    destinationDirectory: null,
+    saveMode: "save-as",
+    userSelectedFirefox: false,
+    userActionToken: "proof-assembled",
+    createdAt: "2026-08-12T12:00:00.000Z",
+  };
+  const running = await env.ctrl.enqueueDownload({
+    type: "save-as-download",
+    tabId: 41,
+    item: { id: mediaId },
+    intent: initialIntent,
+  }, "popup");
+  await eventually(
+    () => env.starts.some((command) => command.cmd === "file-open"),
+    "assembled file-open"
+  );
+  const open = env.starts.find((command) => command.cmd === "file-open");
+  assert.equal(await env.ctrl.handleNativeMessage({
+    type: "file-error",
+    jobId: running.id,
+    attemptToken: open.attemptToken,
+    failureCategory: "local_io",
+    reason: "write_failed",
+  }), true);
+  const pending = env.ctrl.popupJobs().find((row) => row.id === running.id);
+  assert.equal(pending.state, "needs_user");
+
+  const result = await env.ctrl.requestFirefoxHandoff(
+    handoffMessage(pending, "proof-assembled"),
+    "popup"
+  );
+
+  assert.equal(result.state, "handed_to_firefox");
+  assert.equal(env.downloads.length, 1);
+  assert.deepEqual(env.downloads[0], {
+    url: "blob:assembled-1",
+    filename: "movie.mp4",
+    saveAs: true,
+  });
+  assert.deepEqual(env.revokedObjectUrls, ["blob:assembled-1"]);
+  assert.equal(env.createdObjectUrls.length, 1);
+  assert.equal(env.createdObjectUrls[0] instanceof Blob, true);
+  assert.equal(env.createdObjectUrls[0].type, "video/mp4");
+  assert.equal(JSON.stringify(env.downloads).includes("m3u8"), false);
+  assert.equal(JSON.stringify(env.downloads).includes("PRIVATE_MANIFEST"), false);
 });

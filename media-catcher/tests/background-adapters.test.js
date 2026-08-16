@@ -1131,32 +1131,17 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
   const jobs2 = ctrl.popupJobs();
   assert.notEqual(jobs, jobs2, "popupJobs must return a fresh array");
 
-  // Async future stubs return a Promise before rejecting (never throw sync).
-  const asyncStubs = [
-    () => ctrl.cancel("j1"),
-    () => ctrl.manualRetry("j1"),
-    () => ctrl.helperDisconnected(),
-  ];
-  for (const call of asyncStubs) {
-    let p;
-    assert.doesNotThrow(() => {
-      p = call();
-    });
-    assert.ok(p && typeof p.then === "function", "must return a thenable");
-    let rejected = null;
-    await p.then(
-      () => {
-        throw new Error("expected rejection");
-      },
-      (err) => {
-        rejected = err;
-      }
-    );
-    assert.ok(rejected instanceof Error);
-    assert.equal(rejected.message, LEASE1_MSG);
-  }
+  const disconnected = await ctrl.helperDisconnected();
+  const disconnectedAgain = await ctrl.helperDisconnected();
+  assert.equal(await ctrl.cancel("j1"), false);
+  assert.equal(await ctrl.manualRetry("j1"), false);
+  assert.ok(Array.isArray(disconnected));
+  assert.equal(disconnected.length, 0);
+  assertDeepFrozen(disconnected, "helperDisconnected empty");
+  assert.notEqual(disconnected, disconnectedAgain);
+  assertDeepFrozen(disconnectedAgain, "helperDisconnected fresh empty");
   assert.equal(await ctrl.handleNativeMessage({}), false);
-  // Stubs must not invoke effects or mutate by publishing.
+  // Inert lifecycle controls must not invoke effects or mutate by publishing.
   assert.equal(effectHits, 0);
   assert.equal(fx.counts.publishDetection, 0);
   assert.equal(fx.counts.postNative, 0);
@@ -8176,46 +8161,19 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
         assertVariantRegError(err);
       }
 
-      // Representative future stubs — await all rejections.
-      const stubCalls = [
-        () => ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"),
-        () => ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"),
-        () => ctrl.helperDisconnected(),
-      ];
       const materialBefore = snapshotEffectBaseline(fx);
-      for (const call of stubCalls) {
-        const p = call();
-        assert.ok(p && typeof p.then === "function");
-        let rejected = null;
-        await p.then(
-          () => {
-            throw new Error("expected rejection");
-          },
-          (err) => {
-            rejected = err;
-          }
-        );
-        assert.ok(rejected instanceof Error);
-        assert.equal(rejected.message, LEASE1_MSG);
-        assert.equal(
-          String(rejected.message).includes("SECRET_"),
-          false
-        );
-      }
-      assert.equal(fx.counts.publishJobs, materialBefore.publishJobs);
-      assert.equal(fx.counts.persistHistory, materialBefore.persistHistory);
-      assert.equal(fx.counts.postNative, materialBefore.postNative);
-      assert.equal(fx.counts.downloadsDownload, materialBefore.downloadsDownload);
-      assert.equal(fx.counts.fetchArrayBuffer, materialBefore.fetchArrayBuffer);
-      assert.equal(fx.counts.assembleMedia, materialBefore.assembleMedia);
-      assert.equal(fx.counts.createObjectURL, materialBefore.createObjectURL);
-      assert.equal(fx.counts.revokeObjectURL, materialBefore.revokeObjectURL);
-      assert.equal(fx.counts.reportDiagnostic, materialBefore.reportDiagnostic);
-      assert.equal(fx.counts.isPopupSender, materialBefore.isPopupSender);
-      assert.equal(
-        fx.counts.getEffectiveDestinationDirectory,
-        materialBefore.getEffectiveDestinationDirectory
-      );
+      const privacyBefore = inst.privacyCalls.length;
+      const disconnected = await ctrl.helperDisconnected();
+      const disconnectedAgain = await ctrl.helperDisconnected();
+      assert.equal(await ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"), false);
+      assert.equal(await ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"), false);
+      assert.ok(Array.isArray(disconnected));
+      assert.equal(disconnected.length, 0);
+      assertDeepFrozen(disconnected, "BA06 helperDisconnected");
+      assert.notEqual(disconnected, disconnectedAgain);
+      assertDeepFrozen(disconnectedAgain, "BA06 helperDisconnected fresh");
+      assert.equal(inst.privacyCalls.length, privacyBefore);
+      assertEffectBaseline(fx, materialBefore, "BA06 inert lifecycle");
 
       const surfaces = [
         netRows,

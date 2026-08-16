@@ -38,8 +38,10 @@ const DEFAULT_SETTINGS = {
   enableCasting: false,         // panel: Now-Casting transport + per-item Cast buttons (preview — network backend pending)
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
+let liveController = null;
+let liveControllerInitialized = false;
 
-api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
+const settingsReady = api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
   // One-time migrations to newer defaults, each guarded by its own flag so a later
   // deliberate choice is respected (won't be re-applied on the next load).
@@ -53,7 +55,101 @@ api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
     flags.dq1done = true;
   }
   if (Object.keys(flags).length) api.storage.local.set(Object.assign({ settings }, flags)).catch(() => {});
-}).catch(() => {});
+}, () => {}).then(() => initializeLiveController());
+
+function mintLiveToken() {
+  const secure = typeof crypto !== "undefined" ? crypto : self.crypto;
+  if (secure && typeof secure.randomUUID === "function") return secure.randomUUID();
+  if (secure && typeof secure.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    secure.getRandomValues(bytes);
+    return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  throw new Error("Secure token generation unavailable.");
+}
+
+function isExtensionPopupSender(sender) {
+  return !!sender && sender.id === api.runtime.id &&
+    sender.url === api.runtime.getURL("popup/popup.html");
+}
+
+// Opaque IDs the controller mints. Deliberately narrow: no separators that
+// could smuggle a URL, and bounded so a hostile query cannot grow unbounded.
+function isSafeOpaqueActionId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 200 &&
+    /^[A-Za-z0-9:_-]+$/.test(value);
+}
+
+// The Save As page's identity is whatever the background put in the URL when it
+// created the window — never anything the page later claims in a message.
+function parseSaveAsSender(sender) {
+  try {
+    if (!sender || sender.id !== api.runtime.id || typeof sender.url !== "string") return null;
+    const parsed = new URL(sender.url);
+    const base = new URL(api.runtime.getURL("saveas/saveas.html"));
+    if (parsed.origin !== base.origin || parsed.pathname !== base.pathname) return null;
+    if (parsed.hash) return null;
+    const params = parsed.searchParams;
+    const keys = Array.from(params.keys());
+    if (keys.length !== new Set(keys).size) return null;
+    for (const key of keys) {
+      if (key !== "tabId" && key !== "mediaId" && key !== "variantId") return null;
+    }
+    const rawTabId = params.get("tabId");
+    if (typeof rawTabId !== "string" || !/^\d{1,9}$/.test(rawTabId)) return null;
+    const mediaId = params.get("mediaId");
+    if (!isSafeOpaqueActionId(mediaId)) return null;
+    const hasVariant = params.has("variantId");
+    const variantId = hasVariant ? params.get("variantId") : null;
+    if (hasVariant && !isSafeOpaqueActionId(variantId)) return null;
+    return { tabId: Number(rawTabId), mediaId, variantId };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Managed download actions come from exactly two extension surfaces.
+function isExtensionActionSender(sender) {
+  return isExtensionPopupSender(sender) || parseSaveAsSender(sender) !== null;
+}
+
+function initializeLiveController() {
+  if (liveControllerInitialized) return liveController;
+  liveControllerInitialized = true;
+  const liveAssembler = self.McLiveMediaAssembler.createLiveMediaAssembler({
+    HLS: self.HLS,
+    DASH: self.DASH,
+    Mux: self.Mux,
+  });
+  liveController = self.McBackgroundAdapters.createBackgroundAdapters({
+    maxConcurrent: settings.maxConcurrentDownloads,
+    segmentConcurrency: settings.concurrency,
+    retries: settings.retries,
+    now: () => Date.now(),
+    randomToken: () => mintLiveToken(),
+    postNative: (command) => {
+      if (!nativePort) throw new Error("Native helper unavailable.");
+      return nativePort.postMessage(command);
+    },
+    downloadsDownload: (options) => api.downloads.download(options),
+    createObjectURL: (blob) => URL.createObjectURL(blob),
+    revokeObjectURL: (url) => URL.revokeObjectURL(url),
+    fetchArrayBuffer: (tabId, url, options) => makeOneShotFetchFn(tabId)(url, options),
+    assembleMedia: liveAssembler,
+    // Keeps the controller's existing dependency key; the predicate now also
+    // admits the exact validated Save As page.
+    isPopupSender: isExtensionActionSender,
+    getEffectiveDestinationDirectory: () => settings.saveFolder || null,
+    publishDetection: () => broadcast({ type: "live-media-updated" }),
+    publishJobs: (jobs) => broadcast({ type: "live-jobs-updated", jobs }),
+    persistHistory: (entry) => addHistory(entry),
+    reportDiagnostic: (diagnostic) => mclog(
+      "warn",
+      "policy: " + String(diagnostic && diagnostic.code || "unknown")
+    ),
+  });
+  return liveController;
+}
 
 // ---- diagnostics log + update history (Settings "Log console" panel) -------
 // A rolling buffer of structured log lines (extension + host + guardian) and a
@@ -127,6 +223,21 @@ function convertSpec() {
 
 // tabId -> Map(url -> mediaItem)
 const mediaByTab = new Map();
+// Raw webRequest evidence is kept off the enumerable legacy item until the
+// existing enrichment path has proved that the candidate is usable media.
+const liveNetworkEvidence = new WeakMap();
+// Tabs with controller-owned rows may have no remaining legacy map entry.
+const liveControllerTabs = new Set();
+const liveControllerMediaIds = new Map();
+const livePromotedKeys = new Map();
+const liveDirectSourceKeys = new Map();
+// tabId -> canonical direct source key -> the opaque media ID that owns it.
+// Late evidence for an owned source enriches that row instead of minting a
+// second one. Session-only; cleared with the rest of a tab's ownership.
+const liveDirectMediaOwners = new Map();
+// opaque media ID -> frozen { sizeBytes, sizeConfidence }. Never holds URLs,
+// headers, or any other transport evidence.
+const liveSizeMetadata = new Map();
 // tabId -> { referer, origin, userAgent, cookieUrl, pageTitle, ogTitle }
 const tabContext = new Map();
 // tabId -> JPEG data URL of the playing video (from content script)
@@ -154,7 +265,47 @@ let downloadCounter = 0;
 const pendingSaves = new Map();
 
 // reqId -> sendResponse, for the settings-page "Browse folder" round trip.
+// requestId -> { respond, timer }. Every request settles exactly once: on a
+// terminal native frame, on the timeout, or when the helper disconnects.
 const pendingFolderPicks = new Map();
+const FOLDER_PICK_TIMEOUT_MS = 180000;
+
+// Maps one native folder frame to the extension-facing response. A frame for an
+// unknown or already-settled request is inert, so a late selection after a
+// timeout can never revive a resolved picker.
+function finishFolderPick(requestId, nativeFrame) {
+  const pending = pendingFolderPicks.get(requestId);
+  if (!pending) return;
+  pendingFolderPicks.delete(requestId);
+  if (pending.timer !== null) { try { clearTimeout(pending.timer); } catch (e) {} }
+  let response;
+  const status = nativeFrame && nativeFrame.status;
+  if (status === "selected") {
+    response = typeof nativeFrame.directory === "string" && nativeFrame.directory
+      ? { ok: true, status: "selected", dir: nativeFrame.directory }
+      : { ok: false, error: "folder_picker_failed" };
+  } else if (status === "cancelled") {
+    response = { ok: true, status: "cancelled" };
+  } else if (status === "error") {
+    response = { ok: false, error: "folder_picker_failed" };
+  } else if (status === "timeout") {
+    response = { ok: false, error: "folder_picker_timeout" };
+  } else if (nativeFrame && typeof nativeFrame.dir === "string") {
+    // Legacy frame: a nonempty dir meant selected, an empty one meant cancelled.
+    response = nativeFrame.dir
+      ? { ok: true, status: "selected", dir: nativeFrame.dir }
+      : { ok: true, status: "cancelled" };
+  } else {
+    response = { ok: false, error: "folder_picker_failed" };
+  }
+  try { pending.respond(response); } catch (e) {}
+}
+
+function failAllFolderPicks() {
+  for (const requestId of Array.from(pendingFolderPicks.keys())) {
+    finishFolderPick(requestId, { status: "error" });
+  }
+}
 
 // ---- Native helper (ffmpeg via native messaging) ----
 // When the companion host is installed, recording is handed off to it: ffmpeg
@@ -172,6 +323,15 @@ let nativeInfo = null;
 // "ready" (green) | "no-ffmpeg" (amber) | "connecting" | "disconnected" (gray)
 let nativeState = "disconnected";
 let nativeError = null;
+// The helper exits with Firefox, can be killed, and is replaced by every host
+// update, so a dropped port is routine rather than proof it is uninstalled.
+// Nothing else reconnects — connectNative runs only at extension startup or on
+// an explicit re-check — so one drop used to disable the helper for the whole
+// session. Re-dial once per connected session: `handshook` gates that on having
+// actually reached a live helper, and `redialled` stops a helper that is truly
+// gone from spinning.
+let nativeHandshook = false;      // a pong has been seen on some connection
+let nativeRedialled = false;      // the one automatic re-dial is spent
 
 function setNativeState(state, error) {
   nativeState = state;
@@ -197,8 +357,26 @@ function helperStatus() {
 // YouTube (and any yt-dlp-supported site): hand the canonical URL to the native
 // helper, which runs yt-dlp (best video+audio, merged) with the PO-token provider
 // and Firefox cookies. Progress/done/error arrive as ytdl-* native messages.
+// Statuses that mean a job still owns its output path.
+const YT_IN_FLIGHT = new Set(["downloading", "converting"]);
+
 async function downloadYouTube(item, tabId, filename, opts) {
   opts = opts || {};
+  // One yt-dlp per URL. A second click used to mint a fresh id and start a
+  // competing process writing the SAME output template: the two then fought
+  // over one .part file ("WinError 32: used by another process"), one wedged,
+  // and cancelling a row killed only its own job while the survivors kept
+  // reporting progress — which read as "cancel doesn't work, it keeps
+  // re-adding". Terminal rows (done/error/cancelled) are not in flight, so a
+  // deliberate retry still works.
+  for (const existing of activeDownloads.values()) {
+    if (existing.kind === "youtube" && existing.url === item.url &&
+        YT_IN_FLIGHT.has(existing.status)) {
+      mclog("info", "yt-dlp: already downloading " + item.url + " — ignoring duplicate request");
+      broadcast({ type: "download-update", download: existing });   // resurface the live row
+      return;
+    }
+  }
   const id = ++downloadCounter;
   const dl = { id, url: item.url, name: sanitizeFilename(filename || item.name || "YouTube video"),
                kind: "youtube", status: "downloading", live: true, tabId,
@@ -235,11 +413,29 @@ function connectNative() {
     nativePort = api.runtime.connectNative(NATIVE_HOST);
     nativePort.onMessage.addListener(onNativeMessage);
     nativePort.onDisconnect.addListener(() => {
+      const controller = liveController;
+      if (controller) {
+        Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
+          mclog("warn", "policy disconnect: " + (e && e.message ? e.message : String(e)));
+        });
+      }
       const err = api.runtime.lastError && api.runtime.lastError.message;
       dlog("native host disconnected", err || "");
       mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
       nativePort = null; nativeInfo = null;
-      setNativeState("disconnected", err || "Helper not installed.");
+      // No helper means no dialog will ever answer; settle every waiter now.
+      failAllFolderPicks();
+      if (nativeHandshook && !nativeRedialled) {
+        nativeRedialled = true;
+        mclog("info", "native helper disconnected — reconnecting…");
+        connectNative();          // sets state to "connecting" and re-pings
+      } else {
+        // Only claim it is missing when we never reached a live helper; a drop
+        // after a good handshake is a disconnect, and saying otherwise sent
+        // people to reinstall software that was already there.
+        setNativeState("disconnected", err ||
+          (nativeHandshook ? "Helper disconnected." : "Helper not installed."));
+      }
       // The host owned the cast session and its status poller — without it the
       // session is gone; don't leave the popup showing a live transport forever.
       if (castState.state !== "idle") {
@@ -257,6 +453,19 @@ function connectNative() {
 }
 
 function onNativeMessage(msg) {
+  const controller = liveController;
+  if (!controller) {
+    onLegacyNativeMessage(msg);
+    return;
+  }
+  Promise.resolve().then(() => controller.handleNativeMessage(msg)).then((handled) => {
+    if (handled !== true) onLegacyNativeMessage(msg);
+  }).catch((e) => {
+    mclog("warn", "policy native frame: " + (e && e.message ? e.message : String(e)));
+  });
+}
+
+function onLegacyNativeMessage(msg) {
   if (!msg) return;
   if (msg.type === "log") {
     // a structured line from the host or guardian → the live console
@@ -329,6 +538,10 @@ function onNativeMessage(msg) {
   }
   if (msg.type === "pong") {
     nativeInfo = msg;
+    // A live helper answered: remember that, and restore the re-dial budget so
+    // the NEXT drop also gets one automatic retry.
+    nativeHandshook = true;
+    nativeRedialled = false;
     setNativeState(msg.ffmpeg ? "ready" : "no-ffmpeg",
       msg.ffmpeg ? null : "Helper is installed but ffmpeg was not found.");
     dlog("native helper", msg.ffmpeg ? "ready (ffmpeg ok)" : "connected but ffmpeg missing", msg.ffmpegPath || "");
@@ -342,8 +555,8 @@ function onNativeMessage(msg) {
     return;
   }
   if (msg.type === "folder") {
-    const cb = pendingFolderPicks.get(msg.reqId);
-    if (cb) { pendingFolderPicks.delete(msg.reqId); try { cb({ ok: true, dir: msg.dir || "" }); } catch (e) {} }
+    const requestId = msg.requestId !== undefined ? msg.requestId : msg.reqId;
+    finishFolderPick(requestId, msg);
     return;
   }
   if (msg.type === "update-result") {
@@ -462,6 +675,14 @@ function onNativeMessage(msg) {
     notifyDone(dl.name || "YouTube video", fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
     setTimeout(() => activeDownloads.delete(dl.id), DONE_RETAIN_MS);
   } else if (msg.type === "ytdl-error") {
+    // Killing yt-dlp makes it exit non-zero, so a user cancel arrives here as a
+    // failure. Settle the row as "Cancelled" rather than a red error — trust the
+    // helper's own verdict as well as our local flag.
+    if (msg.reason === "cancelled" || dl.status === "cancelled") {
+      dl.status = "cancelled";
+      broadcast({ type: "download-update", download: dl });
+      return;
+    }
     dl.status = "error"; dl.error = msg.error || "YouTube download failed"; dl.errReason = msg.reason || "";
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "saved") {
@@ -723,7 +944,107 @@ function directGroupKey(url) {
   }
 }
 
-function addMedia(tabId, item) {
+function directSourceKey(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.href;
+  } catch (e) {
+    return url;
+  }
+}
+
+function hasLiveMediaKey(tabId, key) {
+  const keys = livePromotedKeys.get(tabId);
+  return !!keys && keys.has(key);
+}
+
+function hasLiveDirectSource(tabId, url) {
+  const keys = liveDirectSourceKeys.get(tabId);
+  return !!keys && keys.has(directSourceKey(url));
+}
+
+// The opaque media ID that already owns this exact direct source, if any.
+function getLiveDirectOwner(tabId, url) {
+  const bySource = liveDirectMediaOwners.get(tabId);
+  return bySource ? bySource.get(directSourceKey(url)) || null : null;
+}
+
+// Store a validated size only when it actually improves what the row shows.
+// Exact evidence outranks estimates; identical values broadcast nothing.
+function rememberLiveSize(mediaId, candidate, tabId) {
+  if (typeof mediaId !== "string" || !mediaId) return false;
+  const current = liveSizeMetadata.get(mediaId) || null;
+  const next = self.McMediaSize.chooseSize(current, candidate);
+  if (!next || (current && current.sizeBytes === next.sizeBytes &&
+      current.sizeConfidence === next.sizeConfidence)) return false;
+  liveSizeMetadata.set(mediaId, next);
+  broadcast({ type: "media-updated", tabId });
+  return true;
+}
+
+// Exact total from already-copied response headers. A 206 chunk length is not
+// a total, so this returns null unless a valid Content-Range total is present.
+function exactSizeFromEvidence(evidence) {
+  const details = evidence && evidence.details;
+  if (!details) return null;
+  return self.McMediaSize.exactSizeFromHttp({
+    statusCode: details.statusCode,
+    responseHeaders: details.responseHeaders,
+  });
+}
+
+// Bitrate × duration, used only when no exact total is known for this row.
+function estimatedSizeForItem(item, selectedBandwidth) {
+  if (!item) return null;
+  return self.McMediaSize.estimatedSizeFromBitrate({
+    durationSeconds: item.duration,
+    selectedBandwidth,
+    bandwidth: item.bandwidth,
+    sampledKbps: item.estKbps,
+  });
+}
+
+function forgetLiveSizesForTab(tabId) {
+  const ids = liveControllerMediaIds.get(tabId);
+  if (ids) for (const id of ids) liveSizeMetadata.delete(id);
+  liveDirectMediaOwners.delete(tabId);
+}
+
+// Network and DOM are independent evidence producers for the same direct file.
+// Claim their shared tab-scoped identity at ingress so the controller receives
+// one source, while different directGroupKey values remain separate media.
+function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
+  liveControllerTabs.add(tabId);
+  const ids = liveControllerMediaIds.get(tabId) || new Set();
+  ids.add(mediaId);
+  liveControllerMediaIds.set(tabId, ids);
+  if (claimGroupKey !== false) {
+    const keys = livePromotedKeys.get(tabId) || new Set();
+    keys.add(key);
+    livePromotedKeys.set(tabId, keys);
+  }
+  if (Array.isArray(directUrls) && directUrls.length) {
+    const sources = liveDirectSourceKeys.get(tabId) || new Set();
+    const owners = liveDirectMediaOwners.get(tabId) || new Map();
+    for (const url of directUrls) {
+      const sourceKey = directSourceKey(url);
+      sources.add(sourceKey);
+      owners.set(sourceKey, mediaId);
+    }
+    liveDirectSourceKeys.set(tabId, sources);
+    liveDirectMediaOwners.set(tabId, owners);
+  }
+
+  const map = mediaByTab.get(tabId);
+  const legacy = map && map.get(key);
+  if (legacy) {
+    map.delete(key);
+    liveNetworkEvidence.delete(legacy);
+  }
+}
+
+function addMedia(tabId, item, networkEvidence) {
   if (tabId < 0) return;
   // De-dup key collapses Low-Latency HLS reloads of one playlist (differing only
   // by _HLS_msn / cache-bust params) into a single item. The item keeps its
@@ -731,6 +1052,17 @@ function addMedia(tabId, item) {
   const key = (item.kind === "hls" || item.kind === "dash") ? mediaKey(item.url)
             : item.kind === "direct" ? directGroupKey(item.url) : item.url;
   item.key = key;
+  if (item.kind === "direct") {
+    // An owned source keeps its single opaque row; late transport evidence only
+    // enriches it. Never mint a second detection for the same file.
+    const owner = getLiveDirectOwner(tabId, item.url);
+    if (owner) {
+      rememberLiveSize(owner, exactSizeFromEvidence(networkEvidence), tabId);
+      return;
+    }
+    if (hasLiveDirectSource(tabId, item.url)) return;
+  }
+  if (hasLiveMediaKey(tabId, key)) return;
   // Stash any audio-track playlist URL (even one we're about to suppress) so the
   // recorder can pair it with the video by directory.
   if (item.kind === "hls" && isAudioUrl(item.url)) rememberAudioTrack(tabId, item.url);
@@ -760,8 +1092,15 @@ function addMedia(tabId, item) {
     const mirrors = existing.mirrors || [existing.url];
     if (item.kind === "direct" && item.url && !mirrors.includes(item.url)) mirrors.push(item.url);
     Object.assign(existing, item, { url: stableUrl, key, mirrors });
+    if (networkEvidence &&
+        existing.enrichState !== "done" &&
+        existing.enrichState !== "error" &&
+        !liveNetworkEvidence.has(existing)) {
+      liveNetworkEvidence.set(existing, networkEvidence);
+    }
   } else {
     if (item.kind === "direct") item.mirrors = [item.url];
+    if (networkEvidence) liveNetworkEvidence.set(item, networkEvidence);
     map.set(key, item);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -770,6 +1109,101 @@ function addMedia(tabId, item) {
     else if (item.kind === "direct") enrichDirect(tabId, key);
     else if (item.kind === "youtube") enrichYouTube(tabId, key);
   }
+}
+
+function copyLiveResponseHeaders(headers) {
+  if (!Array.isArray(headers)) return [];
+  const out = [];
+  for (const header of headers) {
+    if (!header || typeof header.name !== "string" || typeof header.value !== "string") continue;
+    out.push({ name: header.name, value: header.value });
+  }
+  return out;
+}
+
+function buildLiveNetworkEvidence(details, mediaKind) {
+  const ctx = tabContext.get(details.tabId) || {};
+  const safeDetails = {
+    url: details.url,
+    tabId: details.tabId,
+    frameId: Number.isInteger(details.frameId) ? details.frameId : 0,
+    timeStamp: Number.isFinite(details.timeStamp) ? details.timeStamp : Date.now(),
+    responseHeaders: copyLiveResponseHeaders(details.responseHeaders),
+  };
+  // Safe scalar; the controller allowlists it away but size policy needs it to
+  // tell a 206 chunk length from a real resource total.
+  if (Number.isInteger(details.statusCode)) safeDetails.statusCode = details.statusCode;
+  if (typeof details.documentId === "string") safeDetails.documentId = details.documentId;
+  if (typeof details.documentUrl === "string") safeDetails.documentUrl = details.documentUrl;
+  if (typeof details.originUrl === "string") safeDetails.originUrl = details.originUrl;
+
+  const hints = {
+    topLevelUrlHint: typeof ctx.topLevelPageUrl === "string"
+      ? ctx.topLevelPageUrl
+      : (typeof details.documentUrl === "string" ? details.documentUrl : ""),
+    frameOrigin: "",
+  };
+  try {
+    hints.frameOrigin = new URL(details.originUrl || details.documentUrl).origin;
+  } catch (e) {
+    hints.frameOrigin = typeof ctx.origin === "string" ? ctx.origin : "";
+  }
+  const transport = { mediaKind, requestHeaders: null };
+  if (mediaKind === "direct") transport.mirrors = [details.url];
+  if (typeof ctx.referer === "string" && ctx.referer) transport.referer = ctx.referer;
+  if (typeof ctx.userAgent === "string" && ctx.userAgent) transport.userAgent = ctx.userAgent;
+  return { details: safeDetails, hints, transport };
+}
+
+async function promoteLiveNetworkItem(tabId, key, item, variants, probeSizeMetadata) {
+  await settingsReady;
+  const controller = liveController;
+  const evidence = liveNetworkEvidence.get(item);
+  if (!controller || !evidence) return false;
+  // The candidate must still be the live legacy owner after enrichment I/O.
+  // Clear/navigation or a DOM claim removes it and invalidates this result.
+  const current = mediaByTab.get(tabId);
+  if (!current || current.get(key) !== item) {
+    liveNetworkEvidence.delete(item);
+    return false;
+  }
+  // A matching DOM report may have claimed this file while the network probe
+  // awaited I/O. Recheck after the await and before minting a second media ID.
+  if (item.kind === "direct" && Array.isArray(item.mirrors) &&
+      item.mirrors.some((url) => hasLiveDirectSource(tabId, url))) return false;
+  if (hasLiveMediaKey(tabId, key)) return false;
+  if (item.kind === "direct" && Array.isArray(item.mirrors)) {
+    evidence.transport.mirrors = item.mirrors.slice();
+  }
+
+  let mediaId;
+  try {
+    mediaId = controller.captureNetwork(evidence);
+  } catch (e) {
+    dlog("live promotion rejected", item.kind, e && e.message);
+    return false;
+  }
+  if (Array.isArray(variants) && variants.length) {
+    try { controller.registerVariants(mediaId, variants); }
+    catch (e) { dlog("live variant registration rejected", item.kind, e && e.message); }
+  }
+
+  claimLiveMediaKey(
+    tabId,
+    key,
+    mediaId,
+    item.kind === "direct" ? (item.mirrors || [item.url]) : null,
+    true
+  );
+  // Trusted probe/header totals first; a bitrate estimate only fills the gap
+  // when nothing exact is known for this row.
+  rememberLiveSize(mediaId, exactSizeFromEvidence(evidence), tabId);
+  rememberLiveSize(mediaId, probeSizeMetadata, tabId);
+  if (!liveSizeMetadata.has(mediaId)) {
+    rememberLiveSize(mediaId, estimatedSizeForItem(item), tabId);
+  }
+  liveNetworkEvidence.delete(item);
+  return true;
 }
 
 // Ask the helper (yt-dlp -J) for a YouTube URL's real formats so the popup can show
@@ -845,13 +1279,30 @@ async function enrichDash(tabId, key) {
     item.variants = parsed.variants;      // {id,label,height,bandwidth,resolution}
     item.codec = codecLabel((parsed.variants[0] || {}).codecs || "");
     item.drm = parsed.drm;
+    item.isDynamic = parsed.isDynamic;
     item.hasAudio = parsed.audio.length > 0;
     item.duration = parsed.duration;
+    item.unsupported = !Array.isArray(parsed.video) || parsed.video.length === 0;
     item.enrichState = "done";
+    if (!item.isDynamic && !item.drm && !item.unsupported) {
+      const variants = parsed.video.map((v) => {
+        const out = { url: item.url };
+        if (v.width > 0 && v.height > 0) out.label = v.width + "x" + v.height +
+          (v.bandwidth > 0 ? " · " + Math.round(v.bandwidth / 1000) + " kbps" : "");
+        else if (v.height > 0) out.label = v.height + "p";
+        if (v.width > 0) out.width = v.width;
+        if (v.height > 0) out.height = v.height;
+        if (v.bandwidth > 0) out.bandwidth = v.bandwidth;
+        if (/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(v.mimeType || "")) out.mime = v.mimeType;
+        return out;
+      });
+      await promoteLiveNetworkItem(tabId, key, item, variants);
+    }
   } catch (e) {
     item.enrichState = "error";
     item.enrichError = e.message || String(e);
   } finally {
+    liveNetworkEvidence.delete(item);
     enriching.delete(key);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -876,10 +1327,16 @@ async function probeDirect(tabId, url) {
       signal: controller.signal,
     });
     const ct = resp.headers.get("content-type") || "";
-    let size = 0;
-    const cr = resp.headers.get("content-range");
-    if (cr) { const m = cr.match(/\/(\d+)\s*$/); if (m) size = parseInt(m[1], 10); }
-    if (!size) { const cl = resp.headers.get("content-length"); if (cl) size = parseInt(cl, 10); }
+    // A ranged probe's Content-Length describes the 256 KB chunk, never the
+    // file. Only a valid Content-Range total (or a full 200) is a real total.
+    const sizeMetadata = self.McMediaSize.exactSizeFromHttp({
+      statusCode: resp.status,
+      responseHeaders: [
+        { name: "Content-Range", value: resp.headers.get("content-range") || "" },
+        { name: "Content-Length", value: resp.headers.get("content-length") || "" },
+      ],
+    });
+    const size = sizeMetadata ? sizeMetadata.sizeBytes : 0;
     const ok = resp.ok || resp.status === 206;
     // Read up to 256 KB, then abort so we never pull a whole file that ignored Range.
     const LIMIT = 262144, chunks = [];
@@ -896,7 +1353,7 @@ async function probeDirect(tabId, url) {
     const head = new Uint8Array(recv);
     let off = 0;
     for (const c of chunks) { head.set(c, off); off += c.length; }
-    return { status: resp.status, ok, contentType: ct, size, head };
+    return { status: resp.status, ok, contentType: ct, size, sizeMetadata, head };
   } finally {
     clearTimeout(timer);
     taggedRequests.delete(token);
@@ -1025,12 +1482,14 @@ async function enrichDirect(tabId, key) {
       if (codec) item.codec = codec;
     }
     item.enrichState = "done";
+    if (!item.junk) await promoteLiveNetworkItem(tabId, key, item, null, r.sizeMetadata);
     dlog("probed direct", { url: item.url, status: r.status, size: item.size, container, junk: item.junk, kbps: item.estKbps });
   } catch (e) {
     item.enrichState = "error";
     item.probeError = e.message || String(e);
     item.junk = true;
   } finally {
+    liveNetworkEvidence.delete(item);
     enriching.delete(key);
     updateBadge(tabId);
     broadcast({ type: "media-updated", tabId });
@@ -1112,6 +1571,10 @@ async function enrichHls(tabId, key) {
           const vparsed = self.HLS.parsePlaylist(vtext, top.uri);
           if (vparsed.type === "media") {
             item.isLive = vparsed.isLive;
+            item.encrypted = !!vparsed.encryption;
+            item.drm = !!(vparsed.encryption &&
+              (vparsed.encryption.method !== "AES-128" ||
+               (vparsed.encryption.keyFormat && vparsed.encryption.keyFormat !== "identity")));
             registerSegments(tabId, vparsed);
           }
         } catch (e) { /* best-effort — pattern-based filtering still applies */ }
@@ -1136,11 +1599,25 @@ async function enrichHls(tabId, key) {
       }
     }
     item.enrichState = "done";
+    if (item.isLive === false && !item.drm) {
+      const variants = parsed.type === "master" ? parsed.variants.map((v) => {
+        const out = { url: v.uri };
+        const resolution = typeof v.resolution === "string" ? v.resolution.match(/^(\d+)x(\d+)$/) : null;
+        if (resolution) out.width = parseInt(resolution[1], 10);
+        if (v.height > 0) out.height = v.height;
+        if (v.bandwidth > 0) out.bandwidth = v.bandwidth;
+        out.label = (v.resolution || (v.height > 0 ? v.height + "p" : "auto")) +
+          (v.bandwidth > 0 ? " · " + Math.round(v.bandwidth / 1000) + " kbps" : "");
+        return out;
+      }) : [];
+      await promoteLiveNetworkItem(tabId, key, item, variants);
+    }
   } catch (e) {
     item.enrichState = "error";
     item.enrichError = e.message || String(e);
     dlog("enrich ERROR", item.url, "→", item.enrichError);
   } finally {
+    liveNetworkEvidence.delete(item);
     enriching.delete(key);
     dlog("enriched", { url: item.url, master: item.isMaster, live: item.isLive,
       estKbps: item.estKbps, group: renditionGroup(item.url), state: item.enrichState });
@@ -1150,7 +1627,7 @@ async function enrichHls(tabId, key) {
 }
 
 function updateBadge(tabId) {
-  const count = visibleFor(tabId).length;
+  const count = visibleFor(tabId).length + liveRowsForTab(tabId).length;
   const text = count > 0 ? String(count) : "";
   try {
     api.browserAction.setBadgeText({ tabId, text });
@@ -1205,7 +1682,7 @@ api.webRequest.onHeadersReceived.addListener(
       name: shortName(details.url),
       source: "network",
       ts: Date.now(),
-    });
+    }, buildLiveNetworkEvidence(details, kind));
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -1266,6 +1743,26 @@ function makeFetchFn(tabId) {
       }
     }
     throw lastErr;
+  };
+}
+
+// One authenticated browser fetch bound to the immutable source tab context.
+// Retry ownership belongs to the live scheduler/assembler path.
+function makeOneShotFetchFn(tabId) {
+  const ctx = tabContext.get(tabId) || {};
+  return async function (url, opts) {
+    opts = opts || {};
+    const token = "mc_" + mintLiveToken();
+    taggedRequests.set(token, { referer: ctx.referer, origin: ctx.origin });
+    try {
+      const headers = { "X-MC-Token": token };
+      if (opts.range) headers.Range = opts.range;
+      const resp = await fetch(url, { credentials: "include", headers });
+      if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
+      return await resp.arrayBuffer();
+    } finally {
+      taggedRequests.delete(token);
+    }
   };
 }
 
@@ -2009,12 +2506,259 @@ function keepHighestRendition(items) {
   return passthrough.concat(kept);
 }
 
+function copyLiveVariantRow(row) {
+  const out = {};
+  if (!row || typeof row !== "object") return out;
+  for (const key of ["id", "label", "width", "height", "bandwidth", "mime"]) {
+    const value = row[key];
+    if (typeof value === "string" || (typeof value === "number" && Number.isFinite(value))) out[key] = value;
+  }
+  return out;
+}
+
+function liveRowsForTab(tabId) {
+  if (!liveController || !liveControllerTabs.has(tabId)) return [];
+  try {
+    const rows = liveController.popupMedia(tabId);
+    const ids = liveControllerMediaIds.get(tabId);
+    return Array.isArray(rows) && ids ? rows.filter((row) => row && ids.has(row.id)) : [];
+  } catch (e) {
+    dlog("live popupMedia failed", e && e.message);
+    return [];
+  }
+}
+
+function decorateLiveRow(row, tabId) {
+  if (!row || typeof row !== "object" || typeof row.id !== "string") return null;
+  const out = {
+    id: row.id,
+    proposedFilename: typeof row.proposedFilename === "string" ? row.proposedFilename : "download",
+    kind: typeof row.kind === "string" ? row.kind : "direct",
+    variants: Array.isArray(row.variants) ? row.variants.map(copyLiveVariantRow) : [],
+    tabId,
+    thumb: tabThumbs.get(tabId) || null,
+  };
+  // Only the validated scalar pair crosses into the public row — never the
+  // record itself and never any raw evidence it was derived from.
+  const size = liveSizeMetadata.get(row.id);
+  if (size) {
+    out.sizeBytes = size.sizeBytes;
+    out.sizeConfidence = size.sizeConfidence;
+  }
+  const title = tabTitle(tabId);
+  if (title) out.pageTitle = title;
+  return out;
+}
+
+function livePopupJobs() {
+  if (!liveController) return [];
+  try {
+    const jobs = liveController.popupJobs();
+    if (!Array.isArray(jobs)) return [];
+    return jobs.map((job) => Object.assign({}, job));
+  } catch (e) {
+    dlog("live popupJobs failed", e && e.message);
+    return [];
+  }
+}
+
+function readOwnActionId(record) {
+  try {
+    if (!record || (typeof record !== "object" && typeof record !== "function")) {
+      return { present: false };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, "id");
+    if (!descriptor) return { present: false };
+    if (descriptor.get || descriptor.set || !("value" in descriptor)) {
+      return { present: true, kind: "invalid" };
+    }
+    if (typeof descriptor.value === "string") {
+      return { present: true, kind: "string", value: descriptor.value };
+    }
+    if (typeof descriptor.value === "number" && Number.isFinite(descriptor.value)) {
+      return { present: true, kind: "number", value: descriptor.value };
+    }
+    return { present: true, kind: "invalid" };
+  } catch (e) {
+    return { present: true, kind: "invalid" };
+  }
+}
+
+async function runLiveControllerAction(sender, action) {
+  try {
+    await settingsReady;
+    if (!liveController || !isExtensionActionSender(sender)) {
+      return { ok: false, error: "Download action rejected." };
+    }
+    const job = await action(liveController);
+    if (!job || typeof job !== "object") {
+      return { ok: false, error: "Download action rejected." };
+    }
+    return { ok: true, job };
+  } catch (e) {
+    return { ok: false, error: "Download action rejected." };
+  }
+}
+
+// The main UI is an extension window, not a browser-action popup. A popup
+// derives its size from its content and Firefox clips it, which left the
+// Downloads rail cut off; a window has a real viewport, is resizable, and
+// cannot clip. Same ownership pattern as the Save As window below.
+let mainWindowId = null;
+
+// A browser-action popup could ask for {active:true, currentWindow:true}; an
+// extension window IS the current window, so it would find no tabs. The
+// background tracks the browsing tab instead and the page asks for it.
+let lastActiveTabId = null;
+
+function noteActiveTab(tabId) {
+  if (Number.isInteger(tabId) && tabId >= 0) lastActiveTabId = tabId;
+}
+
+api.tabs.onActivated.addListener((info) => { noteActiveTab(info && info.tabId); });
+
+async function resolveActiveTab() {
+  // Prefer the remembered browsing tab; fall back to querying, ignoring any
+  // tab that belongs to one of our own extension windows.
+  try {
+    if (Number.isInteger(lastActiveTabId)) {
+      const tab = await api.tabs.get(lastActiveTabId);
+      if (tab && tab.windowId !== mainWindowId) return tab;
+    }
+  } catch (e) { lastActiveTabId = null; }
+  try {
+    const tabs = await api.tabs.query({ active: true });
+    const usable = tabs.filter((tab) => tab && tab.windowId !== mainWindowId);
+    if (usable.length) {
+      noteActiveTab(usable[usable.length - 1].id);
+      return usable[usable.length - 1];
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function openMainWindow() {
+  if (!api.windows || typeof api.windows.create !== "function") return;
+  if (mainWindowId !== null) {
+    try {
+      await api.windows.update(mainWindowId, { focused: true });
+      return;
+    } catch (e) {
+      mainWindowId = null;
+    }
+  }
+  await settingsReady;
+  // Two panes need room; a single column does not.
+  const wantRail = !!settings.showRail && (!!settings.showQueue || !!settings.enableCasting);
+  try {
+    const created = await api.windows.create({
+      url: api.runtime.getURL("popup/popup.html"),
+      type: "popup",
+      width: wantRail ? 860 : 470,
+      height: 680,
+    });
+    if (created && Number.isInteger(created.id)) mainWindowId = created.id;
+  } catch (e) {
+    dlog("main window failed", e && e.message);
+  }
+}
+
+api.browserAction.onClicked.addListener(() => { openMainWindow(); });
+
+// One Save As window per media/variant. Repeat clicks focus the live one.
+const saveAsWindows = new Map();
+
+function saveAsWindowKey(tabId, mediaId, variantId) {
+  return tabId + "|" + mediaId + "|" + (variantId || "");
+}
+
+if (api.windows && api.windows.onRemoved) {
+  api.windows.onRemoved.addListener((windowId) => {
+    if (windowId === mainWindowId) mainWindowId = null;
+    for (const [key, id] of saveAsWindows) {
+      if (id === windowId) saveAsWindows.delete(key);
+    }
+  });
+}
+
+function knownExtensionFromFilename(name) {
+  const match = /\.([A-Za-z0-9]{1,8})$/.exec(typeof name === "string" ? name : "");
+  return match ? "." + match[1].toLowerCase() : ".mp4";
+}
+
+// Fresh allowlist projection of an owned row. Never a spread, never a URL, and
+// only the exact variant the caller already owns.
+function safeSaveAsContext(tabId, mediaId, variantId) {
+  const row = liveRowsForTab(tabId).find((candidate) => candidate && candidate.id === mediaId);
+  if (!row) return null;
+  const safe = decorateLiveRow(row, tabId);
+  if (!safe) return null;
+  let ownedVariantId = null;
+  if (variantId !== null && variantId !== undefined) {
+    const variant = safe.variants.find((candidate) => candidate && candidate.id === variantId);
+    if (!variant) return null;
+    ownedVariantId = variant.id;
+  }
+  const context = {
+    tabId,
+    mediaId: safe.id,
+    variantId: ownedVariantId,
+    proposedFilename: safe.proposedFilename,
+    knownExtension: knownExtensionFromFilename(safe.proposedFilename),
+    kind: safe.kind,
+  };
+  if (Number.isInteger(safe.sizeBytes) && typeof safe.sizeConfidence === "string") {
+    context.sizeBytes = safe.sizeBytes;
+    context.sizeConfidence = safe.sizeConfidence;
+  }
+  return context;
+}
+
+async function openSaveAsWindow(tabId, mediaId, variantId) {
+  if (!api.windows || typeof api.windows.create !== "function") {
+    return { ok: false, error: "Save As window unavailable." };
+  }
+  const key = saveAsWindowKey(tabId, mediaId, variantId);
+  const existing = saveAsWindows.get(key);
+  if (existing !== undefined) {
+    try {
+      await api.windows.update(existing, { focused: true });
+      return { ok: true, focused: true };
+    } catch (e) {
+      saveAsWindows.delete(key);
+    }
+  }
+  let relative = "saveas/saveas.html?tabId=" + encodeURIComponent(String(tabId)) +
+    "&mediaId=" + encodeURIComponent(mediaId);
+  if (variantId) relative += "&variantId=" + encodeURIComponent(variantId);
+  try {
+    const created = await api.windows.create({
+      url: api.runtime.getURL(relative),
+      type: "popup",
+      width: 520,
+      height: 360,
+    });
+    if (created && Number.isInteger(created.id)) saveAsWindows.set(key, created.id);
+    return { ok: true, focused: false };
+  } catch (e) {
+    return { ok: false, error: "Save As window unavailable." };
+  }
+}
+
+function isUnpromotedManagedMedia(item) {
+  if (!item || typeof item !== "object") return false;
+  if (item.kind === "direct") return true;
+  if (item.kind === "hls" || item.kind === "dash") return true;
+  return false;
+}
+
 // ---- Messaging ----
 
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "get-media") {
+        await settingsReady;
         const tabId = msg.tabId;
         let items;
         // decorate() attaches per-tab extras: thumbnail + backfilled title for
@@ -2029,16 +2773,57 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const kickYt = (tid) => { const m = mediaByTab.get(tid); if (m) for (const [k, it] of m) if (it.kind === "youtube") enrichYouTube(tid, k); };
         if (msg.allTabs) {
           items = [];
-          for (const tid of mediaByTab.keys()) {
+          const tids = new Set(mediaByTab.keys());
+          for (const tid of liveControllerTabs) tids.add(tid);
+          for (const tid of tids) {
             kickYt(tid);
             for (const it of visibleFor(tid)) items.push(decorate(it, tid));
+            for (const row of liveRowsForTab(tid)) {
+              const safe = decorateLiveRow(row, tid);
+              if (safe) items.push(safe);
+            }
           }
         } else {
           kickYt(tabId);
           items = visibleFor(tabId).map((it) => decorate(it, tabId));
+          for (const row of liveRowsForTab(tabId)) {
+            const safe = decorateLiveRow(row, tabId);
+            if (safe) items.push(safe);
+          }
         }
-        items.sort((a, b) => b.ts - a.ts);
-        sendResponse({ items, downloads: Array.from(activeDownloads.values()), helper: helperStatus(), cast: castState });
+        items.sort((a, b) => (Number.isFinite(b.ts) ? b.ts : 0) - (Number.isFinite(a.ts) ? a.ts : 0));
+        sendResponse({
+          items,
+          downloads: livePopupJobs().concat(Array.from(activeDownloads.values())),
+          helper: helperStatus(),
+          cast: castState,
+        });
+      } else if (msg.type === "page-snapshot-context") {
+        if (!sender.tab || !Number.isInteger(sender.tab.id)) {
+          sendResponse({ ok: false });
+        } else {
+          if (typeof sender.tab.url === "string") {
+            const ctx = tabContext.get(sender.tab.id) || {};
+            ctx.topLevelPageUrl = sender.tab.url;
+            tabContext.set(sender.tab.id, ctx);
+          }
+          sendResponse({
+            ok: true,
+            tabId: sender.tab.id,
+            frameId: Number.isInteger(sender.frameId) ? sender.frameId : 0,
+            documentId: typeof sender.documentId === "string" ? sender.documentId : null,
+            topLevelPageUrl: typeof sender.tab.url === "string" ? sender.tab.url : "",
+          });
+        }
+      } else if (msg.type === "page-snapshot") {
+        await settingsReady;
+        if (sender.tab && Number.isInteger(sender.tab.id) && typeof msg.topLevelPageUrl === "string") {
+          const ctx = tabContext.get(sender.tab.id) || {};
+          ctx.topLevelPageUrl = msg.topLevelPageUrl;
+          tabContext.set(sender.tab.id, ctx);
+        }
+        if (liveController) liveController.acceptPageSnapshot(msg);
+        sendResponse({ ok: true });
       } else if (msg.type === "helper-status") {
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "recheck-helper") {
@@ -2076,16 +2861,83 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, info });
       } else if (msg.type === "download") {
         const { item, tabId, filename, variantUrl } = msg;
-        if (item.kind === "hls") {
+        const itemId = readOwnActionId(item);
+        if (itemId.kind === "string") {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.enqueueDownload(msg, sender)));
+        } else if (itemId.present) {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else if (isUnpromotedManagedMedia(item)) {
+          sendResponse({ ok: false, error: "This static media is not ready for the managed download queue." });
+        } else if (item.kind === "hls") {
           downloadHls(item, tabId, filename, variantUrl);
+          sendResponse({ ok: true });
         } else if (item.kind === "dash") {
           downloadDash(item, tabId, filename, msg.variantId);
+          sendResponse({ ok: true });
         } else if (item.kind === "youtube") {
           downloadYouTube(item, tabId, filename, { height: msg.ytHeight, audioOnly: msg.ytAudioOnly });
+          sendResponse({ ok: true });
         } else {
           await downloadDirect(item, tabId, filename);
+          sendResponse({ ok: true });
         }
-        sendResponse({ ok: true });
+      } else if (msg.type === "get-active-tab") {
+        // The main UI runs in an extension window, where a currentWindow query
+        // would resolve to itself. Answer with the browsing tab instead.
+        const tab = await resolveActiveTab();
+        sendResponse(tab
+          ? { ok: true, tabId: tab.id, title: tab.title || "", url: tab.url || "" }
+          : { ok: false });
+      } else if (msg.type === "open-save-as") {
+        await settingsReady;
+        const mediaId = readOwnActionId({ id: msg.mediaId });
+        const variantId = msg.variantId == null ? null : msg.variantId;
+        if (!isExtensionPopupSender(sender) ||
+            mediaId.kind !== "string" || !isSafeOpaqueActionId(mediaId.value) ||
+            !Number.isInteger(msg.tabId) || msg.tabId < 0 ||
+            (variantId !== null && !isSafeOpaqueActionId(variantId)) ||
+            !safeSaveAsContext(msg.tabId, mediaId.value, variantId)) {
+          sendResponse({ ok: false, error: "Save As is unavailable for this item." });
+        } else {
+          sendResponse(await openSaveAsWindow(msg.tabId, mediaId.value, variantId));
+        }
+      } else if (msg.type === "get-save-as-context") {
+        await settingsReady;
+        const identity = parseSaveAsSender(sender);
+        const context = identity
+          ? safeSaveAsContext(identity.tabId, identity.mediaId, identity.variantId)
+          : null;
+        sendResponse(context
+          ? { ok: true, context, helper: helperStatus() }
+          : { ok: false, error: "Save As context unavailable." });
+      } else if (msg.type === "save-as-download") {
+        const identity = parseSaveAsSender(sender);
+        const itemId = readOwnActionId(msg.item);
+        const messageVariantId = msg.variantId == null ? null : msg.variantId;
+        // The window's own URL is the authority; a mismatched message is inert.
+        if (!identity || itemId.kind !== "string" ||
+            itemId.value !== identity.mediaId ||
+            msg.tabId !== identity.tabId ||
+            messageVariantId !== identity.variantId) {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else {
+          sendResponse(await runLiveControllerAction(sender,
+            (controller) => controller.enqueueDownload(msg, sender)));
+        }
+      } else if (msg.type === "retry-download") {
+        const retryId = readOwnActionId(msg);
+        if (retryId.kind !== "string") {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.manualRetry(retryId.value)));
+        }
+      } else if (msg.type === "use-firefox") {
+        const firefoxId = readOwnActionId(msg);
+        if (firefoxId.kind !== "string") {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        } else {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.requestFirefoxHandoff(msg, sender)));
+        }
       } else if (msg.type === "record-live") {
         const { item, tabId, filename, variantUrl } = msg;
         if (!nativePort) promptInstallHelper();   // works in-browser, but the helper is better — nudge once
@@ -2150,12 +3002,23 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       } else if (msg.type === "pick-folder") {
         if (nativePort) {
-          const reqId = "fp" + (++downloadCounter);
-          pendingFolderPicks.set(reqId, sendResponse);
-          nativePort.postMessage({ cmd: "pickFolder", reqId, dir: msg.dir || settings.saveFolder || "" });
+          const requestId = "fp" + (++downloadCounter);
+          const timer = setTimeout(
+            () => finishFolderPick(requestId, { status: "timeout" }),
+            FOLDER_PICK_TIMEOUT_MS
+          );
+          pendingFolderPicks.set(requestId, { respond: sendResponse, timer });
+          try {
+            nativePort.postMessage({
+              cmd: "pickFolder", requestId, reqId: requestId,
+              dir: msg.dir || settings.saveFolder || "",
+            });
+          } catch (e) {
+            finishFolderPick(requestId, { status: "error" });
+          }
           return true;   // sendResponse called when the host replies
         }
-        sendResponse({ ok: false, error: "Native helper not available for the folder picker." });
+        sendResponse({ ok: false, error: "folder_picker_failed" });
       } else if (msg.type === "discard-recording") {
         const dl = activeDownloads.get(msg.id);
         if (dl && dl.native && nativePort) nativePort.postMessage({ cmd: "discard", id: msg.id });
@@ -2221,7 +3084,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "get-settings") {
         sendResponse({ ok: true, settings, defaults: DEFAULT_SETTINGS });
       } else if (msg.type === "set-settings") {
+        const previousMaxConcurrent = settings.maxConcurrentDownloads;
         await saveSettings(msg.settings);
+        if (liveController && settings.maxConcurrentDownloads !== previousMaxConcurrent) {
+          await liveController.setMaxConcurrent(settings.maxConcurrentDownloads);
+        }
         sendResponse({ ok: true, settings });
       } else if (msg.type === "get-history") {
         const r = await api.storage.local.get("history");
@@ -2230,9 +3097,26 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await api.storage.local.set({ history: [] });
         sendResponse({ ok: true });
       } else if (msg.type === "cancel") {
-        const dl = activeDownloads.get(msg.id);
-        if (dl) dl.status = "cancelled";
-        sendResponse({ ok: true });
+        const cancelId = readOwnActionId(msg);
+        if (cancelId.kind === "string") {
+          sendResponse(await runLiveControllerAction(sender, (controller) => controller.cancel(cancelId.value)));
+        } else if (cancelId.kind === "number") {
+          const dl = activeDownloads.get(cancelId.value);
+          if (dl) dl.status = "cancelled";
+          // Browser-run loops poll dl.status, but yt-dlp runs INSIDE the helper —
+          // a flag it never sees, so the process kept downloading and the row sat
+          // on "Preparing" forever. Legacy yt-dlp ops are keyed by id alone, so
+          // OMIT attemptToken: the host treats a PRESENT key as a token check and
+          // would no-op the cancel. Unknown ids are a host-side no-op.
+          if (nativePort) {
+            try { nativePort.postMessage({ cmd: "pget-cancel", id: cancelId.value }); }
+            catch (e) { /* helper gone — the flag above still stops browser-run work */ }
+          }
+          if (dl) broadcast({ type: "download-update", download: dl });
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: "Download action rejected." });
+        }
       } else if (msg.type === "open-file") {
         // Popup "Open" on a helper-saved file. Browser-API saves are opened by
         // the popup itself via downloads.open (that call needs the user-input
@@ -2247,6 +3131,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } else if (msg.type === "clear") {
         mediaByTab.delete(msg.tabId);
+        forgetLiveSizesForTab(msg.tabId);
+        liveControllerTabs.delete(msg.tabId);
+        liveControllerMediaIds.delete(msg.tabId);
+        livePromotedKeys.delete(msg.tabId);
+        liveDirectSourceKeys.delete(msg.tabId);
         childUrls.delete(msg.tabId);
         updateBadge(msg.tabId);
         sendResponse({ ok: true });
@@ -2254,8 +3143,34 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // From content script: a <video> element src.
         if (sender.tab) {
           const item = msg.item;
-          item.name = item.name || shortName(item.url);
-          addMedia(sender.tab.id, item);
+          if (item && item.kind === "direct" && msg.snapshot) {
+            await settingsReady;
+          }
+          if (item && item.kind === "direct" && msg.snapshot && liveController) {
+            const mediaUrl = item.url;
+            const key = directGroupKey(mediaUrl);
+            if (!hasLiveDirectSource(sender.tab.id, mediaUrl)) {
+              let mediaOrigin = "";
+              try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
+              const mediaId = liveController.captureDomMedia({
+                mediaUrl,
+                mediaOrigin,
+                contentDisposition: null,
+                referrerUrl: typeof msg.referrerUrl === "string" ? msg.referrerUrl : "",
+                frameOrigin: typeof msg.frameOrigin === "string" ? msg.frameOrigin : "",
+                ts: Number.isFinite(item.ts) ? item.ts : 0,
+                snapshot: msg.snapshot,
+                transport: { mediaKind: "direct", requestHeaders: null },
+              });
+              // DOM owns only this exact canonical media URL. The broader
+              // directGroupKey is a network mirror policy and must not collapse
+              // distinct query-addressed DOM media.
+              claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false);
+            }
+          } else {
+            item.name = item.name || shortName(item.url);
+            addMedia(sender.tab.id, item);
+          }
         }
         sendResponse({ ok: true });
       } else if (msg.type === "page-info") {
@@ -2304,6 +3219,11 @@ function endTabRecordings(tabId) {
 api.tabs.onRemoved.addListener((tabId) => {
   endTabRecordings(tabId);
   mediaByTab.delete(tabId);
+  forgetLiveSizesForTab(tabId);
+  liveControllerTabs.delete(tabId);
+  liveControllerMediaIds.delete(tabId);
+  livePromotedKeys.delete(tabId);
+  liveDirectSourceKeys.delete(tabId);
   tabContext.delete(tabId);
   childUrls.delete(tabId);
   tabThumbs.delete(tabId);
@@ -2315,6 +3235,11 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url) {
     endTabRecordings(tabId);
     mediaByTab.delete(tabId);
+    forgetLiveSizesForTab(tabId);
+    liveControllerTabs.delete(tabId);
+    liveControllerMediaIds.delete(tabId);
+    livePromotedKeys.delete(tabId);
+    liveDirectSourceKeys.delete(tabId);
     tabContext.delete(tabId);
     childUrls.delete(tabId);
     tabThumbs.delete(tabId);

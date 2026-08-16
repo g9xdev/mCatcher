@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Save As — Media Catcher</title>
+  <link rel="stylesheet" href="saveas.css">
+</head>
+<body>
+  <main class="saveas" aria-labelledby="saveas-heading">
+    <h1 id="saveas-heading">Save As</h1>
+
+    <p class="media" id="media-line"></p>
+
+    <label class="field" for="filename">Filename</label>
+    <input id="filename" type="text" spellcheck="false" autocomplete="off" aria-describedby="feedback">
+
+    <div class="folder-row">
+      <button id="choose-folder" class="btn ghost" type="button">Choose folder…</button>
+      <span id="folder" class="folder">Folder: default download location</span>
+    </div>
+
+    <p id="feedback" class="feedback" role="status" aria-live="polite"></p>
+
+    <div class="actions">
+      <button id="confirm" class="btn amber" type="button">Confirm</button>
+      <button id="cancel" class="btn ghost" type="button">Cancel</button>
+    </div>
+  </main>
+
+  <script src="../lib/filename-ranker.js"></script>
+  <script src="../lib/download-intent.js"></script>
+  <script src="../lib/popup-download-ui.js"></script>
+  <script src="../lib/media-size.js"></script>
+  <script src="saveas.js"></script>
+</body>
+</html>

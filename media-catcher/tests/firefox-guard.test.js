@@ -803,6 +803,61 @@ test("bytes success creates object URL after proof, calls API once, revokes exac
   assert.equal(events.filter((e) => e.startsWith("revoke:")).length, 1);
 });
 
+test("bytes filename override changes only the API filename and still consumes the exact proof", async () => {
+  let apiArg = null;
+  const intent = baseIntent({
+    requestedFilename: "movie.m3u8",
+    userActionToken: "assembled-proof",
+  });
+  const store = new Set(["assembled-proof"]);
+  const g = createFirefoxGuard({
+    downloadsDownload: async (options) => {
+      apiArg = options;
+      return 9;
+    },
+    createObjectURL: () => "blob:override",
+    revokeObjectURL: () => {},
+  });
+
+  await g.downloadWithFirefox({
+    intent,
+    filename: "movie.mp4",
+    source: { type: "bytes", bytes: new Uint8Array([7]), mime: "video/mp4" },
+    tokenStore: store,
+  });
+
+  assert.equal(intent.requestedFilename, "movie.m3u8");
+  assert.equal(store.has("assembled-proof"), false);
+  assert.deepEqual(apiArg, {
+    url: "blob:override",
+    filename: "movie.mp4",
+    saveAs: true,
+  });
+});
+
+test("invalid bytes filename override rejects before proof or object URL effects", async () => {
+  let creates = 0;
+  let apiCalls = 0;
+  const g = createFirefoxGuard({
+    downloadsDownload: async () => { apiCalls += 1; },
+    createObjectURL: () => { creates += 1; return "blob:invalid"; },
+    revokeObjectURL: () => {},
+  });
+
+  for (const filename of ["", "   ", new String("movie.mp4"), { value: "movie.mp4" }]) {
+    const store = new Set(["tok"]);
+    await assert.rejects(() => g.downloadWithFirefox({
+      intent: baseIntent(),
+      filename,
+      source: { type: "bytes", bytes: new Uint8Array([1]) },
+      tokenStore: store,
+    }));
+    assert.equal(store.has("tok"), true);
+  }
+  assert.equal(creates, 0);
+  assert.equal(apiCalls, 0);
+});
+
 test("bytes default mime is application/octet-stream when mime absent", async () => {
   let blobSeen = null;
   const g = createFirefoxGuard({

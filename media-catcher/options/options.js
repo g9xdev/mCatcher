@@ -103,7 +103,9 @@ function wireBrowse(btnId, inputId) {
     if (r && r.ok && r.dir) { get(inputId).value = r.dir; await save(); }
     else if (r && r.ok === false) {
       const s = get("status");
-      s.textContent = r.error || "Folder picker needs the helper.";
+      s.textContent = r.error === "folder_picker_timeout"
+        ? "The folder dialog timed out."
+        : "Couldn't open the folder dialog — the helper may be unavailable.";
       setTimeout(() => (s.textContent = ""), 2500);
     }
   });
@@ -171,13 +173,22 @@ function renderHelper(h) {
   } else if (helperState === "connecting") {
     el.classList.add("warn"); txt.textContent = "Connecting to the native helper…";
   } else {
-    el.classList.add("off"); txt.textContent = "Native helper not connected — click to install it";
+    el.classList.add("off"); txt.textContent = "Native helper not connected — click to reconnect";
   }
 }
 get("helperStatus").addEventListener("click", async () => {
-  if (helperState === "disconnected") { send({ type: "open-helper-setup" }); return; }
+  // Re-check FIRST, same as the popup badge: a dropped port is not a missing
+  // install, and routing straight to the installer skipped the reconnect.
   const r = await send({ type: "recheck-helper" });
   if (r && r.helper) renderHelper(r.helper);
+  setTimeout(async () => {
+    const after = await send({ type: "helper-status" });
+    if (after && after.helper) renderHelper(after.helper);
+    // Offer the installer only once a live re-check has actually failed.
+    if (after && after.helper && after.helper.state === "disconnected") {
+      send({ type: "open-helper-setup" });
+    }
+  }, 600);
 });
 api.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "helper-status" && msg.helper) renderHelper(msg.helper);
