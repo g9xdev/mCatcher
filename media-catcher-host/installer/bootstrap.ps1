@@ -100,6 +100,20 @@ if ($srcResolved -ne $dstResolved) {
     $s = Join-Path $SourceDir $f
     if (Test-Path $s) { Copy-Item $s (Join-Path $InstallDir $f) -Force }
   }
+  # Recursive runtime package: SourceDir\mchost -> InstallDir\mchost (nested paths, no caches).
+  $mchostSrc = Join-Path $SourceDir "mchost"
+  if (Test-Path -LiteralPath $mchostSrc) {
+    $mchostDst = Join-Path $InstallDir "mchost"
+    New-Item -ItemType Directory -Force -Path $mchostDst | Out-Null
+    Get-ChildItem -Path $mchostSrc -Recurse -File | Where-Object {
+      $_.Extension -ne '.pyc' -and ($_.FullName -notmatch '[\\/]__pycache__[\\/]')
+    } | ForEach-Object {
+      $rel = $_.FullName.Substring((Resolve-Path -LiteralPath $mchostSrc).Path.Length).TrimStart('\')
+      $dest = Join-Path $mchostDst $rel
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+      Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+    }
+  }
   # seed an empty config only if one is not already installed (preserve user settings)
   $cfg = Join-Path $InstallDir "mc_config.json"
   if (-not (Test-Path $cfg)) { Set-Content -Path $cfg -Value "{}" -Encoding UTF8 }

@@ -35,6 +35,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Source: "{#HostSrc}mc_host.py";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostSrc}guardian.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostSrc}README.md";    DestDir: "{app}"; Flags: ignoreversion
+Source: "{#HostSrc}mchost\*";     DestDir: "{app}\mchost"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__\*,*.pyc"
 Source: "bootstrap.ps1";          DestDir: "{app}"; Flags: ignoreversion
 
 [Run]

@@ -66,6 +66,18 @@ jobs:
           # Host: only the runtime files (no ffmpeg, tests, installer, or machine files)
           New-Item -ItemType Directory -Force host-staging | Out-Null
           Copy-Item 'media-catcher-host/mc_host.py','media-catcher-host/guardian.ps1','media-catcher-host/README.md' host-staging/
+          # Recursively stage the source mchost package once under host-staging; drop caches/bytecode.
+          $mchostSrc = 'media-catcher-host/mchost'
+          $mchostDst = 'host-staging/mchost'
+          New-Item -ItemType Directory -Force $mchostDst | Out-Null
+          Get-ChildItem -Path $mchostSrc -Recurse -File | Where-Object {
+            $_.Extension -ne '.pyc' -and ($_.FullName -notmatch '[\\/]__pycache__[\\/]')
+          } | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $mchostSrc).Path.Length).TrimStart('\')
+            $dest = Join-Path $mchostDst $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+          }
           Compress-Archive -Path 'host-staging/*' -DestinationPath "dist/media-catcher-host-$v.zip" -Force
 
       - name: Build installer (MediaCatcherHostSetup.exe)
