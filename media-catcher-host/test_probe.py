@@ -68,7 +68,7 @@ def test_av_check_offers_the_command_as_text_and_never_runs_it():
     v = probe.check_av({"realtime": True, "cloudLevel": 2, "tamper": False},
                        cloud_events=9, host_dir=r"C:\X\Host")
     assert "Add-MpPreference" in (v.get("fix") or ""), "command is offered as text"
-    assert v.get("autofix") is not True, "the AV check must never self-apply"
+    assert v.get("fixable") is not True, "the AV check must never be marked self-applying"
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def test_directory_build_passes_and_onefile_is_fixable():
     ok = probe.check_ytdlp_build(has_internal=True, exe_bytes=7_700_000)
     assert ok["status"] == "pass"
     bad = probe.check_ytdlp_build(has_internal=False, exe_bytes=18_000_000)
-    assert bad["status"] == "fail" and bad["autofix"] is True
+    assert bad["status"] == "fail" and bad["fixable"] is True
     assert "onefile" in bad["detail"].lower()
 
 
@@ -91,7 +91,7 @@ def test_directory_build_passes_and_onefile_is_fixable():
 def test_orphans_are_reported_with_their_pids_and_are_fixable():
     v = probe.check_orphans([{"pid": 40052, "name": "yt-dlp.exe", "orphan": True},
                              {"pid": 111, "name": "yt-dlp.exe", "orphan": False}])
-    assert v["status"] == "fail" and v["autofix"] is True
+    assert v["status"] == "fail" and v["fixable"] is True
     assert "40052" in v["detail"]
     assert "111" not in v["detail"], "a live, parented process is not an orphan"
 
@@ -103,7 +103,7 @@ def test_no_orphans_passes():
 def test_stale_extraction_dirs_are_fixable_and_sized():
     v = probe.check_stale_mei([{"name": "_MEI1", "bytes": 30_000_000},
                                {"name": "_MEI2", "bytes": 30_000_000}])
-    assert v["status"] == "fail" and v["autofix"] is True
+    assert v["status"] == "fail" and v["fixable"] is True
     assert "2" in v["detail"]
 
 
@@ -195,3 +195,77 @@ def test_internal_dir_is_derived_from_the_exe_not_the_host_dir(tmp_path):
     assert probe.has_internal_for(str(exe)) is True
     assert probe.has_internal_for(str(tmp_path / "nope" / "yt-dlp.exe")) is False
     assert probe.has_internal_for(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Review findings (grok, nonce 9ef8a3adf27a, 2026-08-16). Every one of these is
+# the same shape: a FAILURE that read as a PASS. A probe whose failure modes are
+# silent passes is worse than no probe.
+# ---------------------------------------------------------------------------
+
+def test_absent_ytdlp_is_not_diagnosed_as_a_onefile_build():
+    """Finding 1. exe missing -> hasInternal False, exeBytes 0 -> "onefile build
+    (0.0 MB)". check_binaries already reports the absence; this was a second,
+    mislabelled failure."""
+    v = probe.check_ytdlp_build(has_internal=False, exe_bytes=0, exe_present=False)
+    assert v["status"] == "skip", v
+    assert "onefile" not in v["detail"].lower()
+
+
+def test_a_launch_that_failed_is_not_reported_as_fast():
+    """Finding 2. _time_ytdlp_launch swallowed every exception and still returned
+    elapsed time, so a yt-dlp that could not start at all came back as ~0s and
+    read as 'not being intercepted'."""
+    v = probe.check_launch_time(0.02, ok=False)
+    assert v["status"] == "fail", v
+    assert "could not" in v["detail"].lower() or "failed" in v["detail"].lower()
+    assert "not being intercepted" not in v["detail"]
+
+
+def test_a_slow_launch_carries_the_exclusion_command_itself():
+    """Finding 4. The command lived only on the AV item, which is 'pass' when
+    cloud_events is 0 — and the UI only renders fail/warn items. A slow launch
+    with 0 events therefore hid the one command that fixes it, which is exactly
+    the case observed on 2026-08-16."""
+    v = probe.check_launch_time(21.4, ok=True, host_dir=r"C:\X\Host")
+    assert "Add-MpPreference" in (v.get("fix") or ""), \
+        "the finding must carry its own remedy, not point at another item"
+    assert r"C:\X\Host" in v["fix"]
+
+
+def test_unreadable_av_state_is_not_reported_as_defender_off():
+    """Finding 7. _powershell_json returns {} on ANY error, and an empty dict is
+    indistinguishable from realtime=False — so a failed query asserted the
+    machine was unprotected AND passed."""
+    v = probe.check_av({}, cloud_events=0, host_dir=r"C:\X\Host")
+    assert v["status"] == "warn", v
+    assert "could not" in v["detail"].lower()
+    assert "OFF" not in v["detail"], "absence of a reading is not a reading of OFF"
+
+
+def test_warnings_do_not_render_as_all_checks_passed():
+    """Finding 8. ok = failed == 0, so a warn-only run showed green 'All checks
+    passed' while listing warnings underneath it."""
+    assert probe.summarize([{"status": "pass"}, {"status": "warn"}])["ok"] is False
+    assert probe.summarize([{"status": "pass"}, {"status": "pass"}])["ok"] is True
+
+
+def test_skipped_checks_count_separately_and_do_not_fail_the_run():
+    s = probe.summarize([{"status": "pass"}, {"status": "skip"}])
+    assert s["skipped"] == 1 and s["ok"] is True and s["passed"] == 1
+
+
+def test_collection_budget_fits_inside_the_ui_wait():
+    """Finding 6. The UI dropped the result at 120s while collection could run
+    60 + 45 + 45 + 45 = 195s, so a slow-but-working probe reported 'no result'."""
+    assert probe.collection_budget_seconds() < probe.UI_WAIT_SECONDS, \
+        "worst-case collection must finish before the UI stops waiting"
+
+
+def test_fixable_items_are_labelled_as_fixable_not_as_fixed():
+    """Finding 3. autofix was only ever SET, never read: nothing applied a fix,
+    while the spec and UI both promised one. The flag now states that a remedy
+    exists, which is what the probe actually delivers."""
+    v = probe.check_stale_mei([{"name": "_MEI1", "bytes": 1}])
+    assert v.get("fixable") is True
+    assert "autofix" not in v, "a flag named autofix must not survive without an auto-fixer"

@@ -2875,7 +2875,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             pendingProbes.set(reqId, resolve);
             try { nativePort.postMessage({ cmd: "probe", reqId }); }
             catch (e) { pendingProbes.delete(reqId); resolve(null); }
-            setTimeout(() => { if (pendingProbes.has(reqId)) { pendingProbes.delete(reqId); resolve(null); } }, 120000);
+            // Must outlast the host's worst-case collection (a 60s launch timing
+            // plus three 20s PowerShell calls). At 120s a slow-but-working probe
+            // reported "no result" — the same silent-failure shape it exists to
+            // expose. Keep in step with probe.UI_WAIT_SECONDS.
+            setTimeout(() => { if (pendingProbes.has(reqId)) { pendingProbes.delete(reqId); resolve(null); } }, 300000);
           });
         }
         sendResponse({ ok: !!result, result, helper: helperStatus() });

@@ -331,12 +331,16 @@ function renderProbeSummary(result) {
   el.className = "probe-summary " + (s.ok ? "good" : "bad");
   const head = document.createElement("span");
   head.className = "ps-head";
-  head.textContent = s.ok ? "All checks passed" : (s.failed + " problem" + (s.failed === 1 ? "" : "s") + " found");
+  // Warnings are not passes: heading off s.failed alone rendered a warn-only run
+  // as green "All checks passed" with the warnings listed directly underneath.
+  const problems = (s.failed || 0) + (s.warned || 0);
+  head.textContent = s.ok ? "All checks passed"
+    : problems + " item" + (problems === 1 ? "" : "s") + " need attention";
   const counts = document.createElement("span");
   counts.className = "ps-counts";
   counts.textContent = [s.passed + " passed", s.failed + " failed",
-                        s.fixed ? s.fixed + " fixed" : null,
-                        s.warned ? s.warned + " warned" : null].filter(Boolean).join(" · ");
+                        s.warned ? s.warned + " warned" : null,
+                        s.skipped ? s.skipped + " skipped" : null].filter(Boolean).join(" · ");
   el.replaceChildren(head, counts);
   for (const item of failed) {
     const row = document.createElement("div");

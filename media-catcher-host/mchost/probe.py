@@ -27,6 +27,19 @@ def _h():
 # being held: the incident measured 20s+ with zero CPU and no connections.
 LAUNCH_SLOW_SECONDS = 3.0
 
+# Per-step ceilings, and the wait the UI gives the whole run. The UI must outlast
+# the worst case or a slow-but-working probe reports "no result" — which is the
+# same silent-failure shape the probe exists to expose.
+LAUNCH_TIMEOUT_SECONDS = 60
+PS_TIMEOUT_SECONDS = 20
+PS_CALLS = 3                      # AV state, Defender events, orphan scan
+UI_WAIT_SECONDS = 300
+
+
+def collection_budget_seconds():
+    """Worst case for collect_state, so the UI wait can be checked against it."""
+    return LAUNCH_TIMEOUT_SECONDS + PS_TIMEOUT_SECONDS * PS_CALLS
+
 # Get-MpPreference returns this literal string for the exclusion fields when the
 # caller is not elevated, and the host never is.
 EXCLUSIONS_UNREADABLE = "N/A: Must be an administrator to view exclusions"
@@ -34,36 +47,60 @@ EXCLUSIONS_UNREADABLE = "N/A: Must be an administrator to view exclusions"
 _MEI_RE = re.compile(r"^_MEI\w+$")
 
 
-def _verdict(id, label, status, detail, fix=None, autofix=False):
+def _verdict(id, label, status, detail, fix=None, fixable=False):
+    """`fixable` states that a remedy exists and is named in `fix`. It does NOT
+    mean the probe applied one — nothing here does. The flag was called
+    `autofix` and was only ever set, never read, while the spec and UI both
+    promised the fix would be applied."""
     v = {"id": id, "label": label, "status": status, "detail": detail}
     if fix:
         v["fix"] = fix
-    if autofix:
-        v["autofix"] = True
+    if fixable:
+        v["fixable"] = True
     return v
+
+
+def exclusion_command(host_dir):
+    return 'Add-MpPreference -ExclusionPath "%s"' % host_dir
 
 
 # ---- checks (pure) --------------------------------------------------------
 
-def check_launch_time(seconds):
+def check_launch_time(seconds, ok=True, host_dir=""):
     """THE antivirus verdict.
 
     Settings cannot answer this. During the incident real-time protection was
     OFF and the fault persisted, because disabling real-time monitoring does not
     unload the WdFilter minifilter — only a timed launch separated "AV is
     intercepting this" from "the network is broken".
+
+    `ok` is False when the launch did not actually produce a version. Without it
+    a yt-dlp that could not start returned ~0s and read as healthy.
     """
+    if not ok:
+        return _verdict("launch", "yt-dlp launch", "fail",
+                        "could not launch yt-dlp (no version returned after %.2fs)" % seconds)
     if seconds < LAUNCH_SLOW_SECONDS:
         return _verdict("launch", "yt-dlp launch", "pass",
                         "%.2fs — not being intercepted" % seconds)
+    # Carries its own remedy: pointing at the AV item hid the command whenever
+    # that item was "pass", which is precisely the slow-launch-with-no-events case.
     return _verdict("launch", "yt-dlp launch", "fail",
                     "%.2fs — launches are being intercepted (a clean launch is ~0.4s)"
                     % seconds,
-                    fix="Exclude the host directory from your antivirus (see the AV check).")
+                    fix=exclusion_command(host_dir) if host_dir else
+                        "Exclude the host directory from your antivirus.")
 
 
 def check_av(av, cloud_events, host_dir):
     """Report what is readable unelevated; never claim to know the exclusions."""
+    if not av:
+        # _powershell_json returns {} on ANY failure, and an empty dict is
+        # indistinguishable from realtime=False. Asserting "OFF" from a failed
+        # read would claim the machine is unprotected on no evidence.
+        return _verdict("av", "Antivirus", "warn",
+                        "could not read antivirus state (the query failed)",
+                        fix=exclusion_command(host_dir))
     bits = ["Defender real-time %s" % ("ON" if av.get("realtime") else "OFF"),
             "cloud level %s" % av.get("cloudLevel"),
             "tamper protection %s" % ("on" if av.get("tamper") else "off"),
@@ -71,11 +108,11 @@ def check_av(av, cloud_events, host_dir):
     if av.get("exclusions") == EXCLUSIONS_UNREADABLE:
         bits.append("exclusion list needs admin to read")
     detail = " · ".join(str(b) for b in bits)
-    cmd = 'Add-MpPreference -ExclusionPath "%s"' % host_dir
     # Reported, never applied: it needs admin regardless, and a diagnostics
     # button that silently punches AV holes is shaped exactly like malware.
     status = "warn" if cloud_events else "pass"
-    return _verdict("av", "Antivirus", status, detail, fix=cmd, autofix=False)
+    return _verdict("av", "Antivirus", status, detail,
+                    fix=exclusion_command(host_dir), fixable=False)
 
 
 def internal_dir_for(exe):
@@ -95,16 +132,24 @@ def has_internal_for(exe):
     return bool(d) and os.path.isdir(d)
 
 
-def check_ytdlp_build(has_internal, exe_bytes):
+def check_ytdlp_build(has_internal, exe_bytes, exe_present=True):
     """The onefile build re-extracts ~145 files to %TEMP% on EVERY launch, which
-    is precisely what AV kept rescanning. The directory build extracts nothing."""
+    is precisely what AV kept rescanning. The directory build extracts nothing.
+
+    With no exe there is nothing to classify: reporting "onefile build (0.0 MB)"
+    was a second, mislabelled failure on top of the one check_binaries already
+    reports correctly.
+    """
+    if not exe_present:
+        return _verdict("ytdlpBuild", "yt-dlp packaging", "skip",
+                        "yt-dlp not installed — see the binaries check")
     if has_internal:
         return _verdict("ytdlpBuild", "yt-dlp packaging", "pass",
                         "directory build (_internal present) — nothing extracted per launch")
     return _verdict("ytdlpBuild", "yt-dlp packaging", "fail",
                     "onefile build (%.1f MB, no _internal) — re-extracts ~145 files every launch"
                     % (exe_bytes / 1048576.0),
-                    fix="Replace with the yt-dlp_win.zip directory build.", autofix=True)
+                    fix="Replace with the yt-dlp_win.zip directory build.", fixable=True)
 
 
 def check_orphans(procs):
@@ -115,7 +160,7 @@ def check_orphans(procs):
                     "%d orphaned: %s" % (len(orphans),
                                          ", ".join("%s (%s)" % (p["pid"], p["name"])
                                                    for p in orphans)),
-                    fix="Kill the process trees.", autofix=True)
+                    fix="Kill the process trees.", fixable=True)
 
 
 def check_stale_mei(dirs):
@@ -124,7 +169,7 @@ def check_stale_mei(dirs):
     total = sum(d.get("bytes", 0) for d in dirs)
     return _verdict("staleMei", "Extraction debris", "fail",
                     "%d stale _MEI dirs, %.0f MB" % (len(dirs), total / 1048576.0),
-                    fix="Delete them.", autofix=True)
+                    fix="Delete them.", fixable=True)
 
 
 def check_binaries(present):
@@ -134,39 +179,46 @@ def check_binaries(present):
                         "all present: %s" % ", ".join(sorted(present)))
     return _verdict("binaries", "Helper binaries", "fail",
                     "missing: %s" % ", ".join(missing),
-                    fix="Fetch the missing binaries.", autofix=True)
+                    fix="Fetch the missing binaries.", fixable=True)
 
 
 def summarize(items):
-    counts = {"passed": 0, "failed": 0, "fixed": 0, "warned": 0}
+    counts = {"passed": 0, "failed": 0, "fixed": 0, "warned": 0, "skipped": 0}
+    buckets = {"pass": "passed", "fail": "failed", "fixed": "fixed",
+               "warn": "warned", "skip": "skipped"}
     for i in items:
-        s = i.get("status")
-        counts["passed" if s == "pass" else
-                "failed" if s == "fail" else
-                "fixed" if s == "fixed" else
-                "warned" if s == "warn" else "passed"] += 1
-    counts["ok"] = counts["failed"] == 0
+        counts[buckets.get(i.get("status"), "passed")] += 1
+    # A warning is not a pass. `ok` gated on failures alone rendered a warn-only
+    # run as green "All checks passed" with the warnings listed underneath it.
+    counts["ok"] = counts["failed"] == 0 and counts["warned"] == 0
     return counts
 
 
 # ---- collection (the only part that touches the OS) -----------------------
 
 def _time_ytdlp_launch(exe):
+    """Returns (seconds, ok). `ok` is False unless a version actually came back:
+    swallowing the exception and returning elapsed time alone made a yt-dlp that
+    could not start at all look like a fast, healthy launch."""
     if not exe or not os.path.isfile(exe):
-        return None
+        return None, False
     from mchost.downloads import _no_window
     cf, si = _no_window()
     t0 = time.time()
+    p = None
+    ok = False
     try:
         p = subprocess.Popen([exe, "--version"], stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, creationflags=cf, startupinfo=si)
-        p.communicate(timeout=60)
+        out, _ = p.communicate(timeout=LAUNCH_TIMEOUT_SECONDS)
+        ok = p.returncode == 0 and bool((out or b"").strip())
     except Exception:
         try:
-            p.kill()
+            if p:
+                p.kill()
         except Exception:
             pass
-    return time.time() - t0
+    return time.time() - t0, ok
 
 
 def _powershell_json(script):
@@ -177,7 +229,7 @@ def _powershell_json(script):
         cf, si = _no_window()
         r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                             "-Command", script], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=45,
+                           encoding="utf-8", errors="replace", timeout=PS_TIMEOUT_SECONDS,
                            creationflags=cf, startupinfo=si)
         return json.loads(r.stdout) if r.stdout.strip() else {}
     except Exception:
@@ -222,9 +274,12 @@ def collect_state():
                 stale.append({"name": name, "path": d, "bytes": size})
     except Exception:
         pass
+    _launch = _time_ytdlp_launch(exe)
     return {
         "hostDir": here,
-        "launchSeconds": _time_ytdlp_launch(exe),
+        "launchSeconds": _launch[0],
+        "launchOk": _launch[1],
+        "exePresent": bool(exe) and os.path.isfile(exe),
         "av": _powershell_json(_AV_SCRIPT),
         "cloudEvents": (_powershell_json(_EVENTS_SCRIPT) or {}).get("count", 0),
         "binaries": {"ffmpeg": bool(_h().FFMPEG), "yt-dlp": bool(exe),
@@ -274,13 +329,15 @@ def handle_probe(req):
             _h()._hlog("info", "probe: starting", "probe")
             st = collect_state()
 
+            host_dir = st.get("hostDir", "")
             secs = st.get("launchSeconds")
             if secs is not None:
-                log(check_launch_time(secs))
-            log(check_av(st.get("av") or {}, st.get("cloudEvents", 0),
-                         st.get("hostDir", "")))
+                log(check_launch_time(secs, ok=st.get("launchOk", True),
+                                      host_dir=host_dir))
+            log(check_av(st.get("av") or {}, st.get("cloudEvents", 0), host_dir))
             log(check_binaries(st.get("binaries") or {}))
-            log(check_ytdlp_build(st.get("hasInternal"), st.get("exeBytes", 0)))
+            log(check_ytdlp_build(st.get("hasInternal"), st.get("exeBytes", 0),
+                                  exe_present=st.get("exePresent", True)))
             log(check_orphans(st.get("orphans") or []))
             log(check_stale_mei(st.get("staleMei") or []))
         except Exception as e:
@@ -290,8 +347,9 @@ def handle_probe(req):
             items.append(_verdict("probe", "Probe", "fail", "probe failed: %s" % e))
 
         summary = summarize(items)
-        _h()._hlog("info", "probe: %d passed, %d failed, %d fixed"
-                   % (summary["passed"], summary["failed"], summary["fixed"]), "probe")
+        _h()._hlog("info", "probe: %d passed, %d failed, %d warned, %d skipped"
+                   % (summary["passed"], summary["failed"], summary["warned"],
+                      summary["skipped"]), "probe")
         _h().send({"type": "probe-result", "reqId": reqid,
                    "summary": summary, "items": items})
 

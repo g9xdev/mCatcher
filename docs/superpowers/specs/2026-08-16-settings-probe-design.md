@@ -25,24 +25,32 @@ pipeline is already generic (`_hlog(level, msg, src)` → `{type:"log"}` →
 so this needs no rendering work.
 
 A compact summary card renders above the console: counts of passed / failed /
-fixed, and the failed items. Same shape `handle_get_report` already uses — glance
-for the verdict, scroll the console for the why.
+warned / skipped, and the items needing attention with their remedies. Same shape
+`handle_get_report` already uses — glance for the verdict, scroll the console for
+the why.
 
 ## Checks
 
-Auto-fix is limited to actions that are safely reversible and need no admin.
-Everything else reports, with the exact command where one exists.
+The probe **reports**; it does not change anything. Each finding names the remedy
+so it can be applied deliberately.
+
+This is narrower than the first draft of this spec, which promised auto-fix. That
+was written before the code and never implemented: the `autofix` flag was set on
+four checks and read by nothing, while the UI said "fixes what it safely can".
+An external review caught it (grok, nonce 9ef8a3adf27a, 2026-08-16, finding 3).
+Rather than ship the claim, the claim was withdrawn — the diagnosis is the value,
+and applying fixes is a separate change that deserves its own consent model.
 
 | Check | On failure |
 | --- | --- |
 | Host reachable (ping → pong) | report |
-| Registration: HKCU key, manifest, `mc_host.bat` | fix — re-run `bootstrap.ps1` |
-| `ffmpeg` / `yt-dlp` / `deno` present | fix — fetch |
-| yt-dlp is the directory build, not onefile | fix — replace |
+| Registration: HKCU key, manifest, `mc_host.bat` | report — re-run `bootstrap.ps1` |
+| `ffmpeg` / `yt-dlp` / `deno` present | report — fetch them |
+| yt-dlp is the directory build, not onefile | report — replace with the zip build |
 | yt-dlp launch time | report — the AV verdict |
 | AV state, cloud events, exclusion command | report — never auto-applies |
-| Orphaned yt-dlp / deno processes | fix — tree-kill |
-| Stale `_MEI*` dirs in `%TEMP%` | fix — delete |
+| Orphaned yt-dlp / deno processes | report — kill the trees |
+| Stale `_MEI*` dirs in `%TEMP%` | report — delete them |
 | Installed files match the shipped set | report |
 | Cookies readable · YouTube reachable · disk space | report |
 
@@ -101,8 +109,21 @@ is not downloads.
   check reads the world directly.
 - A thin collection layer gathers that state; only it touches the OS.
 - `handle_probe(req)` orchestrates: run checks in order, `_hlog(..., src="probe")`
-  per step, apply fixes where the verdict allows, then emit one
-  `{type: "probe-result", reqId, passed, failed, fixed, items[]}`.
+  per step, then emit one
+  `{type: "probe-result", reqId, summary{passed,failed,warned,skipped,ok}, items[]}`.
+- A verdict's `fixable` flag means *a remedy exists and is named in `fix`* — never
+  that the probe applied one.
+
+Failure must never read as success. Every check distinguishes "could not
+determine" from "determined to be fine": an unreadable AV state warns rather than
+reporting Defender OFF, a launch that never returned a version fails rather than
+timing as fast, an absent yt-dlp skips the packaging check rather than being
+classified as a onefile build, and a warning keeps `ok` false. The whole point of
+the probe is to surface silent failures, so its own silent failures are the one
+defect it cannot afford.
+
+The UI wait must exceed `collection_budget_seconds()`, or a slow-but-working
+probe reports "no result" — the same shape it exists to expose.
 
 Cross-module names resolve through the `mc_host` shim at call time (`_h().<name>`),
 matching the convention the other `mchost` modules follow.
