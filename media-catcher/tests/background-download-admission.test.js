@@ -510,3 +510,249 @@ test("unauthorized or unowned requests are effect-free", async () => {
     );
   });
 });
+
+test("undefined destination directory rejects before job token native or publication", async () => {
+  const h = makeHarness();
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 51,
+    docId: "doc-undef-dest",
+    filename: "undef.mp4",
+    referer: YT_REFERER,
+    userAgent: YT_UA,
+  });
+  h.setDest(undefined);
+  const baseline = {
+    postNative: h.counts.postNative,
+    publishJobs: h.counts.publishJobs,
+    dest: h.counts.getEffectiveDestinationDirectory,
+    token: h.counts.randomToken,
+  };
+  await expectGenericReject(
+    h.ctrl.enqueueDownload(
+      {
+        type: "download",
+        tabId: 51,
+        item: { id: mediaId },
+        intent: defaultIntent("undef.mp4"),
+      },
+      {}
+    )
+  );
+  assert.equal(h.counts.getEffectiveDestinationDirectory, baseline.dest + 1);
+  assert.equal(h.counts.postNative, baseline.postNative);
+  assert.equal(h.counts.publishJobs, baseline.publishJobs);
+  assert.equal(h.counts.randomToken, baseline.token);
+  assert.equal(h.posted.length, 0);
+  assert.equal(h.published.length, 0);
+  assert.equal(h.ctrl.popupJobs().length, 0);
+});
+
+test("rejected postNative still publishes one safe running job and rethrows the same error", async () => {
+  const boom = new Error("native-reject-identity");
+  const h = makeHarness({
+    postNative() {
+      return Promise.reject(boom);
+    },
+  });
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 52,
+    docId: "doc-post-reject",
+    filename: "rej.mp4",
+    referer: YT_REFERER,
+    userAgent: YT_UA,
+  });
+  let caught = null;
+  await h.ctrl
+    .enqueueDownload(
+      {
+        type: "download",
+        tabId: 52,
+        item: { id: mediaId },
+        intent: saveAsIntent("rej.mp4", "D:\\Vids"),
+      },
+      {}
+    )
+    .then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (err) => {
+        caught = err;
+      }
+    );
+  assert.equal(caught, boom);
+  assert.equal(h.counts.publishJobs, 1);
+  assert.equal(h.published.length, 1);
+  const rows = h.published[0];
+  assert.equal(Array.isArray(rows), true);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, "job:j1:1");
+  assert.equal(rows[0].state, "running");
+  assertSafeProjection(rows[0], "rejected-post publish");
+  assertSafeProjection(rows, "rejected-post publish list");
+});
+
+test("synchronously thrown postNative still publishes one safe running job and rethrows the same error", async () => {
+  const boom = new Error("native-throw-identity");
+  const h = makeHarness({
+    postNative() {
+      throw boom;
+    },
+  });
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 53,
+    docId: "doc-post-throw",
+    filename: "thr.mp4",
+    referer: YT_REFERER,
+    userAgent: YT_UA,
+  });
+  let caught = null;
+  await h.ctrl
+    .enqueueDownload(
+      {
+        type: "download",
+        tabId: 53,
+        item: { id: mediaId },
+        intent: saveAsIntent("thr.mp4", "D:\\Vids"),
+      },
+      {}
+    )
+    .then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (err) => {
+        caught = err;
+      }
+    );
+  assert.equal(caught, boom);
+  assert.equal(h.counts.publishJobs, 1);
+  assert.equal(h.published.length, 1);
+  const rows = h.published[0];
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, "running");
+  assertSafeProjection(rows[0], "thrown-post publish");
+});
+
+test("setMaxConcurrent publishes committed running jobs when newly admitted postNative fails", async () => {
+  const boom = new Error("raise-native-reject");
+  let failNext = false;
+  const h = makeHarness({
+    maxConcurrent: 1,
+    postNative(command) {
+      if (failNext) return Promise.reject(boom);
+      return command;
+    },
+  });
+  const firstId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 54,
+    docId: "doc-raise-a",
+    filename: "one.mp4",
+    referer: YT_REFERER,
+    userAgent: YT_UA,
+  });
+  const secondId = captureDirect(h.ctrl, {
+    url: VM_SIGNED,
+    pageUrl: VM_PAGE,
+    tabId: 55,
+    docId: "doc-raise-b",
+    filename: "two.mp4",
+    referer: VM_PAGE,
+    userAgent: YT_UA,
+  });
+  await h.ctrl.enqueueDownload(
+    {
+      type: "download",
+      tabId: 54,
+      item: { id: firstId },
+      intent: defaultIntent("one.mp4"),
+    },
+    {}
+  );
+  await h.ctrl.enqueueDownload(
+    {
+      type: "download",
+      tabId: 55,
+      item: { id: secondId },
+      intent: defaultIntent("two.mp4"),
+    },
+    {}
+  );
+  assert.equal(h.counts.publishJobs, 2);
+  failNext = true;
+  let caught = null;
+  await h.ctrl.setMaxConcurrent(2).then(
+    () => {
+      throw new Error("expected rejection");
+    },
+    (err) => {
+      caught = err;
+    }
+  );
+  assert.equal(caught, boom);
+  assert.equal(h.counts.publishJobs, 3);
+  const last = h.published[h.published.length - 1];
+  assert.equal(last.length, 2);
+  const states = last.map((j) => j.state).sort();
+  assert.deepEqual(states, ["running", "running"].sort());
+  assertSafeProjection(last, "setMaxConcurrent failed post");
+});
+
+test("overlapping pump calls post one native start for the live attempt token", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let settleCount = 0;
+  const postedCmds = [];
+  const h = makeHarness({
+    postNative(command) {
+      postedCmds.push(command);
+      return gate.then(() => command);
+    },
+  });
+  const mediaId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 56,
+    docId: "doc-overlap-pump",
+    filename: "ov.mp4",
+    referer: YT_REFERER,
+    userAgent: YT_UA,
+  });
+  const enqueueP = h.ctrl.enqueueDownload(
+    {
+      type: "download",
+      tabId: 56,
+      item: { id: mediaId },
+      intent: saveAsIntent("ov.mp4", "D:\\Vids"),
+    },
+    {}
+  );
+  while (postedCmds.length === 0) {
+    await Promise.resolve();
+  }
+  const p1 = h.ctrl.pump().then(() => {
+    settleCount += 1;
+  });
+  const p2 = h.ctrl.pump().then(() => {
+    settleCount += 1;
+  });
+  assert.equal(postedCmds.length, 1);
+  assert.equal(postedCmds[0].attemptToken, "a1#1");
+  assert.equal(settleCount, 0);
+  release();
+  await enqueueP;
+  await p1;
+  await p2;
+  assert.equal(settleCount, 2);
+  assert.equal(postedCmds.length, 1);
+});
