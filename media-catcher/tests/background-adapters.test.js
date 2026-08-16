@@ -1133,14 +1133,11 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
 
   // Async future stubs return a Promise before rejecting (never throw sync).
   const asyncStubs = [
-    () => ctrl.enqueueDownload({}, {}),
     () => ctrl.handleNativeMessage({}),
     () => ctrl.requestFirefoxHandoff({}, {}),
     () => ctrl.cancel("j1"),
     () => ctrl.manualRetry("j1"),
     () => ctrl.helperDisconnected(),
-    () => ctrl.setMaxConcurrent(3),
-    () => ctrl.pump(),
   ];
   for (const call of asyncStubs) {
     let p;
@@ -1160,6 +1157,36 @@ test("BA01 — dual export assigns McBackgroundAdapters and exports only createB
     assert.ok(rejected instanceof Error);
     assert.equal(rejected.message, LEASE1_MSG);
   }
+  // Admission APIs are always-Promise. Unauthorized enqueue rejects generically;
+  // setMaxConcurrent/pump with no jobs resolve without native work.
+  let pEnq;
+  assert.doesNotThrow(() => {
+    pEnq = ctrl.enqueueDownload({}, {});
+  });
+  assert.ok(pEnq && typeof pEnq.then === "function");
+  let enqErr = null;
+  await pEnq.then(
+    () => {
+      throw new Error("expected rejection");
+    },
+    (err) => {
+      enqErr = err;
+    }
+  );
+  assert.ok(enqErr instanceof TypeError);
+  assert.equal(enqErr.message, GENERIC_ADAPTER_MSG);
+  let pMax;
+  assert.doesNotThrow(() => {
+    pMax = ctrl.setMaxConcurrent(3);
+  });
+  assert.ok(pMax && typeof pMax.then === "function");
+  await pMax;
+  let pPump;
+  assert.doesNotThrow(() => {
+    pPump = ctrl.pump();
+  });
+  assert.ok(pPump && typeof pPump.then === "function");
+  await pPump;
   // Stubs must not invoke effects or mutate by publishing.
   assert.equal(effectHits, 0);
   assert.equal(fx.counts.publishDetection, 0);
@@ -7075,7 +7102,7 @@ test("BA05 — opaque variant IDs bind original private URLs and replay cannot r
         false
       );
 
-      // enqueueDownload remains Lease-1 stub; no reads / effects.
+      // Unauthorized enqueue (no own-data item.id / tabId) is effect-free.
       let itemHits = 0;
       const item = {};
       Object.defineProperty(item, "url", {
@@ -7117,10 +7144,16 @@ test("BA05 — opaque variant IDs bind original private URLs and replay cannot r
           rejected = err;
         }
       );
-      assert.ok(rejected instanceof Error);
-      assert.equal(rejected.message, LEASE1_MSG);
+      assert.ok(rejected instanceof TypeError);
+      assert.equal(rejected.message, GENERIC_ADAPTER_MSG);
       assert.equal(itemHits, 0);
-      assertEffectBaseline(fx, baseline, "enqueueDownload stub");
+      assert.equal(fx.counts.postNative, baseline.postNative);
+      assert.equal(fx.counts.publishJobs, baseline.publishJobs);
+      assert.equal(
+        fx.counts.getEffectiveDestinationDirectory,
+        baseline.getEffectiveDestinationDirectory
+      );
+      assert.equal(fx.counts.randomToken, baseline.randomToken);
       assert.deepEqual(
         ctrl.popupMedia(tabId)[0].variants.map((v) => v.id),
         rows.map((r) => r.id)
@@ -8058,23 +8091,11 @@ test("BA06 — public outputs and callbacks exclude every private URL/header/ove
 
       // Representative future stubs — await all rejections.
       const stubCalls = [
-        () =>
-          ctrl.enqueueDownload(
-            {
-              url: "https://override.example/SECRET_OVERRIDE_URL.mp4",
-              providerKey: "SECRET_CALLER_PROVIDER",
-              variantUrl: vUrlNet,
-              variantId: netRows[0].id,
-            },
-            {}
-          ),
         () => ctrl.handleNativeMessage({ cookie: "SECRET_COOKIE_ABC" }),
         () => ctrl.requestFirefoxHandoff({ url: vUrlNet }, {}),
         () => ctrl.cancel("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.manualRetry("job-SECRET_CALLER_VARIANT_ID"),
         () => ctrl.helperDisconnected(),
-        () => ctrl.setMaxConcurrent(9),
-        () => ctrl.pump(),
       ];
       const materialBefore = snapshotEffectBaseline(fx);
       for (const call of stubCalls) {

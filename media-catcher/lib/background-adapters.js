@@ -79,6 +79,18 @@
       throw new Error("McFirefoxGuard is required for BackgroundAdapters");
     }
 
+    function resolveDownloadScheduler() {
+      if (isCommonJsActive()) return require("./download-scheduler.js");
+      if (root && root.McDownloadScheduler) return root.McDownloadScheduler;
+      throw new Error("McDownloadScheduler is required for BackgroundAdapters");
+    }
+
+    function resolveDownloadMessageRouter() {
+      if (isCommonJsActive()) return require("./download-message-router.js");
+      if (root && root.McDownloadMessageRouter) return root.McDownloadMessageRouter;
+      throw new Error("McDownloadMessageRouter is required for BackgroundAdapters");
+    }
+
     function deepClone(value) {
       if (value == null || typeof value !== "object") return value;
       if (safeIsArray(value)) return value.map(deepClone);
@@ -1192,21 +1204,18 @@
       var persistHistory = optionalCallback(persistHistoryOpt, "persistHistory");
       var reportDiagnostic = optionalCallback(reportDiagnosticOpt, "reportDiagnostic");
 
-      // Retain accepted scalars for later leases (scheduler not constructed here).
+      // Retain accepted scalars. Scheduler is constructed once, on first use.
       var settings = {
         maxConcurrent: maxConcurrent,
         segmentConcurrency: segmentConcurrency,
         retries: retries,
       };
+      var currentMaxConcurrent = maxConcurrent;
       void settings;
-      void postNative;
       void createObjectURL;
       void revokeObjectURL;
       void fetchArrayBuffer;
       void assembleMedia;
-      void isPopupSender;
-      void getEffectiveDestinationDirectory;
-      void publishJobs;
       void persistHistory;
 
       /** Transactional now sample used during a capture finalizer call. */
@@ -1294,7 +1303,7 @@
       var sessionDocCounter = 0;
       var sessionPageCounter = 0;
 
-      // Empty holders for later leases (no behavior yet).
+      // Empty holders for later leases (native/Firefox slices).
       var jobsById = new Map();
       var sinkSessions = new Map();
       var proofTokens = new Set();
@@ -1303,6 +1312,11 @@
       void sinkSessions;
       void proofTokens;
       void historyEntries;
+
+      var scheduler = null;
+      var downloadRouterApi = null;
+      var jobBindings = Object.create(null);
+      var postedAttempts = Object.create(null);
 
       // Lease-2 variant ownership (Batch 1). Provider observation stays dormant empty.
       /** @type {Map<string, object[]>} media ID → ordered private variant records */
@@ -1922,8 +1936,298 @@
         return Promise.reject(new Error(LEASE1_MSG));
       }
 
-      function enqueueDownload(/* message, sender */) {
-        return lease1Reject();
+      function ensureScheduler() {
+        if (scheduler) return scheduler;
+        var SchedulerApi = resolveDownloadScheduler();
+        scheduler = SchedulerApi.createDownloadScheduler({
+          maxConcurrent: currentMaxConcurrent,
+          now: nowFn,
+          randomToken: randomTokenFn,
+        });
+        return scheduler;
+      }
+
+      function ensureRouter() {
+        if (!downloadRouterApi) downloadRouterApi = resolveDownloadMessageRouter();
+        return downloadRouterApi;
+      }
+
+      function projectSafeJobs() {
+        if (!scheduler) return deepFreeze([]);
+        var snap = scheduler.getSnapshot();
+        var list = snap && snap.jobs ? snap.jobs : [];
+        var rows = [];
+        for (var i = 0; i < list.length; i++) {
+          rows.push(Privacy.projectPopupJob(list[i]));
+        }
+        return deepFreeze(rows);
+      }
+
+      function publishSafeJobs() {
+        try {
+          publishJobs(projectSafeJobs());
+        } catch (e) {
+          reportSafeDiagnostic("publish-jobs-failed", null);
+        }
+      }
+
+      function requirePopupSender(sender) {
+        var ok;
+        try {
+          ok = isPopupSender(sender);
+        } catch (e) {
+          throw genericTypeError();
+        }
+        if (ok !== true) throw genericTypeError();
+      }
+
+      function attemptKey(jobId, token) {
+        return String(jobId) + "\0" + String(token);
+      }
+
+      function takeStartCommand(job) {
+        if (!job || job.state !== "running") return null;
+        if (job.mediaKind != null && job.mediaKind !== "direct") return null;
+        if (typeof job.attemptToken !== "string" || job.attemptToken.trim().length === 0) {
+          return null;
+        }
+        var key = attemptKey(job.id, job.attemptToken);
+        if (Object.prototype.hasOwnProperty.call(postedAttempts, key)) {
+          return null;
+        }
+        postedAttempts[key] = true;
+
+        var binding = jobBindings[job.id];
+        var handle = binding && binding.handle;
+        var url;
+        try {
+          url = handle && handle.mediaUrl;
+        } catch (e) {
+          delete postedAttempts[key];
+          throw genericTypeError();
+        }
+        if (typeof url !== "string" || url.trim().length === 0) {
+          delete postedAttempts[key];
+          throw genericTypeError();
+        }
+
+        var lease;
+        try {
+          lease = scheduler.nativeLeaseFor(job.id);
+        } catch (e) {
+          delete postedAttempts[key];
+          throw e;
+        }
+
+        var input = {
+          kind: "pget",
+          jobId: job.id,
+          attemptToken: job.attemptToken,
+          intent: job.intent,
+          url: url,
+          maxConnections: lease.maxConnections,
+          providerGeneration: lease.providerGeneration,
+        };
+        if (binding && binding.effectiveDir !== undefined) {
+          input.effectiveDestinationDirectory = binding.effectiveDir;
+        }
+        var ft = binding && binding.futureTransport;
+        if (ft) {
+          if (Object.prototype.hasOwnProperty.call(ft, "mirrors")) {
+            input.mirrors = ft.mirrors;
+          }
+          if (Object.prototype.hasOwnProperty.call(ft, "referer")) {
+            input.referer = ft.referer;
+          }
+          if (Object.prototype.hasOwnProperty.call(ft, "userAgent")) {
+            input.userAgent = ft.userAgent;
+          }
+        }
+
+        try {
+          return ensureRouter().buildNativeStartPayload(input);
+        } catch (e) {
+          delete postedAttempts[key];
+          throw genericTypeError();
+        }
+      }
+
+      function pumpStartedJobs() {
+        if (!scheduler) return Promise.resolve();
+        var snap = scheduler.getSnapshot();
+        var list = snap && snap.jobs ? snap.jobs : [];
+        var commands = [];
+        for (var i = 0; i < list.length; i++) {
+          var cmd = takeStartCommand(list[i]);
+          if (cmd) commands.push(cmd);
+        }
+        var chain = Promise.resolve();
+        for (var j = 0; j < commands.length; j++) {
+          chain = chain.then(
+            function postOne(next) {
+              return Promise.resolve(postNative(next));
+            }.bind(null, commands[j])
+          );
+        }
+        return chain;
+      }
+
+      function enqueueDownloadSync(message, sender) {
+        requirePopupSender(sender);
+        if (!message || typeof message !== "object") throw genericTypeError();
+
+        var tabState = ownKeyState(message, "tabId");
+        if (!tabState.present || !tabState.data || !isNonnegInt(tabState.value)) {
+          throw genericTypeError();
+        }
+        var tabId = tabState.value;
+
+        var itemState = ownKeyState(message, "item");
+        if (
+          !itemState.present ||
+          !itemState.data ||
+          itemState.value == null ||
+          (typeof itemState.value !== "object" && typeof itemState.value !== "function")
+        ) {
+          throw genericTypeError();
+        }
+        var idState = ownKeyState(itemState.value, "id");
+        if (!idState.present || !idState.data || typeof idState.value !== "string") {
+          throw genericTypeError();
+        }
+        var mediaId = idState.value;
+
+        var record = sourcesByMediaId.get(mediaId);
+        if (!record) throw genericTypeError();
+        if (record.tabId !== tabId) throw genericTypeError();
+
+        var variantUrlState = ownKeyState(message, "variantUrl");
+        if (
+          variantUrlState.present &&
+          variantUrlState.data &&
+          variantUrlState.value != null
+        ) {
+          throw genericTypeError();
+        }
+
+        var selectedHandle = record.ephemeral;
+        var selectedVariantId = null;
+        var variantIdState = ownKeyState(message, "variantId");
+        if (
+          variantIdState.present &&
+          variantIdState.data &&
+          variantIdState.value != null
+        ) {
+          var variantId = variantIdState.value;
+          if (variantOwnerById.get(variantId) !== mediaId) throw genericTypeError();
+          var byId = variantsByIdByMediaId.get(mediaId);
+          var variantRec = byId ? byId.get(variantId) : null;
+          if (!variantRec || !variantRec.sourceHandle) throw genericTypeError();
+          selectedHandle = variantRec.sourceHandle;
+          selectedVariantId = variantId;
+        }
+
+        if (record.mediaKind !== "direct") throw genericTypeError();
+        if (!selectedHandle) throw genericTypeError();
+        if (
+          typeof record.providerKey !== "string" ||
+          record.providerKey.trim().length === 0
+        ) {
+          throw genericTypeError();
+        }
+
+        var type = "download";
+        var typeState = ownKeyState(message, "type");
+        if (
+          typeState.present &&
+          typeState.data &&
+          (typeState.value === "download" || typeState.value === "save-as-download")
+        ) {
+          type = typeState.value;
+        }
+
+        var sanitized = {
+          type: type,
+          tabId: record.tabId,
+          item: {
+            id: record.mediaId,
+            kind: record.mediaKind,
+            proposedFilename: record.proposedFilename,
+            providerKey: record.providerKey,
+            tabId: record.tabId,
+          },
+        };
+
+        var intentState = ownKeyState(message, "intent");
+        if (intentState.present && intentState.data && intentState.value != null) {
+          sanitized.intent = intentState.value;
+        } else {
+          var tokenState = ownKeyState(message, "userActionToken");
+          if (
+            !tokenState.present ||
+            !tokenState.data ||
+            typeof tokenState.value !== "string" ||
+            tokenState.value.trim().length === 0
+          ) {
+            throw genericTypeError();
+          }
+          sanitized.userActionToken = tokenState.value;
+        }
+        if (selectedVariantId != null) sanitized.variantId = selectedVariantId;
+
+        var normalized;
+        try {
+          normalized = ensureRouter().normalizeDownloadRequest(sanitized);
+        } catch (e) {
+          throw genericTypeError();
+        }
+
+        var intent = normalized.intent;
+        var effectiveDir;
+        if (intent.destinationDirectory === null) {
+          var rawDir;
+          try {
+            rawDir = getEffectiveDestinationDirectory();
+          } catch (e) {
+            throw genericTypeError();
+          }
+          if (
+            rawDir !== null &&
+            (typeof rawDir !== "string" || rawDir.trim().length === 0)
+          ) {
+            throw genericTypeError();
+          }
+          effectiveDir = rawDir;
+        }
+
+        var sched = ensureScheduler();
+        var jobId = commitPublicId(preparePublicId("job"));
+        sched.createJob({
+          id: jobId,
+          providerKey: record.providerKey,
+          intent: intent,
+          segmentConcurrency: segmentConcurrency,
+          retries: retries,
+          mediaKind: record.mediaKind,
+          ephemeral: selectedHandle,
+        });
+        jobBindings[jobId] = {
+          handle: selectedHandle,
+          futureTransport: record.futureTransport || null,
+          effectiveDir: effectiveDir,
+        };
+        sched.enqueue(jobId);
+        publishSafeJobs();
+
+        return pumpStartedJobs().then(function () {
+          return Privacy.projectPopupJob(sched.getJob(jobId));
+        });
+      }
+
+      function enqueueDownload(message, sender) {
+        return Promise.resolve().then(function () {
+          return enqueueDownloadSync(message, sender);
+        });
       }
 
       function handleNativeMessage(/* message */) {
@@ -1946,8 +2250,17 @@
         return lease1Reject();
       }
 
-      function setMaxConcurrent(/* value */) {
-        return lease1Reject();
+      function setMaxConcurrent(value) {
+        return Promise.resolve().then(function () {
+          requirePositiveInt(value, "maxConcurrent");
+          currentMaxConcurrent = value;
+          if (scheduler) {
+            scheduler.setMaxConcurrent(value);
+          }
+          return pumpStartedJobs().then(function () {
+            if (scheduler) publishSafeJobs();
+          });
+        });
       }
 
       function tick(nowMs) {
@@ -1961,11 +2274,13 @@
       }
 
       function pump() {
-        return lease1Reject();
+        return Promise.resolve().then(function () {
+          return pumpStartedJobs();
+        });
       }
 
       function popupJobs() {
-        return Object.freeze([]);
+        return projectSafeJobs();
       }
 
       var controller = {};
