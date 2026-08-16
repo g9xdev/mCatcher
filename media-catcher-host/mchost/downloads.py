@@ -1093,19 +1093,43 @@ def handle_ytmeta(req):
             cmd += ["--js-runtimes", "deno:%s" % deno]
         cmd += [url]
         cf, si = _no_window()
+        # Popen + explicit tree kill, NOT subprocess.run(timeout=...): yt-dlp's
+        # onefile launcher re-execs the real program as a child that inherits
+        # these pipes, so run()'s timeout path kills only the launcher and then
+        # blocks in its cleanup communicate(), waiting on a pipe the surviving
+        # grandchild still holds. The popup then sits on "Reading formats…"
+        # forever and the grandchild is orphaned. Kept under the extension's 60s
+        # wait so a completed probe is never orphaned the other way.
+        p = None
         try:
-            # Kept under the extension's 60s wait so a completed probe is never orphaned.
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               creationflags=cf, startupinfo=si, timeout=45)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=cf, startupinfo=si)
+            try:
+                out, err = p.communicate(timeout=_YTMETA_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _safe_kill(p)                      # whole tree, else the pipe stays open
+                try:
+                    out, err = p.communicate(timeout=15)
+                except Exception:
+                    out, err = b"", b""
+                _h()._hlog("warn", "yt-dlp -J: no answer in %ds for %s — stopped%s"
+                           % (_YTMETA_TIMEOUT, url,
+                              ("; last output:\n" + (err or b"").decode("utf-8", "replace")[-2000:])
+                              if err else ""))
+                _h().send({"type": "ytmeta", "reqId": reqid, "ok": False,
+                           "error": "Timed out reading formats after %ds. The log console "
+                                    "has yt-dlp's last output." % _YTMETA_TIMEOUT})
+                return
         except Exception as e:
+            _safe_kill(p)
             _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": str(e)})
             return
-        if r.returncode != 0 or not r.stdout:
-            _reason, emsg = _map_yt_error((r.stderr or b"").decode("utf-8", "replace"))
+        if p.returncode != 0 or not out:
+            _reason, emsg = _map_yt_error((err or b"").decode("utf-8", "replace"))
             _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": emsg})
             return
         try:
-            info = json.loads(r.stdout.decode("utf-8", "replace"))
+            info = json.loads(out.decode("utf-8", "replace"))
         except Exception as e:
             _h().send({"type": "ytmeta", "reqId": reqid, "ok": False, "error": "parse: %s" % e})
             return
@@ -2673,6 +2697,10 @@ def _ytdl_cleanup_stage_tree(stage_handle):
 # job stuck. Resolution normally takes 2-5s, so this is deliberately generous —
 # it only has to beat "forever", and it is disarmed once bytes start flowing.
 _YTDL_RESOLVE_STALL = 90
+
+# Bound on the -J metadata probe. Kept under the extension's 60s wait so a
+# completed probe is never orphaned by the caller giving up first.
+_YTMETA_TIMEOUT = 45
 
 
 class _StallWatch:

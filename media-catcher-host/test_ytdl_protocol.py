@@ -3,6 +3,7 @@
 Deterministic fakes only: no network and no real yt-dlp process.
 """
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -4563,3 +4564,65 @@ def test_ytdl_cmd_forces_utf8_output_encoding():
     assert "--encoding" in cmd, "yt-dlp must be told which encoding to emit"
     assert cmd[cmd.index("--encoding") + 1].lower() in ("utf-8", "utf8"), \
         "the emitted encoding must be UTF-8 to match how we decode it"
+
+
+# ---------------------------------------------------------------------------
+# The -J metadata probe needs the same bound as the download
+# ---------------------------------------------------------------------------
+
+def test_ytmeta_probe_that_never_answers_replies_and_kills_the_tree(tmp_path, monkeypatch):
+    """subprocess.run(timeout=...) is not a bound here. yt-dlp's onefile launcher
+    re-execs the real program as a child that inherits these pipes, so run()'s
+    timeout path kills only the launcher and then blocks in its cleanup
+    communicate(), waiting on a pipe the surviving grandchild still holds. The
+    popup then sits on "Reading formats..." and the grandchild is orphaned --
+    exactly the stray probes found running with a dead parent."""
+    import mchost.downloads as d
+
+    pidfile = tmp_path / "grandchild.pid"
+    child = "\n".join([
+        "import subprocess, sys, time",
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])",
+        "open(%r, 'w').write(str(c.pid))" % str(pidfile),
+        "time.sleep(120)",
+    ])
+
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, **kw):
+        # Swap ONLY the probe argv, keeping REAL process semantics: the pipe and
+        # the process tree are what is under test. Everything else must pass
+        # through -- d.subprocess is the global module, so blanket-replacing
+        # Popen would also break the taskkill that _safe_kill shells out to.
+        if cmd and cmd[0] == "yt-dlp-fake":
+            return real_popen([sys.executable, "-c", child], **kw)
+        return real_popen(cmd, **kw)
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "find_ytdlp", lambda: "yt-dlp-fake")
+    monkeypatch.setattr(d, "find_deno", lambda: None)
+    monkeypatch.setattr(d, "DENO", None)
+    monkeypatch.setattr(d, "_no_window", lambda: (0, None))
+    monkeypatch.setattr(d, "_YTMETA_TIMEOUT", 2, raising=False)
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+
+    d.handle_ytmeta({"reqId": "meta1", "url": "https://example.test/v"})
+
+    assert wait_for(lambda: any(m.get("type") == "ytmeta" and m.get("reqId") == "meta1"
+                                for m in sent), timeout=30), \
+        "a probe that never answers must still settle the row, not hang on 'Reading formats'"
+    reply = [m for m in sent if m.get("type") == "ytmeta" and m.get("reqId") == "meta1"][-1]
+    assert reply.get("ok") is False, "a timed-out probe reports failure"
+
+    gc = int(pidfile.read_text().strip())
+
+    def alive(pid):
+        r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                           capture_output=True, text=True)
+        return str(pid) in (r.stdout or "")
+
+    assert wait_for(lambda: not alive(gc), timeout=20), \
+        "the probe's descendants must be killed too, not orphaned holding the pipe"
