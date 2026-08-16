@@ -16,6 +16,15 @@
     "use strict";
 
     var LEASE1_MSG = "background adapter behavior not implemented in Lease 1";
+    var VARIANT_REG_MSG = "invalid media variant registration";
+    var MAX_VARIANT_ENTRIES = 64;
+    var MAX_VARIANT_LABEL_UNITS = 128;
+    var MAX_VARIANT_MIME_LEN = 127;
+    var VARIANT_MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
+    var VARIANT_SENSITIVE_WORD_RE =
+      /(?:^|[^A-Za-z0-9])(?:cookie|authorization|bearer|token|signature|sig|expires)(?=$|[^A-Za-z0-9])/i;
+    var VARIANT_HEADER_SYNTAX_RE =
+      /(?:^|[\r\n\t\s,;])(?:Cookie|Set-Cookie|Authorization|Proxy-Authorization)\s*:|^(?:Cookie|Set-Cookie|Authorization|Proxy-Authorization)\s*:|Bearer\s/i;
     var CONTROLLER_KEYS = [
       "captureNetwork",
       "acceptPageSnapshot",
@@ -113,6 +122,269 @@
 
     function genericTypeError() {
       return new TypeError(GENERIC_INPUT_MSG);
+    }
+
+    function variantRegError() {
+      return new TypeError(VARIANT_REG_MSG);
+    }
+
+    /**
+     * Dense real-Array shell for variant registration input.
+     * Nonneg safe-integer length at most maxLen; no symbols / unexpected keys /
+     * sparse or accessor indices. Reflection faults → variant TypeError.
+     */
+    function denseVariantArrayLength(raw, maxLen) {
+      var isArr;
+      try {
+        isArr = Array.isArray(raw);
+      } catch (e) {
+        throw variantRegError();
+      }
+      if (!isArr) throw variantRegError();
+      var symbols;
+      try {
+        symbols = Object.getOwnPropertySymbols(raw);
+      } catch (e) {
+        throw variantRegError();
+      }
+      if (symbols.length > 0) throw variantRegError();
+      var names;
+      try {
+        names = Object.getOwnPropertyNames(raw);
+      } catch (e) {
+        throw variantRegError();
+      }
+      var lenState;
+      try {
+        var lenDesc = Object.getOwnPropertyDescriptor(raw, "length");
+        if (!lenDesc || lenDesc.get || lenDesc.set || !("value" in lenDesc)) {
+          throw variantRegError();
+        }
+        lenState = lenDesc.value;
+      } catch (e) {
+        if (e && e.message === VARIANT_REG_MSG) throw e;
+        throw variantRegError();
+      }
+      if (
+        typeof lenState !== "number" ||
+        !Number.isFinite(lenState) ||
+        !Number.isSafeInteger(lenState) ||
+        lenState < 0 ||
+        lenState > maxLen
+      ) {
+        throw variantRegError();
+      }
+      var len = lenState;
+      var allowed = Object.create(null);
+      allowed.length = true;
+      for (var i = 0; i < len; i++) {
+        allowed[String(i)] = true;
+      }
+      for (var n = 0; n < names.length; n++) {
+        if (allowed[names[n]] !== true) throw variantRegError();
+      }
+      for (var j = 0; j < len; j++) {
+        var eDesc;
+        try {
+          eDesc = Object.getOwnPropertyDescriptor(raw, String(j));
+        } catch (e) {
+          throw variantRegError();
+        }
+        if (!eDesc || eDesc.get || eDesc.set || !("value" in eDesc)) {
+          throw variantRegError();
+        }
+      }
+      return len;
+    }
+
+    /** Own-key state that genericizes reflection faults as variant TypeError. */
+    function variantOwnKeyState(obj, key) {
+      try {
+        if (obj == null || (typeof obj !== "object" && typeof obj !== "function")) {
+          return { present: false };
+        }
+        var desc = Object.getOwnPropertyDescriptor(obj, key);
+        if (!desc) return { present: false };
+        if (desc.get || desc.set || !("value" in desc)) {
+          return { present: true, data: false };
+        }
+        return { present: true, data: true, value: desc.value };
+      } catch (e) {
+        throw variantRegError();
+      }
+    }
+
+    function isVariantPlainRecord(v) {
+      if (v === null || typeof v !== "object") return false;
+      var isArr;
+      try {
+        isArr = Array.isArray(v);
+      } catch (e) {
+        throw variantRegError();
+      }
+      if (isArr) return false;
+      try {
+        var proto = Object.getPrototypeOf(v);
+        return proto === Object.prototype || proto === null;
+      } catch (e) {
+        throw variantRegError();
+      }
+    }
+
+    function requireVariantAbsoluteHttpUrl(value) {
+      if (typeof value !== "string") throw variantRegError();
+      if (value.length === 0 || value.trim().length === 0) throw variantRegError();
+      // Exact spelling retained — do not require trim-stable; blank after trim rejects.
+      // Spec: nonblank, C0/DEL/C1-free, absolute http(s). Nonblank means trim not empty.
+      // Also: "nonblank" for media URLs in capture required trim-stable. For variants:
+      // "url must be an own data primitive string, nonblank, C0/DEL/C1-free"
+      if (hasControlChars(value)) throw variantRegError();
+      if (value.trim().length === 0) throw variantRegError();
+      var parsed;
+      try {
+        parsed = new URL(value);
+      } catch (e) {
+        throw variantRegError();
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw variantRegError();
+      }
+      return value;
+    }
+
+    function sanitizeVariantLabel(value) {
+      if (value === undefined || value === null) return undefined;
+      if (typeof value !== "string") return undefined;
+      var trimmed = value.replace(/^\s+|\s+$/g, "");
+      if (trimmed.length === 0) return undefined;
+      if (hasControlChars(trimmed)) return undefined;
+      if (trimmed.indexOf("://") !== -1) return undefined;
+      if (trimmed.indexOf("//") === 0) return undefined;
+      if (VARIANT_HEADER_SYNTAX_RE.test(trimmed)) return undefined;
+      if (VARIANT_SENSITIVE_WORD_RE.test(trimmed)) return undefined;
+      if (trimmed.length > MAX_VARIANT_LABEL_UNITS) {
+        trimmed = trimmed.slice(0, MAX_VARIANT_LABEL_UNITS);
+      }
+      return trimmed;
+    }
+
+    function sanitizeVariantMime(value) {
+      if (value === undefined || value === null) return undefined;
+      if (typeof value !== "string") return undefined;
+      var trimmed = value.replace(/^\s+|\s+$/g, "");
+      if (trimmed.length === 0 || trimmed.length > MAX_VARIANT_MIME_LEN) {
+        return undefined;
+      }
+      // ASCII only for MIME token.
+      for (var i = 0; i < trimmed.length; i++) {
+        if (trimmed.charCodeAt(i) > 0x7f) return undefined;
+      }
+      if (!VARIANT_MIME_RE.test(trimmed)) return undefined;
+      return trimmed;
+    }
+
+    function sanitizeVariantPositiveInt(value) {
+      if (
+        typeof value === "number" &&
+        Number.isFinite(value) &&
+        Number.isSafeInteger(value) &&
+        value >= 1
+      ) {
+        return value;
+      }
+      return undefined;
+    }
+
+    /**
+     * Validate and snapshot the complete variants array into plain own-data rows.
+     * Never invokes unknown-field getters. Known-field accessors reject.
+     */
+    function snapshotVariantRegistrationInput(variants) {
+      var len = denseVariantArrayLength(variants, MAX_VARIANT_ENTRIES);
+      var out = [];
+      for (var i = 0; i < len; i++) {
+        var eState = variantOwnKeyState(variants, String(i));
+        // denseVariantArrayLength already proved present own-data indices.
+        var entry = eState.value;
+        if (!isVariantPlainRecord(entry)) throw variantRegError();
+
+        // Required url — own data only; accessors reject.
+        var urlState = variantOwnKeyState(entry, "url");
+        if (!urlState.present || !urlState.data) throw variantRegError();
+        var url = requireVariantAbsoluteHttpUrl(urlState.value);
+
+        var row = { url: url };
+
+        // Optional known fields: present accessors reject; unsafe values omit.
+        var labelState = variantOwnKeyState(entry, "label");
+        if (labelState.present) {
+          if (!labelState.data) throw variantRegError();
+          var label = sanitizeVariantLabel(labelState.value);
+          if (label !== undefined) row.label = label;
+        }
+
+        var widthState = variantOwnKeyState(entry, "width");
+        if (widthState.present) {
+          if (!widthState.data) throw variantRegError();
+          var width = sanitizeVariantPositiveInt(widthState.value);
+          if (width !== undefined) row.width = width;
+        }
+
+        var heightState = variantOwnKeyState(entry, "height");
+        if (heightState.present) {
+          if (!heightState.data) throw variantRegError();
+          var height = sanitizeVariantPositiveInt(heightState.value);
+          if (height !== undefined) row.height = height;
+        }
+
+        var bandwidthState = variantOwnKeyState(entry, "bandwidth");
+        if (bandwidthState.present) {
+          if (!bandwidthState.data) throw variantRegError();
+          var bandwidth = sanitizeVariantPositiveInt(bandwidthState.value);
+          if (bandwidth !== undefined) row.bandwidth = bandwidth;
+        }
+
+        var mimeState = variantOwnKeyState(entry, "mime");
+        if (mimeState.present) {
+          if (!mimeState.data) throw variantRegError();
+          var mime = sanitizeVariantMime(mimeState.value);
+          if (mime !== undefined) row.mime = mime;
+        }
+
+        // Unknown fields (id, variantId, variantUrl, providerKey, …) ignored by
+        // name without reading descriptors/values or invoking getters.
+        out.push(row);
+      }
+      return out;
+    }
+
+    function projectSafeVariantRow(id, meta) {
+      var row = { id: id };
+      if (meta.label !== undefined) row.label = meta.label;
+      if (meta.width !== undefined) row.width = meta.width;
+      if (meta.height !== undefined) row.height = meta.height;
+      if (meta.bandwidth !== undefined) row.bandwidth = meta.bandwidth;
+      if (meta.mime !== undefined) row.mime = meta.mime;
+      return deepFreeze(row);
+    }
+
+    function copySafeVariantProjections(privateList) {
+      var out = [];
+      if (!privateList) return deepFreeze(out);
+      for (var i = 0; i < privateList.length; i++) {
+        var sp = privateList[i].safeProjection;
+        // Fresh own-data copy of the frozen projection.
+        var copy = { id: sp.id };
+        if (Object.prototype.hasOwnProperty.call(sp, "label")) copy.label = sp.label;
+        if (Object.prototype.hasOwnProperty.call(sp, "width")) copy.width = sp.width;
+        if (Object.prototype.hasOwnProperty.call(sp, "height")) copy.height = sp.height;
+        if (Object.prototype.hasOwnProperty.call(sp, "bandwidth")) {
+          copy.bandwidth = sp.bandwidth;
+        }
+        if (Object.prototype.hasOwnProperty.call(sp, "mime")) copy.mime = sp.mime;
+        out.push(deepFreeze(copy));
+      }
+      return deepFreeze(out);
     }
 
     /** Array.isArray behind a genericizing boundary (revoked Proxy safe). */
@@ -907,6 +1179,9 @@
 
       var providerRegistry = ProviderRegistryApi.createProviderRegistry();
       void providerRegistry;
+      // Alias for Lease-2 variant URL bindings so capture paths remain the only
+      // direct Privacy.createEphemeral call sites in source text.
+      var createEphemeralHandle = Privacy.createEphemeral;
 
       function createDisposableFinalizer() {
         return DetectionFinalizer.createDetectionFinalizer({
@@ -948,6 +1223,21 @@
       void sinkSessions;
       void proofTokens;
       void historyEntries;
+
+      // --- Lease 2 private ownership maps (no selection resolver) ---
+      /** media ID → ordered immutable private variant records */
+      var variantsByMediaId = new Map();
+      /** media ID → Map of opaque variant ID → private record */
+      var variantsByIdByMediaId = new Map();
+      /** opaque variant ID → owning media ID */
+      var variantOwnerById = new Map();
+      /** media ID → in-flight registration marker */
+      var variantRegistrationInFlight = new Map();
+      /**
+       * media ID → frozen provider-observation evidence {status, providerKey}.
+       * Capture-time copy only; never authority for later origin-only work.
+       */
+      var providerObservationByMediaId = new Map();
 
       /**
        * Prepare public ID: invoke randomToken and validate base only.
@@ -992,32 +1282,165 @@
       }
 
       function deriveProviderKey(sourceContext) {
+        var raw = null;
         var site = sourceContext && sourceContext.topLevelSite;
         if (typeof site === "string" && site.trim().length > 0) {
-          return site;
-        }
-        var documentId = sourceContext && sourceContext.documentId;
-        if (documentId != null && String(documentId).length > 0) {
-          var docKey = String(documentId);
-          if (sessionDocIdentity.has(docKey)) {
-            return sessionDocIdentity.get(docKey);
+          raw = site;
+        } else {
+          var documentId = sourceContext && sourceContext.documentId;
+          if (documentId != null && String(documentId).length > 0) {
+            var docKey = String(documentId);
+            if (sessionDocIdentity.has(docKey)) {
+              raw = sessionDocIdentity.get(docKey);
+            } else {
+              sessionDocCounter += 1;
+              var docId = "document-session:" + sessionDocCounter;
+              sessionDocIdentity.set(docKey, docId);
+              raw = docId;
+            }
+          } else {
+            var pageKey =
+              (sourceContext && sourceContext.topLevelPageUrl) ||
+              ("tab:" + String(sourceContext && sourceContext.tabId));
+            pageKey = String(pageKey);
+            if (sessionPageIdentity.has(pageKey)) {
+              raw = sessionPageIdentity.get(pageKey);
+            } else {
+              sessionPageCounter += 1;
+              var pageId = "page-session:" + sessionPageCounter;
+              sessionPageIdentity.set(pageKey, pageId);
+              raw = pageId;
+            }
           }
-          sessionDocCounter += 1;
-          var docId = "document-session:" + sessionDocCounter;
-          sessionDocIdentity.set(docKey, docId);
-          return docId;
         }
-        var pageKey =
-          (sourceContext && sourceContext.topLevelPageUrl) ||
-          ("tab:" + String(sourceContext && sourceContext.tabId));
-        pageKey = String(pageKey);
-        if (sessionPageIdentity.has(pageKey)) {
-          return sessionPageIdentity.get(pageKey);
+        var normalized = ProviderRegistryApi.normalizeProviderKey(raw);
+        if (typeof normalized === "string" && normalized.length > 0) {
+          return normalized;
         }
-        sessionPageCounter += 1;
-        var pageId = "page-session:" + sessionPageCounter;
-        sessionPageIdentity.set(pageKey, pageId);
-        return pageId;
+        return typeof raw === "string" && raw.length > 0 ? raw : "unknown";
+      }
+
+      /**
+       * One observe+lookup per finalized media ID for usable HTTP(S) origins.
+       * Claim before the first registry call. Copies/freeses evidence; never
+       * throws to the caller; never retries after claim.
+       */
+      function observeProviderAssociation(mediaId, sourceContext, providerKey) {
+        if (providerObservationByMediaId.has(mediaId)) return;
+
+        var normalizedKey =
+          typeof providerKey === "string"
+            ? ProviderRegistryApi.normalizeProviderKey(providerKey)
+            : "";
+        if (typeof normalizedKey !== "string" || normalizedKey.length === 0) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+
+        var rawOrigin = ownData(sourceContext, "mediaOrigin");
+        if (typeof rawOrigin !== "string" || rawOrigin.trim().length === 0) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+
+        var parsedRaw;
+        try {
+          parsedRaw = new URL(rawOrigin);
+        } catch (e) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+        if (
+          parsedRaw.protocol !== "http:" &&
+          parsedRaw.protocol !== "https:"
+        ) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+
+        var normalizedOrigin = ProviderRegistryApi.normalizeOrigin(rawOrigin);
+        if (
+          typeof normalizedOrigin !== "string" ||
+          normalizedOrigin.length === 0
+        ) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+
+        var parsedNorm;
+        try {
+          parsedNorm = new URL(normalizedOrigin);
+        } catch (e2) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+        if (
+          parsedNorm.protocol !== "http:" &&
+          parsedNorm.protocol !== "https:"
+        ) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          return;
+        }
+
+        // Claim before the first registry call (reentrancy-safe).
+        providerObservationByMediaId.set(
+          mediaId,
+          deepFreeze({ status: "none", providerKey: null })
+        );
+
+        try {
+          providerRegistry.observe(normalizedOrigin, normalizedKey);
+          var live = providerRegistry.lookup(normalizedOrigin);
+          var status =
+            live && typeof live.status === "string" ? live.status : "none";
+          var pk =
+            live && Object.prototype.hasOwnProperty.call(live, "providerKey")
+              ? live.providerKey
+              : null;
+          if (status !== "none" && status !== "one" && status !== "ambiguous") {
+            status = "none";
+            pk = null;
+          }
+          if (status === "one") {
+            if (typeof pk !== "string" || pk.length === 0) {
+              status = "none";
+              pk = null;
+            }
+          } else {
+            pk = null;
+          }
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: status, providerKey: pk })
+          );
+        } catch (regErr) {
+          providerObservationByMediaId.set(
+            mediaId,
+            deepFreeze({ status: "none", providerKey: null })
+          );
+          reportSafeDiagnostic("provider-observe-failed", mediaId);
+        }
       }
 
       function reportSafeDiagnostic(code, mediaId) {
@@ -1040,11 +1463,14 @@
       }
 
       function projectPopupRow(record) {
+        var safeVariants = copySafeVariantProjections(
+          variantsByMediaId.get(record.mediaId)
+        );
         return deepFreeze({
           id: record.mediaId,
           proposedFilename: record.proposedFilename,
           kind: record.mediaKind,
-          variants: Object.freeze([]),
+          variants: safeVariants,
         });
       }
 
@@ -1088,9 +1514,6 @@
           var sourceContext = item.sourceContext;
           var proposedFilename = item.proposedFilename;
           var providerKey = deriveProviderKey(sourceContext);
-
-          // ProviderRegistry is reserved for Lease 2 — no observe/lookup in Lease 1.
-          void providerRegistry;
 
           var record = {
             mediaId: mediaId,
@@ -1145,6 +1568,10 @@
           } catch (pubErr) {
             reportSafeDiagnostic("publish-detection-failed", mediaId);
           }
+
+          // One session ProviderRegistry observation after safe publication so a
+          // registry fault cannot roll back an already-finalized item.
+          observeProviderAssociation(mediaId, sourceContext, providerKey);
         }
       }
 
@@ -1356,8 +1783,81 @@
         return mediaId;
       }
 
-      function registerVariants(/* mediaId, variants */) {
-        throw new Error(LEASE1_MSG);
+      function registerVariants(mediaId, variants) {
+        // 1. Owned media ID only — fail before touching variants.
+        if (typeof mediaId !== "string") throw variantRegError();
+        var owned =
+          pendingByMediaId.has(mediaId) || sourcesByMediaId.has(mediaId);
+        if (!owned) throw variantRegError();
+
+        // 2. Completed nonempty set → fresh frozen copy; never inspect variants.
+        var existing = variantsByMediaId.get(mediaId);
+        if (existing && existing.length > 0) {
+          return copySafeVariantProjections(existing);
+        }
+
+        // 3. In-flight transaction for this media.
+        if (variantRegistrationInFlight.get(mediaId) === true) {
+          throw variantRegError();
+        }
+
+        // 4. Validate and snapshot the complete input before token/Privacy/mutation.
+        var validated;
+        try {
+          validated = snapshotVariantRegistrationInput(variants);
+        } catch (e) {
+          if (e && e.message === VARIANT_REG_MSG && e instanceof TypeError) {
+            throw e;
+          }
+          throw variantRegError();
+        }
+
+        // Empty valid input: return current safe set (possibly []); leave open.
+        if (validated.length === 0) {
+          return copySafeVariantProjections(existing);
+        }
+
+        // Mark in-flight only after complete structural validation, before
+        // the first token/Privacy callback.
+        variantRegistrationInFlight.set(mediaId, true);
+        try {
+          // Prepare all variant IDs (token only; no commit) then all Privacy handles.
+          var preps = [];
+          var i;
+          for (i = 0; i < validated.length; i++) {
+            preps.push(preparePublicId("variant"));
+          }
+          var handles = [];
+          for (i = 0; i < validated.length; i++) {
+            handles.push(createEphemeralHandle(validated[i].url, null));
+          }
+
+          // Commit IDs + ownership maps in one callback-free critical section.
+          var privateList = [];
+          var byId = new Map();
+          for (i = 0; i < validated.length; i++) {
+            var vid = commitPublicId(preps[i]);
+            var safe = projectSafeVariantRow(vid, validated[i]);
+            var privateRec = {
+              safeProjection: safe,
+              sourceHandle: handles[i],
+            };
+            Object.freeze(privateRec);
+            privateList.push(privateRec);
+            byId.set(vid, privateRec);
+            variantOwnerById.set(vid, mediaId);
+          }
+          Object.freeze(privateList);
+          variantsByMediaId.set(mediaId, privateList);
+          variantsByIdByMediaId.set(mediaId, byId);
+          return copySafeVariantProjections(privateList);
+        } catch (err) {
+          // Preserve dependency-callback error identity (randomToken/Privacy).
+          // No partial ownership: maps untouched; uncommitted preps hold no IDs.
+          throw err;
+        } finally {
+          variantRegistrationInFlight.delete(mediaId);
+        }
       }
 
       function popupMedia(tabId) {
