@@ -2724,6 +2724,13 @@ def _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot):
            # A dropped (not refused) packet leaves a socket read blocked forever.
            # Bound every read so yt-dlp surfaces an error instead of hanging.
            "--socket-timeout", "30",
+           # yt-dlp otherwise picks its stdout encoding from the locale (cp1252
+           # here) and writes the @@FILE@@ path through it, destroying anything
+           # outside that codepage BEFORE we read it: the fullwidth quotes it
+           # substitutes for '"' vanished and the em dash became '?', so
+           # os.path.isfile missed a finished download and reported failure.
+           # Must stay paired with the encoding="utf-8" read below.
+           "--encoding", "utf-8",
            # --print puts yt-dlp in QUIET mode, which suppresses the very status
            # lines _yt_stage_note parses (so the bar sat on "Preparing" all the
            # way through). --no-quiet keeps them; --print still emits @@FILE@@.

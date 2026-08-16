@@ -4548,3 +4548,18 @@ def test_utf8_filepath_from_ytdlp_is_not_mojibaked(tmp_path, monkeypatch):
         "a UTF-8 filename must not turn a finished download into a failure (got %r)" % term
     assert term.get("file") == str(target), \
         "the reported path must survive the decode intact"
+
+
+def test_ytdl_cmd_forces_utf8_output_encoding():
+    """yt-dlp picks its OWN stdout encoding from the locale (cp1252 here) and
+    writes the @@FILE@@ path through it, so characters outside that codepage were
+    destroyed before we ever read them -- the fullwidth quotes it substitutes for
+    '"' vanished and the em dash became '?'. Reading as UTF-8 cannot recover what
+    was never written; yt-dlp has to be told to emit UTF-8 in the first place."""
+    import mchost.downloads as d
+
+    cmd = d._ytdl_build_cmd("yt-dlp", "bv*+ba/b", "out.%(ext)s",
+                            "https://example.test/v", None, False)
+    assert "--encoding" in cmd, "yt-dlp must be told which encoding to emit"
+    assert cmd[cmd.index("--encoding") + 1].lower() in ("utf-8", "utf8"), \
+        "the emitted encoding must be UTF-8 to match how we decode it"
