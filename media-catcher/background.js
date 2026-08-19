@@ -356,6 +356,17 @@ let nativeError = null;
 // truly gone cannot spin. A pong or an explicit recheck-helper resets the
 // budget.
 let nativeHandshook = false;      // a pong has been seen on some connection
+// The heartbeat below sends the same {cmd:"ping"} the connect path does, so the
+// host answers EVERY beat with a full pong. Pong is therefore no longer a
+// per-connection event, and the connection-time work keyed off it (announcing
+// the helper, arming the host's folder watch, asking GitHub about updates) was
+// re-running every 30s: a watcher thread and a directory handle leaked per beat
+// (stop_watch only sets a flag the parked ReadDirectoryChangesW never re-reads),
+// and the release API took 120 hits an hour against a 60/hour budget and a
+// designed 6-hour interval. This says "the current connection has already been
+// handshaken"; it is reset where a new port is assigned, so the first pong of
+// every connection still does the work, exactly once.
+let nativeHandshakeApplied = false;
 const HELPER_REDIAL_MS = [1000, 4000, 15000, 60000];
 let nativeRedialAttempt = 0;
 let nativeRedialTimer = null;
@@ -445,6 +456,11 @@ function connectNative() {
     return;
   }
   nativePort = port;
+  // Re-arm here rather than in the disconnect handler: this is the sole
+  // assignment of a new port, so every reconnect route passes through it (the
+  // re-dial timer and recheck-helper both land here), and the `if (nativePort)
+  // return;` above keeps a no-op call from clearing a live connection's guard.
+  nativeHandshakeApplied = false;
   port.onMessage.addListener(onNativeMessage);
   port.onDisconnect.addListener(function nativeDisconnect() {
     // A disconnect now schedules a re-dial instead of running one inline, so
@@ -476,6 +492,11 @@ function connectNative() {
     if (nativeHandshook && nativeRedialAttempt < HELPER_REDIAL_MS.length) {
       const wait = HELPER_REDIAL_MS[nativeRedialAttempt];
       nativeRedialAttempt += 1;
+      // Say so now, not when the timer fires. nativePort is already null above,
+      // so downloadYouTube refuses for the whole wait — up to 60s on the last
+      // backoff step — and without this the pill stayed green the entire time:
+      // "Helper ready" and "YouTube needs the native helper" at once.
+      setNativeState("connecting", err || "Helper disconnected — reconnecting…");
       mclog("info", "native helper disconnected — reconnecting in " + wait + "ms…");
       if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);
       nativeRedialTimer = setTimeout(function nativeRedial() {
@@ -628,12 +649,19 @@ function onLegacyNativeMessage(msg) {
     setNativeState(msg.ffmpeg ? "ready" : "no-ffmpeg",
       msg.ffmpeg ? null : "Helper is installed but ffmpeg was not found.");
     dlog("native helper", msg.ffmpeg ? "ready (ffmpeg ok)" : "connected but ffmpeg missing", msg.ffmpegPath || "");
-    mclog("info", "helper ready — v" + (msg.version || "?") + (msg.ffmpeg ? "" : " · ffmpeg MISSING"));
-    if (settings.autoUpdate && nativePort) {
-      nativePort.postMessage({ cmd: "watch", enable: true,
-        extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
-      nativePort.postMessage({ cmd: "checkGithub", auto: true, extVersion: api.runtime.getManifest().version,
-        extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+    // Connection-time work, not per-pong work: the heartbeat's ping draws a
+    // pong every 30s, and repeating any of this on a beat leaks host watcher
+    // threads, burns the GitHub rate limit, and floods the persisted log ring.
+    // The dlog above stays unconditional — it is DEBUG-gated and costs nothing.
+    if (!nativeHandshakeApplied) {
+      nativeHandshakeApplied = true;
+      mclog("info", "helper ready — v" + (msg.version || "?") + (msg.ffmpeg ? "" : " · ffmpeg MISSING"));
+      if (settings.autoUpdate && nativePort) {
+        nativePort.postMessage({ cmd: "watch", enable: true,
+          extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+        nativePort.postMessage({ cmd: "checkGithub", auto: true, extVersion: api.runtime.getManifest().version,
+          extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+      }
     }
     if (helperPingTimer === null && typeof setInterval === "function") {
       helperPingTimer = setInterval(() => {

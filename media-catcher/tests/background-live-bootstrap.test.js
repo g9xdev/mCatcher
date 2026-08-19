@@ -531,3 +531,133 @@ test("a connected helper keeps being pinged, not only at connect", async () => {
   beat.fn();
   assert.equal(pings(), before + 1, "the heartbeat must ping a connected helper");
 });
+
+// The heartbeat sends the same `{cmd:"ping"}` the connect path does, so the
+// host answers every beat with a full pong. Connection-time handshake work was
+// keyed off pong arrival — which stopped being a per-connection event the
+// moment the heartbeat existed. With autoUpdate on, every 30s beat re-ran the
+// host's `handle_watch` (leaking a thread and a CreateFileW directory handle
+// each time, because `stop_watch` only sets a flag the parked
+// ReadDirectoryChangesW never re-reads) and re-hit the GitHub release API
+// against a designed 6-hour interval — 120 calls/hour into a 60/hour
+// unauthenticated budget, exhausted in about half an hour.
+test("a heartbeat pong does not re-run the connection handshake", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: { autoUpdate: true } });
+  await settle();
+
+  const handshakePosts = () => h.nativePosts.filter(
+    (p) => p && (p.cmd === "watch" || p.cmd === "checkGithub")).length;
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(handshakePosts(), 2, "the first pong of a connection does the handshake work");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 5; i += 1) {
+    beat.fn();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  assert.equal(handshakePosts(), 2,
+    "heartbeat pongs must not re-post watch/checkGithub");
+});
+
+// mclog persists into a 500-entry ring and re-arms a full rewrite of it to
+// storage.local, so an unconditional per-pong line is 120 writes an hour. With
+// autoUpdate on the host adds two more per beat, rotating the whole ring in
+// under 1.5 hours — a user told to "open the log console for yt-dlp's output"
+// would find heartbeat noise and nothing else.
+test("the helper-ready log line is written once per connection, not once per beat", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const readyLines = () => h.runtimeMessages.filter(
+    (m) => m && m.type === "log-line" && m.line && /helper ready/.test(m.line.msg)).length;
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(readyLines(), 1, "the first pong announces the helper");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 5; i += 1) {
+    beat.fn();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  assert.equal(readyLines(), 1, "heartbeat pongs must not re-announce the helper");
+});
+
+// The guard is reset where a new port is assigned, not in the disconnect
+// handler, so it is the arrival of a connection that re-arms the handshake —
+// which is what keeps "once per connection" from degrading into "once ever".
+// Every reconnect route (the re-dial timer and an explicit recheck-helper)
+// passes through that one assignment.
+test("a reconnect runs the connection handshake again rather than latching it off", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: { autoUpdate: true } });
+  await settle();
+
+  const handshakePosts = () => h.nativePosts.filter(
+    (p) => p && (p.cmd === "watch" || p.cmd === "checkGithub")).length;
+  const readyLines = () => h.runtimeMessages.filter(
+    (m) => m && m.type === "log-line" && m.line && /helper ready/.test(m.line.msg)).length;
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  beat.fn();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(handshakePosts(), 2, "the beat must not repeat the handshake");
+
+  h.nativeDisconnects.emit();
+  await settle();
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active)
+    .forEach((t) => t.fn());
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  assert.equal(handshakePosts(), 4, "a new connection must re-run the handshake exactly once");
+  assert.equal(readyLines(), 2, "a new connection must announce the helper again");
+});
+
+// The re-dial branch nulls nativePort and schedules a timer but used to change
+// no state at all, so no helper-status went out: the pill stayed green ("ready")
+// with no live port for the whole wait — up to 60s on the last backoff step —
+// while downloadYouTube refused on `!nativePort`. The user saw "Helper ready"
+// and "YouTube needs the native helper" at the same time.
+test("a scheduled re-dial reports connecting instead of leaving the pill green", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses().at(-1).helper.state, "ready", "the handshake leaves the pill green");
+
+  h.nativeDisconnects.emit();
+  await settle();
+
+  // Deliberately do NOT fire the re-dial timer: this is the window the user
+  // actually looks at, between the drop and the reconnect.
+  const pending = h.timers.filter(
+    (t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active);
+  assert.equal(pending.length, 1, "the drop must schedule a re-dial");
+
+  const last = statuses().at(-1);
+  assert.equal(last.helper.state, "connecting",
+    "the wait before a re-dial must be reported as connecting");
+  assert.equal(last.helper.ready, false, "nothing is connected during the wait");
+});
