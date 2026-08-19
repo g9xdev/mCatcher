@@ -370,6 +370,19 @@ let nativeHandshakeApplied = false;
 const HELPER_REDIAL_MS = [1000, 4000, 15000, 60000];
 let nativeRedialAttempt = 0;
 let nativeRedialTimer = null;
+// Restoring the budget on any pong made the bound per-outage rather than
+// per-helper: a helper that answers the connect ping and then dies gets a
+// full budget every cycle, so connect → pong → disconnect → 1000ms →
+// connect → … runs at about 1 Hz for the whole browser session, never
+// reaching a terminal state and rotating the 500-line persisted log ring in
+// roughly four minutes. Only a connection that proved USEFUL earns the
+// budget back. Pongs come only in answer to a ping, and the only ping sent
+// long after the port was assigned is a heartbeat beat — so requiring the
+// connection to have outlived one full beat interval means "this connection
+// answered a beat", not "this connection said hello once". A genuinely
+// healthy helper clears that in its first 30 seconds; a flapper never does.
+const HELPER_REDIAL_RESET_MS = HELPER_PING_MS;
+let nativePortSince = 0;         // Date.now() when the live port was assigned
 
 function setNativeState(state, error) {
   nativeState = state;
@@ -456,6 +469,7 @@ function connectNative() {
     return;
   }
   nativePort = port;
+  nativePortSince = Date.now();
   // Re-arm here rather than in the disconnect handler: this is the sole
   // assignment of a new port, so every reconnect route passes through it (the
   // re-dial timer and recheck-helper both land here), and the `if (nativePort)
@@ -634,14 +648,16 @@ function onLegacyNativeMessage(msg) {
     // would otherwise be left in: at least "connecting"/"disconnected" is
     // honest about there being no live port.
     if (!nativePort) return;
-    // A live helper answered: remember that, and restore the full re-dial
-    // budget so the NEXT drop backs off from scratch. A backoff timer can
+    // A live helper answered: remember that. The re-dial budget comes back
+    // only once this connection has outlived a full heartbeat interval —
+    // answering the connect ping proves a process started, not that it is
+    // worth reconnecting to (see HELPER_REDIAL_RESET_MS). A backoff timer can
     // still be pending here if this pong arrived on a connection made outside
     // that timer (e.g. a manual recheck-helper beat it to a live helper) —
     // cancel it, since the wait it was counting down is now moot and letting
     // it fire later would just be a stray, if harmless, no-op reconnect.
     nativeHandshook = true;
-    nativeRedialAttempt = 0;
+    if (Date.now() - nativePortSince >= HELPER_REDIAL_RESET_MS) nativeRedialAttempt = 0;
     if (nativeRedialTimer !== null) {
       clearTimeout(nativeRedialTimer);
       nativeRedialTimer = null;

@@ -56,6 +56,18 @@ function backgroundScripts() {
 }
 
 function createHarness() {
+  // background.js measures how long a connection lasted with Date.now(), so a
+  // test that needs a connection to have been up for a while has to be able to
+  // say so. Proxy the real Date rather than replacing it: `new Date(...)` is
+  // still the genuine constructor for every other script in this context, and
+  // with no skew applied Date.now() is byte-for-byte the usual answer.
+  let clockSkew = 0;
+  const SkewableDate = new Proxy(Date, {
+    get(target, prop, receiver) {
+      if (prop === "now") return () => Date.now() + clockSkew;
+      return Reflect.get(target, prop, receiver);
+    },
+  });
   const settingsLoad = deferred();
   const nativePosts = [];
   const runtimeMessages = [];
@@ -185,7 +197,7 @@ function createHarness() {
     TextEncoder,
     URL,
     Blob,
-    Date,
+    Date: SkewableDate,
     Math,
     JSON,
     Number,
@@ -270,6 +282,7 @@ function createHarness() {
     assemblerCreates,
     ticks,
     timers,
+    advanceClock(ms) { clockSkew += ms; },
     setTickError(err) { tickError = err; },
     // background.js declares its entry points at top level, so they land on the
     // vm global — the only way to drive one directly, since runtime.onMessage
@@ -430,6 +443,76 @@ test("automatic re-dials are bounded rather than unbounded", async () => {
     await settle();
   }
   assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");
+});
+
+// The bound is only a bound if it is per-helper, not per-outage. Any pong used
+// to restore the whole budget, so a helper that answers the connect ping and
+// then dies produced connect → pong → disconnect → 1000ms → connect → … at
+// roughly 1 Hz for the entire browser session: never terminal, and two mclog
+// lines a cycle rotating the 500-entry persisted ring — the diagnostic trail
+// that ring exists for — in about four minutes. The repo's own boundedness
+// test missed it only because its single pong came BEFORE the loop.
+test("a helper that answers each connect ping and dies stays bounded", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  for (let i = 0; i < 6; i += 1) {
+    h.nativeDisconnects.emit();
+    await settle();
+    waits().filter((t) => t.active).slice(-1).forEach((t) => t.fn());
+    await settle();
+    // The flap: this connection says hello and is gone by the next loop turn.
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  assert.equal(waits().length, 4,
+    "a helper that only ever says hello must still run out of re-dials");
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses[statuses.length - 1].helper.state, "disconnected",
+    "the exhausted budget must settle, not keep flapping");
+});
+
+// The other half of the same rule: a genuinely healthy helper that drops must
+// still get a fresh budget. Pongs only come back in answer to a ping, and the
+// only ping sent long after the port was assigned is a heartbeat beat — so
+// "answered a beat" is the durability signal, and this is what proves the
+// budget is restored rather than removed.
+test("a connection that outlives a heartbeat beat earns a fresh budget", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  for (let i = 0; i < 3; i += 1) {
+    h.nativeDisconnects.emit();
+    await settle();
+    waits().filter((t) => t.active).slice(-1).forEach((t) => t.fn());
+    await settle();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+  assert.deepEqual(waits().map((t) => t.ms), [1000, 4000, 15000],
+    "three flaps burn three backoff steps");
+
+  // This connection is still answering half a minute later.
+  h.advanceClock(31000);
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  h.nativeDisconnects.emit();
+  await settle();
+
+  assert.equal(waits().length, 4, "the drop after a durable connection re-dials");
+  assert.equal(waits()[3].ms, 1000,
+    "a connection that lasted must back off from scratch, not from where the flapping left off");
 });
 
 // The scheduling site clears any pending re-dial timer before arming a new
