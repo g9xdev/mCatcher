@@ -144,16 +144,18 @@ _DESC_OPENER = None
 
 
 def _desc_opener():
-    """The opener the device description is fetched with: no redirects.
+    """The opener every request AT a device goes through: no redirects.
 
-    The host pin below is checked on the URL we ASK for, and urlopen's default
+    The host pins below are checked on the URL we ASK for, and urlopen's default
     opener follows a 302 to any host — so a device could answer its own SSDP
-    LOCATION with a redirect and the FETCH ITSELF would be the request an
-    attacker wanted made. Re-checking afterwards is too late: by then the GET
-    has landed. Returning None from redirect_request leaves the 3xx unhandled,
-    so it surfaces as an HTTPError and _dlna_describe's except clause turns it
-    into "no such device". UPnP serves the description directly at LOCATION;
-    nothing in the spec asks a control point to chase redirects for it.
+    LOCATION (or, in _dlna_soap, the control POST) with a redirect and the
+    REQUEST ITSELF would be the one an attacker wanted made. Re-checking
+    afterwards is too late: by then it has landed. Returning None from
+    redirect_request leaves the 3xx unhandled, so it surfaces as an HTTPError —
+    _dlna_describe's except clause turns that into "no such device" and
+    _dlna_soap's into a non-200. UPnP serves the description directly at
+    LOCATION and control at controlURL; nothing in the spec asks a control
+    point to chase redirects for either.
     """
     global _DESC_OPENER
     import urllib.request
@@ -234,7 +236,17 @@ def _dlna_describe(loc, expect_host=None):
 
 
 def _dlna_soap(ctrl, service, action, inner, timeout=8):
-    """One SOAP call. Returns (status, body); -1 on connection errors."""
+    """One SOAP call. Returns (status, body); -1 on connection errors.
+
+    Sent through _desc_opener for the same reason the description fetch is:
+    _pin_ctrl constrains the URL this ASKS for, and a redirect-following opener
+    would let the device move the POST itself — pass the pin with a same-host
+    <controlURL>, answer with `302 -> http://127.0.0.1:8080/...`, and the
+    re-issued request is the one the attacker wanted made, eight times over via
+    _dlna_soap_retry. Refusing the redirect surfaces as an HTTPError, which the
+    clause below already turns into (code, body): a non-200, so callers treat
+    it as a failed action rather than a reply.
+    """
     import urllib.request
     import urllib.error
     body = ('<?xml version="1.0" encoding="utf-8"?>'
@@ -246,7 +258,7 @@ def _dlna_soap(ctrl, service, action, inner, timeout=8):
         "Content-Type": 'text/xml; charset="utf-8"',
         "SOAPACTION": '"urn:schemas-upnp-org:service:%s:1#%s"' % (service, action)})
     try:
-        r = urllib.request.urlopen(req, timeout=timeout)
+        r = _desc_opener().open(req, timeout=timeout)
         return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         try:

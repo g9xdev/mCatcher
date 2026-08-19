@@ -461,18 +461,29 @@ class _FakeResponse:
 
 
 def _describe_serving(monkeypatch, xml):
-    """Point the description fetch at `xml` and record every SOAP POST."""
+    """Point the description fetch at `xml` and record every SOAP POST.
+
+    Both go through _desc_opener (the no-redirect opener), so the fake below
+    serves the description for the GET and records the URL for the POST. The
+    urlopen tripwire keeps that arrangement honest: if a request ever goes back
+    to the redirect-following default opener, it lands in `posted` tagged, and
+    the host-pin assertions below fail on it rather than passing vacuously.
+    """
     import urllib.request
     posted = []
 
     class _Opener:
-        def open(self, url, timeout=None):
-            return _FakeResponse(xml)
+        def open(self, req, timeout=None):
+            if isinstance(req, str):
+                return _FakeResponse(xml)       # the description GET
+            posted.append(req.full_url)         # a SOAP POST
+            return _FakeResponse("")
 
     monkeypatch.setattr(legacy_mod, "_desc_opener", lambda: _Opener())
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda req, *a, **kw: posted.append(
-                            req if isinstance(req, str) else req.full_url) or _FakeResponse(""))
+                            "urlopen:" + (req if isinstance(req, str)
+                                          else req.full_url)) or _FakeResponse(""))
     return posted
 
 
@@ -540,6 +551,15 @@ def _one_shot_server(handler_body):
         def do_GET(self):
             handler_body(self)
 
+        def do_POST(self):
+            # Drain the SOAP envelope first: an unread body leaves bytes in the
+            # socket that the client sees as a broken reply rather than the
+            # status this server meant to send.
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            handler_body(self)
+
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -577,6 +597,51 @@ def test_a_redirect_cannot_move_the_description_fetch_off_the_device():
         out = legacy_mod._dlna_describe(loc, expect_host="127.0.0.1")
         assert out is None, "a redirected description was accepted"
         assert hits == [], "the description fetch followed a redirect to %r" % (hits,)
+    finally:
+        for s in (red, vic):
+            s.shutdown()
+            s.server_close()
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_redirect_cannot_move_the_soap_post_off_the_device(code):
+    """_pin_ctrl pins the URL the SOAP call ASKS for, not the one it reaches.
+
+    A device passes the pin with a same-host <controlURL>, then answers the
+    POST with a redirect anywhere it likes; a redirect-following opener
+    re-issues the request there, and _dlna_soap_retry does it up to 8 times.
+    301/302/303 are the live hole: urllib rewrites a redirected POST to GET and
+    re-issues it. 307/308 already fail closed, because urllib's own
+    redirect_request raises rather than replay a body — they are here so a
+    future opener that DOES honour them (they preserve method and body, so they
+    would forward the whole envelope) fails this test instead of shipping.
+    """
+    hits = []
+
+    def victim(h):
+        hits.append(h.path)
+        h.send_response(200)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    vic = _one_shot_server(victim)
+    target = "http://localhost:%d/internal/admin" % vic.server_address[1]
+
+    def redirector(h):
+        h.send_response(code)
+        h.send_header("Location", target)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    red = _one_shot_server(redirector)
+    try:
+        ctrl = "http://127.0.0.1:%d/upnp/control/AVTransport1" % red.server_address[1]
+        st, _body = legacy_mod._dlna_soap(ctrl, "AVTransport", "Stop",
+                                          "<InstanceID>0</InstanceID>")
+        assert hits == [], "the SOAP POST followed a %d to %r" % (code, hits)
+        # The refusal surfaces as the 3xx itself, which is not 200 — so
+        # _dlna_start treats it as a failure and _dlna_soap_retry keeps failing.
+        assert st == code, "expected the %d back, got %r" % (code, st)
     finally:
         for s in (red, vic):
             s.shutdown()
