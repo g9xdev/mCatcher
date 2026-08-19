@@ -328,9 +328,13 @@ def _download(url, dest):
 # The refusal is logged, never silent, and only the folder ITSELF is refused:
 # a subfolder of Downloads is not where a drive-by download lands.
 def _is_downloads_dir(path):
-    # normcase as well as realpath: on Win32 realpath resolves the links but
-    # leaves the case as written, so "C:\Users\x\downloads" would otherwise
-    # slip past a folder named "Downloads".
+    # realpath is the load-bearing half. Downloads is routinely redirected
+    # through a junction or symlink (OneDrive does exactly this), so a link is
+    # another spelling of the same folder and resolving it is what collapses
+    # the two. It also canonicalizes case for a path that EXISTS, which covers
+    # the case-variant spellings on both sides here. normcase is the belt for
+    # what realpath leaves as written -- a path that does not exist -- and
+    # costs nothing; do not read it as the half that handles case.
     def key(p):
         return os.path.normcase(os.path.realpath(p))
     try:

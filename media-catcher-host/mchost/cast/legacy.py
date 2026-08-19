@@ -463,8 +463,11 @@ def _stop_media_server():
 
     Three lifecycle details this has to respect:
       - shutdown() waits for serve_forever to return, and DEADLOCKS if the
-        caller is the serving thread. The handler never calls this; the check
-        below makes that a fact rather than a promise.
+        caller IS that thread. The check below guards exactly that, but nothing
+        reaches it today and it is not what keeps handlers out: Srv is a
+        ThreadingMixIn, so a request runs on its own thread and is never the
+        one compared against. It is kept for a caller that ever does run on the
+        serving thread — a non-threading server, or a serve_forever callback.
       - a request in flight does not hold it up: Srv is a ThreadingMixIn, so
         serve_forever hands each request to its own thread and stays free to
         notice the shutdown flag.

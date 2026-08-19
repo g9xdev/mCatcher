@@ -3,6 +3,7 @@ Run:  python -m pytest test_update.py -q   (or directly:  py test_update.py)"""
 import json
 import os
 import struct
+import subprocess
 import threading
 import zipfile
 
@@ -216,6 +217,42 @@ def test_watch_folder_never_defaults_to_downloads(tmp_path, monkeypatch):
                 {"zipDir": downloads.lower()}, {"zipDir": downloads + os.sep}):
         got = mc_updates._resolve_zip_dir(cfg)
         assert os.path.realpath(got) != os.path.realpath(downloads),             "cfg=%r resolved the watch folder to Downloads" % (cfg,)
+
+
+def _dir_link(target, link):
+    """A directory link at `link` pointing at `target`.
+
+    A junction on Windows, because it needs no elevation where os.symlink does,
+    and os.path.realpath resolves the two identically."""
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                       check=True, capture_output=True)
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def test_a_link_that_resolves_to_downloads_is_refused_too(tmp_path, monkeypatch):
+    """realpath, not normcase, is what _is_downloads_dir rests on: Downloads is
+    routinely redirected through a junction/symlink, and a link to it is another
+    spelling of the same folder. Case is already covered above."""
+    downloads = os.path.join(str(tmp_path), "Downloads"); os.makedirs(downloads)
+    link = os.path.join(str(tmp_path), "dl-link")
+    try:
+        _dir_link(downloads, link)
+    except (OSError, NotImplementedError, AttributeError,
+            subprocess.CalledProcessError) as e:
+        pytest.skip("no directory link available here: %s" % e)
+    assert os.path.realpath(link) == os.path.realpath(downloads), \
+        "the link was not made, so this would pass for the wrong reason"
+    monkeypatch.setattr(mc, "downloads_dir", lambda: downloads)
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc_tools, "HERE", str(tmp_path))
+
+    assert mc_updates._is_downloads_dir(link), \
+        "a link pointing at Downloads was not recognised as Downloads"
+    got = mc_updates._resolve_zip_dir({"zipDir": link})
+    assert os.path.realpath(got) != os.path.realpath(downloads), \
+        "packages would be staged in Downloads through a link"
 
 
 def test_explicitly_configured_watch_folder_still_wins(tmp_path, monkeypatch):

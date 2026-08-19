@@ -27,7 +27,9 @@ const DEFAULT_SETTINGS = {
   minDirectSizeMB: 5,           // hide direct files smaller than this (0 = off)
   saveFolder: "",               // default save folder for the helper ("" = Downloads)
   updateExtDir: "",             // the extension's source folder (for self-update)
-  updateZipDir: "",             // where update .zip packages land ("" = Downloads)
+  updateZipDir: "",             // where update .zip packages land ("" = the helper's
+                                // own updates folder; the browser's download folder
+                                // is refused, it is the drive-by plant vector)
   autoUpdate: false,            // helper watches the package folder and auto-installs
   convertCodec: "off",          // "off" | "h265" | "av1" — re-encode saved & downloaded files
   convertQuality: "visually-lossless", // "visually-lossless" | "balanced" | "true-lossless" (h265 only)

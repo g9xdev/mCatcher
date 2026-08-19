@@ -36,3 +36,22 @@ test("Task21 preserves settings IDs, bounds, and segment-concurrency wording", (
     '<input id="concurrency" type="number" min="1" max="16" />'
   ));
 });
+
+// The update package folder is NOT the browser's download folder, and never
+// silently falls back to it: _resolve_zip_dir refuses Downloads in both the
+// request and the config position (it is the drive-by plant vector the staging
+// folder exists to close), and logs the refusal where the UI never shows it.
+// Copy that promised "Downloads (default)" therefore described a folder the
+// helper will not use, and a user who typed one got no visible reason.
+test("update package folder copy never promises the browser download folder", () => {
+  assert.ok(compact.includes(
+    '<span class="label">Update package folder</span> ' +
+    '<span class="folder-row"> <input id="updateZipDir" type="text" ' +
+    'spellcheck="false" placeholder="Helper\'s updates folder (default)" />'
+  ));
+  const field = html.slice(html.indexOf('id="updateZipDir"'));
+  const placeholder = /placeholder="([^"]*)"/.exec(field);
+  assert.ok(placeholder, "the update package folder field lost its placeholder");
+  assert.equal(/downloads/i.test(placeholder[1]), false,
+    "the placeholder promises Downloads, which the helper refuses");
+});
