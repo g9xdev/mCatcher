@@ -55,6 +55,9 @@ def _verdict(id, label, status, detail, fix=None, fixable=False):
     v = {"id": id, "label": label, "status": status, "detail": detail}
     if fix:
         v["fix"] = fix
+    # `fixable` is host-side bookkeeping: no extension code reads it
+    # (grep "fixable" over media-catcher/ returns nothing). Kept so a future
+    # check that IS safely fixable has somewhere to say so.
     if fixable:
         v["fixable"] = True
     return v
