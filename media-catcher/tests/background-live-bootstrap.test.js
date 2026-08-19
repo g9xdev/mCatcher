@@ -340,7 +340,7 @@ test("controller owns recognized native frames while legacy pong and disconnect 
   assert.equal(h.helperDisconnects.length, 1);
   // The re-dial is now scheduled rather than immediate — drive it before
   // checking listener count.
-  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").forEach((t) => t.fn());
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active).forEach((t) => t.fn());
   await settle();
   // One listener: the re-dial's reconnect gets its own fresh port (matching
   // real runtime.connectNative, which returns an independent Port per call),
@@ -373,7 +373,7 @@ test("a dropped helper port re-dials instead of reporting it uninstalled", async
 
   h.nativeDisconnects.emit();
   await settle();
-  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").forEach((t) => t.fn());
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active).forEach((t) => t.fn());
   await settle();
 
   assert.equal(pings(), before + 1, "the drop must trigger a re-dial");
@@ -426,7 +426,7 @@ test("automatic re-dials are bounded rather than unbounded", async () => {
   for (let i = 0; i < 6; i += 1) {
     h.nativeDisconnects.emit();
     await settle();
-    waits().slice(-1).forEach((t) => t.fn());
+    waits().filter((t) => t.active).slice(-1).forEach((t) => t.fn());
     await settle();
   }
   assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");

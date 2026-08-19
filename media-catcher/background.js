@@ -504,7 +504,11 @@ function connectNative() {
     // ping (the helper is already gone, or about to be) is not the same as
     // "nothing is connected" — leave nativePort and state alone and let the
     // real onDisconnect event above drive cleanup and the re-dial backoff,
-    // exactly like any other disconnect.
+    // exactly like any other disconnect. But say so somewhere the user can
+    // see: dlog alone is DEBUG-gated, and a live port that never manages to
+    // send would otherwise park the UI on "connecting" with no visible sign
+    // anything went wrong while waiting for the real disconnect to arrive.
+    mclog("warn", "native ping failed: " + (e.message || String(e)));
     dlog("native ping failed", e.message || e);
   }
 }
@@ -602,19 +606,22 @@ function onLegacyNativeMessage(msg) {
   }
   if (msg.type === "pong") {
     nativeInfo = msg;
+    // A pong with no live nativePort is not a connection to trust — the
+    // same reasoning the re-dial cancellation below relies on. Without this,
+    // a stray/late pong could mark the helper "ready" (and broadcast that)
+    // with nothing actually connected, which is worse than the state it
+    // would otherwise be left in: at least "connecting"/"disconnected" is
+    // honest about there being no live port.
+    if (!nativePort) return;
     // A live helper answered: remember that, and restore the full re-dial
     // budget so the NEXT drop backs off from scratch. A backoff timer can
     // still be pending here if this pong arrived on a connection made outside
     // that timer (e.g. a manual recheck-helper beat it to a live helper) —
     // cancel it, since the wait it was counting down is now moot and letting
-    // it fire later would just be a stray, if harmless, no-op reconnect. Only
-    // do that while a port is actually connected, though: a pong with no
-    // nativePort is not a live connection to trust, and cancelling the one
-    // scheduled re-dial in that case would silently drop the reconnect that
-    // was still needed, leaving nothing to bring the helper back.
+    // it fire later would just be a stray, if harmless, no-op reconnect.
     nativeHandshook = true;
     nativeRedialAttempt = 0;
-    if (nativePort && nativeRedialTimer !== null) {
+    if (nativeRedialTimer !== null) {
       clearTimeout(nativeRedialTimer);
       nativeRedialTimer = null;
     }
