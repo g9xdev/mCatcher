@@ -6,6 +6,8 @@ import os
 import struct
 import subprocess
 import sys
+import threading
+import time
 
 from conftest import HERE, HOST, load_host, wait_for
 
@@ -406,3 +408,102 @@ def test_safe_kill_takes_the_whole_process_tree():
             p.kill()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# handle_snapshot must not run on the message loop
+#
+# It is a full-file copy of a LIVE recording, and it was the one long-running
+# command that did not dispatch to a worker (ytdl, pget, record, probe,
+# pickFolder, update and checkGithub all do). The extension now disconnects the
+# native port after four missed heartbeats (~150s); that EOFs read_message() and
+# ends main(), so a multi-GB snapshot on slow or AV-scanned storage could take
+# the in-flight recording down with it.
+# ---------------------------------------------------------------------------
+
+def _live_job(d, tmp_path, jid, payload=b"x" * 32):
+    temp = tmp_path / (str(jid) + ".tmp")
+    temp.write_bytes(payload)
+    job = d.Job(jid, str(temp))
+    job.base = "clip"
+    job.seconds = 3.0
+    with d.JOBS_LOCK:
+        d.JOBS[jid] = job
+    return job
+
+
+def test_a_snapshot_copy_does_not_block_the_message_loop(tmp_path, monkeypatch):
+    """The caller of handle_snapshot IS the read loop, so what this measures is
+    how long that loop is held: the handler must return while the copy is still
+    running, not after it."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-snap")
+    sent = []
+    copying = threading.Event()
+    copied = threading.Event()
+    real_copy = d._copy_prefix
+
+    def slow_copy(src, dst):
+        copying.set()
+        # A real one runs for minutes. A second is enough to tell the two
+        # dispatch shapes apart without making the suite slow.
+        assert not threading.Event().wait(1.0)
+        real_copy(src, dst)
+        copied.set()
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", slow_copy)
+    try:
+        started = time.monotonic()
+        d.handle_snapshot({"id": "j-snap", "dir": str(tmp_path)})
+        held = time.monotonic() - started
+
+        assert copying.wait(5), "the copy never started"
+        assert held < 0.5, (
+            "handle_snapshot held its caller for %.2fs while the copy ran" % held)
+        assert copied.wait(5), "the copy never finished"
+        assert wait_for(lambda: any(m.get("type") == "snapshot" for m in sent),
+                        timeout=5), sent
+        reply = [m for m in sent if m.get("type") == "snapshot"][0]
+        assert reply["id"] == "j-snap" and reply["bytes"] == 32, reply
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-snap", None)
+
+
+def test_two_snapshots_never_copy_at_the_same_time(tmp_path, monkeypatch):
+    """Both write one "<base> (partial).mp4". The message loop used to serialise
+    them for free; off it, two overlapping writes to one path interleave and the
+    checkpoint they leave is corrupt."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-a")
+    _live_job(d, tmp_path, "j-b")
+    sent = []
+    state = {"now": 0, "peak": 0}
+    real_copy = d._copy_prefix
+
+    def counting_copy(src, dst):
+        state["now"] += 1
+        state["peak"] = max(state["peak"], state["now"])
+        assert not threading.Event().wait(0.2)
+        state["now"] -= 1
+        real_copy(src, dst)
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", counting_copy)
+    try:
+        d.handle_snapshot({"id": "j-a", "dir": str(tmp_path)})
+        d.handle_snapshot({"id": "j-b", "dir": str(tmp_path)})
+        assert wait_for(lambda: len([m for m in sent
+                                     if m.get("type") == "snapshot"]) == 2,
+                        timeout=10), sent
+        assert state["peak"] == 1, (
+            "%d snapshot copies ran at once" % state["peak"])
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-a", None)
+            d.JOBS.pop("j-b", None)

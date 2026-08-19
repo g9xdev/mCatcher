@@ -175,26 +175,61 @@ def _copy_prefix(src, dst):
             remaining -= len(chunk)
 
 
+# Serialises the snapshot copies against each other. The message loop used to
+# give that for free by running them one at a time; now that the copy is off the
+# loop, this is what stops two of them writing one "<base> (partial).mp4" at
+# once. Deliberately ONE lock rather than one per job: two different recordings
+# whose sanitized base names collide resolve to the SAME dest, so a per-job lock
+# would leave exactly the interleaving this exists to prevent. The copy is
+# I/O-bound on one disk, so the parallelism given up is worth little.
+_SNAPSHOT_LOCK = threading.Lock()
+
+
 def handle_snapshot(req):
-    """Save what's recorded so far WITHOUT stopping — a crash-safety checkpoint."""
+    """Save what's recorded so far WITHOUT stopping — a crash-safety checkpoint.
+
+    The copy runs on a worker thread, like every other long command (ytdl, pget,
+    record, probe, pickFolder, update, checkGithub). It is a full-file copy of a
+    LIVE recording, so on slow or antivirus-scanned storage a multi-GB one runs
+    for minutes, and this handler is called INLINE from the message loop. The
+    extension now disconnects the native port after four missed heartbeats
+    (~150s); that EOFs read_message() and ends main(), so a long snapshot on the
+    loop could take the recording it was checkpointing down with it.
+
+    Only the registry lookup stays on the loop — a dict read under a lock. Every
+    filesystem touch moves to the worker, including the stats: a destination the
+    user pointed at a dead network share can block a stat for a long time too,
+    and the loop must not be where that lands.
+    """
     jid = req.get("id")
     with JOBS_LOCK:
         job = JOBS.get(jid)
-    if not job or not os.path.isfile(job.temp) or os.path.getsize(job.temp) == 0:
+    if not job:
         _h().send({"type": "error", "id": jid, "error": "nothing recorded yet"})
         return
-    base = _h().sanitize(req.get("base") or job.base)
-    d = req.get("dir") or _h().downloads_dir()
-    if not os.path.isdir(d):
-        d = _h().downloads_dir()
-    dest = os.path.join(d, base + " (partial).mp4")
-    try:
-        _copy_prefix(job.temp, dest)      # overwrites the previous partial (latest is fullest)
-        job.partial = dest
-        _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": os.path.getsize(dest),
-                   "seconds": round(job.seconds, 1)})
-    except Exception as e:
-        _h().send({"type": "error", "id": jid, "error": "save-now failed: %s" % e})
+
+    def worker():
+        if not os.path.isfile(job.temp) or os.path.getsize(job.temp) == 0:
+            _h().send({"type": "error", "id": jid, "error": "nothing recorded yet"})
+            return
+        try:
+            base = _h().sanitize(req.get("base") or job.base)
+            d = req.get("dir") or _h().downloads_dir()
+            if not os.path.isdir(d):
+                d = _h().downloads_dir()
+            dest = os.path.join(d, base + " (partial).mp4")
+            with _SNAPSHOT_LOCK:
+                _copy_prefix(job.temp, dest)  # overwrites the previous partial (latest is fullest)
+                job.partial = dest
+                # Sized under the lock: outside it, the next snapshot to this
+                # same dest could have truncated the file before the read.
+                written = os.path.getsize(dest)
+            # Never across the pipe write, which can block.
+            _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": written,
+                       "seconds": round(job.seconds, 1)})
+        except Exception as e:
+            _h().send({"type": "error", "id": jid, "error": "save-now failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _dedup(dest):
