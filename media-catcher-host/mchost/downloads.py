@@ -3751,6 +3751,15 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
                 continue
             if not _claim_terminal(unless_progressing=True):
                 return                  # already terminal, or bytes just started
+            # Bytes can still start between winning that claim and the kill
+            # below, and that residue is LEFT OPEN deliberately. Re-reading
+            # progressing here could only be acted on by handing the claim back,
+            # and by then the unwind may already have tried to send and gone
+            # quiet on losing — which would leave the job with no terminal frame
+            # at all. A killed download reports "stalled" and the row ends; a
+            # silent one is the failure this whole mechanism exists to remove.
+            # The window is a few statements wide, after 90s of real silence.
+            #
             # Flag BEFORE kill: the flag is polled from yt-dlp's hooks and log
             # lines, and killing the child is what makes the next poll happen at
             # all. Both before the send, which writes the pipe and can block.

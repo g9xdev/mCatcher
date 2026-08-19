@@ -5146,6 +5146,67 @@ def test_a_terminal_frame_is_claimed_once_when_the_watchdog_wakes_mid_send(tmp_p
     assert terminal[0]["reason"] == "cancelled"
 
 
+def test_the_watchdog_loses_the_claim_to_bytes_starting_in_its_check_then_claim_gap(
+        tmp_path, monkeypatch):
+    """Killing a download that has just started transferring is the cardinal risk
+    of this whole mechanism. The watchdog tests `progressing` at the top of its
+    loop, so bytes arriving after that test would be killed by a deadline they
+    had already beaten; the claim re-reads the event under its own lock, which is
+    the only place the two can be ordered.
+
+    Nothing else in the suite names that re-read: dropping unless_progressing
+    from the watchdog's claim leaves every other test green. This is the one that
+    goes red."""
+    import mchost.downloads as d
+
+    out = tmp_path / "v.mp4"
+    out.write_bytes(b"x" * 11)
+    sent = []
+    captured = {}
+    in_the_gap = threading.Event()
+    bytes_flowing = threading.Event()
+
+    class ExpireInsideTheGap:
+        """Stands in for the 90s deadline. It is read as
+        `idle < _YTDL_RESOLVE_STALL`, which lands here as __gt__ — the last thing
+        the watchdog evaluates before it claims. Starting the transfer from
+        inside it puts the bytes exactly in the window under test, with no sleep
+        anywhere that could lose the race by accident."""
+
+        def __gt__(self, idle):
+            in_the_gap.set()
+            assert bytes_flowing.wait(5), "the download never reported progress"
+            return False                # ...and the deadline has expired
+
+        def __str__(self):
+            return "0"
+
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", ExpireInsideTheGap())
+    _capture_lib_op(d, monkeypatch, captured)
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        assert in_the_gap.wait(5), "the watchdog never reached its claim"
+        on_progress({"stage": "downloading", "pct": 1.0, "total": 11})
+        bytes_flowing.set()
+        # Stay inside the transfer while the watchdog decides, so what the
+        # assertions below measure is that decision and not a race with this
+        # unwind reaching the wire first.
+        assert not threading.Event().wait(0.5)
+        return str(out)
+
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: FakeYtdlLib(fake_download))
+    d._ytdl_download_via_lib("j-gap", "https://youtu.be/x", "b", str(out), None, False)
+
+    assert not captured["op"]["cancel_requested"], \
+        "a download that had started transferring was cancelled by the watchdog"
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m["type"] for m in terminal] == ["ytdl-done"], terminal
+
+
 def test_a_preflight_failure_ends_the_row_it_acknowledged(tmp_path, monkeypatch):
     """The acknowledgement promises a terminal frame will follow. A throw out of
     the preflight used to kill the worker thread silently, which now reads as a
