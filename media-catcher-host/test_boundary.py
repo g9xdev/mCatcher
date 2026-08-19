@@ -20,7 +20,7 @@ import struct
 import subprocess
 import sys
 
-from conftest import HOST, load_host
+from conftest import HOST, load_host, wait_for
 
 mc = load_host()
 
@@ -150,3 +150,88 @@ def test_validate_message_never_raises():
 
     for bad in (Hostile(), {"cmd": object()}, {"cmd": "open", "path": object()}):
         assert isinstance(guard.validate_message(bad), (str, type(None)))
+
+
+# ---------------------------------------------------------------------------
+# 2. `open` / `reveal` — what the host will hand to the shell
+# ---------------------------------------------------------------------------
+
+def test_open_refuses_an_executable(monkeypatch, tmp_path):
+    """C1a. os.startfile is ShellExecuteW: it RUNS the file with its registered
+    handler. The only gate used to be os.path.isfile, so any .exe/.bat/.ps1/.lnk
+    the extension could name was a sandbox escape."""
+    evil = tmp_path / "payload.exe"
+    evil.write_bytes(b"MZ")
+
+    ran = []
+    if hasattr(mc.os, "startfile"):
+        monkeypatch.setattr(mc.os, "startfile", lambda p: ran.append(p))
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append(a))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_open({"id": "n1", "path": str(evil)})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_open answered"
+    assert ran == [], "the .exe was never handed to the shell"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "n1", sent
+    assert "refus" in sent[0].get("error", "").lower(), \
+        "the refusal is reported to the user, not silent"
+
+
+def test_open_allows_a_media_file(monkeypatch, tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\0")
+
+    ran = []
+    if hasattr(mc.os, "startfile"):
+        monkeypatch.setattr(mc.os, "startfile", lambda p: ran.append(p))
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append(a))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_open({"id": "n2", "path": str(clip)})
+    assert wait_for(lambda: bool(ran), timeout=2.0), "the .mp4 opened"
+    assert sent == [], "no error for a legitimate media file"
+
+
+def test_reveal_refuses_a_non_media_path(monkeypatch, tmp_path):
+    evil = tmp_path / "payload.exe"
+    evil.write_bytes(b"MZ")
+
+    ran = []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append(a))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_reveal({"id": "n3", "path": str(evil)})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_reveal answered"
+    assert ran == [], "explorer was never spawned for the .exe"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "n3", sent
+
+
+def test_refuse_open_covers_the_windows_shapes(tmp_path):
+    r = guard.refuse_open
+
+    assert r(str(tmp_path / "a.mp4")) is None
+    assert r(str(tmp_path / "a.MKV")) is None       # case-insensitive
+    assert r(str(tmp_path / "a.m4a")) is None
+    assert r(str(tmp_path / "a.vtt")) is None
+
+    for bad in ("a.exe", "a.bat", "a.cmd", "a.ps1", "a.lnk", "a.scr", "a.hta",
+                "a.msi", "a.js", "a.vbs", "a.reg", "a.url", "a.pif", "a.com",
+                "a.dll", "a.cpl", "a.msc", "a.jar", "a.py", "a.wsf", "a.chm",
+                "a.settingcontent-ms", "a.appref-ms", "a"):
+        assert r(str(tmp_path / bad)) is not None, bad
+
+    # no extension at all, and the empty/awkward inputs
+    for bad in (None, "", "   ", 7, {"a": 1}, ["a"]):
+        assert r(bad) is not None, bad
+
+    # an NTFS alternate data stream must not smuggle one past the split
+    assert r(str(tmp_path / "a.mp4") + ":evil.exe") is not None
+    assert r(str(tmp_path / "a.mp4") + ":evil") is not None
+
+    # trailing dot/space: Win32 strips them, so ".mp4 " would resolve to ".mp4"
+    # while any suffix check saw something else. Refuse the shape outright.
+    assert r(str(tmp_path / "a.exe.")) is not None
+    assert r(str(tmp_path / "a.exe ")) is not None

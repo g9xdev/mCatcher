@@ -30,6 +30,12 @@ import unicodedata
 import uuid
 from ctypes import wintypes
 
+# The boundary rules (mchost/guard.py). Imported directly rather than through
+# the shim: it holds no mutable or patched state — it is tables and pure
+# functions — and it imports no mchost sibling, so there is no import-order or
+# stale-copy hazard to route around.
+from mchost import guard
+
 
 def _h():
     """Call-time shim lookup (same convention as hlog/config/updates after the
@@ -873,7 +879,16 @@ def handle_open(req):
     """
     def worker():
         path = req.get("path")
-        if not path or not os.path.isfile(path):
+        # BEFORE the stat, deliberately. os.startfile is ShellExecuteW, so the
+        # only gate here used to be "does this file exist" — meaning any .exe,
+        # .bat, .ps1, .lnk, .scr or .hta the extension could name, it could RUN.
+        # Checking the suffix first also stops `open` doubling as a
+        # file-existence oracle for paths this helper has no business touching.
+        refusal = guard.refuse_open(path)
+        if refusal:
+            _h().send({"type": "error", "id": req.get("id"), "error": refusal})
+            return
+        if not os.path.isfile(path):
             _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
             return
         try:
@@ -900,7 +915,16 @@ def handle_reveal(req):
     """
     def worker():
         path = req.get("path")
-        if not path or not os.path.isfile(path):
+        # Same allowlist as handle_open. Revealing is the milder verb — Explorer
+        # selects the file rather than launching it — but the shape is
+        # identical: a caller-supplied absolute path handed to a shell command,
+        # gated only on existence. Holding both to one rule is also what keeps
+        # "which paths may this helper act on" a single answer.
+        refusal = guard.refuse_open(path)
+        if refusal:
+            _h().send({"type": "error", "id": req.get("id"), "error": refusal})
+            return
+        if not os.path.isfile(path):
             _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
             return
         try:

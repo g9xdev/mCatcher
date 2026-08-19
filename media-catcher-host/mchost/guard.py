@@ -13,9 +13,18 @@ a list where an int is), it stops unknown commands, and it stops a malformed
 frame from throwing out of the read loop. A `str` check on a path does NOT make
 that path safe — containment checks at the point of use are what do that.
 
+OPENABLE_EXTS / refuse_open say what `open` and `reveal` may hand to the OS.
+os.startfile is ShellExecuteW: it RUNS the file with its registered handler, so
+an extension that could name a path could run it. Windows has far too many
+executable suffixes to blocklist (.exe .bat .cmd .ps1 .lnk .scr .hta .msi .js
+.vbs .wsf .cpl .msc .pif .com .url .settingcontent-ms …, plus whatever the next
+shell integration adds), so this is an ALLOWLIST of the media, container,
+subtitle and thumbnail suffixes this host actually produces.
+
 No mchost sibling is imported here: guard sits under everything else so any
 module can use it without an import-order hazard.
 """
+import os
 
 # ---------------------------------------------------------------------------
 # Field kinds
@@ -176,4 +185,67 @@ def message_id(msg):
                 return v
     except Exception:
         pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# What `open` / `reveal` may hand to the OS
+# ---------------------------------------------------------------------------
+
+OPENABLE_EXTS = frozenset({
+    # containers / video
+    ".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".flv", ".ts", ".m2ts",
+    ".mts", ".mpg", ".mpeg", ".mpe", ".wmv", ".ogv", ".3gp", ".3g2", ".mxf",
+    ".divx", ".rmvb", ".vob",
+    # audio
+    ".m4a", ".m4b", ".mp3", ".aac", ".flac", ".wav", ".opus", ".ogg", ".oga",
+    ".wma", ".aiff", ".aif", ".ac3", ".dts", ".alac", ".ape",
+    # subtitles the downloader writes alongside a video
+    ".srt", ".vtt", ".ass", ".ssa", ".lrc", ".sub",
+    # thumbnails / poster art
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif",
+})
+
+
+def _ext_ok(path):
+    ext = os.path.splitext(path)[1].lower()
+    return bool(ext) and ext in OPENABLE_EXTS
+
+
+def refuse_open(path):
+    """None when `path` is safe to hand to the shell, else a user-facing reason.
+
+    Shape only — the caller still does its own existence check. Deliberately
+    evaluated BEFORE that stat so a refused path is never probed for existence
+    on the caller's behalf.
+
+    The suffix is checked on the path as given AND on its realpath: a symlink,
+    junction or hardlink named clip.mp4 that resolves onto payload.exe is
+    exactly the case a name-only check misses.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return "refused: no file path given"
+
+    # NTFS alternate data stream — "clip.mp4:payload.exe" is one file to the
+    # shell and two different suffixes to anything that splits on the last dot.
+    _drive, rest = os.path.splitdrive(path)
+    if ":" in rest:
+        return "refused: %s is not a file this helper can open" % os.path.basename(path)
+
+    # Win32 strips a trailing dot or space when it opens the file, so a name
+    # ending in one resolves to a DIFFERENT suffix than any check can see.
+    if path[-1] in (" ", "."):
+        return "refused: %s is not a file this helper can open" % os.path.basename(path)
+
+    if not _ext_ok(path):
+        return ("refused: %s is not a media file this helper produced"
+                % os.path.basename(path))
+
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return "refused: %s could not be resolved" % os.path.basename(path)
+    if not _ext_ok(real):
+        return ("refused: %s resolves to something this helper cannot open"
+                % os.path.basename(path))
     return None
