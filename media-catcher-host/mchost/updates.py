@@ -310,12 +310,55 @@ def _download(url, dest):
     os.replace(tmp, dest)
 
 
+# ---- where update packages are staged ------------------------------------
+# ONE resolution for the watched folder, because there were five and they
+# disagreed about nothing except how they spelled downloads_dir().
+#
+# `req` is the extension's message. background.js sends `settings.updateZipDir
+# || ""`, so a non-blank req["zipDir"] IS the user's explicit choice and blank
+# means "you pick" — that empty string is the fallback this function defines.
+#
+# The browser's own download folder is refused rather than honoured, in BOTH
+# positions. As a request value it is the setting that recreates the plant
+# vector this function exists to close; as a config value it is very likely not
+# a choice at all -- handle_update used to write its resolved zip_dir back
+# unconditionally, so one press of "Check & install update" on a host that had
+# never been configured persisted downloads_dir() as if the user had asked for
+# it. There is no field that distinguishes those two, so neither is followed.
+# The refusal is logged, never silent, and only the folder ITSELF is refused:
+# a subfolder of Downloads is not where a drive-by download lands.
+def _is_downloads_dir(path):
+    # normcase as well as realpath: on Win32 realpath resolves the links but
+    # leaves the case as written, so "C:\Users\x\downloads" would otherwise
+    # slip past a folder named "Downloads".
+    def key(p):
+        return os.path.normcase(os.path.realpath(p))
+    try:
+        return key(path) == key(_h().downloads_dir())
+    except Exception:
+        return False
+
+
+def _resolve_zip_dir(cfg, req=None):
+    """The folder to watch and stage packages in: the user's explicit choice if
+    there is one, else the host's own staging folder."""
+    for src in ((req or {}).get("zipDir"), (cfg or {}).get("zipDir")):
+        if isinstance(src, str) and src.strip():
+            if _is_downloads_dir(src):
+                _h()._hlog("warn", "update: ignoring %s as the package folder — "
+                                   "the browser writes there; using %s instead"
+                           % (src, _h().update_staging_dir()))
+                break
+            return src
+    return _h().update_staging_dir()
+
+
 def github_stage_release(cfg, force=False, ext_version=None):
     """If the latest GitHub release is newer than what's installed, download its
     extension/host packages into the watched folder. Returns a status dict and
     never raises."""
     ext_dir = cfg.get("extDir")
-    zip_dir = cfg.get("zipDir") or _h().downloads_dir()
+    zip_dir = _resolve_zip_dir(cfg)
     version, assets = github_latest_release()
     if not version:
         return {"reached": False}
@@ -371,7 +414,7 @@ def handle_check_github(req):
         # Newer packages are staged in the watched folder — install them now.
         # _install_updates is single-flight, so the folder-watcher firing on the
         # same downloads can't double-prompt.
-        _install_updates(cfg.get("extDir"), cfg.get("zipDir") or _h().downloads_dir(), silent=auto, source="github")
+        _install_updates(cfg.get("extDir"), _resolve_zip_dir(cfg), silent=auto, source="github")
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -493,10 +536,14 @@ def handle_update(req):
     def worker():
         cfg = _h().load_config()
         ext_dir = req.get("extDir") or cfg.get("extDir")
-        zip_dir = req.get("zipDir") or cfg.get("zipDir") or _h().downloads_dir()
+        zip_dir = _resolve_zip_dir(cfg, req)
         if ext_dir and os.path.isdir(ext_dir):
             cfg["extDir"] = ext_dir
-        cfg["zipDir"] = zip_dir
+        # Only an explicit choice is persisted. Writing the resolved folder back
+        # unconditionally is what turned the old implicit Downloads fallback
+        # into a stored setting.
+        if req.get("zipDir"):
+            cfg["zipDir"] = req["zipDir"]
         _h().save_config(cfg)
         _install_updates(ext_dir, zip_dir, silent=bool(req.get("silent")), source="manual")
     threading.Thread(target=worker, daemon=True).start()
@@ -574,7 +621,7 @@ def _dir_watcher(path, stop_event, on_relevant):
 
 def _auto_update_check():
     cfg = _h().load_config()
-    _install_updates(cfg.get("extDir"), cfg.get("zipDir") or _h().downloads_dir(), silent=False, source="watcher")
+    _install_updates(cfg.get("extDir"), _resolve_zip_dir(cfg), silent=False, source="watcher")
 
 
 def start_watch(zip_dir):
@@ -614,7 +661,7 @@ def handle_watch(req):
     enable = bool(req.get("enable"))
     cfg["autoUpdate"] = enable
     _h().save_config(cfg)
-    zdir = cfg.get("zipDir") or _h().downloads_dir()
+    zdir = _resolve_zip_dir(cfg)
     if enable and os.name == "nt":
         start_watch(zdir)
         start_github_poll()
