@@ -443,6 +443,41 @@ test("automatic re-dials are bounded rather than unbounded", async () => {
     await settle();
   }
   assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");
+  // Running out of re-dials has to SETTLE, not just stop scheduling: the pill
+  // is the only thing telling the user why nothing works. The equivalent
+  // assertion was dropped when the one-shot re-dial test became this one.
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const last = statuses[statuses.length - 1];
+  assert.equal(last.helper.state, "disconnected",
+    "an exhausted re-dial budget settles as disconnected");
+  assert.equal(last.helper.ready, false, "nothing is connected once the budget is gone");
+  assert.equal(last.helper.error, "Helper disconnected.",
+    "a helper that was reached is never reported as a missing install");
+});
+
+// The other arm of that same branch, which nothing covered at all: only claim
+// the helper is missing when no connection ever reached a live one. A drop
+// after a good handshake is a disconnect, and saying otherwise sent people to
+// reinstall software that was already there.
+test("a connection that never reached a helper reports the missing install", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  // No pong has ever arrived on any connection — this is what a missing host
+  // looks like: connectNative hands back a port that immediately drops.
+  h.nativeDisconnects.emit();
+  await settle();
+
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const last = statuses[statuses.length - 1];
+  assert.equal(last.helper.state, "disconnected", "an unreachable helper settles at once");
+  assert.equal(last.helper.error, "Helper not installed.",
+    "a helper that was never reached is reported as a missing install");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").length, 0,
+    "a helper that was never reached is not re-dialled automatically");
 });
 
 // The bound is only a bound if it is per-helper, not per-outage. Any pong used
