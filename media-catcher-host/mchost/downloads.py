@@ -3574,7 +3574,36 @@ def _ytdl_lib_argv(fmt, outtmpl, url, deno, pot):
     return argv
 
 
-def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
+class _TerminalClaim:
+    """Exactly one terminal frame per job, CLAIMED rather than ordered.
+
+    Several threads can reach the end of one job — the download unwind, the
+    resolve watchdog, and the guard around the worker thread itself — and
+    _h().send writes the native-messaging pipe and can block, so any of them
+    can reach the wire first. The loser stays silent rather than contradicting
+    the row. Shared by the whole job so a fault ABOVE the download frame cannot
+    turn a ytdl-done that already went out into a failure.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._taken = False
+
+    def take(self, veto=None):
+        """True for exactly one caller.
+
+        veto is an Event the caller agrees to lose to. It closes the watchdog's
+        check-then-claim gap: bytes can start flowing between its is_set() test
+        and the claim, and killing a job that is transferring is the one failure
+        this mechanism must never cause."""
+        with self._lock:
+            if self._taken or (veto is not None and veto.is_set()):
+                return False
+            self._taken = True
+            return True
+
+
+def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     """In-process download for the legacy (tokenless) path. Emits the same
     ytdl-progress / ytdl-done / ytdl-error wire shapes the exe worker did.
 
@@ -3596,8 +3625,14 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     and that worker stays parked. Its registration is held until the thread
     really ends rather than dropped when the watchdog reports: the registry
     means "this job still holds resources", which stays true, and a retry of
-    that id is then refused instead of racing a live writer for one path."""
+    that id is then refused instead of racing a live writer for one path.
+
+    claim is the job-wide terminal claim; the caller passes its own so a fault in
+    the frame above this one cannot contradict the frame this one already sent.
+    A direct caller that has no job around it gets a private one."""
     lib = _ytdlp_lib()
+    if claim is None:
+        claim = _TerminalClaim()
     # yt-dlp still shells out — deno for the JS challenge, ffmpeg for the merge —
     # and a wedged child is the hang "in-process" did not remove. ytdlp_lib hands
     # each launch to the thread that made it; holding them here is what gives the
@@ -3646,8 +3681,6 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
         _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn",
                    "error": "Download id already in use."})
         return
-    _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
-               % (url, "on" if pot else "off"))
     # The acknowledgement frame is sent by _handle_ytdl_legacy's worker before the
     # preflight — one per job, so none here.
     last = {"pct": -1.0}
@@ -3661,25 +3694,14 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     touched = [time.monotonic()]
     progressing = threading.Event()
     finished = threading.Event()
-    # Exactly one terminal frame per job, CLAIMED rather than ordered: the watchdog
-    # fires from its own thread while the download may be unwinding on this one,
-    # and _h().send writes the native-messaging pipe and can block, so either side
-    # can reach the wire first. The loser stays silent instead of contradicting
-    # the row.
-    claim_lock = threading.Lock()
-    claimed = []
-
     def _claim_terminal(unless_progressing=False):
-        """True for exactly one caller. unless_progressing closes the watchdog's
-        check-then-claim gap: bytes can start flowing between its is_set() test
-        and the claim, and killing a job that is transferring is the one failure
-        this mechanism must never cause. Only the watchdog passes it — a real
-        terminal frame is still owed once progress has started."""
-        with claim_lock:
-            if claimed or (unless_progressing and progressing.is_set()):
-                return False
-            claimed.append(True)
-            return True
+        """True for exactly one caller — see _TerminalClaim.
+
+        Only the watchdog passes unless_progressing: it is the one caller that
+        must lose to bytes starting, because a real terminal frame is still owed
+        once progress has started and killing a transferring job is the failure
+        this mechanism must never cause."""
+        return claim.take(progressing if unless_progressing else None)
 
     def on_progress(m):
         progressing.set()
@@ -3728,7 +3750,21 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
                        "error": "yt-dlp made no progress while resolving. "
                                 "Open the log console for its output."})
             return
-    threading.Thread(target=_resolve_watchdog, daemon=True).start()
+
+    # Both of these can throw — a log sink with a broken pipe, and a thread that
+    # cannot be started under exhaustion — and the registration above is already
+    # taken. Left behind, it owns this id for the life of the helper and every
+    # retry of it is refused as already in use, so the unwind hands it back. This
+    # is the throw case only: a job that hangs INSIDE lib.download still holds
+    # its registration, deliberately, because it still holds the output path.
+    try:
+        _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
+                   % (url, "on" if pot else "off"))
+        threading.Thread(target=_resolve_watchdog, daemon=True).start()
+    except BaseException:
+        finished.set()
+        _pget_unregister(jid, op)
+        raise
 
     try:
         path = lib.download(_ytdl_lib_argv(fmt, outtmpl, url, deno, pot),
@@ -3781,6 +3817,16 @@ def _join_ytdl_workers_for_test(timeout=5.0):
 def _handle_ytdl_legacy(req):
     """Token-omitted path: preserve title/ID template and tokenless wire shapes.
     Prefers the in-process library; falls back to the exe worker below."""
+    # One claim for the whole job, held OUTSIDE worker() so the guard around the
+    # thread can see what the worker already sent. Every terminal frame below
+    # goes through _terminal; the progress frames do not.
+    claim = _TerminalClaim()
+
+    def _terminal(msg):
+        """Send a terminal frame only if nothing has already ended this job."""
+        if claim.take():
+            _h().send(msg)
+
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
@@ -3813,15 +3859,15 @@ def _handle_ytdl_legacy(req):
             reason, msg = _map_yt_error(str(e))
             _h()._hlog("error", "yt-dlp: preflight failed (%s): %s"
                        % (reason, str(e)[:500]), "ytdlp")
-            _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+            _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             return
 
         if use_lib:
-            _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot)
+            _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=claim)
             return
 
         if not ytdlp:
-            _h().send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
+            _terminal({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
                   "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
             return
         cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
@@ -3836,7 +3882,7 @@ def _handle_ytdl_legacy(req):
                                  # @@FILE@@ path, failing an already-finished job.
                                  encoding="utf-8", errors="replace")
         except Exception as e:
-            _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
+            _terminal({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return
         # Tagged yt-dlp op: same CAS registry as pget; no lease_cv so set-limit ignores it.
         # Legacy keeps spawn-then-register so a duplicate id still kills the new proc.
@@ -3844,7 +3890,7 @@ def _handle_ytdl_legacy(req):
         if not _pget_register(jid, op):
             # Duplicate id owns the registry — kill the just-spawned process, do not overwrite.
             _safe_kill(p)
-            _h().send({
+            _terminal({
                 "type": "ytdl-error",
                 "id": jid,
                 "reason": "spawn",
@@ -3891,7 +3937,7 @@ def _handle_ytdl_legacy(req):
             watch.finish()
             p.wait()
             if op.get("cancel_requested"):
-                _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled",
+                _terminal({"type": "ytdl-error", "id": jid, "reason": "cancelled",
                            "error": "Cancelled."})
             elif watch.stalled.is_set():
                 # Log whatever it DID say before going quiet — the user-facing
@@ -3901,7 +3947,7 @@ def _handle_ytdl_legacy(req):
                               ("; last output:\n" + "\n".join(errbuf[-12:])[:2000])
                               if errbuf else " (it produced no output at all)"))
                 # Observation, not a guessed cause — see the structured path.
-                _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                _terminal({"type": "ytdl-error", "id": jid, "reason": "stalled",
                            "error": "yt-dlp stopped responding while preparing the download "
                                     "(no output for %ds) and was stopped. Its last output is "
                                     "in the log console." % _YTDL_RESOLVE_STALL})
@@ -3911,16 +3957,16 @@ def _handle_ytdl_legacy(req):
                 except Exception:
                     size = None
                 if type(size) is int and size >= 0:
-                    _h().send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": size})
+                    _terminal({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": size})
                     _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
                 else:
                     reason, msg = _map_yt_error("\n".join(errbuf))
-                    _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+                    _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             else:
                 reason, msg = _map_yt_error("\n".join(errbuf))
                 _h()._hlog("error", "yt-dlp failed (%s): %s"
                            % (reason, ("\n".join(errbuf[-12:]))[:2000]))
-                _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+                _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         finally:
             watch.finish()          # idempotent; also covers the exception path
             _pget_unregister(jid, op)
@@ -3928,6 +3974,30 @@ def _handle_ytdl_legacy(req):
     def _run():
         try:
             worker()
+        except BaseException as e:
+            # A throw that escapes worker() reaches the default excepthook: a
+            # traceback on a stderr nobody reads, and a row acknowledged as
+            # "resolving" with nothing ever following it. worker()'s own handlers
+            # cannot cover a fault in the frame above them, or one raised while
+            # they are unwinding, so the last frame in the thread owes the row a
+            # terminal like every other failure.
+            #
+            # Through the shared claim, never unconditionally: a throw AFTER a
+            # ytdl-done must not turn a saved file into an error row. And note
+            # what this does NOT cover — a worker that HANGS raises nothing and
+            # never reaches here.
+            if claim.take():
+                try:
+                    _h().send({"type": "ytdl-error", "id": req.get("id"),
+                               "reason": "generic",
+                               "error": "The download stopped unexpectedly — open "
+                                        "the log console for details."})
+                except Exception:
+                    pass        # a dead pipe is not something to raise about here
+            try:
+                _h()._hlog("error", "yt-dlp worker died: %r" % (e,), "ytdlp")
+            except Exception:
+                pass
         finally:
             try:
                 _YTDL_WORKERS.remove(threading.current_thread())

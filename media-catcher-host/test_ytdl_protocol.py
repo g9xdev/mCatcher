@@ -5127,6 +5127,119 @@ def test_a_preflight_failure_ends_the_row_it_acknowledged(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# A worker that DIES still owes the row a terminal frame
+#
+# The preflight wrapper above covers a throw inside it. A throw anywhere else in
+# the worker — or in the frame that calls it — reaches the default excepthook: a
+# traceback on a stderr nobody reads, and a row acknowledged as "resolving" with
+# nothing ever following it. This is exceptions only; a genuine HANG inside
+# lib.download still reaches no handler at all.
+# ---------------------------------------------------------------------------
+
+def _lib_that_is_available(download):
+    lib = FakeYtdlLib(download)
+    lib.available = lambda: True
+    return lib
+
+
+def test_a_worker_dying_outside_every_handler_still_ends_the_row(tmp_path, monkeypatch):
+    """The download call sits in worker() unwrapped: a throw out of it (or out of
+    anything the worker does around it) killed the thread silently."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: _lib_that_is_available(None))
+
+    def die(*a, **k):
+        raise RuntimeError("the worker thread died mid-flight")
+
+    monkeypatch.setattr(d, "_ytdl_download_via_lib", die)
+
+    d._handle_ytdl_legacy({"id": "j-dead", "url": "https://youtu.be/x",
+                           "dir": str(tmp_path)})
+    assert wait_for(lambda: any(m["type"] == "ytdl-error" for m in sent), timeout=5), \
+        "a dying worker emitted no terminal frame at all: %r" % (sent,)
+    d._join_ytdl_workers_for_test()
+
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert len(terminal) == 1, terminal
+    assert terminal[0]["id"] == "j-dead"
+
+
+def test_the_dying_worker_guard_never_contradicts_a_frame_already_sent(tmp_path,
+                                                                       monkeypatch):
+    """A throw AFTER a ytdl-done must not turn a saved file into an error row.
+    Reporting a completed download as failed is the failure this whole liveness
+    effort has already been burned by once, so the guard claims the same terminal
+    the download path claims rather than sending unconditionally."""
+    import mchost.downloads as d
+
+    out = tmp_path / "v.mp4"
+    out.write_bytes(b"x" * 7)
+    sent = []
+
+    def hlog(level, msg, *a, **k):
+        # The line the download path logs immediately AFTER the done frame.
+        if isinstance(msg, str) and msg.startswith("yt-dlp: saved"):
+            raise RuntimeError("the log sink blew up after the terminal frame")
+
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", hlog)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        return str(out)
+
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: _lib_that_is_available(fake_download))
+
+    d._handle_ytdl_legacy({"id": "j-done-then-boom", "url": "https://youtu.be/x",
+                           "dir": str(tmp_path)})
+    assert wait_for(lambda: any(m["type"] == "ytdl-done" for m in sent), timeout=5), sent
+    d._join_ytdl_workers_for_test()
+
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m["type"] for m in terminal] == ["ytdl-done"], \
+        "a completed download was overwritten with a failure: %r" % (terminal,)
+
+
+def test_a_throw_between_registering_and_downloading_releases_the_job_id(tmp_path,
+                                                                         monkeypatch):
+    """The registration is taken before the log call and the watchdog thread
+    start, either of which can throw. Left behind, it owns the id for the life of
+    the helper and every retry of that id is refused as already in use."""
+    import mchost.downloads as d
+
+    monkeypatch.setattr(mc, "send", lambda m: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    def hlog(*a, **k):
+        raise RuntimeError("the log sink blew up before the download started")
+
+    monkeypatch.setattr(mc, "_hlog", hlog)
+    monkeypatch.setattr(d, "_ytdlp_lib",
+                        lambda: _lib_that_is_available(
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                AssertionError("must not reach the download"))))
+
+    try:
+        d._ytdl_download_via_lib("j-stuck-id", "https://youtu.be/x", "b",
+                                 str(tmp_path / "v.mp4"), None, False)
+    except RuntimeError:
+        pass                                # the throw is expected to propagate
+
+    assert d._pget_registry_get("j-stuck-id") is None, \
+        "the job id is still owned by an operation that will never run"
+
+
+# ---------------------------------------------------------------------------
 # The in-process path's children: a wedged deno is the one hang no hook and no
 # log line can reach, so bounding the silence is not enough — the child has to
 # go. These pin the kill policy, and above all that it can never reach a
