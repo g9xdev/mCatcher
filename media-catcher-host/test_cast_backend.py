@@ -779,6 +779,183 @@ def test_cast_run_timeout_cancels_the_coroutine(monkeypatch):
             loop.call_soon_threadsafe(loop.stop)
 
 
+# ===========================================================================
+# A cancelled pair_begin must still be closeable
+#
+# _cast_run now cancels a coroutine it stopped waiting on. pair_begin opens a
+# real session on the device before it returns, so the ONE reference to that
+# handler has to exist from the moment it does — otherwise an Apple TV that is
+# merely asleep (begin() past the 30s bound) leaks the aiohttp session, holds
+# its PIN, and the retry's pair_cancel finds None and closes nothing.
+# ===========================================================================
+
+class _PairHandler:
+    """The pyatv pairing handler, reduced to what _cast_pair_* touches."""
+
+    def __init__(self, begin):
+        self._begin = begin
+        self.closed = False
+        self.device_provides_pin = True
+
+    async def begin(self):
+        await self._begin()
+
+    async def close(self):
+        self.closed = True
+
+
+def _fake_pyatv(monkeypatch, pair):
+    """A minimal importable pyatv whose pair() is `pair`. The real one is an
+    on-demand install (ensure_pyatv), so it is not importable in the suite."""
+    const = types.ModuleType("pyatv.const")
+    const.Protocol = types.SimpleNamespace(AirPlay="airplay")
+    mod = types.ModuleType("pyatv")
+    mod.const = const
+    mod.pair = pair
+    monkeypatch.setitem(sys.modules, "pyatv", mod)
+    monkeypatch.setitem(sys.modules, "pyatv.const", const)
+
+
+def test_a_cancelled_pair_begin_leaves_the_handler_closeable(monkeypatch):
+    import asyncio
+    import concurrent.futures
+    monkeypatch.setattr(legacy_mod, "_CAST",
+                        {"loop": None, "thread": None, "pairing": None,
+                         "storage": None})
+
+    async def asleep():
+        await asyncio.sleep(30)          # an Apple TV that has to be woken
+
+    handler = _PairHandler(asleep)
+
+    async def pair(config, protocol, loop, storage=None):
+        return handler
+
+    _fake_pyatv(monkeypatch, pair)
+
+    async def storage():
+        return None
+
+    async def find_config(device_id):
+        return object()
+
+    monkeypatch.setattr(legacy_mod, "_cast_storage", storage)
+    monkeypatch.setattr(legacy_mod, "_find_config", find_config)
+
+    try:
+        with pytest.raises(concurrent.futures.TimeoutError):
+            legacy_mod._cast_run(legacy_mod._cast_pair_begin("atv-1"), timeout=0.3)
+        assert legacy_mod._CAST.get("pairing") is handler, \
+            "the cancel dropped the only reference to an already-open pairing session"
+        legacy_mod._cast_run(legacy_mod._cast_pair_cancel(), timeout=5)
+        assert handler.closed, "the retry's pair_cancel had nothing to close"
+    finally:
+        loop = legacy_mod._CAST.get("loop")
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+
+
+def test_pair_begin_still_reports_whether_the_device_shows_a_pin(monkeypatch):
+    """Storing the handler earlier must not change what begin() returns."""
+    monkeypatch.setattr(legacy_mod, "_CAST",
+                        {"loop": None, "thread": None, "pairing": None,
+                         "storage": None})
+
+    async def quick():
+        return None
+
+    handler = _PairHandler(quick)
+    handler.device_provides_pin = False
+
+    async def pair(config, protocol, loop, storage=None):
+        return handler
+
+    _fake_pyatv(monkeypatch, pair)
+
+    async def storage():
+        return None
+
+    async def find_config(device_id):
+        return object()
+
+    monkeypatch.setattr(legacy_mod, "_cast_storage", storage)
+    monkeypatch.setattr(legacy_mod, "_find_config", find_config)
+
+    try:
+        assert legacy_mod._cast_run(legacy_mod._cast_pair_begin("atv-1"),
+                                    timeout=5) is False
+        assert legacy_mod._CAST.get("pairing") is handler
+    finally:
+        loop = legacy_mod._CAST.get("loop")
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+
+
+# ===========================================================================
+# The token map is shared state, and cast requests are not serialized
+#
+# handle_cast spawns one daemon thread per request, so a stop can land in the
+# middle of a start. _stop_media_server clears _DLNA["media"] under
+# _DLNA_SRV_LOCK; _dlna_media_url read-modify-wrote it under nothing, so the
+# start could repopulate the map the stop had just emptied — the stopped
+# session's file LAN-fetchable again — or lose the stop's own token.
+# ===========================================================================
+
+def test_a_stop_during_a_registration_does_not_resurrect_the_token_map(monkeypatch,
+                                                                       tmp_path):
+    """Park a registration at the READ half of its read-modify-write and stop
+    the server underneath it.
+
+    The map it read still holds the previous session's token (the deliberate
+    one-token carry-forward), so an unlocked write-back puts that token back on
+    the map the stop had just emptied — and the next start serves it again.
+    """
+    clip = tmp_path / "a.mp4"
+    clip.write_bytes(b"a")
+    monkeypatch.setattr(legacy_mod, "_DLNA",
+                        dict(legacy_mod._DLNA, server=None, port=0, media={},
+                             thread=None, devices={}))
+    monkeypatch.setattr(legacy_mod, "_lan_ip", lambda *a: "127.0.0.1")
+
+    reached = threading.Event()
+    release = threading.Event()
+
+    class _SlowMap(dict):
+        """Blocks exactly where _dlna_media_url reads the map it will rewrite."""
+
+        def items(self):
+            reached.set()
+            release.wait(5)
+            return dict.items(self)
+
+    try:
+        legacy_mod._dlna_media_url(str(clip))          # session 1 takes a token
+        old_token = next(iter(legacy_mod._DLNA["media"]))
+        legacy_mod._DLNA["media"] = _SlowMap(legacy_mod._DLNA["media"])
+
+        starter = threading.Thread(
+            target=legacy_mod._dlna_media_url, args=(str(clip),), daemon=True)
+        starter.start()
+        assert reached.wait(5), "the registration never reached the map"
+
+        stopper = threading.Thread(target=legacy_mod._stop_media_server, daemon=True)
+        stopper.start()
+        # Bounded, and the outcome differs by design: unlocked, the stop runs to
+        # completion here and the parked write-back lands after it; locked, the
+        # stop is still waiting and the two cannot interleave at all. Either way
+        # the assertion below is the same.
+        stopper.join(1.0)
+        release.set()
+        starter.join(5)
+        stopper.join(5)
+        assert not starter.is_alive() and not stopper.is_alive()
+
+        assert old_token not in legacy_mod._DLNA["media"], \
+            "a stopped session's token came back onto the map"
+    finally:
+        release.set()
+        legacy_mod._stop_media_server()
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))

@@ -488,9 +488,19 @@ def _stop_media_server():
 
 
 def _dlna_media_url(source, device_ip=None):
-    """Register a local path or remote URL; return (LAN URL the TV fetches, ctype)."""
+    """Register a local path or remote URL; return (LAN URL the TV fetches, ctype).
+
+    Starting the server and claiming a token on it is ONE step under
+    _DLNA_SRV_LOCK. handle_cast runs each request on its own thread with no
+    ordering between them, so a stop lands wherever it lands; with the lock
+    taken and released by _ensure_media_server and the map rewritten outside it,
+    a start could read the map, lose the server to a concurrent stop, and write
+    that map back — putting the stopped session's carried-forward token onto the
+    next server, LAN-fetchable again. Held across both, the stop is either
+    entirely before this (so it starts a fresh server and carries nothing
+    forward) or entirely after (so it clears this too).
+    """
     import uuid
-    port = _ensure_media_server()
     token = uuid.uuid4().hex
     ctype = "video/mp4"
     low = source.lower()
@@ -507,9 +517,13 @@ def _dlna_media_url(source, device_ip=None):
     # off a stream still being read. Ending a session clears the map outright --
     # both an explicit stop and the dispatcher's stop-before-start go through
     # _cast_stop_active -- so in the ordinary re-cast this keeps nothing.
-    media = dict(list(_DLNA["media"].items())[-1:])
-    media[token] = entry
-    _DLNA["media"] = media
+    with _DLNA_SRV_LOCK:
+        port = _ensure_media_server_locked()
+        media = dict(list(_DLNA["media"].items())[-1:])
+        media[token] = entry
+        _DLNA["media"] = media
+    # Outside the lock deliberately: _lan_ip probes the routing table, and the
+    # lock is also what a teardown waits on.
     # Advertise the interface that actually routes to this TV (multi-homed PCs/VPNs).
     ip = _lan_ip(device_ip) if device_ip else _lan_ip()
     return "http://%s:%d/m/%s" % (ip, port, token), ctype
@@ -916,8 +930,14 @@ async def _cast_pair_begin(device_id):
     st = await _cast_storage()
     config = await _find_config(device_id)
     handler = await pyatv.pair(config, Protocol.AirPlay, _cast_loop(), storage=st)
-    await handler.begin()
+    # Stored BEFORE begin(): begin() opens a session on the device, and _cast_run
+    # cancels this coroutine once its wait runs out (an asleep Apple TV takes
+    # longer than that to answer). Storing it afterwards meant the cancel dropped
+    # the only reference to an already-open session — the aiohttp session leaked,
+    # the device held its PIN, and the retry's _cast_pair_cancel() found None and
+    # closed nothing before pyatv.pair() ran again.
     _CAST["pairing"] = handler
+    await handler.begin()
     return bool(handler.device_provides_pin)
 
 
