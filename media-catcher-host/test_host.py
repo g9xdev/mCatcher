@@ -1,6 +1,7 @@
 """Offline tests for mc_host.py: wire-protocol framing + ffmpeg command building.
 Does not require a real stream. Run:  python -m pytest test_host.py -q
 (or directly:  py test_host.py)"""
+import io
 import json
 import os
 import struct
@@ -586,3 +587,165 @@ def test_the_snapshot_worker_removes_the_temp_the_discard_could_not(
     finally:
         with d.JOBS_LOCK:
             d.JOBS.pop("j-held", None)
+
+
+# ---------------------------------------------------------------------------
+# The read loop's shape, owned HERE
+#
+# The rule is: nothing dispatched from main()'s message loop may hold it for
+# longer than the extension's heartbeat tolerates. Until now that rule lived
+# only in a comment in background.js - on the far side of the port from the code
+# that has to honour it - and it regressed twice (handle_snapshot, then
+# handle_file_commit / _pget_cancel / handle_open) with a green suite both times.
+#
+# WHAT THIS CATCHES
+#   - a new elif branch added to the loop: the parsed set stops matching the
+#     table below and the test fails naming the command
+#   - a handler classified "worker" that stops dispatching to a thread
+#   - a handler moved between the two classes without its entry being updated
+#
+# WHAT IT DOES NOT CATCH
+#   - an inline handler that grows new unbounded work inside it (the bound is a
+#     written claim here, not a measurement)
+#   - a handler that starts a thread and then joins it
+#   - blocking work added to main() outside any handler branch
+# Those need a reader. This stops the silent case: a whole new command landing
+# on the loop with nobody having thought about it.
+# ---------------------------------------------------------------------------
+
+# cmd -> ("worker", (names that must start a thread,)) | ("inline", why bounded)
+# "<dispatch>" means the loop branch itself starts the thread.
+LOOP_DISPATCH = {
+    "ping": ("inline",
+             "one small frame, and it IS the heartbeat reply: answered anywhere "
+             "but the loop, a missed beat stops meaning 'the loop is turning'"),
+    "ytdl": ("worker", ("_handle_ytdl_legacy", "_handle_ytdl_structured")),
+    "ytmeta": ("worker", ("handle_ytmeta",)),
+    "cast": ("worker", ("handle_cast",)),
+    "ytdlUpdate": ("worker", ("<dispatch>",)),
+    "record": ("worker", ("handle_record",)),
+    "stop": ("inline",
+             "writes 'q' to ffmpeg's stdin and returns - no wait, no filesystem"),
+    "snapshot": ("worker", ("handle_snapshot",)),
+    "save": ("worker", ("handle_save",)),
+    "saveAs": ("worker", ("handle_save_as",)),
+    "pickFolder": ("worker", ("handle_pick_folder",)),
+    "open": ("worker", ("handle_open",)),
+    "reveal": ("inline",
+               "one stat, then a Popen of the file manager, which never waits"),
+    "update": ("worker", ("handle_update",)),
+    "watch": ("inline",
+              "reads and rewrites the small config file, then arms an OS watcher"),
+    "checkGithub": ("worker", ("handle_check_github",)),
+    "discard": ("inline",
+                "bounded 10s wait for ffmpeg to finalize, inside one beat; the "
+                "unlinks are best-effort and a snapshot worker retries the one "
+                "that can fail"),
+    "pget": ("worker", ("handle_pget",)),
+    "pget-single": ("worker", ("handle_pget_single",)),
+    "pget-set-limit": ("inline", "registry and lease bookkeeping, then one send"),
+    "getReport": ("inline", "reads a bounded tail of two small local files"),
+    "probe": ("worker", ("handle_probe",)),
+    # Decision inline (it pins WHICH op the cancel names), kills on a worker.
+    "pget-cancel": ("worker", ("_pget_kill_off_loop",)),
+    "file-open": ("inline",
+                  "one O_EXCL create of the .part under the registry lock"),
+    "file-chunk": ("inline",
+                   "one write+flush of a single chunk, bounded by MAX_UNACKED"),
+    "file-commit": ("worker", ("handle_file_commit",)),
+    "file-abort": ("inline",
+                   "closes the handle and unlinks the .part - metadata only"),
+}
+
+
+def _loop_branches():
+    """Every `cmd == "..."` branch in main(), by AST rather than by grep, with a
+    flag for whether the branch body itself starts a thread."""
+    import ast
+
+    tree = ast.parse(io.open(HOST, encoding="utf-8").read())
+    main = [n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "main"]
+    assert main, "main() not found in mc_host.py"
+    found = {}
+    for node in ast.walk(main[0]):
+        if not isinstance(node, ast.If):
+            continue
+        t = node.test
+        if not (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+                and t.left.id == "cmd" and len(t.ops) == 1
+                and isinstance(t.ops[0], ast.Eq)
+                and isinstance(t.comparators[0], ast.Constant)):
+            continue
+        starts = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                     and c.func.attr == "start"
+                     for b in node.body for c in ast.walk(b))
+        found[t.comparators[0].value] = starts
+    return found
+
+
+def _module_functions():
+    """Module-level functions across the mchost package, by name."""
+    import ast
+
+    out = {}
+    root_dir = os.path.join(HERE, "mchost")
+    for root, _, files in os.walk(root_dir):
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            fp = os.path.join(root, f)
+            for n in ast.parse(io.open(fp, encoding="utf-8").read()).body:
+                if isinstance(n, ast.FunctionDef):
+                    out[n.name] = (n, os.path.relpath(fp, HERE))
+    return out
+
+
+def _starts_a_thread(fnnode):
+    import ast
+
+    return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+               and c.func.attr == "start" for c in ast.walk(fnnode))
+
+
+def test_every_loop_command_is_classified():
+    """A new command dispatched from the read loop fails here until someone has
+    decided, in writing, whether it may run on that loop."""
+    branches = _loop_branches()
+    assert set(branches) == set(LOOP_DISPATCH), (
+        "the loop's commands and this table disagree; added=%s removed=%s"
+        % (sorted(set(branches) - set(LOOP_DISPATCH)),
+           sorted(set(LOOP_DISPATCH) - set(branches))))
+
+
+def test_every_long_loop_command_really_dispatches_to_a_worker():
+    """The "worker" half of the table is a claim about code, so check the code.
+    Names the function that does the dispatching, not just the handler, because
+    several handlers delegate (ytdl to two protocol paths, pget-cancel to the
+    killer it hands the slow half to)."""
+    branches = _loop_branches()
+    funcs = _module_functions()
+    for cmd, (kind, detail) in sorted(LOOP_DISPATCH.items()):
+        if kind != "worker":
+            continue
+        for name in detail:
+            if name == "<dispatch>":
+                assert branches.get(cmd), (
+                    "%s claims the loop branch starts its own thread; it does not"
+                    % cmd)
+                continue
+            assert name in funcs, "%s names %s, which does not exist" % (cmd, name)
+            node, where = funcs[name]
+            assert _starts_a_thread(node), (
+                "%s is classified worker via %s (%s), but that function starts no "
+                "thread - it now runs on the read loop" % (cmd, name, where))
+
+
+def test_every_inline_loop_command_states_its_bound():
+    """The inline half cannot be checked mechanically, so it is checked
+    editorially: an exemption with no stated bound is not an exemption."""
+    for cmd, (kind, detail) in sorted(LOOP_DISPATCH.items()):
+        if kind != "inline":
+            continue
+        assert isinstance(detail, str) and len(detail) > 20, (
+            "%s is exempt from the worker rule with no bound written down" % cmd)
