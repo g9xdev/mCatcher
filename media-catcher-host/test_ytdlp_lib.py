@@ -129,3 +129,60 @@ def test_the_logger_routes_lines_to_a_sink_not_stdout():
     log.debug("d"); log.warning("w"); log.error("e")
     levels = [l[0] for l in lines]
     assert "error" in levels and "warn" in levels
+
+
+# ---- cancellation during resolve ------------------------------------------
+# yt-dlp's progress hooks do not fire until bytes flow, so the log sink is the
+# only poll that can see a cancel while the job is still resolving.
+
+def _fake_yt(on_extract):
+    """Minimal stand-in for the yt_dlp module: just enough of parse_options and
+    YoutubeDL for download() to run without the vendored library present."""
+
+    class YoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return on_extract(self.opts)
+
+        def sanitize_info(self, info):
+            return info
+
+    return type("yt_dlp", (), {
+        "parse_options": staticmethod(
+            lambda argv: type("P", (), {"ydl_opts": {}, "urls": ["u"]})()),
+        "YoutubeDL": YoutubeDL,
+    })
+
+
+def test_a_cancel_is_seen_from_the_log_sink_before_any_bytes_flow(monkeypatch):
+    def on_extract(opts):
+        opts["logger"].info("[youtube] Downloading webpage")
+        raise AssertionError("the sink should have cancelled before this")
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract))
+    try:
+        lib.download(["u"], should_cancel=lambda: True)
+    except lib.Cancelled:
+        return
+    raise AssertionError("download() did not raise Cancelled from the log sink")
+
+
+def test_the_sink_cancel_poll_is_inert_when_no_poll_was_given(monkeypatch):
+    """Several callers pass no should_cancel; a missing poll is not a cancel."""
+    notes = []
+
+    def on_extract(opts):
+        opts["logger"].info("[youtube] Downloading webpage")
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract))
+    assert lib.download(["u"], on_note=notes.append) == r"C:\out.mp4"
+    assert notes == ["Reading page"]

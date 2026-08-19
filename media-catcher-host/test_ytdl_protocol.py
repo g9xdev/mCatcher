@@ -4716,3 +4716,118 @@ def test_ensure_ytdlp_accepts_a_directory_build_without_refetching(tmp_path, mon
 
     monkeypatch.setattr("urllib.request.urlopen", boom)
     assert d.ensure_ytdlp() == str(exe)
+
+
+def test_youtube_job_is_acknowledged_before_the_slow_preflight(tmp_path, monkeypatch):
+    """ensure_deno() and start_pot_provider() can take minutes. The row must be
+    host-acknowledged first, or it is indistinguishable from a dead helper."""
+    import mchost.downloads as d
+
+    order = []
+    monkeypatch.setattr(mc, "send",
+                        lambda m: order.append(("send", m.get("type"), m.get("stage"))))
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_deno",
+                        lambda: order.append(("ensure_deno", None, None)))
+    monkeypatch.setattr(d, "start_pot_provider",
+                        lambda: order.append(("start_pot", None, None)))
+    monkeypatch.setattr(d, "_ytdl_download_via_lib",
+                        lambda *a, **k: order.append(("download", None, None)))
+    monkeypatch.setattr(d, "_ytdlp_lib",
+                        lambda: type("L", (), {"available": staticmethod(lambda: True)})())
+
+    d._handle_ytdl_legacy({"id": "j1", "url": "https://youtu.be/x", "dir": str(tmp_path)})
+    d._join_ytdl_workers_for_test()
+
+    assert order[0] == ("send", "ytdl-progress", "resolving"), order
+    assert ("ensure_deno", None, None) in order
+    assert order.index(("send", "ytdl-progress", "resolving")) < order.index(("ensure_deno", None, None))
+
+
+class FakeYtdlLib:
+    """Stand-in for mchost.ytdlp_lib: the two names _ytdl_download_via_lib touches."""
+
+    class Cancelled(Exception):
+        pass
+
+    def __init__(self, download):
+        self.download = download
+
+
+def _capture_lib_op(d, monkeypatch, captured):
+    """Keep the real registry (so nothing leaks) while grabbing the op dict."""
+    real = d._pget_register
+
+    def cap(jid, op):
+        captured["op"] = op
+        return real(jid, op)
+
+    monkeypatch.setattr(d, "_pget_register", cap)
+
+
+def test_the_resolve_watchdog_disarms_on_the_first_progress_callback(tmp_path, monkeypatch):
+    """Bytes flowing means yt-dlp is alive: a slow download must never be killed.
+    The watchdog bounds resolve-phase silence only."""
+    import mchost.downloads as d
+
+    out = tmp_path / "v.mp4"
+    out.write_bytes(b"x" * 9)
+    sent = []
+    captured = {}
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.05)
+    _capture_lib_op(d, monkeypatch, captured)
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None):
+        on_progress({"stage": "downloading", "pct": 1.0, "total": 9})
+        # Hold well past the (shrunk) deadline. A False return proves the wall
+        # time really elapsed, so a pass here can never be vacuous.
+        assert not threading.Event().wait(d._YTDL_RESOLVE_STALL * 10)
+        return str(out)
+
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: FakeYtdlLib(fake_download))
+    d._ytdl_download_via_lib("j-slow", "https://youtu.be/x", "b", str(out), None, False)
+
+    assert not captured["op"]["cancel_requested"], "a progressing download was cancelled"
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert len(terminal) == 1, terminal
+    assert terminal[0]["type"] == "ytdl-done"
+
+
+def test_a_silent_resolve_is_reported_as_stalled_once(tmp_path, monkeypatch):
+    """No callback at all means yt-dlp is wedged (deno still runs as a subprocess
+    on this path). Report the exe path's reason, and only once — the unwind that
+    follows the cancel flag must not overwrite it with 'cancelled'."""
+    import mchost.downloads as d
+
+    sent = []
+    captured = {}
+    saw_stalled = threading.Event()
+
+    def fake_send(m):
+        sent.append(m)
+        if m.get("reason") == "stalled":
+            saw_stalled.set()
+
+    monkeypatch.setattr(mc, "send", fake_send)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.05)
+    _capture_lib_op(d, monkeypatch, captured)
+
+    lib = None
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None):
+        assert saw_stalled.wait(5), "the watchdog never fired"
+        assert should_cancel(), "the watchdog must set the cancel flag it acts on"
+        raise lib.Cancelled()          # what yt-dlp does once the poll sees it
+
+    lib = FakeYtdlLib(fake_download)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib)
+    d._ytdl_download_via_lib("j-wedged", "https://youtu.be/x", "b",
+                             str(tmp_path / "v.mp4"), None, False)
+
+    assert captured["op"]["cancel_requested"] is True
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert len(terminal) == 1, terminal
+    assert terminal[0]["reason"] == "stalled"

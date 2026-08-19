@@ -198,6 +198,11 @@ def download(argv, on_progress=None, on_note=None, should_cancel=None, pylib=Non
     from mchost.downloads import _yt_stage_note   # the same mapper the exe path used
 
     def _sink(level, msg):
+        # The progress hooks do not fire until bytes flow, so this is the only
+        # poll that can see a cancel during resolve — yt-dlp logs here from its
+        # first "[youtube] Downloading webpage".
+        if should_cancel is not None and should_cancel():
+            raise Cancelled()
         if on_note and level == "info":
             note = _yt_stage_note(msg or "")
             if note:

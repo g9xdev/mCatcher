@@ -3467,11 +3467,12 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     """In-process download for the legacy (tokenless) path. Emits the same
     ytdl-progress / ytdl-done / ytdl-error wire shapes the exe worker did.
 
-    Cancellation is by flag, polled inside yt-dlp's hooks: the hooks fire once
-    bytes flow, so a cancel during the (now fast, in-process) resolve is seen at
-    the first progress callback rather than instantly. No stall watchdog — the
-    launch-scan hang it guarded against cannot happen in-process, and a network
-    stall is bounded by --socket-timeout."""
+    Cancellation is by flag, polled inside yt-dlp's hooks and inside the log
+    sink — the hooks do not fire until bytes flow, so the sink is what makes a
+    cancel visible during resolve. The resolve phase also gets the same
+    _YTDL_RESOLVE_STALL deadline the exe path's _StallWatch applies, reported
+    with the same reason: "in-process" does not make it unstallable, because
+    --js-runtimes still launches deno while resolving."""
     lib = _ytdlp_lib()
     op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
     if not _pget_register(jid, op):
@@ -3480,11 +3481,18 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
         return
     _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
                % (url, "on" if pot else "off"))
-    _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving",
-               "note": "Preparing"})
+    # The acknowledgement frame is sent by _handle_ytdl_legacy's worker before the
+    # preflight — one per job, so none here.
     last = {"pct": -1.0}
+    # Resolve-phase liveness only. Bytes flowing means yt-dlp's hooks are firing,
+    # and a slow download must never be killed - the watchdog below disarms on the
+    # first callback. It exists because --js-runtimes still launches deno on the
+    # resolve path, so "in-process" does not make this phase unstallable.
+    resolved = threading.Event()
+    stalled = threading.Event()
 
     def on_progress(m):
+        resolved.set()
         if m.get("stage") == "merging" or m.get("pct") is None:
             _h().send({"type": "ytdl-progress", "id": jid, **m})
             return
@@ -3495,12 +3503,34 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
             _h().send({"type": "ytdl-progress", "id": jid, **m})
 
     def on_note(note):
+        resolved.set()
         if last["pct"] < 0:
             _h().send({"type": "ytdl-progress", "id": jid, "pct": 0,
                        "stage": "resolving", "note": note})
 
+    def _terminal(msg):
+        """One terminal frame per job. The watchdog speaks from its own thread
+        while yt-dlp may still be unwinding, and whatever that unwind reports
+        (usually Cancelled, since the watchdog sets the cancel flag) must not
+        contradict the stall already on the row."""
+        if stalled.is_set():
+            return
+        _h().send(msg)
+
     def _cancelled():
-        _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled", "error": "Cancelled."})
+        _terminal({"type": "ytdl-error", "id": jid, "reason": "cancelled", "error": "Cancelled."})
+
+    def _resolve_watchdog():
+        if resolved.wait(_YTDL_RESOLVE_STALL):
+            return
+        stalled.set()
+        op["cancel_requested"] = True
+        _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling"
+                   % _YTDL_RESOLVE_STALL, "ytdlp")
+        _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                   "error": "yt-dlp made no progress while resolving. "
+                            "Open the log console for its output."})
+    threading.Thread(target=_resolve_watchdog, daemon=True).start()
 
     try:
         path = lib.download(_ytdl_lib_argv(fmt, outtmpl, url, deno, pot),
@@ -3515,19 +3545,33 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
             return
         reason, msg = _map_yt_error(str(e))
         _h()._hlog("error", "yt-dlp (lib) failed (%s): %s" % (reason, str(e)[:500]), "ytdlp")
-        _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+        _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         return
     finally:
+        resolved.set()          # release the watchdog on every path, fast or failed
         _pget_unregister(jid, op)
 
     if op.get("cancel_requested"):
         _cancelled()
     elif path and os.path.isfile(path):
-        _h().send({"type": "ytdl-done", "id": jid, "file": path, "bytes": os.path.getsize(path)})
+        _terminal({"type": "ytdl-done", "id": jid, "file": path,
+                   "bytes": os.path.getsize(path)})
         _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(path))
     else:
-        _h().send({"type": "ytdl-error", "id": jid, "reason": "generic",
+        _terminal({"type": "ytdl-error", "id": jid, "reason": "generic",
                    "error": "Download failed — open the log console for yt-dlp's output."})
+
+
+# Test seam: _handle_ytdl_legacy's worker is a daemon thread with no handle, so
+# a test has no way to await it without sleeping. Each worker discards its own
+# entry as it finishes, so this cannot grow across the life of the helper.
+_YTDL_WORKERS = []
+
+
+def _join_ytdl_workers_for_test(timeout=5.0):
+    for t in list(_YTDL_WORKERS):
+        t.join(timeout)
+    _YTDL_WORKERS.clear()
 
 
 def _handle_ytdl_legacy(req):
@@ -3536,6 +3580,11 @@ def _handle_ytdl_legacy(req):
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
+        # Acknowledge before the preflight: ensure_deno() can download a JS runtime
+        # and start_pot_provider() waits on a socket bind, and until one of these
+        # frames lands the row is indistinguishable from a dead helper.
+        _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving",
+                   "note": "Preparing"})
         deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
         outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
         try:
@@ -3558,7 +3607,7 @@ def _handle_ytdl_legacy(req):
             return
         cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
         _h()._hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
-        _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": "Preparing"})
+        # No acknowledgement frame here: worker() already sent it before the preflight.
         cf, si = _no_window()
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3656,7 +3705,18 @@ def _handle_ytdl_legacy(req):
         finally:
             watch.finish()          # idempotent; also covers the exception path
             _pget_unregister(jid, op)
-    threading.Thread(target=worker, daemon=True).start()
+
+    def _run():
+        try:
+            worker()
+        finally:
+            try:
+                _YTDL_WORKERS.remove(threading.current_thread())
+            except ValueError:
+                pass            # already drained by _join_ytdl_workers_for_test
+    t = threading.Thread(target=_run, daemon=True)
+    _YTDL_WORKERS.append(t)
+    t.start()
 
 # ---- parallel multi-mirror direct download --------------------------------
 # Fetch a direct file from one or more mirror URLs using several range requests
