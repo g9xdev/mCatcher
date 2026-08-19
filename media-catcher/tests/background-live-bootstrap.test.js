@@ -57,14 +57,15 @@ function backgroundScripts() {
 
 function createHarness() {
   const settingsLoad = deferred();
-  const nativeMessages = event();
-  const nativeDisconnects = event();
   const nativePosts = [];
   const runtimeMessages = [];
   const controllerCreates = [];
   const handledNative = [];
   const helperDisconnects = [];
   const assemblerCreates = [];
+  const ticks = [];
+  const timers = [];
+  let tickError = null;
 
   const controller = {
     async handleNativeMessage(message) {
@@ -76,12 +77,37 @@ function createHarness() {
       return false;
     },
     helperDisconnected() { helperDisconnects.push(true); },
+    tick(nowMs) {
+      ticks.push(nowMs);
+      if (tickError) throw tickError;
+    },
   };
 
-  const nativePort = {
-    onMessage: nativeMessages,
-    onDisconnect: nativeDisconnects,
-    postMessage(message) { nativePosts.push(message); },
+  // Real runtime.connectNative() returns an independent Port per call — its
+  // onDisconnect fires at most once, for its own lifetime, and never again
+  // once superseded. Mirror that here instead of handing back one shared
+  // object: each connectNative() call gets its own fresh onMessage/
+  // onDisconnect event lists, so a listener registered by an earlier
+  // connection is simply never reached by a later drop — no accumulation to
+  // route around. nativeMessages/nativeDisconnects stay the stable handles
+  // tests already drive; they proxy to whichever port is current.
+  let currentPort = null;
+  function makeNativePort() {
+    const port = {
+      onMessage: event(),
+      onDisconnect: event(),
+      postMessage(message) { nativePosts.push(message); },
+    };
+    currentPort = port;
+    return port;
+  }
+  const nativeMessages = {
+    emit(...args) { if (currentPort) currentPort.onMessage.emit(...args); },
+    get size() { return currentPort ? currentPort.onMessage.size : 0; },
+  };
+  const nativeDisconnects = {
+    emit(...args) { if (currentPort) currentPort.onDisconnect.emit(...args); },
+    get size() { return currentPort ? currentPort.onDisconnect.size : 0; },
   };
 
   const noOpEvent = () => event();
@@ -101,7 +127,7 @@ function createHarness() {
       lastError: null,
       onMessage: noOpEvent(),
       onInstalled: noOpEvent(),
-      connectNative() { return nativePort; },
+      connectNative() { return makeNativePort(); },
       sendMessage(message) {
         runtimeMessages.push(message);
         return Promise.resolve();
@@ -173,8 +199,34 @@ function createHarness() {
     Reflect,
     Proxy,
     AbortController,
-    setTimeout() { return 1; },
-    clearTimeout() {},
+    // `active` starts true and goes false the moment the timer is either
+    // fired (setTimeout only — setInterval keeps firing) or cleared, so
+    // tests can tell a still-pending re-dial from one that already ran or
+    // was cancelled, instead of treating every entry ever pushed as live.
+    // `name` carries the callback's declared function name (background.js
+    // names the ones tests need to pick out, e.g. `nativeRedial`) so tests
+    // can identify a specific timer without guessing from its duration.
+    setTimeout(fn, ms) {
+      const entry = { kind: "timeout", ms, name: fn.name, active: true };
+      entry.fn = function timerFn() {
+        entry.active = false;
+        return fn.apply(null, arguments);
+      };
+      timers.push(entry);
+      return entry;
+    },
+    clearTimeout(handle) {
+      if (handle && typeof handle === "object") handle.active = false;
+    },
+    setInterval(fn, ms) {
+      const entry = { kind: "interval", ms, name: fn.name, active: true };
+      entry.fn = function timerFn() { return fn.apply(null, arguments); };
+      timers.push(entry);
+      return entry;
+    },
+    clearInterval(handle) {
+      if (handle && typeof handle === "object") handle.active = false;
+    },
     fetch() { throw new Error("unexpected fetch"); },
     crypto: {
       randomUUID() { return "00000000-0000-4000-8000-000000000001"; },
@@ -216,6 +268,9 @@ function createHarness() {
     handledNative,
     helperDisconnects,
     assemblerCreates,
+    ticks,
+    timers,
+    setTickError(err) { tickError = err; },
     // background.js declares its entry points at top level, so they land on the
     // vm global — the only way to drive one directly, since runtime.onMessage
     // is a no-op event here.
@@ -283,11 +338,15 @@ test("controller owns recognized native frames while legacy pong and disconnect 
   h.nativeDisconnects.emit();
   await settle();
   assert.equal(h.helperDisconnects.length, 1);
-  // Two listeners, because the drop triggers one automatic re-dial and this
-  // harness hands back the SAME port object every connect, so its listeners
-  // accumulate. Real runtime.connectNative returns a fresh Port per call, so
-  // nothing accumulates in production.
-  assert.equal(h.nativeDisconnects.size, 2);
+  // The re-dial is now scheduled rather than immediate — drive it before
+  // checking listener count.
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active).forEach((t) => t.fn());
+  await settle();
+  // One listener: the re-dial's reconnect gets its own fresh port (matching
+  // real runtime.connectNative, which returns an independent Port per call),
+  // so the dropped port's now-orphaned listener is not watching this one —
+  // nothing accumulates, in the harness or in production.
+  assert.equal(h.nativeDisconnects.size, 1);
   assert.equal(
     h.runtimeMessages.some((message) => message && message.type === "cast-update" &&
       message.cast && message.cast.state === "idle" && /disconnected/i.test(message.error)),
@@ -301,7 +360,7 @@ test("controller owns recognized native frames while legacy pong and disconnect 
 // reconnects — connectNative runs only at extension startup or on an explicit
 // re-check — so before this, one drop left the helper unusable for the rest of
 // the session while the UI reported "Helper not installed."
-test("a dropped helper port re-dials once instead of reporting it uninstalled", async () => {
+test("a dropped helper port re-dials instead of reporting it uninstalled", async () => {
   const h = createHarness();
   h.load();
   h.settingsLoad.resolve({ settings: {} });
@@ -314,15 +373,17 @@ test("a dropped helper port re-dials once instead of reporting it uninstalled", 
 
   h.nativeDisconnects.emit();
   await settle();
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active).forEach((t) => t.fn());
+  await settle();
 
-  assert.equal(pings(), before + 1, "the drop must trigger exactly one re-dial");
+  assert.equal(pings(), before + 1, "the drop must trigger a re-dial");
   const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
   const last = statuses[statuses.length - 1];
   assert.notEqual(last.helper.error, "Helper not installed.",
     "a dropped port must not be reported as a missing install");
 });
 
-test("a re-dial that also drops settles instead of looping", async () => {
+test("a re-dial that also drops backs off instead of giving up", async () => {
   const h = createHarness();
   h.load();
   h.settingsLoad.resolve({ settings: {} });
@@ -331,17 +392,78 @@ test("a re-dial that also drops settles instead of looping", async () => {
   await settle();
 
   const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+
   const before = pings();
-
-  h.nativeDisconnects.emit();   // drop -> one automatic re-dial
-  await settle();
-  h.nativeDisconnects.emit();   // the re-dial drops too -> must give up, not spin
+  h.nativeDisconnects.emit();
   await settle();
 
-  assert.equal(pings(), before + 1, "only one automatic re-dial per connected session");
-  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
-  assert.equal(statuses[statuses.length - 1].helper.state, "disconnected",
-    "a re-dial that also fails settles as disconnected");
+  const first = waits();
+  assert.equal(first.length, 1, "the drop must schedule one re-dial");
+  assert.equal(first[0].ms, 1000);
+  assert.equal(pings(), before, "the re-dial must be scheduled, not immediate");
+
+  first[0].fn();
+  await settle();
+  assert.equal(pings(), before + 1, "firing the timer re-dials");
+
+  h.nativeDisconnects.emit();
+  await settle();
+  const second = waits();
+  assert.equal(second.length, 2, "the second drop must schedule another re-dial");
+  assert.ok(second[1].ms > first[0].ms, "the second wait must be longer");
+});
+
+test("automatic re-dials are bounded rather than unbounded", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  for (let i = 0; i < 6; i += 1) {
+    h.nativeDisconnects.emit();
+    await settle();
+    waits().filter((t) => t.active).slice(-1).forEach((t) => t.fn());
+    await settle();
+  }
+  assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");
+});
+
+// The scheduling site clears any pending re-dial timer before arming a new
+// one (`if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);`),
+// so two overlapping schedule attempts cannot leave two live timers ticking
+// at once. Reaching a second schedule attempt while the first is still
+// pending needs a reconnect that did NOT come from that pending timer
+// itself — the timer always clears its own handle before it reconnects, so
+// nothing else is ever waiting to race it. background.js's own entry points
+// land on the vm global (see createHarness's `sandbox`), so connectNative()
+// is driven directly here to stand in for such a reconnect.
+test("overlapping disconnects clear the previous re-dial instead of stacking it", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const redials = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  const pending = () => redials().filter((t) => t.active);
+
+  h.nativeDisconnects.emit();
+  await settle();
+  assert.equal(pending().length, 1, "the first drop schedules one pending re-dial");
+  const firstTimer = pending()[0];
+
+  h.sandbox.connectNative();
+  await settle();
+  h.nativeDisconnects.emit();
+  await settle();
+
+  assert.equal(firstTimer.active, false, "the earlier pending re-dial must be cleared, not left live");
+  assert.equal(pending().length, 1, "the second drop must not stack a second live re-dial");
 });
 
 // Every YouTube click minted a fresh id and spawned another yt-dlp writing to
@@ -368,4 +490,174 @@ test("a second click on a downloading YouTube URL does not start a second yt-dlp
   await settle();
   assert.equal(ytdls().length, 1,
     "a second click on the same URL must not spawn a competing yt-dlp");
+});
+
+test("the live controller is driven by a clock", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const clock = h.timers.find((t) => t.kind === "interval" && t.ms === 1000);
+  assert.ok(clock, "expected a 1s interval driving the controller");
+
+  const before = h.ticks.length;
+  clock.fn();
+  assert.equal(h.ticks.length, before + 1);
+  assert.equal(typeof h.ticks[h.ticks.length - 1], "number");
+
+  // A throwing tick must not stop the clock, or every later expiry goes unobserved.
+  h.setTickError(new Error("boom"));
+  assert.doesNotThrow(() => clock.fn());
+  h.setTickError(null);
+  const afterThrow = h.ticks.length;
+  clock.fn();
+  assert.equal(h.ticks.length, afterThrow + 1);
+});
+
+test("a connected helper keeps being pinged, not only at connect", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
+  const before = pings();
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  beat.fn();
+  assert.equal(pings(), before + 1, "the heartbeat must ping a connected helper");
+});
+
+// The heartbeat sends the same `{cmd:"ping"}` the connect path does, so the
+// host answers every beat with a full pong. Connection-time handshake work was
+// keyed off pong arrival — which stopped being a per-connection event the
+// moment the heartbeat existed. With autoUpdate on, every 30s beat re-ran the
+// host's `handle_watch` (leaking a thread and a CreateFileW directory handle
+// each time, because `stop_watch` only sets a flag the parked
+// ReadDirectoryChangesW never re-reads) and re-hit the GitHub release API
+// against a designed 6-hour interval — 120 calls/hour into a 60/hour
+// unauthenticated budget, exhausted in about half an hour.
+test("a heartbeat pong does not re-run the connection handshake", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: { autoUpdate: true } });
+  await settle();
+
+  const handshakePosts = () => h.nativePosts.filter(
+    (p) => p && (p.cmd === "watch" || p.cmd === "checkGithub")).length;
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(handshakePosts(), 2, "the first pong of a connection does the handshake work");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 5; i += 1) {
+    beat.fn();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  assert.equal(handshakePosts(), 2,
+    "heartbeat pongs must not re-post watch/checkGithub");
+});
+
+// mclog persists into a 500-entry ring and re-arms a full rewrite of it to
+// storage.local, so an unconditional per-pong line is 120 writes an hour. With
+// autoUpdate on the host adds two more per beat, rotating the whole ring in
+// under 1.5 hours — a user told to "open the log console for yt-dlp's output"
+// would find heartbeat noise and nothing else.
+test("the helper-ready log line is written once per connection, not once per beat", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const readyLines = () => h.runtimeMessages.filter(
+    (m) => m && m.type === "log-line" && m.line && /helper ready/.test(m.line.msg)).length;
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(readyLines(), 1, "the first pong announces the helper");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 5; i += 1) {
+    beat.fn();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  assert.equal(readyLines(), 1, "heartbeat pongs must not re-announce the helper");
+});
+
+// The guard is reset where a new port is assigned, not in the disconnect
+// handler, so it is the arrival of a connection that re-arms the handshake —
+// which is what keeps "once per connection" from degrading into "once ever".
+// Every reconnect route (the re-dial timer and an explicit recheck-helper)
+// passes through that one assignment.
+test("a reconnect runs the connection handshake again rather than latching it off", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: { autoUpdate: true } });
+  await settle();
+
+  const handshakePosts = () => h.nativePosts.filter(
+    (p) => p && (p.cmd === "watch" || p.cmd === "checkGithub")).length;
+  const readyLines = () => h.runtimeMessages.filter(
+    (m) => m && m.type === "log-line" && m.line && /helper ready/.test(m.line.msg)).length;
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  beat.fn();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(handshakePosts(), 2, "the beat must not repeat the handshake");
+
+  h.nativeDisconnects.emit();
+  await settle();
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active)
+    .forEach((t) => t.fn());
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  assert.equal(handshakePosts(), 4, "a new connection must re-run the handshake exactly once");
+  assert.equal(readyLines(), 2, "a new connection must announce the helper again");
+});
+
+// The re-dial branch nulls nativePort and schedules a timer but used to change
+// no state at all, so no helper-status went out: the pill stayed green ("ready")
+// with no live port for the whole wait — up to 60s on the last backoff step —
+// while downloadYouTube refused on `!nativePort`. The user saw "Helper ready"
+// and "YouTube needs the native helper" at the same time.
+test("a scheduled re-dial reports connecting instead of leaving the pill green", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses().at(-1).helper.state, "ready", "the handshake leaves the pill green");
+
+  h.nativeDisconnects.emit();
+  await settle();
+
+  // Deliberately do NOT fire the re-dial timer: this is the window the user
+  // actually looks at, between the drop and the reconnect.
+  const pending = h.timers.filter(
+    (t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active);
+  assert.equal(pending.length, 1, "the drop must schedule a re-dial");
+
+  const last = statuses().at(-1);
+  assert.equal(last.helper.state, "connecting",
+    "the wait before a re-dial must be reported as connecting");
+  assert.equal(last.helper.ready, false, "nothing is connected during the wait");
 });

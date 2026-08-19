@@ -41,3 +41,17 @@ if (Test-Path $out) {
 } else {
   throw "Compile reported success but $out is missing."
 }
+
+# Optional code signing. Unsigned by default: no certificate belongs in this repo.
+# Set MC_SIGN_PFX (path) and MC_SIGN_PASS to produce a signed setup.exe.
+if ($env:MC_SIGN_PFX) {
+  if (-not (Test-Path $env:MC_SIGN_PFX)) { throw "MC_SIGN_PFX is set but $($env:MC_SIGN_PFX) does not exist." }
+  $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+  if (-not $signtool) { throw "MC_SIGN_PFX is set but signtool.exe is not on PATH (install the Windows SDK)." }
+  & $signtool.Source sign /fd SHA256 /f $env:MC_SIGN_PFX /p $env:MC_SIGN_PASS `
+      /tr http://timestamp.digicert.com /td SHA256 $out
+  if ($LASTEXITCODE -ne 0) { throw "signtool failed (exit $LASTEXITCODE)." }
+  Write-Host "Signed: $out" -ForegroundColor Green
+} else {
+  Write-Host "Unsigned build (set MC_SIGN_PFX to sign)." -ForegroundColor Yellow
+}

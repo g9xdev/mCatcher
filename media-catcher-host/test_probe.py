@@ -71,6 +71,47 @@ def test_av_check_offers_the_command_as_text_and_never_runs_it():
     assert v.get("fixable") is not True, "the AV check must never be marked self-applying"
 
 
+def test_no_probe_check_ever_offers_to_apply_an_av_exclusion(monkeypatch):
+    """Deliberate, not unimplemented: applying an exclusion needs admin the host
+    never has, and a diagnostics button that silently punches AV holes is shaped
+    exactly like malware. The command is reported for the user to run themselves.
+
+    Two ratchets, not one. A source scan catches a naive reintroduction of an
+    elevation call. Monkeypatching the actual execution primitives proves that
+    composing the command never runs it -- via subprocess or os.system/startfile
+    -- regardless of which API a future change reaches for, which a string scan
+    alone would not catch (a call through a variable, or a different API)."""
+    import inspect
+
+    # `probe` is already imported at module scope in this file.
+    src = inspect.getsource(probe)
+    assert "Add-MpPreference" in src, "the command should still be composed and shown"
+    for forbidden in ("Start-Process -Verb runAs", "ShellExecute", "runas"):
+        assert forbidden not in src, "the exclusion must never be executed by the host"
+
+    def _boom(*a, **k):
+        raise AssertionError("a probe check tried to execute a command")
+
+    monkeypatch.setattr(probe.subprocess, "run", _boom)
+    monkeypatch.setattr(probe.subprocess, "Popen", _boom)
+    monkeypatch.setattr(probe.os, "system", _boom)
+    if hasattr(probe.os, "startfile"):
+        monkeypatch.setattr(probe.os, "startfile", _boom)
+
+    # Every verdict path that can carry the exclusion command as its `fix`.
+    verdicts = [
+        probe.check_av({}, cloud_events=0, host_dir=r"C:\X\Host"),
+        probe.check_av({"realtime": True, "cloudLevel": 2, "tamper": False},
+                       cloud_events=6, host_dir=r"C:\X\Host"),
+        probe.check_launch_time(21.4, ok=True, host_dir=r"C:\X\Host"),
+    ]
+    for v in verdicts:
+        assert v.get("fixable") is not True, \
+            "an AV-exclusion remedy must never be marked self-applying"
+        assert "Add-MpPreference" in (v.get("fix") or ""), \
+            "the user still gets the command to run"
+
+
 # ---------------------------------------------------------------------------
 # yt-dlp packaging: the onefile build re-extracts ~145 files per launch, which is
 # what AV kept rescanning.

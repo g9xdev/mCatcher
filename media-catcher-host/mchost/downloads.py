@@ -279,6 +279,50 @@ def _codec_args(codec, encoder, quality):
         return ["-c:v", "hevc_amf", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
     return ["-c:v", "libx265", "-crf", str(q), "-preset", "slow"]
 
+
+def _proc_alive(p):
+    """True while p is still running. A process object that cannot answer is
+    treated as gone: the callers use this to decide what is worth killing, and
+    guessing "alive" there would report kills that never happened."""
+    try:
+        return p.poll() is None
+    except Exception:
+        return False
+
+
+# How long to let a killed process actually exit before calling it a survivor.
+# Termination is not instantaneous, and asking the instant after the kill would
+# report healthy kills as failures.
+_KILL_GRACE = 1.0
+
+
+def _kill_summary(killed, survived):
+    """What the kill actually achieved, for the log. A survivor is named rather
+    than folded into the total: it means the worker is still parked and the id
+    still held, which is a different situation to explain."""
+    if survived:
+        return "killed %d, %d would not die" % (killed, survived)
+    if killed:
+        return "killed %d subprocess(es)" % killed
+    return "no live subprocess to kill"
+
+
+def _survivors(procs, grace=None):
+    """Which of procs are STILL alive after up to `grace` seconds.
+
+    _safe_kill swallows every failure it meets — a taskkill that will not run, a
+    process that will not die — so the only way to know whether a kill worked is
+    to look afterwards. Callers report from this, never from what they attempted.
+    """
+    grace = _KILL_GRACE if grace is None else grace
+    alive = [p for p in procs if _proc_alive(p)]
+    deadline = time.monotonic() + grace
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.05)
+        alive = [p for p in alive if _proc_alive(p)]
+    return alive
+
+
 def _safe_kill(p):
     """Kill p AND its descendants.
 
@@ -914,10 +958,26 @@ def ytdlp_update():
         return None
 
 
+# Set once a session has already tried to replace a onefile: a failing network
+# must not re-download on every job.
+_YTDLP_REFETCHED = False
+
+
+def _has_internal(exe):
+    """True when exe is the directory build - yt-dlp.exe beside _internal/.
+
+    The onefile launcher re-extracts ~145 files to %TEMP% on every launch and,
+    under a browser-descended process, each extraction is rescanned; that is the
+    ~90s DLL-load stall the UI showed as "Preparing" forever."""
+    if not exe:
+        return False
+    return os.path.isdir(os.path.join(os.path.dirname(exe), "_internal"))
+
+
 def ensure_ytdlp():
-    """Return a path to yt-dlp, fetching the official release into HERE if it's missing.
-    Lets auto-updated installs (which don't ship the binary) get YouTube without a
-    manual installer re-run.
+    """Return a path to yt-dlp, fetching the official release into HERE if it's missing
+    or is a onefile. Lets auto-updated installs (which don't ship the binary) get
+    YouTube without a manual installer re-run.
 
     Fetches the DIRECTORY build (yt-dlp_win.zip: yt-dlp.exe + _internal/), never
     the onefile exe. The onefile launcher re-extracts ~145 files to %TEMP% on
@@ -926,11 +986,15 @@ def ensure_ytdlp():
     command from a shell started in about a second. The directory build extracts
     nothing and starts in ~0.4s.
     """
-    global YTDLP
-    if YTDLP:
+    global YTDLP, _YTDLP_REFETCHED
+    if YTDLP and _has_internal(YTDLP):
         return YTDLP
     if os.name != "nt":
-        return None
+        # Nothing to upgrade off-Windows: keep whatever was resolved.
+        return YTDLP
+    if _YTDLP_REFETCHED:
+        return YTDLP
+    _YTDLP_REFETCHED = True
     here = _h().HERE
     dest = os.path.join(here, "yt-dlp.exe")
     try:
@@ -959,7 +1023,9 @@ def ensure_ytdlp():
         return YTDLP
     except Exception as e:
         _h()._hlog("error", "yt-dlp download failed: %s" % e)
-        return None
+        # Keep a working-but-slow onefile rather than turning it into no yt-dlp
+        # at all. A sharing violation here just means a download is in flight.
+        return YTDLP
 
 
 def ensure_deno():
@@ -3445,24 +3511,111 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     """In-process download for the legacy (tokenless) path. Emits the same
     ytdl-progress / ytdl-done / ytdl-error wire shapes the exe worker did.
 
-    Cancellation is by flag, polled inside yt-dlp's hooks: the hooks fire once
-    bytes flow, so a cancel during the (now fast, in-process) resolve is seen at
-    the first progress callback rather than instantly. No stall watchdog — the
-    launch-scan hang it guarded against cannot happen in-process, and a network
-    stall is bounded by --socket-timeout."""
+    Cancellation is by flag, polled inside yt-dlp's hooks and inside the log
+    sink — the hooks do not fire until bytes flow, so the sink is what makes a
+    cancel visible during resolve. The resolve phase carries the same
+    _YTDL_RESOLVE_STALL deadline the exe path's _StallWatch applies, rolling on
+    every note the way _StallWatch.touch() rolls on every output line, because
+    --js-runtimes still launches deno and "in-process" does not make this phase
+    unstallable. The remedy now matches _StallWatch's: ytdlp_lib announces every
+    subprocess yt-dlp launches for this job, and the watchdog takes their trees
+    with the same _safe_kill the exe path uses. That kill is what makes the flag
+    reachable again — it unblocks the communicate() deno is parked in, yt-dlp
+    then raises or logs, the log sink polls, and the unwind releases the _pget
+    entry and ends this thread.
+
+    A wedge with no live child — blocked inside Python itself, which
+    --socket-timeout bounds but does not eliminate — still has only the flag,
+    and that worker stays parked. Its registration is held until the thread
+    really ends rather than dropped when the watchdog reports: the registry
+    means "this job still holds resources", which stays true, and a retry of
+    that id is then refused instead of racing a live writer for one path."""
     lib = _ytdlp_lib()
+    # yt-dlp still shells out — deno for the JS challenge, ffmpeg for the merge —
+    # and a wedged child is the hang "in-process" did not remove. ytdlp_lib hands
+    # each launch to the thread that made it; holding them here is what gives the
+    # watchdog and _pget_cancel something to act on.
+    children = []
+    children_lock = threading.Lock()
     op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
+
+    def on_child(proc):
+        with children_lock:
+            # Prune while appending: a job launches several over its life, and a
+            # finished one holds an OS handle open until it is dropped.
+            children[:] = [p for p in children if _proc_alive(p)]
+            children.append(proc)
+        # Already cancelled means a kill pass has been and gone. yt-dlp's JS
+        # challenge director wraps each provider in `except Exception`, so it can
+        # absorb the Cancelled the log sink raises and spawn again; take this one
+        # now rather than let the worker park on it as if nothing had happened.
+        if op.get("cancel_requested"):
+            _safe_kill(proc)
+
+    def kill_children(confirm=False):
+        """Take the whole tree of everything yt-dlp spawned for this job.
+
+        Returns (killed, survived). With confirm, those are counted AFTER giving
+        the kill time to land: _safe_kill swallows a taskkill that fails, so the
+        count going in would call a kill that never happened a success, and a
+        stall that reads as handled while the child still runs sends whoever
+        reads the log anywhere but at it.
+
+        Confirming costs up to _KILL_GRACE, so only a caller that REPORTS the
+        numbers asks for it. _pget_cancel runs inline on the native-messaging
+        read loop and reports nothing, so it takes the default and every command
+        queued behind it is spared the wait."""
+        with children_lock:
+            live = [p for p in children if _proc_alive(p)]
+        for p in live:
+            _safe_kill(p)
+        survived = _survivors(live) if confirm else []
+        return len(live) - len(survived), len(survived)
+
+    # _pget_cancel reaches the exe path's child through "proc". This path has no
+    # single process, so it carries a killer instead.
+    op["kill_children"] = kill_children
     if not _pget_register(jid, op):
         _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn",
                    "error": "Download id already in use."})
         return
     _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
                % (url, "on" if pot else "off"))
-    _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving",
-               "note": "Preparing"})
+    # The acknowledgement frame is sent by _handle_ytdl_legacy's worker before the
+    # preflight — one per job, so none here.
     last = {"pct": -1.0}
+    # Resolve-phase liveness only, and ROLLING: every note pushes the deadline out
+    # again, which is what _StallWatch.touch() gives the exe path. A one-shot
+    # deadline would be disarmed by the first "[youtube] ..." line ~1s in and would
+    # never see the wedge this guards - deno hanging partway through the JS
+    # challenge, which is a subprocess even here, so "in-process" does not make
+    # this phase unstallable. The first progress callback disarms it for good:
+    # once bytes flow, a slow download or a long merge is healthy.
+    touched = [time.monotonic()]
+    progressing = threading.Event()
+    finished = threading.Event()
+    # Exactly one terminal frame per job, CLAIMED rather than ordered: the watchdog
+    # fires from its own thread while the download may be unwinding on this one,
+    # and _h().send writes the native-messaging pipe and can block, so either side
+    # can reach the wire first. The loser stays silent instead of contradicting
+    # the row.
+    claim_lock = threading.Lock()
+    claimed = []
+
+    def _claim_terminal(unless_progressing=False):
+        """True for exactly one caller. unless_progressing closes the watchdog's
+        check-then-claim gap: bytes can start flowing between its is_set() test
+        and the claim, and killing a job that is transferring is the one failure
+        this mechanism must never cause. Only the watchdog passes it — a real
+        terminal frame is still owed once progress has started."""
+        with claim_lock:
+            if claimed or (unless_progressing and progressing.is_set()):
+                return False
+            claimed.append(True)
+            return True
 
     def on_progress(m):
+        progressing.set()
         if m.get("stage") == "merging" or m.get("pct") is None:
             _h().send({"type": "ytdl-progress", "id": jid, **m})
             return
@@ -3473,17 +3626,48 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
             _h().send({"type": "ytdl-progress", "id": jid, **m})
 
     def on_note(note):
+        touched[0] = time.monotonic()
         if last["pct"] < 0:
             _h().send({"type": "ytdl-progress", "id": jid, "pct": 0,
                        "stage": "resolving", "note": note})
 
+    def _terminal(msg):
+        """Send a terminal frame only if this side won the claim."""
+        if _claim_terminal():
+            _h().send(msg)
+
     def _cancelled():
-        _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled", "error": "Cancelled."})
+        _terminal({"type": "ytdl-error", "id": jid, "reason": "cancelled", "error": "Cancelled."})
+
+    def _resolve_watchdog():
+        while not progressing.is_set():
+            idle = time.monotonic() - touched[0]
+            if idle < _YTDL_RESOLVE_STALL:
+                # Sleep out the remainder; a note that lands meanwhile moves it.
+                if finished.wait(_YTDL_RESOLVE_STALL - idle):
+                    return              # done, failed, or cancelled
+                continue
+            if not _claim_terminal(unless_progressing=True):
+                return                  # already terminal, or bytes just started
+            # Flag BEFORE kill: the flag is polled from yt-dlp's hooks and log
+            # lines, and killing the child is what makes the next poll happen at
+            # all. Both before the send, which writes the pipe and can block.
+            op["cancel_requested"] = True
+            killed, survived = kill_children(confirm=True)
+            _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling (%s)"
+                       % (_YTDL_RESOLVE_STALL,
+                          _kill_summary(killed, survived)), "ytdlp")
+            _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                       "error": "yt-dlp made no progress while resolving. "
+                                "Open the log console for its output."})
+            return
+    threading.Thread(target=_resolve_watchdog, daemon=True).start()
 
     try:
         path = lib.download(_ytdl_lib_argv(fmt, outtmpl, url, deno, pot),
                             on_progress=on_progress, on_note=on_note,
-                            should_cancel=lambda: op.get("cancel_requested"))
+                            should_cancel=lambda: op.get("cancel_requested"),
+                            on_child=on_child)
     except lib.Cancelled:
         _cancelled()
         return
@@ -3493,19 +3677,38 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
             return
         reason, msg = _map_yt_error(str(e))
         _h()._hlog("error", "yt-dlp (lib) failed (%s): %s" % (reason, str(e)[:500]), "ytdlp")
-        _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+        _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         return
     finally:
+        finished.set()          # release the watchdog on every path, fast or failed
         _pget_unregister(jid, op)
 
     if op.get("cancel_requested"):
         _cancelled()
     elif path and os.path.isfile(path):
-        _h().send({"type": "ytdl-done", "id": jid, "file": path, "bytes": os.path.getsize(path)})
+        _terminal({"type": "ytdl-done", "id": jid, "file": path,
+                   "bytes": os.path.getsize(path)})
         _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(path))
     else:
-        _h().send({"type": "ytdl-error", "id": jid, "reason": "generic",
+        _terminal({"type": "ytdl-error", "id": jid, "reason": "generic",
                    "error": "Download failed — open the log console for yt-dlp's output."})
+
+
+# Test seam: _handle_ytdl_legacy's worker is a daemon thread with no handle, so
+# a test has no way to await it without sleeping. Each worker discards its own
+# entry as it finishes, so this cannot grow across the life of the helper.
+_YTDL_WORKERS = []
+
+
+def _join_ytdl_workers_for_test(timeout=5.0):
+    try:
+        for t in list(_YTDL_WORKERS):
+            t.join(timeout)
+            # Never drop a live worker silently: it would go on sending into
+            # whatever the NEXT test monkeypatched, reading as that test's frames.
+            assert not t.is_alive(), "a yt-dlp worker outran the %ss join" % timeout
+    finally:
+        _YTDL_WORKERS.clear()   # one real failure, not a cascade through the suite
 
 
 def _handle_ytdl_legacy(req):
@@ -3514,29 +3717,49 @@ def _handle_ytdl_legacy(req):
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
-        deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
-        outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
+        # Acknowledge before the preflight: ensure_deno() can download a JS runtime
+        # and start_pot_provider() waits on a socket bind, and until one of these
+        # frames lands the row is indistinguishable from a dead helper.
+        _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving",
+                   "note": "Preparing"})
+        # Any throw in here used to kill the thread silently. That merely looked
+        # unstarted before the acknowledgement above existed; now it would be a row
+        # acknowledged as "resolving" with nothing ever following it, so the
+        # preflight owes the caller a terminal frame like every other failure.
         try:
-            os.makedirs(outdir, exist_ok=True)
-        except Exception:
-            pass
-        pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
-        outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
-        # Optional format selector from the popup's quality picker; default = best.
-        fmt = req.get("format") or "bv*+ba/b"
+            deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
+            outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
+            try:
+                os.makedirs(outdir, exist_ok=True)
+            except Exception:
+                pass
+            pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
+            outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
+            # Optional format selector from the popup's quality picker; default = best.
+            fmt = req.get("format") or "bv*+ba/b"
+            # Both of these are on the acknowledged path too, so they belong inside
+            # the wrapper. ensure_ytdlp() stays lazy: it fetches an exe the
+            # in-process library makes unnecessary.
+            use_lib = _ytdlp_lib().available()
+            ytdlp = None if use_lib else ensure_ytdlp()
+        except Exception as e:
+            reason, msg = _map_yt_error(str(e))
+            _h()._hlog("error", "yt-dlp: preflight failed (%s): %s"
+                       % (reason, str(e)[:500]), "ytdlp")
+            _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+            return
 
-        if _ytdlp_lib().available():
+        if use_lib:
             _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot)
             return
 
-        ytdlp = ensure_ytdlp()
         if not ytdlp:
             _h().send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
                   "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
             return
         cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
         _h()._hlog("info", "yt-dlp: downloading %s (pot=%s)" % (url, "on" if pot else "off"))
-        _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving", "note": "Preparing"})
+        # No acknowledgement frame here: worker() already sent it before the preflight.
         cf, si = _no_window()
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3634,7 +3857,18 @@ def _handle_ytdl_legacy(req):
         finally:
             watch.finish()          # idempotent; also covers the exception path
             _pget_unregister(jid, op)
-    threading.Thread(target=worker, daemon=True).start()
+
+    def _run():
+        try:
+            worker()
+        finally:
+            try:
+                _YTDL_WORKERS.remove(threading.current_thread())
+            except ValueError:
+                pass            # already drained by _join_ytdl_workers_for_test
+    t = threading.Thread(target=_run, daemon=True)
+    _YTDL_WORKERS.append(t)
+    t.start()
 
 # ---- parallel multi-mirror direct download --------------------------------
 # Fetch a direct file from one or more mirror URLs using several range requests
@@ -4347,11 +4581,14 @@ def _pget_cancel(req):
                 return  # success already linearized — cancel is inert
             j["cancel_requested"] = True
             proc = j.get("proc")
+            kill_children = j.get("kill_children")
         # Kill / wake outside the op lock (never hold it across process ops).
         if j.get("stop"):
             j["stop"].set()
         if proc:
             _safe_kill(proc)
+        if kill_children:
+            kill_children()      # in-process yt-dlp: take what IT spawned
         cv = j.get("lease_cv")
         if cv is not None:
             with cv:
@@ -4362,7 +4599,12 @@ def _pget_cancel(req):
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
     if j.get("proc"):
-        _safe_kill(j["proc"])    # yt-dlp job: kill the process
+        _safe_kill(j["proc"])    # yt-dlp exe job: kill the process
+    if j.get("kill_children"):
+        # In-process yt-dlp: no single proc, so cancel reaches the subprocesses
+        # IT spawned. Without this a cancel of a wedged row set a flag nothing
+        # would ever poll, leaking the worker exactly as a stall did.
+        j["kill_children"]()
     cv = j.get("lease_cv")
     if cv is not None:
         # Wake zero-limit waiters so they can observe cancel without busy-spin.

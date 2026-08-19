@@ -1302,3 +1302,39 @@ def test_guardian_does_not_write_through_a_hardlinked_destination(tmp_path):
 
     assert outside.read_text(encoding="utf-8") == "DO-NOT-TOUCH\n", \
         "guardian wrote through a hard link into a file outside the host directory"
+
+
+def test_bootstrap_fetches_the_ytdlp_directory_build_not_the_onefile():
+    """The onefile re-extracts ~145 files per launch and stalled ~90s under AV.
+    The installer must not put one on disk (see commit a1016a6)."""
+    src = (Path(__file__).parent / "installer" / "bootstrap.ps1").read_text(encoding="utf-8")
+
+    assert "releases/latest/download/yt-dlp_win.zip" in src
+    assert "releases/latest/download/yt-dlp.exe" not in src
+    # The presence check must require _internal/, so re-running upgrades a onefile.
+    assert "_internal" in src
+
+
+def test_bootstrap_writes_ytdlp_exe_last_so_an_interruption_leaves_it_absent():
+    """The exe is the completion marker the presence check keys on. If a copy
+    is interrupted, only an install missing yt-dlp.exe should look incomplete
+    on the next run - never a stale exe beside a fresh _internal, or a fresh
+    exe beside a stale _internal. That requires this order: remove the old
+    exe, remove the old _internal, copy the new _internal, copy the new exe
+    last."""
+    src = (Path(__file__).parent / "installer" / "bootstrap.ps1").read_text(encoding="utf-8")
+
+    section = src[src.index("# ---------- 3b. yt-dlp"):src.index("# ---------- 3b-lib.")]
+
+    remove_old_exe = section.find("Remove-Item $localYtdlp -Force")
+    remove_old_internal = section.find("Remove-Item $localInternal -Recurse -Force")
+    copy_internal = section.find('Copy-Item (Join-Path $staged "_internal") $InstallDir -Recurse -Force')
+    copy_exe = section.find("Copy-Item $hit.FullName $localYtdlp -Force")
+
+    assert -1 not in (remove_old_exe, remove_old_internal, copy_internal, copy_exe), \
+        "expected an explicit removal of the old yt-dlp.exe before the copies"
+    assert remove_old_exe < remove_old_internal < copy_internal < copy_exe, (
+        "yt-dlp.exe must be copied last: it is the completion marker the "
+        "presence check keys on, so an interruption before it lands must "
+        "leave no exe rather than a stale exe beside a fresh _internal"
+    )

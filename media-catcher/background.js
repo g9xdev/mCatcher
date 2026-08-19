@@ -41,6 +41,18 @@ let settings = Object.assign({}, DEFAULT_SETTINGS);
 let liveController = null;
 let liveControllerInitialized = false;
 
+// The controller's tick drives retry_backoff expiry and the detection finalizer's
+// deadlines. Nothing else calls it, so without this clock those states never expire.
+// MV2 persistent background page (manifest "persistent": true), so a plain interval
+// survives; guarded because not every test sandbox defines one.
+const LIVE_TICK_MS = 1000;
+let liveTickTimer = null;
+
+// A helper that is alive but silent looks exactly like a healthy slow one:
+// ping/pong happened once at connect and never again. Keep asking.
+const HELPER_PING_MS = 30000;
+let helperPingTimer = null;
+
 const settingsReady = api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
   // One-time migrations to newer defaults, each guarded by its own flag so a later
@@ -148,6 +160,15 @@ function initializeLiveController() {
       "policy: " + String(diagnostic && diagnostic.code || "unknown")
     ),
   });
+  if (liveTickTimer === null && typeof setInterval === "function") {
+    liveTickTimer = setInterval(() => {
+      try {
+        liveController.tick(Date.now());
+      } catch (err) {
+        mclog("warn", "tick: " + String((err && err.message) || err));
+      }
+    }, LIVE_TICK_MS);
+  }
   return liveController;
 }
 
@@ -328,11 +349,27 @@ let nativeError = null;
 // update, so a dropped port is routine rather than proof it is uninstalled.
 // Nothing else reconnects — connectNative runs only at extension startup or on
 // an explicit re-check — so one drop used to disable the helper for the whole
-// session. Re-dial once per connected session: `handshook` gates that on having
-// actually reached a live helper, and `redialled` stops a helper that is truly
-// gone from spinning.
+// session. `handshook` gates automatic re-dial on having actually reached a
+// live helper. A single immediate re-dial covered a helper replaced by an
+// update, but not one that is slow to come back. A bounded backoff replaces
+// it: four growing waits, then stop — still bounded, so a helper that is
+// truly gone cannot spin. A pong or an explicit recheck-helper resets the
+// budget.
 let nativeHandshook = false;      // a pong has been seen on some connection
-let nativeRedialled = false;      // the one automatic re-dial is spent
+// The heartbeat below sends the same {cmd:"ping"} the connect path does, so the
+// host answers EVERY beat with a full pong. Pong is therefore no longer a
+// per-connection event, and the connection-time work keyed off it (announcing
+// the helper, arming the host's folder watch, asking GitHub about updates) was
+// re-running every 30s: a watcher thread and a directory handle leaked per beat
+// (stop_watch only sets a flag the parked ReadDirectoryChangesW never re-reads),
+// and the release API took 120 hits an hour against a 60/hour budget and a
+// designed 6-hour interval. This says "the current connection has already been
+// handshaken"; it is reset where a new port is assigned, so the first pong of
+// every connection still does the work, exactly once.
+let nativeHandshakeApplied = false;
+const HELPER_REDIAL_MS = [1000, 4000, 15000, 60000];
+let nativeRedialAttempt = 0;
+let nativeRedialTimer = null;
 
 function setNativeState(state, error) {
   nativeState = state;
@@ -410,46 +447,90 @@ function connectNative() {
   if (nativePort) return;
   setNativeState("connecting");
   mclog("info", "connecting to the native helper…");
+  let port;
   try {
-    nativePort = api.runtime.connectNative(NATIVE_HOST);
-    nativePort.onMessage.addListener(onNativeMessage);
-    nativePort.onDisconnect.addListener(() => {
-      const controller = liveController;
-      if (controller) {
-        Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
-          mclog("warn", "policy disconnect: " + (e && e.message ? e.message : String(e)));
-        });
-      }
-      const err = api.runtime.lastError && api.runtime.lastError.message;
-      dlog("native host disconnected", err || "");
-      mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
-      nativePort = null; nativeInfo = null;
-      // No helper means no dialog will ever answer; settle every waiter now.
-      failAllFolderPicks();
-      if (nativeHandshook && !nativeRedialled) {
-        nativeRedialled = true;
-        mclog("info", "native helper disconnected — reconnecting…");
-        connectNative();          // sets state to "connecting" and re-pings
-      } else {
-        // Only claim it is missing when we never reached a live helper; a drop
-        // after a good handshake is a disconnect, and saying otherwise sent
-        // people to reinstall software that was already there.
-        setNativeState("disconnected", err ||
-          (nativeHandshook ? "Helper disconnected." : "Helper not installed."));
-      }
-      // The host owned the cast session and its status poller — without it the
-      // session is gone; don't leave the popup showing a live transport forever.
-      if (castState.state !== "idle") {
-        castState = { state: "idle" };
-        broadcast({ type: "cast-update", cast: castState, error: "Casting ended — the helper disconnected." });
-      }
-      for (const [id, res] of pendingCastDiscover) { pendingCastDiscover.delete(id); res(null); }
-    });
-    nativePort.postMessage({ cmd: "ping" });
+    port = api.runtime.connectNative(NATIVE_HOST);
   } catch (e) {
     dlog("native connect failed", e.message || e);
-    nativePort = null;
     setNativeState("disconnected", e.message || String(e));
+    return;
+  }
+  nativePort = port;
+  // Re-arm here rather than in the disconnect handler: this is the sole
+  // assignment of a new port, so every reconnect route passes through it (the
+  // re-dial timer and recheck-helper both land here), and the `if (nativePort)
+  // return;` above keeps a no-op call from clearing a live connection's guard.
+  nativeHandshakeApplied = false;
+  port.onMessage.addListener(onNativeMessage);
+  port.onDisconnect.addListener(function nativeDisconnect() {
+    // A disconnect now schedules a re-dial instead of running one inline, so
+    // the listener that reconnects outlives the event that queued it — a
+    // newer connection's listener can already be live when an older one's
+    // real disconnect arrives. Compare against the exact port THIS listener
+    // was registered for, not whether the mutable nativePort variable
+    // currently holds any value: the ping send below can fail while this
+    // same port and its listeners are still very much live (see the ping
+    // try/catch), so "nativePort is null" does not reliably mean "port is
+    // gone" — only "nativePort points at a different port" does.
+    if (nativePort !== port) return;
+    const controller = liveController;
+    if (controller) {
+      Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
+        mclog("warn", "policy disconnect: " + (e && e.message ? e.message : String(e)));
+      });
+    }
+    const err = api.runtime.lastError && api.runtime.lastError.message;
+    dlog("native host disconnected", err || "");
+    mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
+    nativePort = null; nativeInfo = null;
+    if (helperPingTimer !== null) {
+      clearInterval(helperPingTimer);
+      helperPingTimer = null;
+    }
+    // No helper means no dialog will ever answer; settle every waiter now.
+    failAllFolderPicks();
+    if (nativeHandshook && nativeRedialAttempt < HELPER_REDIAL_MS.length) {
+      const wait = HELPER_REDIAL_MS[nativeRedialAttempt];
+      nativeRedialAttempt += 1;
+      // Say so now, not when the timer fires. nativePort is already null above,
+      // so downloadYouTube refuses for the whole wait — up to 60s on the last
+      // backoff step — and without this the pill stayed green the entire time:
+      // "Helper ready" and "YouTube needs the native helper" at once.
+      setNativeState("connecting", err || "Helper disconnected — reconnecting…");
+      mclog("info", "native helper disconnected — reconnecting in " + wait + "ms…");
+      if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);
+      nativeRedialTimer = setTimeout(function nativeRedial() {
+        nativeRedialTimer = null;
+        connectNative();        // sets state to "connecting" and re-pings
+      }, wait);
+    } else {
+      // Only claim it is missing when we never reached a live helper; a drop
+      // after a good handshake is a disconnect, and saying otherwise sent
+      // people to reinstall software that was already there.
+      setNativeState("disconnected", err ||
+        (nativeHandshook ? "Helper disconnected." : "Helper not installed."));
+    }
+    // The host owned the cast session and its status poller — without it the
+    // session is gone; don't leave the popup showing a live transport forever.
+    if (castState.state !== "idle") {
+      castState = { state: "idle" };
+      broadcast({ type: "cast-update", cast: castState, error: "Casting ended — the helper disconnected." });
+    }
+    for (const [id, res] of pendingCastDiscover) { pendingCastDiscover.delete(id); res(null); }
+  });
+  try {
+    port.postMessage({ cmd: "ping" });
+  } catch (e) {
+    // The port and both listeners above are already live; a failed initial
+    // ping (the helper is already gone, or about to be) is not the same as
+    // "nothing is connected" — leave nativePort and state alone and let the
+    // real onDisconnect event above drive cleanup and the re-dial backoff,
+    // exactly like any other disconnect. But say so somewhere the user can
+    // see: dlog alone is DEBUG-gated, and a live port that never manages to
+    // send would otherwise park the UI on "connecting" with no visible sign
+    // anything went wrong while waiting for the real disconnect to arrive.
+    mclog("warn", "native ping failed: " + (e.message || String(e)));
+    dlog("native ping failed", e.message || e);
   }
 }
 
@@ -546,19 +627,51 @@ function onLegacyNativeMessage(msg) {
   }
   if (msg.type === "pong") {
     nativeInfo = msg;
-    // A live helper answered: remember that, and restore the re-dial budget so
-    // the NEXT drop also gets one automatic retry.
+    // A pong with no live nativePort is not a connection to trust — the
+    // same reasoning the re-dial cancellation below relies on. Without this,
+    // a stray/late pong could mark the helper "ready" (and broadcast that)
+    // with nothing actually connected, which is worse than the state it
+    // would otherwise be left in: at least "connecting"/"disconnected" is
+    // honest about there being no live port.
+    if (!nativePort) return;
+    // A live helper answered: remember that, and restore the full re-dial
+    // budget so the NEXT drop backs off from scratch. A backoff timer can
+    // still be pending here if this pong arrived on a connection made outside
+    // that timer (e.g. a manual recheck-helper beat it to a live helper) —
+    // cancel it, since the wait it was counting down is now moot and letting
+    // it fire later would just be a stray, if harmless, no-op reconnect.
     nativeHandshook = true;
-    nativeRedialled = false;
+    nativeRedialAttempt = 0;
+    if (nativeRedialTimer !== null) {
+      clearTimeout(nativeRedialTimer);
+      nativeRedialTimer = null;
+    }
     setNativeState(msg.ffmpeg ? "ready" : "no-ffmpeg",
       msg.ffmpeg ? null : "Helper is installed but ffmpeg was not found.");
     dlog("native helper", msg.ffmpeg ? "ready (ffmpeg ok)" : "connected but ffmpeg missing", msg.ffmpegPath || "");
-    mclog("info", "helper ready — v" + (msg.version || "?") + (msg.ffmpeg ? "" : " · ffmpeg MISSING"));
-    if (settings.autoUpdate && nativePort) {
-      nativePort.postMessage({ cmd: "watch", enable: true,
-        extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
-      nativePort.postMessage({ cmd: "checkGithub", auto: true, extVersion: api.runtime.getManifest().version,
-        extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+    // Connection-time work, not per-pong work: the heartbeat's ping draws a
+    // pong every 30s, and repeating any of this on a beat leaks host watcher
+    // threads, burns the GitHub rate limit, and floods the persisted log ring.
+    // The dlog above stays unconditional — it is DEBUG-gated and costs nothing.
+    if (!nativeHandshakeApplied) {
+      nativeHandshakeApplied = true;
+      mclog("info", "helper ready — v" + (msg.version || "?") + (msg.ffmpeg ? "" : " · ffmpeg MISSING"));
+      if (settings.autoUpdate && nativePort) {
+        nativePort.postMessage({ cmd: "watch", enable: true,
+          extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+        nativePort.postMessage({ cmd: "checkGithub", auto: true, extVersion: api.runtime.getManifest().version,
+          extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+      }
+    }
+    if (helperPingTimer === null && typeof setInterval === "function") {
+      helperPingTimer = setInterval(() => {
+        if (!nativePort) return;
+        try {
+          nativePort.postMessage({ cmd: "ping" });
+        } catch (err) {
+          mclog("warn", "heartbeat: " + String((err && err.message) || err));
+        }
+      }, HELPER_PING_MS);
     }
     return;
   }
@@ -2835,6 +2948,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "helper-status") {
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "recheck-helper") {
+        nativeRedialAttempt = 0;
+        if (nativeRedialTimer !== null) { clearTimeout(nativeRedialTimer); nativeRedialTimer = null; }
         if (nativePort) { try { nativePort.postMessage({ cmd: "ping" }); } catch (e) {} }
         else connectNative();
         sendResponse({ ok: true, helper: helperStatus() });

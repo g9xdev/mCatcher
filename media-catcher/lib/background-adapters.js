@@ -2606,6 +2606,55 @@
         return true;
       }
 
+      /**
+       * Undo the startedAttempts guard for one direct attempt and hand its
+       * slot back to the scheduler, the way manualRetry already does on this
+       * same failure class. Shared by every point along the key-add-to-post
+       * span - lease lookup, payload build, and the post itself - that can
+       * fail before a live attempt is on the wire.
+       */
+      function releaseDirectAttempt(activeScheduler, jobId, key) {
+        startedAttempts.delete(key);
+        activeScheduler.onTransportUnavailable(jobId);
+      }
+
+      /**
+       * Post one direct attempt. The key was added to startedAttempts BEFORE the
+       * post on purpose - it is the re-entrancy guard that keeps overlapping pumps
+       * to one live attempt - so a start that never reaches the helper has to undo
+       * it here and hand the slot back, the way manualRetry already does.
+       * Always returns a promise: a synchronous throw must not abort pump's loop
+       * and strand the still-unstarted jobs behind it in the same snapshot.
+       */
+      function postDirectAttempt(activeScheduler, jobId, key, command) {
+        function failStart(err) {
+          releaseDirectAttempt(activeScheduler, jobId, key);
+          throw err;
+        }
+        var effect;
+        try {
+          effect = postNative(command);
+        } catch (errSync) {
+          return Promise.resolve().then(function () {
+            failStart(errSync);
+          });
+        }
+        return Promise.resolve(effect).catch(failStart);
+      }
+
+      /**
+       * Undo the startedAttempts guard for a direct attempt that failed
+       * before it ever reached postDirectAttempt - nativeLeaseFor or
+       * buildNativeStartPayload threw synchronously while building the
+       * native command. Returns a rejected promise (never throws) so pump's
+       * loop can push it onto `pending` and continue to the next job in the
+       * same snapshot, exactly like a post-phase failure does.
+       */
+      function failDirectBuild(activeScheduler, jobId, key, err) {
+        releaseDirectAttempt(activeScheduler, jobId, key);
+        return Promise.reject(err);
+      }
+
       function enqueueDownload(message, sender) {
         return Promise.resolve().then(function () {
           requirePopupSender(sender);
@@ -3227,24 +3276,30 @@
             startedAttempts.add(key);
             delete binding.progress;
             delete binding.limitAck;
-            var lease = scheduler.nativeLeaseFor(job.id);
-            var input = {
-              kind: "pget",
-              jobId: job.id,
-              attemptToken: job.attemptToken,
-              intent: binding.intent,
-              url: binding.url,
-              maxConnections: lease.maxConnections,
-              providerGeneration: lease.providerGeneration,
-            };
-            if (binding.mirrors !== undefined) input.mirrors = binding.mirrors;
-            if (binding.referer !== undefined) input.referer = binding.referer;
-            if (binding.userAgent !== undefined) input.userAgent = binding.userAgent;
-            if (binding.effectiveDir !== undefined) {
-              input.effectiveDestinationDirectory = binding.effectiveDir;
+            var command;
+            try {
+              var lease = scheduler.nativeLeaseFor(job.id);
+              var input = {
+                kind: "pget",
+                jobId: job.id,
+                attemptToken: job.attemptToken,
+                intent: binding.intent,
+                url: binding.url,
+                maxConnections: lease.maxConnections,
+                providerGeneration: lease.providerGeneration,
+              };
+              if (binding.mirrors !== undefined) input.mirrors = binding.mirrors;
+              if (binding.referer !== undefined) input.referer = binding.referer;
+              if (binding.userAgent !== undefined) input.userAgent = binding.userAgent;
+              if (binding.effectiveDir !== undefined) {
+                input.effectiveDestinationDirectory = binding.effectiveDir;
+              }
+              command = getMessageRouter().buildNativeStartPayload(input);
+            } catch (errBuild) {
+              pending.push(failDirectBuild(scheduler, job.id, key, errBuild));
+              continue;
             }
-            var command = getMessageRouter().buildNativeStartPayload(input);
-            pending.push(Promise.resolve(postNative(command)));
+            pending.push(postDirectAttempt(scheduler, job.id, key, command));
           }
           return Promise.all(pending).then(function () {});
         });

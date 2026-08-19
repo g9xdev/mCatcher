@@ -5,9 +5,11 @@ The network calls (extract_info, download) are verified end-to-end, not here —
 these tests pin the translation layer that has to match _parse_yt_progress
 byte-for-byte so the extension sees no difference between the exe and the library.
 """
+import threading
+
 from conftest import load_host
 
-load_host()
+mc = load_host()
 import mchost.ytdlp_lib as lib   # noqa: E402
 
 
@@ -129,3 +131,283 @@ def test_the_logger_routes_lines_to_a_sink_not_stdout():
     log.debug("d"); log.warning("w"); log.error("e")
     levels = [l[0] for l in lines]
     assert "error" in levels and "warn" in levels
+
+
+# ---- cancellation during resolve ------------------------------------------
+# yt-dlp's progress hooks do not fire until bytes flow, so the log sink is the
+# only poll that can see a cancel while the job is still resolving.
+
+def _fake_yt(on_extract, popen=None):
+    """Minimal stand-in for the yt_dlp module: just enough of parse_options and
+    YoutubeDL for download() to run without the vendored library present.
+
+    `popen` becomes utils.Popen — the single class every real yt-dlp spawn site
+    binds. Omitted, the module has no utils at all, which is the shape the child
+    hook has to tolerate.
+    """
+
+    class YoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return on_extract(self.opts)
+
+        def sanitize_info(self, info):
+            return info
+
+    mod = type("yt_dlp", (), {
+        "parse_options": staticmethod(
+            lambda argv: type("P", (), {"ydl_opts": {}, "urls": ["u"]})()),
+        "YoutubeDL": YoutubeDL,
+    })
+    if popen is not None:
+        mod.utils = type("utils", (), {"Popen": popen})
+    return mod
+
+
+def test_a_cancel_is_seen_from_the_log_sink_before_any_bytes_flow(monkeypatch):
+    def on_extract(opts):
+        opts["logger"].info("[youtube] Downloading webpage")
+        raise AssertionError("the sink should have cancelled before this")
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract))
+    try:
+        lib.download(["u"], should_cancel=lambda: True)
+    except lib.Cancelled:
+        return
+    raise AssertionError("download() did not raise Cancelled from the log sink")
+
+
+def test_the_sink_cancel_poll_is_inert_when_no_poll_was_given(monkeypatch):
+    """Several callers pass no should_cancel; a missing poll is not a cancel."""
+    notes = []
+
+    def on_extract(opts):
+        opts["logger"].info("[youtube] Downloading webpage")
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract))
+    assert lib.download(["u"], on_note=notes.append) == r"C:\out.mp4"
+    assert notes == ["Reading page"]
+
+
+# ---- the subprocesses yt-dlp still spawns ----------------------------------
+# "In-process" removes yt-dlp's own exe, not the ones it shells out to. deno
+# solves the JS challenge through yt_dlp.utils.Popen and blocks the calling
+# thread in communicate_or_kill with no timeout, so a hung deno is the one wedge
+# no hook and no log line can reach. The caller needs a handle to what was
+# spawned before it can do anything about it.
+
+def _popen_class():
+    """A FRESH stand-in per test. The hook wraps the class in place — a shared
+    one would carry the wrap from the test that installed it into every test
+    after, and they would pass on each other's work."""
+
+    class _FakePopen:
+        def __init__(self, args, **kw):
+            self.args = args
+
+        def poll(self):
+            return None
+
+    return _FakePopen
+
+
+def _saved(path=r"C:\out.mp4"):
+    return lambda opts: {"filepath": path}
+
+
+def test_a_subprocess_yt_dlp_launches_is_handed_to_the_caller(monkeypatch):
+    seen = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        popen(["deno", "run", "-"])            # the JS challenge solver
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=seen.append)
+    assert [p.args for p in seen] == [["deno", "run", "-"]]
+
+
+def test_a_subprocess_from_another_thread_is_not_this_jobs_child(monkeypatch):
+    """Downloads run concurrently, one worker thread each. A process-wide hook
+    would let one job's stall kill another job's healthy deno."""
+    seen = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        t = threading.Thread(target=lambda: popen(["deno", "other-job"]))
+        t.start()
+        t.join()
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=seen.append)
+    assert seen == [], "a child of another job was reported as this job's"
+
+
+def test_the_hook_is_disarmed_once_the_download_returns(monkeypatch):
+    """The worker thread outlives the call and goes on to other work; a still-armed
+    hook would keep feeding a list nothing will ever drain."""
+    seen = []
+    popen = _popen_class()
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved(), popen))
+
+    lib.download(["u"], on_child=seen.append)
+    popen(["ffmpeg", "-i", "x"])              # a later, unrelated spawn
+    assert seen == []
+
+
+def test_the_wrap_still_constructs_the_process(monkeypatch):
+    """The hook observes. It must not change what yt-dlp spawns or how."""
+    made = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        made.append(popen(["deno", "run", "-"], stdin=-1).args)
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=lambda p: None)
+    assert made == [["deno", "run", "-"]]
+
+
+def test_a_yt_dlp_without_utils_popen_still_downloads(monkeypatch):
+    """yt-dlp could rename or drop the spawn funnel. A download that works today
+    must not start failing in order to gain a watchdog."""
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved()))
+    assert lib.download(["u"], on_child=lambda p: None) == r"C:\out.mp4"
+
+
+def test_a_sink_that_raises_does_not_break_the_download(monkeypatch):
+    """Same rule: observing is never worth failing a job that would have worked."""
+    popen = _popen_class()
+
+    def on_extract(opts):
+        popen(["deno", "run", "-"])
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+
+    def boom(proc):
+        raise RuntimeError("sink is broken")
+
+    assert lib.download(["u"], on_child=boom) == r"C:\out.mp4"
+
+
+def test_arming_the_hook_twice_does_not_announce_a_child_twice(monkeypatch):
+    """Every download arms it. A wrap layered on a wrap would report each child
+    once per download the process had ever run."""
+    seen = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        popen(["deno", "run", "-"])
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=lambda p: None)      # installs
+    lib.download(["u"], on_child=seen.append)         # must not install again
+    assert len(seen) == 1, "the child was announced %d times" % len(seen)
+
+
+def test_two_threads_installing_the_hook_at_once_wrap_it_only_once(monkeypatch):
+    """Every download arms the hook and maxConcurrentDownloads defaults to 4, so
+    two jobs starting together is ordinary, not exotic. The check for the marker
+    and the write of it are two separate statements: a second installer that
+    lands between them reads an __init__ the first has ALREADY replaced, and
+    wraps the wrapper. Nothing unwinds that — for the life of the helper every
+    spawn is announced twice, the same proc lands in `children` twice, and
+    kill_children reports "killed 2 subprocess(es)" for one deno.
+
+    Forced rather than raced: a metaclass parks the first installer between its
+    two writes, which is exactly the window, so this fails every run without the
+    lock instead of once in a few hundred.
+    """
+    first_write = threading.Event()
+    second_write = threading.Event()
+    release_first = threading.Event()
+    writes = []
+
+    class _Gate(type):
+        def __setattr__(cls, name, value):
+            # Let the write land BEFORE parking: the damaging interleaving is
+            # the one where the late installer sees the new __init__ and no mark.
+            super().__setattr__(name, value)
+            if name != "__init__":
+                return                      # the marker write is not the window
+            writes.append(name)
+            if len(writes) == 1:
+                first_write.set()
+                release_first.wait(5)
+            else:
+                second_write.set()
+
+    class _GatedPopen(metaclass=_Gate):
+        def __init__(self, args=None, **kw):
+            self.args = args
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved(), _GatedPopen))
+
+    first = threading.Thread(target=lib._install_child_hook, daemon=True)
+    second = threading.Thread(target=lib._install_child_hook, daemon=True)
+    try:
+        first.start()
+        assert first_write.wait(5), "the first installer never reached the wrap"
+        second.start()
+        # Unsynchronised, the second installer runs straight through to its own
+        # __init__ write: a handful of bytecodes, nothing blocking. Holding the
+        # lock it parks instead, and this bounded wait is what proving that
+        # costs. Kept short because only the passing path ever pays it.
+        raced = second_write.wait(0.5)
+    finally:
+        release_first.set()                 # never leave the hook lock held
+        first.join(5)
+        second.join(5)
+
+    assert not raced, "the second installer wrapped an already-wrapped __init__"
+
+    seen = []
+    lib._arm_child_sink(seen.append)
+    try:
+        _GatedPopen(["deno", "run", "-"])
+    finally:
+        lib._disarm_child_sink()
+    assert len(seen) == 1, "the child was announced %d times" % len(seen)
+
+
+def test_a_hook_that_cannot_be_installed_says_so(monkeypatch):
+    """Failing silently would leave the kill lever off for the life of the helper,
+    with the only symptom being the very leak it exists to prevent. The missing-
+    Popen path already says so; a failure to wrap has to say so too."""
+    warnings = []
+    monkeypatch.setattr(mc, "_hlog",
+                        lambda level, msg, src=None: warnings.append((level, msg)))
+    monkeypatch.setattr(lib, "_hook_warned", [False])
+    # A built-in type refuses __init__ assignment, which is how a future yt-dlp
+    # with a C-implemented Popen would fail.
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved(), int))
+
+    assert lib._install_child_hook() is False
+    assert [l for l, _m in warnings] == ["warn"], warnings
+    assert "cannot be killed" in warnings[0][1], warnings
+
+
+def test_a_missing_popen_says_so_too(monkeypatch):
+    """Same warning, the other way the funnel can go away."""
+    warnings = []
+    monkeypatch.setattr(mc, "_hlog",
+                        lambda level, msg, src=None: warnings.append((level, msg)))
+    monkeypatch.setattr(lib, "_hook_warned", [False])
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved()))
+
+    assert lib._install_child_hook() is False
+    assert [l for l, _m in warnings] == ["warn"], warnings

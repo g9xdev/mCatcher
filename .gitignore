@@ -20,6 +20,7 @@ media-catcher-host/deno.exe
 media-catcher-host/node/
 media-catcher-host/pot-provider/
 media-catcher-host/pylibs/
+media-catcher-host/pylib/
 
 # Build artifacts.
 media-catcher-host/installer/dist/
