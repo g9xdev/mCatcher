@@ -28,7 +28,10 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
       # "reveal".
       # The same list governs what the host will CREATE: a pget/ytdl "name"
       # whose suffix is outside it, or that names a Windows device, is
-      # refused, and "dir" must already exist (nothing builds a tree).
+      # refused. "dir" must already exist for pget, pget-single and the
+      # ytdl legacy path; the ytdl structured (Save As) path still creates
+      # missing components by handle on purpose -- see
+      # guard.resolve_existing_dir.
     {"cmd":"update","extDir":D,"zipDir":D?,"profileDir":D?}  # self-update from a packaged zip
     {"cmd":"watch","enable":bool,"extDir":D?,"zipDir":D?}    # auto-install when a package appears
     {"cmd":"checkGithub","auto":bool?,"extDir":D?,"zipDir":D?}  # pull the latest GitHub release

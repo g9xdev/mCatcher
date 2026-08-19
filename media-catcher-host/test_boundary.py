@@ -468,3 +468,102 @@ def test_sanitize_neutralises_a_reserved_device_stem():
     assert guard.refuse_basename(mc.sanitize("con") + ".mp4") is None
     assert guard.refuse_basename(mc.sanitize("LPT1") + ".mp4") is None
     assert mc.sanitize("congress") == "congress", "only the exact device names"
+
+
+# ---------------------------------------------------------------------------
+# 5. Review closure
+#
+# Each of these pins a claim the prose makes, because prose is where this repo
+# keeps drifting from the code. The suffixless-name rule in particular is
+# asserted in BOTH directions here so the comment describing it cannot outlive
+# it.
+# ---------------------------------------------------------------------------
+
+def test_a_suffixless_name_is_refused_in_both_directions(tmp_path):
+    """The rule that ships: every name this host writes carries a suffix from
+    MEDIA_EXTS, and so does every path it will open. No asymmetry -- an earlier
+    comment claimed a suffixless name could be written but not opened, and the
+    code never did that."""
+    assert guard.refuse_basename("myvideo") is not None
+    assert guard.refuse_open(str(tmp_path / "myvideo")) is not None
+    assert guard.refuse_basename("myvideo.mp4") is None
+    assert guard.refuse_open(str(tmp_path / "myvideo.mp4")) is None
+    # ...which is why the fallback name carries one.
+    import mchost.downloads as d
+    assert guard.refuse_basename(d._PGET_DEFAULT_NAME) is None
+
+
+def test_convert_subfields_are_typed():
+    """`convert` was typed as a dict and nothing inside it, so
+    {"codec":"h265","quality":{}} passed the gate, reached _finalize_move, and
+    raised TypeError on an un-try'd worker AFTER shutil.move had run: the file
+    landed, the `saved` frame never did, and the row hung. That is the exact
+    failure class the gate exists to stop."""
+    v = guard.validate_message
+
+    assert v({"cmd": "save", "id": 1,
+              "convert": {"codec": "h265", "quality": "balanced",
+                          "encoder": "auto"}}) is None
+    assert v({"cmd": "save", "id": 1, "convert": None}) is None
+    assert v({"cmd": "save", "id": 1, "convert": {}}) is None
+
+    for bad, field in (({"codec": "h265", "quality": {}}, "quality"),
+                       ({"codec": ["h265"]}, "codec"),
+                       ({"encoder": 7}, "encoder"),
+                       ({"quality": ["a"]}, "quality")):
+        r = v({"cmd": "save", "id": 1, "convert": bad})
+        assert r and field in r, (bad, r)
+    # every command that carries `convert` gets the same treatment
+    for cmd in ("save", "saveAs", "pget", "pget-single"):
+        r = v({"cmd": cmd, "id": 1, "convert": {"quality": {}}})
+        assert r and "quality" in r, cmd
+
+
+def test_no_schema_field_types_a_container_without_its_contents():
+    """The standing form of the bug above: a field typed as a container whose
+    values nobody typed is a hole the gate cannot see into. Nested specs and
+    "strlist" both type their contents; a bare container kind does not."""
+    untyped = {"dict", "list"}
+    offenders = []
+    for cmd, fields in guard.MESSAGE_SCHEMA.items():
+        for name, spec in fields.items():
+            if isinstance(spec, dict):
+                continue            # nested spec: its contents are typed below
+            if spec in untyped:
+                offenders.append("%s.%s" % (cmd, name))
+    assert offenders == [], offenders
+
+    # and a nested spec may only contain leaf kinds, not another bare container
+    for cmd, fields in guard.MESSAGE_SCHEMA.items():
+        for name, spec in fields.items():
+            if not isinstance(spec, dict):
+                continue
+            for sub, subspec in spec.items():
+                assert subspec not in untyped, "%s.%s.%s" % (cmd, name, sub)
+
+
+@pytest.mark.parametrize("name", [
+    "com0.mp4", "lpt0.mp4", "COM¹.mp4", "LPT².mp4", "com³.mp4",
+    "CONIN$.mp4", "conout$.mp4",
+])
+def test_device_names_cover_zero_and_superscript_digits(name):
+    """Win32's device parser reads U+00B9/B2/B3 as the digits 1/2/3, so COM<sup>1</sup>
+    is COM1. COM0/LPT0 are refused for the same two lines rather than left to
+    argument."""
+    assert guard.refuse_basename(name) is not None, name
+
+
+def test_media_exts_cover_every_ytdlp_remux_target():
+    """yt-dlp --remux-video / --audio-format targets, read off the bundled
+    binary's own --help, plus the audio-only merge mapping it applies
+    (mkv->mka, webm->weba, mp4->m4a, ogg->oga). A file it can produce and the
+    popup cannot open is a usability bug, and .mka/.weba were exactly that."""
+    targets = ["avi", "flv", "gif", "mkv", "mov", "mp4", "webm",
+               "aac", "aiff", "alac", "flac", "m4a", "mka", "mp3", "ogg",
+               "opus", "wav",
+               # audio-only merge outputs
+               "mka", "weba", "m4a", "oga"]
+    missing = [t for t in targets if ("." + t) not in guard.MEDIA_EXTS]
+    assert missing == [], missing
+    # vorbis is a codec yt-dlp writes into .ogg, not a suffix of its own
+    assert ".vorbis" not in guard.MEDIA_EXTS

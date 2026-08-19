@@ -67,7 +67,17 @@ _KINDS = {
 }
 
 STR, ID, INT, NUM, BOOL = "str", "id", "int", "num", "bool"
-SCALAR, STRLIST, DICT = "scalar", "strlist", "dict"
+SCALAR, STRLIST = "scalar", "strlist"
+
+# A field's spec may also be a DICT OF SUB-SPECS, which types the object's
+# contents instead of only its outer shape. There is no bare "dict" kind on
+# purpose: `convert` used to have one, so {"codec":"h265","quality":{}}
+# passed the gate, reached _finalize_move and raised TypeError on an
+# un-try'd worker AFTER shutil.move had already run -- the file landed, the
+# `saved` frame never did, and the row hung. A container whose values nobody
+# typed is a hole the gate cannot see into; test_boundary.py asserts no
+# schema entry has one.
+CONVERT = {"codec": STR, "quality": STR, "encoder": STR}
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +108,8 @@ MESSAGE_SCHEMA = {
                "referer": STR, "userAgent": STR},
     "stop": {"id": ID},
     "snapshot": {"id": ID, "base": STR, "dir": STR},
-    "save": {"id": ID, "base": STR, "dir": STR, "convert": DICT},
-    "saveAs": {"id": ID, "base": STR, "dir": STR, "convert": DICT},
+    "save": {"id": ID, "base": STR, "dir": STR, "convert": CONVERT},
+    "saveAs": {"id": ID, "base": STR, "dir": STR, "convert": CONVERT},
     "pickFolder": {"requestId": ID, "reqId": ID, "dir": STR},
     "open": {"id": ID, "path": STR},
     "reveal": {"id": ID, "path": STR},
@@ -109,11 +119,11 @@ MESSAGE_SCHEMA = {
                     "extVersion": STR},
     "discard": {"id": ID},
     "pget": {"id": ID, "urls": STRLIST, "name": STR, "dir": STR, "referer": STR,
-             "userAgent": STR, "maxConnections": NUM, "convert": DICT,
+             "userAgent": STR, "maxConnections": NUM, "convert": CONVERT,
              "attemptToken": STR},
     "pget-single": {"id": ID, "urls": STRLIST, "name": STR, "dir": STR,
                     "referer": STR, "userAgent": STR, "maxConnections": NUM,
-                    "convert": DICT, "attemptToken": STR},
+                    "convert": CONVERT, "attemptToken": STR},
     "pget-set-limit": {"id": ID, "maxConnections": NUM, "providerGeneration": NUM,
                        "attemptToken": STR},
     "getReport": {"reqId": ID},
@@ -136,6 +146,35 @@ MESSAGE_SCHEMA = {
 REQUIRED_FIELDS = {
     "record": ("id", "videoUrl"),
 }
+
+
+def _check_fields(msg, fields, cmd, prefix=""):
+    """Type every listed field of `msg`, descending into nested specs.
+
+    Returns a refusal naming the field in dotted form (convert.quality), or
+    None. Absent and null are legal everywhere, which is how .get() already
+    read them.
+    """
+    for name, kind in fields.items():
+        if name not in msg:
+            continue
+        value = dict.get(msg, name)
+        if value is None:
+            continue            # null reads the same as absent through .get()
+        label = prefix + name
+        if isinstance(kind, dict):
+            if not isinstance(value, dict):
+                return ("invalid message: field %r must be an object (cmd=%s)"
+                        % (label, cmd))
+            inner = _check_fields(value, kind, cmd, prefix=label + ".")
+            if inner:
+                return inner
+            continue
+        check, described = _KINDS[kind]
+        if not check(value):
+            return ("invalid message: field %r must be %s (cmd=%s)"
+                    % (label, described, cmd))
+    return None
 
 
 def validate_message(msg):
@@ -161,17 +200,7 @@ def validate_message(msg):
                 return ("invalid message: field %r is required (cmd=%s)"
                         % (name, cmd))
 
-        for name, kind in fields.items():
-            if name not in msg:
-                continue
-            value = dict.get(msg, name)
-            if value is None:
-                continue        # null reads the same as absent through .get()
-            check, described = _KINDS[kind]
-            if not check(value):
-                return ("invalid message: field %r must be %s (cmd=%s)"
-                        % (name, described, cmd))
-        return None
+        return _check_fields(msg, fields, cmd)
     except Exception as e:                     # pragma: no cover - belt and braces
         return "invalid message: %s" % (e,)
 
@@ -205,10 +234,13 @@ def message_id(msg):
 # open from the popup, a wider open list means opening suffixes this host never
 # produced, which is the residual the missing directory check already leaves.
 #
-# One asymmetry, deliberate: a name with NO suffix may be written but not
-# opened. An extensionless file has no registered handler, so it cannot be the
-# executable drop this list exists to stop, and there is nothing for
-# ShellExecuteW to do with it either.
+# No asymmetry: a name with NO suffix is refused in BOTH directions. An
+# earlier version of this comment claimed a suffixless name could be written
+# but not opened; the code never did that, and requiring a suffix everywhere
+# is the rule that is easier to hold in your head -- every file this host
+# writes carries a suffix from this list, which is why the pget fallback name
+# is "download.mp4" and not "download". test_boundary.py asserts both
+# directions so this paragraph cannot outlive the behaviour again.
 # ---------------------------------------------------------------------------
 
 MEDIA_EXTS = frozenset({
@@ -219,6 +251,12 @@ MEDIA_EXTS = frozenset({
     # audio
     ".m4a", ".m4b", ".mp3", ".aac", ".flac", ".wav", ".opus", ".ogg", ".oga",
     ".wma", ".aiff", ".aif", ".ac3", ".dts", ".alac", ".ape",
+    # Audio-only merges: yt-dlp maps the container to its audio variant
+    # (mkv -> mka, webm -> weba, mp4 -> m4a, ogg -> oga). Without the first
+    # two, an audio-only download succeeds and then cannot be opened or
+    # revealed from the popup. Checked against the bundled binary's own
+    # --remux-video / --audio-format lists, not against these two by name.
+    ".mka", ".weba",
     # subtitles the downloader writes alongside a video
     ".srt", ".vtt", ".ass", ".ssa", ".lrc", ".sub",
     # thumbnails / poster art
@@ -232,9 +270,17 @@ MEDIA_EXTS = frozenset({
 # cannot launder one.
 _WIN_DEVICE_NAMES = frozenset(
     ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
-    + ["COM%d" % i for i in range(1, 10)]
-    + ["LPT%d" % i for i in range(1, 10)]
+    # 0 included: whether COM0 is a device depends on the Windows build and
+    # the API path, and nobody names a media file com0.mp4 -- two characters
+    # is cheaper than the argument.
+    + ["COM%d" % i for i in range(0, 10)]
+    + ["LPT%d" % i for i in range(0, 10)]
 )
+
+# Win32's device parser reads the superscript digits as their ASCII values,
+# so COM¹ IS COM1. Folded before the lookup rather than added as more
+# entries, so the set stays the list of names a reader recognises.
+_SUPERSCRIPT_DIGITS = {"\u00b9": "1", "\u00b2": "2", "\u00b3": "3"}
 
 _WIN_RESERVED_CHARS = frozenset('\\/:*?"<>|')
 
@@ -245,7 +291,10 @@ def _ext_ok(path):
 
 
 def _is_device_name(name):
-    return name.split(".")[0].strip().upper() in _WIN_DEVICE_NAMES
+    stem = name.split(".")[0].strip().upper()
+    for src, dst in _SUPERSCRIPT_DIGITS.items():
+        stem = stem.replace(src, dst)
+    return stem in _WIN_DEVICE_NAMES
 
 
 def refuse_basename(name):
@@ -312,6 +361,17 @@ def resolve_existing_dir(dir_val, default_dir=None):
     which is exactly how `req.get("dir") or downloads_dir()` already read, so a
     picked folder that exists and the default both still work.
 
+    Covers the two pget handlers and the ytdl LEGACY path. It does NOT cover
+    the ytdl structured (Save As) path: _ytdl_acquire_dest_lease still creates
+    missing destination components by handle, deliberately -- FILE_CREATE on a
+    retained parent is its TOCTOU defence, its contract says "never uses
+    os.makedirs", test_ytdl_protocol.py asserts a missing component is
+    created, and the handler's own error strings say "Couldn't create the save
+    folder". Requiring an existing directory there is a Save As behaviour
+    change that belongs with the destination question, not smuggled in here.
+    So that path can still create a directory tree; what it cannot do is put
+    an executable in it, because the name goes through refuse_basename first.
+
     NOT an approved-roots check. The host still cannot tell a user-chosen
     destination from an attacker-chosen one, because the only channel carrying
     the user's choice is the one the attacker controls — see the boundary
@@ -342,9 +402,23 @@ def refuse_open(path):
     evaluated BEFORE that stat so a refused path is never probed for existence
     on the caller's behalf.
 
-    The suffix is checked on the path as given AND on its realpath: a symlink,
-    junction or hardlink named clip.mp4 that resolves onto payload.exe is
-    exactly the case a name-only check misses.
+    The suffix is checked on the path as given AND on its realpath: a symlink
+    or junction named clip.mp4 that resolves onto payload.exe is exactly the
+    case a name-only check misses. A HARDLINK is not covered and cannot be --
+    a hardlink is a second name for the same file, with no link target for
+    realpath to follow -- so clip.mp4 hardlinked to payload.exe passes here.
+    It executes as whatever ShellExecuteW makes of the .mp4 suffix, which is
+    the point of the allowlist; the suffix is what the shell dispatches on.
+
+    TWO NEAR-MISSES WITH LIVE BACKSTOPS, recorded because a change to either
+    backstop makes them real:
+      - there is no device check here, so "CON" reaches the caller. The
+        caller's os.path.isfile returns False for a character device, which
+        is what stops it.
+      - an embedded NUL defeats os.path.splitext, so the suffix check can be
+        skipped. The caller's os.path.isfile raises ValueError on such a
+        path and the handler treats it as absent.
+    Both are load-bearing uses of that isfile call, not incidental ones.
     """
     if not isinstance(path, str) or not path.strip():
         return "refused: no file path given"

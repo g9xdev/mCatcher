@@ -5250,7 +5250,8 @@ def handle_pget(req):
 
             try:
                 # No makedirs: resolve_existing_dir already required the
-                # destination to exist, so nothing here builds a tree.
+                # destination to exist, so nothing on THIS path builds a
+                # tree (the structured ytdl lease still does, by design).
                 final_path = _dedup(os.path.join(out_dir, name))
                 op["final_path"] = final_path
             except Exception:
@@ -5551,7 +5552,8 @@ def handle_pget_single(req):
 
             try:
                 # No makedirs: resolve_existing_dir already required the
-                # destination to exist, so nothing here builds a tree.
+                # destination to exist, so nothing on THIS path builds a
+                # tree (the structured ytdl lease still does, by design).
                 final_path = _dedup(os.path.join(out_dir, name))
                 op["final_path"] = final_path
                 op["n"] = n
