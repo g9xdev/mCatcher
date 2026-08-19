@@ -914,10 +914,26 @@ def ytdlp_update():
         return None
 
 
+# Set once a session has already tried to replace a onefile: a failing network
+# must not re-download on every job.
+_YTDLP_REFETCHED = False
+
+
+def _has_internal(exe):
+    """True when exe is the directory build - yt-dlp.exe beside _internal/.
+
+    The onefile launcher re-extracts ~145 files to %TEMP% on every launch and,
+    under a browser-descended process, each extraction is rescanned; that is the
+    ~90s DLL-load stall the UI showed as "Preparing" forever."""
+    if not exe:
+        return False
+    return os.path.isdir(os.path.join(os.path.dirname(exe), "_internal"))
+
+
 def ensure_ytdlp():
-    """Return a path to yt-dlp, fetching the official release into HERE if it's missing.
-    Lets auto-updated installs (which don't ship the binary) get YouTube without a
-    manual installer re-run.
+    """Return a path to yt-dlp, fetching the official release into HERE if it's missing
+    or is a onefile. Lets auto-updated installs (which don't ship the binary) get
+    YouTube without a manual installer re-run.
 
     Fetches the DIRECTORY build (yt-dlp_win.zip: yt-dlp.exe + _internal/), never
     the onefile exe. The onefile launcher re-extracts ~145 files to %TEMP% on
@@ -926,11 +942,15 @@ def ensure_ytdlp():
     command from a shell started in about a second. The directory build extracts
     nothing and starts in ~0.4s.
     """
-    global YTDLP
-    if YTDLP:
+    global YTDLP, _YTDLP_REFETCHED
+    if YTDLP and _has_internal(YTDLP):
         return YTDLP
     if os.name != "nt":
-        return None
+        # Nothing to upgrade off-Windows: keep whatever was resolved.
+        return YTDLP
+    if _YTDLP_REFETCHED:
+        return YTDLP
+    _YTDLP_REFETCHED = True
     here = _h().HERE
     dest = os.path.join(here, "yt-dlp.exe")
     try:
@@ -959,7 +979,9 @@ def ensure_ytdlp():
         return YTDLP
     except Exception as e:
         _h()._hlog("error", "yt-dlp download failed: %s" % e)
-        return None
+        # Keep a working-but-slow onefile rather than turning it into no yt-dlp
+        # at all. A sharing violation here just means a download is in flight.
+        return YTDLP
 
 
 def ensure_deno():

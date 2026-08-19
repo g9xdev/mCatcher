@@ -4669,3 +4669,50 @@ def test_lib_argv_carries_the_pot_extractor_arg_only_when_pot_is_on():
     off = d._ytdl_lib_argv("b", "o.%(ext)s", "u", None, pot=False)
     assert any("youtubepot" in a for a in on)
     assert not any("youtubepot" in a for a in off)
+
+
+def test_ensure_ytdlp_refetches_when_the_local_exe_is_a_onefile(tmp_path, monkeypatch):
+    """A onefile left by an older installer must not be accepted as good: it is the
+    build that stalled ~90s in DLL load under a browser-descended process."""
+    import mchost.downloads as d
+
+    onefile = tmp_path / "yt-dlp.exe"
+    onefile.write_bytes(b"MZ onefile")
+    monkeypatch.setattr(d, "YTDLP", str(onefile), raising=False)
+    monkeypatch.setattr(d, "_YTDLP_REFETCHED", False, raising=False)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(os, "name", "nt")
+
+    fetched = {"n": 0}
+
+    def fake_urlopen(*a, **k):
+        fetched["n"] += 1
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    # A onefile is not acceptable, so a fetch must be attempted; and when that fetch
+    # fails the existing exe is still returned rather than None, so a working-but-slow
+    # install does not become a broken one.
+    assert d.ensure_ytdlp() == str(onefile)
+    assert fetched["n"] == 1
+
+    # The re-fetch must be once per process, not once per download.
+    d.ensure_ytdlp()
+    assert fetched["n"] == 1
+
+
+def test_ensure_ytdlp_accepts_a_directory_build_without_refetching(tmp_path, monkeypatch):
+    import mchost.downloads as d
+
+    exe = tmp_path / "yt-dlp.exe"
+    exe.write_bytes(b"MZ dirbuild")
+    (tmp_path / "_internal").mkdir()
+    monkeypatch.setattr(d, "YTDLP", str(exe), raising=False)
+    monkeypatch.setattr(d, "_YTDLP_REFETCHED", False, raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("must not fetch when the directory build is present")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    assert d.ensure_ytdlp() == str(exe)
