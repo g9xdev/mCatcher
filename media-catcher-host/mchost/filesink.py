@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import os
 import threading
+import time
 import uuid
 
 # Firefox native-messaging payload ceiling is 1 MiB framed. Base64 expands by
@@ -38,7 +39,7 @@ def _h():
     return mc_host
 
 
-def cleanup_file_sinks():
+def cleanup_file_sinks(drain_timeout=30.0):
     """Detach and close every live file sink without emitting native frames.
 
     Used on native-messaging EOF / host exit so this process's bound .part
@@ -46,7 +47,16 @@ def cleanup_file_sinks():
     then closes handles and removes only each detached sink's exact .part
     path outside the registry lock. Never removes final paths, never emits
     frames (stdout may be unavailable), and never raises.
+
+    Commits in flight are waited for FIRST, and a sink that is already terminal
+    on entry keeps its .part. Those two are not alternatives: the wait is what
+    lets a finished download land, and the skip is what makes a wait that times
+    out harmless. Without the skip this function raced os.replace and deleted a
+    completed download; without the wait the .part of a commit killed at
+    interpreter exit would be orphaned, and blocking a retry is the very thing
+    this function exists to prevent.
     """
+    drain_commit_workers(drain_timeout)
     try:
         with _LOCK:
             sinks = list(_SINKS.values())
@@ -56,8 +66,14 @@ def cleanup_file_sinks():
         for s in sinks:
             try:
                 with s.lock:
-                    if s.state == "open":
-                        s.state = "terminal"
+                    if s.state != "open":
+                        # Already terminal means some other path owns this
+                        # sink's disposal: a commit worker owns the .part it is
+                        # about to os.replace, and abort / _terminalize_cleanup
+                        # have already removed theirs. Taking it here deleted a
+                        # finished download out from under the replace.
+                        continue
+                    s.state = "terminal"
                     # Close and remove are independent best-effort steps: a
                     # close exception must not skip this sink's exact .part,
                     # and a remove exception must not block later sinks.
@@ -519,18 +535,39 @@ def handle_file_chunk(req):
             sink.unacked = max(0, sink.unacked - 1)
 
 
-# Test seam: commit workers are daemons with no handle, and a test that asserted
-# on the committed file straight after the call would otherwise be racing them.
+# Commits in flight. Not a test seam: cleanup_file_sinks drains this at EOF so a
+# commit mid-replace is not torn down under. Each worker drops its own entry as
+# it ends, so this holds live commits only.
 _COMMIT_WORKERS = []
+_COMMIT_WORKERS_LOCK = threading.Lock()
+
+
+def drain_commit_workers(timeout=30.0):
+    """Wait out the commits still running, up to timeout in total.
+
+    Best effort by design. One that outlives the bound is not abandoned - it
+    keeps running, and cleanup_file_sinks leaves its .part alone because the
+    sink is terminal. That skip is what makes a bound safe here: a deadline that
+    can only stop WAITING, never stop the work or discard its result.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _COMMIT_WORKERS_LOCK:
+        pending = list(_COMMIT_WORKERS)
+    for t in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            t.join(remaining)
+        except Exception:
+            return
 
 
 def _join_commit_workers_for_test(timeout=15.0):
-    try:
-        for t in list(_COMMIT_WORKERS):
-            t.join(timeout)
-            assert not t.is_alive(), "a file-commit outran the %ss join" % timeout
-    finally:
-        _COMMIT_WORKERS.clear()
+    drain_commit_workers(timeout)
+    with _COMMIT_WORKERS_LOCK:
+        alive = [t for t in _COMMIT_WORKERS if t.is_alive()]
+    assert not alive, "a file-commit outran the %ss join" % timeout
 
 
 def handle_file_commit(req):
@@ -637,8 +674,19 @@ def handle_file_commit(req):
             "bytes": byte_count,
         })
 
-    t = threading.Thread(target=worker, daemon=True)
-    _COMMIT_WORKERS.append(t)
+    def run():
+        try:
+            worker()
+        finally:
+            with _COMMIT_WORKERS_LOCK:
+                try:
+                    _COMMIT_WORKERS.remove(threading.current_thread())
+                except ValueError:
+                    pass        # already drained
+
+    t = threading.Thread(target=run, daemon=True)
+    with _COMMIT_WORKERS_LOCK:
+        _COMMIT_WORKERS.append(t)
     t.start()
 
 

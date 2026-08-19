@@ -1549,3 +1549,121 @@ def test_cleanup_reexported_and_reset_delegates(tmp_path, monkeypatch):
     main_src = inspect.getsource(mc.main)
     assert "cleanup_file_sinks" in main_src
     assert "finally" in main_src
+
+
+# ---------------------------------------------------------------------------
+# EOF DURING a commit
+#
+# main()'s finally runs cleanup_file_sinks() on native-messaging EOF, and a
+# committing sink stays registered until its worker unregisters. Inline, a
+# commit and a cleanup could not overlap; off the loop they can, and the .part
+# cleanup wanted to remove is the one os.replace is about to promote. No test
+# exercised this window at all.
+# ---------------------------------------------------------------------------
+
+def _sink_with_one_chunk(tmp_path, monkeypatch, sent, data=b"finished-bytes"):
+    mc.handle_file_open({
+        "jobId": "je", "attemptToken": "a1",
+        "requestedFilename": "out.mp4", "dir": str(tmp_path),
+    })
+    sink = [m for m in sent if m.get("type") == "file-opened"][0]["sinkId"]
+    mc.handle_file_chunk({
+        "sinkId": sink, "jobId": "je", "attemptToken": "a1", "seq": 0,
+        "dataB64": _b64(data), "length": len(data),
+    })
+    return sink
+
+
+def test_eof_during_a_commit_waits_for_it_and_the_download_lands(tmp_path, monkeypatch):
+    """The wanted outcome: EOF arrives mid-replace, cleanup waits, the file
+    lands. Nothing is lost and no .part is left to block a retry."""
+    import mchost.filesink as fs
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    data = b"finished-bytes"
+    sink = _sink_with_one_chunk(tmp_path, monkeypatch, sent, data)
+
+    inside = threading.Event()
+    real_replace = os.replace
+
+    def slow_replace(src, dst):
+        inside.set()
+        # Hold the replace open across the cleanup below.
+        assert not threading.Event().wait(0.4)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", slow_replace)
+    mc.handle_file_commit({"sinkId": sink, "jobId": "je", "attemptToken": "a1"})
+    assert inside.wait(5), "the commit never reached its replace"
+
+    fs.cleanup_file_sinks()          # native-messaging EOF lands here
+
+    assert (tmp_path / "out.mp4").read_bytes() == data, (
+        "a commit in flight at EOF must still land")
+    assert not (tmp_path / "out.mp4.part").exists(), "the .part was left behind"
+    assert [m["type"] for m in sent if m["type"] in ("file-committed", "file-error")] \
+        == ["file-committed"], sent
+
+
+def test_a_cleanup_that_gives_up_waiting_still_never_deletes_the_part(tmp_path,
+                                                                      monkeypatch):
+    """And the outcome that makes the wait safe to bound. A commit slower than
+    the drain keeps its .part: cleanup owns only sinks that are still open, and
+    a terminal one is owned by whoever claimed it. Without this, the bound would
+    be a wall-clock deadline that discards a finished download - the exact shape
+    this project has already reverted once."""
+    import mchost.filesink as fs
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    data = b"finished-bytes"
+    sink = _sink_with_one_chunk(tmp_path, monkeypatch, sent, data)
+
+    inside = threading.Event()
+    release = threading.Event()
+    real_replace = os.replace
+
+    def blocked_replace(src, dst):
+        inside.set()
+        assert release.wait(10), "the replace was never released"
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", blocked_replace)
+    mc.handle_file_commit({"sinkId": sink, "jobId": "je", "attemptToken": "a1"})
+    assert inside.wait(5), "the commit never reached its replace"
+
+    try:
+        # Drain gives up long before this commit can finish.
+        fs.cleanup_file_sinks(drain_timeout=0.05)
+        assert (tmp_path / "out.mp4.part").exists(), (
+            "cleanup deleted the .part a commit was about to promote")
+        assert not (tmp_path / "out.mp4").exists()
+    finally:
+        release.set()
+
+    assert wait_for(lambda: (tmp_path / "out.mp4").exists(), timeout=5), (
+        "the commit that outlived the drain must still complete")
+    assert (tmp_path / "out.mp4").read_bytes() == data
+    fs._join_commit_workers_for_test()
+
+
+def test_the_commit_worker_list_does_not_grow(tmp_path, monkeypatch):
+    """It is drained at EOF, so it is production state, not a test seam. A dead
+    Thread and the _Sink it closes over per completed download, held for the
+    life of the helper, is a leak - each worker drops its own entry."""
+    import mchost.filesink as fs
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    for n in range(3):
+        mc.handle_file_open({
+            "jobId": "jg%d" % n, "attemptToken": "a1",
+            "requestedFilename": "out%d.mp4" % n, "dir": str(tmp_path),
+        })
+        sink = [m for m in sent if m.get("type") == "file-opened"][-1]["sinkId"]
+        commit_and_join({"sinkId": sink, "jobId": "jg%d" % n, "attemptToken": "a1"})
+
+    assert [m["type"] for m in sent].count("file-committed") == 3, sent
+    assert fs._COMMIT_WORKERS == [], (
+        "%d finished commits still retained" % len(fs._COMMIT_WORKERS))
