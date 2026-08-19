@@ -4838,7 +4838,10 @@ def test_a_note_rolls_the_resolve_deadline_forward(tmp_path, monkeypatch):
     A job that keeps talking must survive several deadlines' worth of resolve."""
     import mchost.downloads as d
 
-    stall = 0.25
+    # 10x the note gap below. At 5x a >250ms scheduler hiccup on a loaded box
+    # reads as a stall and fails the test spuriously — in the direction that
+    # trains people to re-run instead of read.
+    stall = 1.0
     out = tmp_path / "v.mp4"
     out.write_bytes(b"x" * 3)
     sent = []
@@ -4850,8 +4853,8 @@ def test_a_note_rolls_the_resolve_deadline_forward(tmp_path, monkeypatch):
 
     def fake_download(argv, on_progress=None, on_note=None, should_cancel=None):
         started = time.monotonic()
-        for _ in range(15):                     # 15 * stall/5 == 3 deadlines
-            assert not threading.Event().wait(stall / 5)
+        for _ in range(25):                     # 25 * stall/10 == 2.5 deadlines
+            assert not threading.Event().wait(stall / 10)
             on_note("Contacting YouTube")
         assert time.monotonic() - started > stall * 2, "did not outlive two deadlines"
         return str(out)
@@ -4908,7 +4911,7 @@ def test_a_terminal_frame_is_claimed_once_when_the_watchdog_wakes_mid_send(tmp_p
     claim rather than contradict the row it is already on."""
     import mchost.downloads as d
 
-    stall = 0.05
+    stall = 0.5                 # the unwind has to claim before this expires
     sent = []
     monkeypatch.setattr(d, "_h", lambda: mc)
     monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", stall)
@@ -4919,7 +4922,7 @@ def test_a_terminal_frame_is_claimed_once_when_the_watchdog_wakes_mid_send(tmp_p
         sent.append(m)
         if m.get("reason") == "cancelled":
             # Hold the pipe across the deadline the watchdog is sleeping on.
-            assert not threading.Event().wait(stall * 10)
+            assert not threading.Event().wait(stall * 2)
 
     monkeypatch.setattr(mc, "send", slow_send)
 
@@ -4960,6 +4963,8 @@ def test_a_preflight_failure_ends_the_row_it_acknowledged(tmp_path, monkeypatch)
                            "dir": str(tmp_path)})
     d._join_ytdl_workers_for_test()
 
-    types = [m["type"] for m in sent if m["type"].startswith("ytdl-")]
+    # Everything but the helper's own console lines: the ack, then the terminal
+    # frame, and nothing else — so the must-not-run sentinel really guards.
+    types = [m["type"] for m in sent if m["type"] != "log"]
     assert types == ["ytdl-progress", "ytdl-error"], sent
     assert sent[-1]["reason"] == "jschallenge", sent[-1]   # the mapped shape, reused

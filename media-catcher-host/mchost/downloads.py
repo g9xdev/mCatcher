@@ -3471,9 +3471,14 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     sink — the hooks do not fire until bytes flow, so the sink is what makes a
     cancel visible during resolve. The resolve phase carries the same
     _YTDL_RESOLVE_STALL deadline the exe path's _StallWatch applies, rolling on
-    every note the way _StallWatch.touch() rolls on every output line, and
-    reported with the same reason: "in-process" does not make it unstallable,
-    because --js-runtimes still launches deno while resolving."""
+    every note the way _StallWatch.touch() rolls on every output line, because
+    --js-runtimes still launches deno and "in-process" does not make this phase
+    unstallable. The REMEDY is weaker than _StallWatch's, though: that one kills
+    the child and unblocks its reader, while this only bounds the silence and
+    reports it. The flag it sets is seen when yt-dlp next reaches a hook or logs
+    a line, so a genuinely wedged deno leaves this worker and its _pget entry
+    alive for the life of the helper — the row stops lying, the thread still
+    leaks."""
     lib = _ytdlp_lib()
     op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
     if not _pget_register(jid, op):
@@ -3503,9 +3508,14 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     claim_lock = threading.Lock()
     claimed = []
 
-    def _claim_terminal():
+    def _claim_terminal(unless_progressing=False):
+        """True for exactly one caller. unless_progressing closes the watchdog's
+        check-then-claim gap: bytes can start flowing between its is_set() test
+        and the claim, and killing a job that is transferring is the one failure
+        this mechanism must never cause. Only the watchdog passes it — a real
+        terminal frame is still owed once progress has started."""
         with claim_lock:
-            if claimed:
+            if claimed or (unless_progressing and progressing.is_set()):
                 return False
             claimed.append(True)
             return True
@@ -3543,8 +3553,8 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
                 if finished.wait(_YTDL_RESOLVE_STALL - idle):
                     return              # done, failed, or cancelled
                 continue
-            if not _claim_terminal():
-                return                  # the job already reached the wire
+            if not _claim_terminal(unless_progressing=True):
+                return                  # already terminal, or bytes just started
             op["cancel_requested"] = True
             _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling"
                        % _YTDL_RESOLVE_STALL, "ytdlp")
@@ -3591,12 +3601,14 @@ _YTDL_WORKERS = []
 
 
 def _join_ytdl_workers_for_test(timeout=5.0):
-    for t in list(_YTDL_WORKERS):
-        t.join(timeout)
-        # Never drop a live worker: it would go on sending into whatever the NEXT
-        # test monkeypatched, which reads as that test's own frames.
-        assert not t.is_alive(), "a yt-dlp worker outran the %ss join" % timeout
-    _YTDL_WORKERS.clear()
+    try:
+        for t in list(_YTDL_WORKERS):
+            t.join(timeout)
+            # Never drop a live worker silently: it would go on sending into
+            # whatever the NEXT test monkeypatched, reading as that test's frames.
+            assert not t.is_alive(), "a yt-dlp worker outran the %ss join" % timeout
+    finally:
+        _YTDL_WORKERS.clear()   # one real failure, not a cascade through the suite
 
 
 def _handle_ytdl_legacy(req):
@@ -3625,6 +3637,11 @@ def _handle_ytdl_legacy(req):
             outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
             # Optional format selector from the popup's quality picker; default = best.
             fmt = req.get("format") or "bv*+ba/b"
+            # Both of these are on the acknowledged path too, so they belong inside
+            # the wrapper. ensure_ytdlp() stays lazy: it fetches an exe the
+            # in-process library makes unnecessary.
+            use_lib = _ytdlp_lib().available()
+            ytdlp = None if use_lib else ensure_ytdlp()
         except Exception as e:
             reason, msg = _map_yt_error(str(e))
             _h()._hlog("error", "yt-dlp: preflight failed (%s): %s"
@@ -3632,11 +3649,10 @@ def _handle_ytdl_legacy(req):
             _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             return
 
-        if _ytdlp_lib().available():
+        if use_lib:
             _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot)
             return
 
-        ytdlp = ensure_ytdlp()
         if not ytdlp:
             _h().send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
                   "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
