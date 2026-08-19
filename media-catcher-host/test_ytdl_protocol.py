@@ -5551,6 +5551,61 @@ def test_the_wedged_worker_and_its_registration_end_with_the_kill(tmp_path,
     assert reported, "the row was never closed"
 
 
+def test_a_cancel_frees_a_wedge_the_watchdog_can_no_longer_reach(tmp_path,
+                                                                 monkeypatch):
+    """The wedge that has no watchdog behind it.
+
+    ffmpeg merging is a per-job spawned image and --socket-timeout does not
+    cover it, so it is the realistic way lib.download never returns. By then
+    on_progress has fired, which disarms the resolve watchdog for good — that
+    disarm is correct, a transferring job must never be killed on a clock — so
+    the only thing left that can reach this worker is the user pressing Cancel.
+    Pin what that has to achieve: the child taken, the thread unwound, exactly
+    one terminal frame, and the registration handed back — a worker that has
+    ended no longer holds the output path, so the entry must not outlive it."""
+    import mchost.downloads as d
+
+    sent = []
+    killed = []
+    merging = threading.Event()
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    # Large enough that a watchdog which HAD still been armed could not fire
+    # inside this test: a pass here is the cancel's doing, not the clock's.
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 30)
+    _record_kills(d, monkeypatch, killed)
+
+    child = FakeChild("ffmpeg")
+    lib = None
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        on_progress({"stage": "downloading", "pct": 100.0, "total": 9})
+        on_progress({"stage": "merging"})
+        on_child(child)                 # yt-dlp shells out to ffmpeg to merge
+        merging.set()
+        # The wedge: nothing in here polls, and only the child going away can
+        # end it — the same shape as Popen.run parked in communicate().
+        assert wait_for(lambda: child.killed, 5), "cancel never reached the merge"
+        raise lib.Cancelled()
+
+    lib = FakeYtdlLib(fake_download)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib)
+    t = threading.Thread(target=d._ytdl_download_via_lib, daemon=True,
+                         args=("j-merge-wedge", "https://youtu.be/x", "b",
+                               str(tmp_path / "v.mp4"), None, False))
+    t.start()
+    assert merging.wait(5), "the download never reached the merge"
+    d._pget_cancel({"id": "j-merge-wedge"})
+    t.join(5)
+
+    assert killed == [child], "the wedged ffmpeg was never killed"
+    assert not t.is_alive(), "the worker thread outlived its job"
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m.get("reason") for m in terminal] == ["cancelled"], terminal
+    assert d._pget_registry_get("j-merge-wedge") is None, "the registration leaked"
+
+
 def test_a_child_spawned_after_the_kill_is_taken_too(tmp_path, monkeypatch):
     """yt-dlp's JS challenge director wraps each provider in `except Exception`,
     so it can absorb the Cancelled our log sink raises and spawn again before the
