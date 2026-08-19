@@ -4007,11 +4007,14 @@ def _handle_ytdl_legacy(req):
         # preflight owes the caller a terminal frame like every other failure.
         try:
             deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
-            outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
-            try:
-                os.makedirs(outdir, exist_ok=True)
-            except Exception:
-                pass
+            outdir, dir_err = guard.resolve_existing_dir(
+                req.get("dir"),
+                (_h().load_config().get("saveFolder") or "") or _h().downloads_dir())
+            if dir_err:
+                # Raised, not swallowed: this whole block is already inside
+                # the preflight try that owes the row a terminal frame, and a
+                # destination that does not exist used to be built here.
+                raise RuntimeError(dir_err)
             pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
             outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
             # Optional format selector from the popup's quality picker; default = best.
@@ -4272,30 +4275,42 @@ def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState
 
 
 _PGET_NAME_MAX = 150
+# The fallback carries a suffix because every name this host writes must;
+# the extension's own guessExt() defaults to .mp4 for the same reason.
+_PGET_DEFAULT_NAME = "download.mp4"
 _PGET_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|]+')
 
 
 def _pget_safe_filename(name):
-    """Pget-local basename normalizer capped at 150 characters.
+    """Pget-local basename normalizer capped at 150 characters, or None.
 
-    Already-safe basenames of length <=150 are preserved exactly. Invalid
-    path characters are replaced like the legacy host sanitizer; empty
-    results fall back to "download". Does not call or mutate tools.sanitize.
+    Already-safe basenames of length <=150 are preserved exactly. Invalid path
+    characters are replaced like the legacy host sanitizer. Does not call or
+    mutate tools.sanitize.
+
+    Returns None when the normalized result is not a name this host may create
+    — a suffix outside guard.MEDIA_EXTS, or a Windows device name. Normalizing
+    was never enough on its own: the suffix survived verbatim, so "payload.exe"
+    came out of here unchanged and every caller wrote it. Callers must treat
+    None as a refusal; the ytdl structured path already did, because its
+    `download` fallback could not be reached from a nonblank name.
     """
     raw = name if isinstance(name, str) else ("" if name is None else str(name))
-    cleaned = _PGET_UNSAFE_NAME.sub("_", raw or "download").strip()
+    cleaned = _PGET_UNSAFE_NAME.sub("_", raw or _PGET_DEFAULT_NAME).strip()
     if not cleaned:
-        cleaned = "download"
-    if len(cleaned) <= _PGET_NAME_MAX:
-        return cleaned
-    root, ext = os.path.splitext(cleaned)
-    if ext and len(ext) < _PGET_NAME_MAX:
-        keep = _PGET_NAME_MAX - len(ext)
-        root = root[:keep]
-        cleaned = (root + ext) if root else cleaned[:_PGET_NAME_MAX]
-    else:
-        cleaned = cleaned[:_PGET_NAME_MAX]
-    return cleaned or "download"
+        cleaned = _PGET_DEFAULT_NAME
+    if len(cleaned) > _PGET_NAME_MAX:
+        root, ext = os.path.splitext(cleaned)
+        if ext and len(ext) < _PGET_NAME_MAX:
+            keep = _PGET_NAME_MAX - len(ext)
+            root = root[:keep]
+            cleaned = (root + ext) if root else cleaned[:_PGET_NAME_MAX]
+        else:
+            cleaned = cleaned[:_PGET_NAME_MAX]
+    cleaned = cleaned or _PGET_DEFAULT_NAME
+    # Checked AFTER the cap, not before: truncation can itself produce a
+    # name this host may not create.
+    return None if guard.refuse_basename(cleaned) else cleaned
 
 
 def _pget_terminal_file_bytes(op):
@@ -5198,15 +5213,25 @@ def handle_pget(req):
             urls = [u for u in (req.get("urls") or []) if u]
             referer = req.get("referer") or ""
             ua = req.get("userAgent") or ""
-            name = _pget_safe_filename(req.get("name") or "download")
-            out_dir = req.get("dir") or _h().downloads_dir()
+            # A refused name is a permanent failure, not a coerced one:
+            # silently renaming a download is worse than telling the caller,
+            # and the extension already falls back to a browser download for
+            # a permanent pget failure — which is where a non-media file
+            # belongs anyway, with Firefox's own warnings around it.
+            name = _pget_safe_filename(req.get("name"))
+            out_dir, dir_err = guard.resolve_existing_dir(
+                req.get("dir"), _h().downloads_dir())
 
             if op.get("cancel_requested") or stop.is_set():
                 finish("cancelled", "cancelled", "empty")
                 return
 
-            if not urls:
+            if not urls or not name:
                 finish("failed", "permanent", "empty")
+                return
+
+            if dir_err:
+                finish("failed", "local_io", "empty")
                 return
 
             try:
@@ -5224,7 +5249,8 @@ def handle_pget(req):
                 return
 
             try:
-                os.makedirs(out_dir, exist_ok=True)
+                # No makedirs: resolve_existing_dir already required the
+                # destination to exist, so nothing here builds a tree.
                 final_path = _dedup(os.path.join(out_dir, name))
                 op["final_path"] = final_path
             except Exception:
@@ -5502,22 +5528,30 @@ def handle_pget_single(req):
             urls = [u for u in (req.get("urls") or []) if u]
             referer = req.get("referer") or ""
             ua = req.get("userAgent") or ""
-            name = _pget_safe_filename(req.get("name") or "download")
-            out_dir = req.get("dir") or _h().downloads_dir()
+            # Same two rules as handle_pget: a name this host may create,
+            # and a destination that already exists.
+            name = _pget_safe_filename(req.get("name"))
+            out_dir, dir_err = guard.resolve_existing_dir(
+                req.get("dir"), _h().downloads_dir())
 
             if op.get("cancel_requested") or stop.is_set():
                 finish("cancelled", "cancelled", "empty")
                 return
 
-            if not urls:
+            if not urls or not name:
                 finish("failed", "permanent", "empty")
+                return
+
+            if dir_err:
+                finish("failed", "local_io", "empty")
                 return
 
             # Scheduler-issued single-connection: one selected candidate only.
             url = urls[0]
 
             try:
-                os.makedirs(out_dir, exist_ok=True)
+                # No makedirs: resolve_existing_dir already required the
+                # destination to exist, so nothing here builds a tree.
                 final_path = _dedup(os.path.join(out_dir, name))
                 op["final_path"] = final_path
                 op["n"] = n

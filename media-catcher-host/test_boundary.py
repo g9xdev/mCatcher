@@ -280,3 +280,191 @@ def test_distinct_recording_ids_get_distinct_temp_files():
     c = guard.temp_basename("a_b")
     assert len({a, b, c}) == 3, (a, b, c)
     assert guard.temp_basename("x") == guard.temp_basename("x"), "stable"
+
+
+# ---------------------------------------------------------------------------
+# 4. What this host is willing to WRITE
+#
+# The suffix allowlist that governs `open` governs creation too. The reason is
+# the escape it closes: the dangerous primitive an unvalidated destination hands
+# an attacker is not "write into an odd folder", it is "drop a file the OS will
+# later execute" -- %APPDATA%\...\Start Menu\Programs\Startup\x.exe is logon
+# persistence and needs no `open` at all. Constrain the basename and that
+# primitive is gone whatever the directory turns out to be.
+#
+# The name is not merely extension-controlled: background.js derives it from the
+# URL and Content-Disposition (`sanitizeFilename(filename || item.name)`, then
+# `guessExt` only when there is no suffix already), so a hostile PAGE reaches
+# this without the extension being compromised at all.
+# ---------------------------------------------------------------------------
+
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+_BODY = b"MZ" + b"\0" * 62
+
+
+class _Ranged(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(_BODY)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+
+    def do_GET(self):
+        rng = self.headers.get("Range")
+        if rng:
+            lo, hi = rng.split("=")[1].split("-")
+            lo = int(lo)
+            hi = int(hi) if hi else len(_BODY) - 1
+            chunk = _BODY[lo:hi + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (lo, hi, len(_BODY)))
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(_BODY)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        self.wfile.write(_BODY)
+
+
+@pytest.fixture(scope="module")
+def served():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Ranged)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield "http://127.0.0.1:%d/x" % httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+
+
+def _pget(monkeypatch, jid, url, name, out_dir):
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    mc.handle_pget({"id": jid, "urls": [url], "name": name, "dir": str(out_dir),
+                    "maxConnections": 1})
+    assert wait_for(lambda: any(m.get("type") == "pget-result" for m in sent),
+                    timeout=15), sent
+    return [m for m in sent if m.get("type") == "pget-result"][-1]
+
+
+@pytest.mark.parametrize("name", [
+    "payload.exe", "payload.bat", "payload.ps1", "payload.lnk", "payload.dll",
+    "payload.scr", "payload.hta", "payload.js", "payload.settingcontent-ms",
+])
+def test_pget_refuses_a_name_outside_the_media_allowlist(monkeypatch, tmp_path,
+                                                         served, name):
+    res = _pget(monkeypatch, "j-" + name, served, name, tmp_path)
+    assert res["status"] == "failed", res
+    assert res["failureCategory"] == "permanent", res
+    assert list(tmp_path.iterdir()) == [], "nothing written, not even a .part"
+
+
+@pytest.mark.parametrize("name", ["con", "con.mp4", "NUL.mp4", "lpt1.mp4",
+                                  "com9.mp4", "aux.mp4", "prn"])
+def test_pget_refuses_a_reserved_device_name(monkeypatch, tmp_path, served, name):
+    """con/prn/aux/nul/com1-9/lpt1-9 are DEVICES on Windows, with or without a
+    suffix -- "con.mp4" passes any suffix check and still opens the console."""
+    res = _pget(monkeypatch, "jdev-" + name, served, name, tmp_path)
+    assert res["status"] == "failed", res
+    assert list(tmp_path.iterdir()) == [], name
+
+
+def test_pget_does_not_create_a_missing_directory_tree(monkeypatch, tmp_path,
+                                                       served):
+    """os.makedirs(out_dir, exist_ok=True) was the first thing either pget
+    handler touched, so a destination that did not exist was built on demand --
+    anywhere the user can write."""
+    missing = tmp_path / "not" / "an" / "approved" / "root"
+    res = _pget(monkeypatch, "jtree", served, "clip.mp4", missing)
+    assert res["status"] == "failed", res
+    assert not (tmp_path / "not").exists(), "no part of the tree was created"
+
+
+def test_the_live_executable_drop_is_refused(monkeypatch, tmp_path, served):
+    """The exact repro that worked before this change: drop payload.exe into a
+    directory tree that does not exist, then open it."""
+    missing = tmp_path / "not" / "an" / "approved" / "root"
+    res = _pget(monkeypatch, "jchain", served, "payload.exe", missing)
+    assert res["status"] == "failed", res
+    assert not (tmp_path / "not").exists()
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    ran = []
+    if hasattr(mc.os, "startfile"):
+        monkeypatch.setattr(mc.os, "startfile", lambda p: ran.append(p))
+    mc.handle_open({"id": "chain", "path": str(missing / "payload.exe")})
+    assert wait_for(lambda: bool(sent), timeout=2.0)
+    assert ran == [] and sent[0]["type"] == "error", sent
+
+
+def test_pget_still_writes_a_media_file(monkeypatch, tmp_path, served):
+    """The rule must not cost the flow it exists to protect."""
+    res = _pget(monkeypatch, "jok", served, "clip.mp4", tmp_path)
+    assert res["status"] == "completed", res
+    assert (tmp_path / "clip.mp4").is_file()
+
+
+def test_file_open_refuses_a_non_media_basename(monkeypatch, tmp_path):
+    """The native file sink writes requestedFilename verbatim -- _is_safe_basename
+    vets its SHAPE but never its suffix, so payload.exe passed."""
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    mc.handle_file_open({"jobId": "jx", "attemptToken": "a1",
+                         "requestedFilename": "payload.exe", "dir": str(tmp_path)})
+    assert not any(m.get("type") == "file-opened" for m in sent), sent
+    assert list(tmp_path.iterdir()) == [], "no .part was created"
+
+
+def test_refuse_basename_covers_the_shapes():
+    r = guard.refuse_basename
+
+    for ok in ("clip.mp4", "a.MKV", "song.m4a", "subs.vtt", "poster.jpg",
+               "11238-makemebi.net.mp4", "con-artist.mp4", "nul-and-void.mp4"):
+        assert r(ok) is None, ok
+
+    for bad in ("payload.exe", "payload.bat", "payload.ps1", "payload.lnk",
+                "payload.dll", "payload.hta", "payload.settingcontent-ms",
+                "noext", "con", "CON.mp4", "nul", "com1.mp4", "LPT9.mp4",
+                "aux.tar.mp4", "a/b.mp4", "a\\b.mp4", ".", "..", "C:\\x.mp4",
+                "trailing.mp4 ", "trailing.mp4.", "null\x00.mp4", "", "   ",
+                None, 7, ["a.mp4"]):
+        assert r(bad) is not None, bad
+
+
+def test_resolve_existing_dir():
+    import tempfile
+
+    real, err = guard.resolve_existing_dir(tempfile.gettempdir())
+    assert err is None and os.path.isdir(real)
+
+    # absent / null / blank fall back to the default, as .get() already did
+    for blank in (None, "", "   "):
+        real, err = guard.resolve_existing_dir(blank)
+        assert err is None and os.path.isdir(real), blank
+
+    for bad in ("relative-not-abs",
+                os.path.join(tempfile.gettempdir(), "no-such-dir-xyz"),
+                7, {"a": 1}):
+        real, err = guard.resolve_existing_dir(bad)
+        assert real is None and err, bad
+
+
+def test_sanitize_neutralises_a_reserved_device_stem():
+    """handle_save builds sanitize(base) + ".mp4", so a base of "con" produced
+    con.mp4 -- a device, not a file. The suffix is host-chosen here and the user
+    must not lose the recording, so this one coerces rather than refuses."""
+    assert guard.refuse_basename(mc.sanitize("con") + ".mp4") is None
+    assert guard.refuse_basename(mc.sanitize("LPT1") + ".mp4") is None
+    assert mc.sanitize("congress") == "congress", "only the exact device names"

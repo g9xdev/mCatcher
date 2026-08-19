@@ -29,5 +29,17 @@ def downloads_dir():
 
 
 def sanitize(name):
+    """A recording's display name, made into a filename stem.
+
+    The caller supplies the stem and the HOST supplies the suffix (".mp4",
+    " (partial).mp4"), so unlike a downloaded file's name there is nothing to
+    refuse here -- refusing would lose a finished recording the user cannot
+    get back. A Windows device name is coerced instead: a base of "con"
+    produced "con.mp4", which is the console device in every directory, not a
+    file. guard.neutralize_device_name owns that rule so the device list has
+    one home.
+    """
+    from mchost import guard
+
     name = re.sub(r'[\\/:*?"<>|]+', "_", name or "recording").strip()
-    return (name[:120] or "recording")
+    return guard.neutralize_device_name(name[:120] or "recording")

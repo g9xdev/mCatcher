@@ -13,7 +13,9 @@ a list where an int is), it stops unknown commands, and it stops a malformed
 frame from throwing out of the read loop. A `str` check on a path does NOT make
 that path safe — containment checks at the point of use are what do that.
 
-OPENABLE_EXTS / refuse_open say what `open` and `reveal` may hand to the OS.
+MEDIA_EXTS is the one list of suffixes this helper deals in, in both
+directions: refuse_open says what `open` and `reveal` may hand to the OS, and
+refuse_basename says what this host may create.
 os.startfile is ShellExecuteW: it RUNS the file with its registered handler, so
 an extension that could name a path could run it. Windows has far too many
 executable suffixes to blocklist (.exe .bat .cmd .ps1 .lnk .scr .hta .msi .js
@@ -194,10 +196,22 @@ def message_id(msg):
 
 
 # ---------------------------------------------------------------------------
-# What `open` / `reveal` may hand to the OS
+# The suffixes this helper deals in
+#
+# ONE list, used in both directions. A file this host WRITES and a file it will
+# later hand to the shell are the same category of thing: everything it writes
+# is something the extension may later ask it to open. Two lists would drift,
+# and either drift is a bug -- a wider write list means files the user cannot
+# open from the popup, a wider open list means opening suffixes this host never
+# produced, which is the residual the missing directory check already leaves.
+#
+# One asymmetry, deliberate: a name with NO suffix may be written but not
+# opened. An extensionless file has no registered handler, so it cannot be the
+# executable drop this list exists to stop, and there is nothing for
+# ShellExecuteW to do with it either.
 # ---------------------------------------------------------------------------
 
-OPENABLE_EXTS = frozenset({
+MEDIA_EXTS = frozenset({
     # containers / video
     ".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".flv", ".ts", ".m2ts",
     ".mts", ".mpg", ".mpeg", ".mpe", ".wmv", ".ogv", ".3gp", ".3g2", ".mxf",
@@ -212,9 +226,113 @@ OPENABLE_EXTS = frozenset({
 })
 
 
+# CON/PRN/AUX/NUL/COM1-9/LPT1-9 are DEVICES on Windows, not files, and they are
+# devices in EVERY directory. "con.mp4" passes any suffix check and still opens
+# the console — the match is on the stem before the FIRST dot, so a suffix
+# cannot launder one.
+_WIN_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
+
+_WIN_RESERVED_CHARS = frozenset('\\/:*?"<>|')
+
+
 def _ext_ok(path):
     ext = os.path.splitext(path)[1].lower()
-    return bool(ext) and ext in OPENABLE_EXTS
+    return bool(ext) and ext in MEDIA_EXTS
+
+
+def _is_device_name(name):
+    return name.split(".")[0].strip().upper() in _WIN_DEVICE_NAMES
+
+
+def refuse_basename(name):
+    """None when `name` is a filename this host may CREATE, else a reason.
+
+    The escape an unvalidated destination hands an attacker is not "write into
+    an odd folder", it is "drop a file the OS will later execute" — a .exe in
+    the per-user Startup folder is logon persistence and needs no `open` at
+    all. Constraining the basename removes that primitive whatever the
+    directory turns out to be, which is what matters here because the directory
+    question is still open.
+
+    Nor is the name reachable only by a compromised extension: background.js
+    derives it from the URL and Content-Disposition, so a hostile PAGE reaches
+    this too.
+
+    The shape rules mirror filesink._is_safe_basename, which vets shape but
+    never the suffix; the suffix and device rules are the half that was missing
+    everywhere.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return "refused: no filename given"
+    if "/" in name or "\\" in name or os.path.isabs(name):
+        return "refused: %r is a path, not a filename" % (name,)
+    if name in (".", "..") or os.path.basename(name) != name:
+        return "refused: %r is a path, not a filename" % (name,)
+    for ch in name:
+        if ord(ch) < 32 or ord(ch) == 127 or ch in _WIN_RESERVED_CHARS:
+            return "refused: %r contains a character a filename may not" % (name,)
+    if name[-1] in (" ", "."):
+        # Win32 strips these when it creates the file, so the name checked would
+        # not be the name written.
+        return "refused: %r ends in a space or a dot" % (name,)
+    if _is_device_name(name):
+        return "refused: %r names a Windows device, not a file" % (name,)
+    if not _ext_ok(name):
+        return "refused: %r is not a media file this helper writes" % (name,)
+    return None
+
+
+def neutralize_device_name(stem):
+    """A display name the host will give its OWN suffix to, made non-device.
+
+    Used where the host chose the suffix and the user must not lose the file
+    (a finished recording), so this coerces rather than refusing: "con" becomes
+    "_con" and is a file again. Anything already safe is returned untouched.
+    """
+    if isinstance(stem, str) and _is_device_name(stem):
+        return "_" + stem
+    return stem
+
+
+def resolve_existing_dir(dir_val, default_dir=None):
+    """(realpath, None) for a destination this host may write into, else
+    (None, reason).
+
+    The directory must ALREADY EXIST. Both pget handlers opened with
+    os.makedirs(out_dir, exist_ok=True), so a destination that did not exist was
+    built on demand anywhere the user can write — a primitive worth removing on
+    its own, and mchost/filesink.py has required an existing directory since it
+    was written.
+
+    Absent / null / blank falls back to `default_dir` (Downloads by default),
+    which is exactly how `req.get("dir") or downloads_dir()` already read, so a
+    picked folder that exists and the default both still work.
+
+    NOT an approved-roots check. The host still cannot tell a user-chosen
+    destination from an attacker-chosen one, because the only channel carrying
+    the user's choice is the one the attacker controls — see the boundary
+    report. This narrows the primitive; it does not close the question.
+    """
+    if dir_val is None or (isinstance(dir_val, str) and not dir_val.strip()):
+        if default_dir is None:
+            import mc_host
+            default_dir = mc_host.downloads_dir()
+        dir_val = default_dir
+    if not isinstance(dir_val, str) or not dir_val.strip():
+        return None, "destination folder is not a path"
+    if not os.path.isabs(dir_val):
+        return None, "destination folder is not an absolute path"
+    try:
+        real = os.path.realpath(dir_val)
+    except Exception:
+        return None, "destination folder could not be resolved"
+    if not os.path.isdir(real):
+        return None, "destination folder does not exist"
+    return real, None
 
 
 def refuse_open(path):
