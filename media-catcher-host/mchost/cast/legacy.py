@@ -140,10 +140,70 @@ def _ssdp_discover(timeout=4):
     return locs
 
 
+_DESC_OPENER = None
+
+
+def _desc_opener():
+    """The opener the device description is fetched with: no redirects.
+
+    The host pin below is checked on the URL we ASK for, and urlopen's default
+    opener follows a 302 to any host — so a device could answer its own SSDP
+    LOCATION with a redirect and the FETCH ITSELF would be the request an
+    attacker wanted made. Re-checking afterwards is too late: by then the GET
+    has landed. Returning None from redirect_request leaves the 3xx unhandled,
+    so it surfaces as an HTTPError and _dlna_describe's except clause turns it
+    into "no such device". UPnP serves the description directly at LOCATION;
+    nothing in the spec asks a control point to chase redirects for it.
+    """
+    global _DESC_OPENER
+    import urllib.request
+    if _DESC_OPENER is None:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        _DESC_OPENER = urllib.request.build_opener(_NoRedirect)
+    return _DESC_OPENER
+
+
+def _pin_ctrl(loc, curl):
+    """`curl` resolved against the description URL `loc`, or None if it lands
+    somewhere else.
+
+    urljoin against an ABSOLUTE url discards the base entirely, so a renderer
+    that answered <controlURL>http://127.0.0.1:8080/x</controlURL> got SOAP
+    POSTed there by _dlna_soap — SSRF into loopback services that trust local
+    callers, from a user-privileged process, triggered by anything that can
+    answer an SSDP M-SEARCH on the LAN.
+
+    SCHEME and HOST are pinned. The scheme has to be: `file:///C:/…` is an
+    absolute URL too, and urllib would happily open it.
+
+    The PORT deliberately is not. Renderers really do split the description and
+    the control endpoint across ports of one device, and once the host is pinned
+    a different port on it is still the device's own box — it buys the attacker
+    nothing it did not already have.
+    """
+    import urllib.parse
+    if not curl:
+        return None
+    url = urllib.parse.urljoin(loc, curl)
+    base, got = urllib.parse.urlparse(loc), urllib.parse.urlparse(url)
+    if got.scheme != base.scheme or got.hostname != base.hostname:
+        return None
+    return url
+
+
 def _dlna_describe(loc, expect_host=None):
     """Fetch a device description; return {name, model, avCtrl, rcCtrl} or None.
+
     expect_host pins the fetch to the device that answered the SSDP query, so a
-    hostile LAN peer can't point us at an arbitrary URL via its LOCATION header."""
+    hostile LAN peer can't point us at an arbitrary URL via its LOCATION header;
+    _desc_opener keeps a redirect from moving that fetch afterwards, and
+    _pin_ctrl holds the control endpoints the description names to the same
+    scheme and host. A device with no AVTransport left is not castable and is
+    dropped; a bad RenderingControl only costs volume control (rcCtrl is
+    already optional at every use).
+    """
     import urllib.request
     import urllib.parse
     import xml.etree.ElementTree as ET
@@ -153,7 +213,7 @@ def _dlna_describe(loc, expect_host=None):
             return None
         if expect_host and parsed.hostname != expect_host:
             return None
-        xmlsrc = urllib.request.urlopen(loc, timeout=4).read().decode("utf-8", "replace")
+        xmlsrc = _desc_opener().open(loc, timeout=4).read().decode("utf-8", "replace")
         root = ET.fromstring(xmlsrc)
         ns = {"u": "urn:schemas-upnp-org:device-1-0"}
         av = rc = None
@@ -161,9 +221,9 @@ def _dlna_describe(loc, expect_host=None):
             stype = svc.findtext("u:serviceType", default="", namespaces=ns)
             curl = svc.findtext("u:controlURL", default="", namespaces=ns)
             if "AVTransport" in stype:
-                av = urllib.parse.urljoin(loc, curl) if curl else None
+                av = _pin_ctrl(loc, curl)
             elif "RenderingControl" in stype:
-                rc = urllib.parse.urljoin(loc, curl) if curl else None
+                rc = _pin_ctrl(loc, curl)
         if not av:
             return None
         return {"name": root.findtext(".//u:friendlyName", default="TV", namespaces=ns),

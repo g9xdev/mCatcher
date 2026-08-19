@@ -422,5 +422,167 @@ def test_control_without_a_live_session_touches_no_transport(monkeypatch):
     assert calls == ["dlna", "airplay", "airplay-run"], calls
 
 
+# ===========================================================================
+# The DLNA control endpoint belongs to the device that answered
+#
+# _dlna_describe pins the description FETCH to the SSDP responder, then resolved
+# <controlURL> with urljoin -- and urljoin against an ABSOLUTE url discards the
+# base. A hostile MediaRenderer (or an SSDP spoofer) that answered with
+# <controlURL>http://127.0.0.1:8080/…</controlURL> therefore got attacker-chosen
+# SOAP XML POSTed to a loopback service by a user-privileged process.
+# ===========================================================================
+
+def _description(av_ctrl, rc_ctrl):
+    return ('<?xml version="1.0"?>'
+            '<root xmlns="urn:schemas-upnp-org:device-1-0"><device>'
+            "<friendlyName>Living Room</friendlyName><modelName>X9</modelName>"
+            "<serviceList>"
+            "<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1"
+            "</serviceType><controlURL>%s</controlURL></service>"
+            "<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1"
+            "</serviceType><controlURL>%s</controlURL></service>"
+            "</serviceList></device></root>" % (av_ctrl, rc_ctrl))
+
+
+class _FakeResponse:
+    status = 200
+
+    def __init__(self, body):
+        self._body = body.encode("utf-8")
+
+    def read(self, *a):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _describe_serving(monkeypatch, xml):
+    """Point the description fetch at `xml` and record every SOAP POST."""
+    import urllib.request
+    posted = []
+
+    class _Opener:
+        def open(self, url, timeout=None):
+            return _FakeResponse(xml)
+
+    monkeypatch.setattr(legacy_mod, "_desc_opener", lambda: _Opener())
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, *a, **kw: posted.append(
+                            req if isinstance(req, str) else req.full_url) or _FakeResponse(""))
+    return posted
+
+
+DEV = "192.168.7.50"
+LOC = "http://192.168.7.50:1900/desc.xml"
+
+
+@pytest.mark.parametrize("hostile", [
+    "http://127.0.0.1:8080/evil",          # loopback service that trusts local callers
+    "http://169.254.169.254/latest/meta",  # cloud metadata
+    "https://attacker.example/collect",    # off-LAN entirely
+    "file:///C:/Windows/win.ini",          # not even http
+])
+def test_control_url_on_another_host_is_never_posted_to(monkeypatch, hostile):
+    posted = _describe_serving(monkeypatch, _description(hostile, hostile))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    # Whatever the describe decides, no endpoint it hands back may be POSTed to
+    # anywhere but the device that served the description.
+    for key in ("avCtrl", "rcCtrl"):
+        url = (d or {}).get(key)
+        if url:
+            legacy_mod._dlna_soap(url, "AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+    assert all(u.startswith("http://%s:" % DEV) for u in posted),         "SOAP was POSTed off the device that served the description: %r" % (posted,)
+
+
+def test_relative_and_same_host_control_urls_still_work(monkeypatch):
+    # The pin must not cost the normal case: relative paths (what nearly every
+    # renderer emits) and an absolute URL back at the same device.
+    _describe_serving(monkeypatch, _description(
+        "/upnp/control/AVTransport1", "http://192.168.7.50:1900/upnp/control/RC1"))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    assert d, "a well-formed description was rejected"
+    assert d["avCtrl"] == "http://192.168.7.50:1900/upnp/control/AVTransport1"
+    assert d["rcCtrl"] == "http://192.168.7.50:1900/upnp/control/RC1"
+
+
+def test_a_control_url_on_another_port_of_the_same_device_is_kept(monkeypatch):
+    # Deliberate: renderers do split description and control across ports, and
+    # once the HOST is pinned a different port is still the attacker's own box.
+    _describe_serving(monkeypatch, _description(
+        "http://192.168.7.50:49152/ctrl", "http://192.168.7.50:49152/rc"))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    assert d and d["avCtrl"] == "http://192.168.7.50:49152/ctrl"
+
+
+def test_a_hostile_rendering_control_url_does_not_take_the_device_out(monkeypatch):
+    # Only the offending endpoint is dropped: AVTransport is what casting needs.
+    _describe_serving(monkeypatch, _description(
+        "/upnp/control/AVTransport1", "http://127.0.0.1:8080/evil"))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    assert d, "a good AVTransport was thrown away with the bad RenderingControl"
+    assert d["rcCtrl"] is None, "the off-host RenderingControl survived"
+
+
+def _one_shot_server(handler_body):
+    """A real ThreadingHTTPServer on 127.0.0.1, stopped by the caller."""
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            handler_body(self)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_a_redirect_cannot_move_the_description_fetch_off_the_device():
+    """The host pin is checked on the URL we ASK for. urlopen follows a 302 to
+    anywhere, so without a no-redirect opener a device could answer its own
+    LOCATION with `302 -> http://<internal>/` and the fetch itself is the SSRF —
+    the GET has already happened by the time anything re-checks."""
+    hits = []
+
+    def victim(h):
+        hits.append(h.path)
+        body = b"<root/>"
+        h.send_response(200)
+        h.send_header("Content-Type", "text/xml")
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    vic = _one_shot_server(victim)
+    target = "http://localhost:%d/internal" % vic.server_address[1]
+
+    def redirector(h):
+        h.send_response(302)
+        h.send_header("Location", target)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    red = _one_shot_server(redirector)
+    try:
+        loc = "http://127.0.0.1:%d/desc.xml" % red.server_address[1]
+        out = legacy_mod._dlna_describe(loc, expect_host="127.0.0.1")
+        assert out is None, "a redirected description was accepted"
+        assert hits == [], "the description fetch followed a redirect to %r" % (hits,)
+    finally:
+        for s in (red, vic):
+            s.shutdown()
+            s.server_close()
+
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
