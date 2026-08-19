@@ -91,7 +91,7 @@ def _emit(msg):
 # HTTP; the control endpoint 500s while the TV switches apps (LG_TRANSITIONING),
 # so SetURI/Play retry.
 _DLNA = {"devices": {}, "ctrl": None, "rctrl": None, "poll": None,
-         "server": None, "port": 0, "media": {}}
+         "server": None, "thread": None, "port": 0, "media": {}}
 
 
 def _lan_ip(target="10.255.255.255"):
@@ -415,9 +415,64 @@ def _ensure_media_server_locked():
     srv = Srv(("0.0.0.0", 0), MediaHandler)
     _DLNA["server"] = srv
     _DLNA["port"] = srv.server_address[1]
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    # Started under _DLNA_SRV_LOCK, which _stop_media_server also takes: a
+    # teardown can therefore never reach a server whose serve_forever thread
+    # has not been started, and srv.shutdown() always has something to wait on.
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    _DLNA["thread"] = t
+    t.start()
     _h()._hlog("info", "cast: media server on :%d" % _DLNA["port"])
     return _DLNA["port"]
+
+
+def _close_media_server(srv):
+    try:
+        srv.shutdown()          # returns once serve_forever has left its loop
+    except Exception:
+        pass
+    try:
+        srv.server_close()      # drops the listening socket
+    except Exception:
+        pass
+
+
+def _stop_media_server():
+    """Stop the media server and forget every token it was serving.
+
+    The server binds 0.0.0.0, so until this runs the last cast file is
+    downloadable by anything on the LAN from http://<lan-ip>:<port>/m/<token>.
+    Neither stop() nor shutdown() used to do either half, so the file outlived
+    the session that justified serving it -- until the next cast, or process
+    exit.
+
+    The token map is cleared FIRST and under the lock, because that is the half
+    that matters: it is what makes a token stop resolving. Closing the socket is
+    the belt.
+
+    Three lifecycle details this has to respect:
+      - shutdown() waits for serve_forever to return, and DEADLOCKS if the
+        caller is the serving thread. The handler never calls this; the check
+        below makes that a fact rather than a promise.
+      - a request in flight does not hold it up: Srv is a ThreadingMixIn, so
+        serve_forever hands each request to its own thread and stays free to
+        notice the shutdown flag.
+      - server_close() does not join those threads either, because
+        daemon_threads is set. In-flight responses run on their own accepted
+        sockets and simply end.
+    """
+    with _DLNA_SRV_LOCK:
+        srv = _DLNA["server"]
+        thread = _DLNA.get("thread")
+        _DLNA["server"] = None
+        _DLNA["thread"] = None
+        _DLNA["port"] = 0
+        _DLNA["media"] = {}
+    if srv is None:
+        return
+    if thread is not None and thread is threading.current_thread():
+        threading.Thread(target=_close_media_server, args=(srv,), daemon=True).start()
+        return
+    _close_media_server(srv)
 
 
 def _dlna_media_url(source, device_ip=None):
@@ -435,8 +490,11 @@ def _dlna_media_url(source, device_ip=None):
         else {"path": source, "ctype": ctype}
     # A direct http:// URL could pass through, but proxying always works
     # (https, cookies, and CORS never reach the TV) — so always proxy.
-    # Keep the most recent old token alive: if this new cast fails, the previous
-    # session may still be streaming and must keep answering Range requests.
+    # Carry at most ONE old token forward, so a re-registration with no stop
+    # between it and the last one (a retry inside a single start) does not cut
+    # off a stream still being read. Ending a session clears the map outright --
+    # both an explicit stop and the dispatcher's stop-before-start go through
+    # _cast_stop_active -- so in the ordinary re-cast this keeps nothing.
     media = dict(list(_DLNA["media"].items())[-1:])
     media[token] = entry
     _DLNA["media"] = media
@@ -695,9 +753,25 @@ def _cast_loop():
 
 
 def _cast_run(coro, timeout=40):
-    """Submit a coroutine to the cast loop and block for its result (from a worker thread)."""
+    """Submit a coroutine to the cast loop and block for its result (from a worker
+    thread), CANCELLING it if the wait runs out.
+
+    result(timeout) only stops WAITING; it left the coroutine running on the cast
+    loop. A slow connect or pair_begin therefore reported failure to the popup and
+    then finished anyway -- arriving at a device the user had already been told was
+    unreachable, and writing into a _CAST the next attempt had moved on from.
+    run_coroutine_threadsafe chains a cancel of its concurrent future onto the
+    loop's task itself, so calling it from this thread is the supported route.
+    The TimeoutError is re-raised unchanged: the caller's error reporting is
+    exactly what it was."""
     import asyncio
-    return asyncio.run_coroutine_threadsafe(coro, _cast_loop()).result(timeout)
+    import concurrent.futures
+    fut = asyncio.run_coroutine_threadsafe(coro, _cast_loop())
+    try:
+        return fut.result(timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise
 
 
 async def _cast_storage():
@@ -1009,7 +1083,13 @@ def _cast_stop_poller():
 def _cast_stop_active():
     """Tear down whatever is currently casting (either protocol) before a new cast
     or an explicit stop. Without this, switching between an AirPlay TV and a DLNA TV
-    orphaned the previous session and left control/stop routed at the wrong one."""
+    orphaned the previous session and left control/stop routed at the wrong one.
+
+    Order matters: the RECEIVER is told to stop before the media server goes, so
+    it is never left reading a socket that died under it. The media server is
+    shared by both protocols, so it is torn down whichever one was live --
+    including when neither was, which is how a start that failed before it
+    committed a session still gets its token cleared."""
     _cast_stop_poller()
     if _CAST.get("kind") == "airplay":
         try:
@@ -1024,6 +1104,7 @@ def _cast_stop_active():
         _DLNA["ctrl"] = None
         _DLNA["rctrl"] = None
     _CAST["kind"] = None
+    _stop_media_server()
 
 
 class LegacyBackend(CastBackend):

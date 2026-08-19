@@ -896,6 +896,7 @@ from mchost.downloads import (find_ytdlp, find_node, find_deno, _POT_PORT,   # n
 from mchost.cast.legacy import (_DLNA, _lan_ip, _ssdp_discover, _dlna_describe,   # noqa: E402,F401
                                 _dlna_soap, _dlna_soap_retry, _ensure_media_server,
                                 _ensure_media_server_locked, _dlna_media_url,
+                                _stop_media_server, _close_media_server,
                                 _dlna_discover, _hms, _from_hms, _DLNA_STATE,
                                 _dlna_status, _dlna_start, _dlna_control,
                                 _dlna_start_poller)

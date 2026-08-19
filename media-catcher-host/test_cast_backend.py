@@ -584,5 +584,136 @@ def test_a_redirect_cannot_move_the_description_fetch_off_the_device():
 
 
 
+# ===========================================================================
+# Stop means the file stops being fetchable
+#
+# The cast media server binds 0.0.0.0 and hands out /m/<token>. stop() and
+# shutdown() tore down the SESSION but never the server and never _DLNA["media"],
+# so after the user pressed Stop the last cast file stayed downloadable from
+# every host on the LAN until the next cast or process exit.
+# ===========================================================================
+
+def _live_cast(monkeypatch, tmp_path, payload=b"cast me"):
+    """A running media server with one registered token. Returns (url, srv)."""
+    import urllib.request
+    monkeypatch.setattr(legacy_mod, "_DLNA",
+                        dict(legacy_mod._DLNA, server=None, port=0, media={},
+                             ctrl=None, rctrl=None))
+    monkeypatch.setattr(mc_host, "_DLNA", legacy_mod._DLNA)
+    monkeypatch.setattr(legacy_mod, "_lan_ip", lambda *a, **kw: "127.0.0.1")
+    monkeypatch.setattr(legacy_mod, "_CAST", {"kind": None, "poll": None})
+    monkeypatch.setattr(mc_host, "_CAST", legacy_mod._CAST)
+    # shutdown() opens with pair_cancel(); there is no pyatv loop here and no
+    # pairing to cancel, so the coroutine is closed rather than submitted.
+    def _no_cast_loop(coro, timeout=None):
+        try:
+            coro.close()
+        except Exception:
+            pass
+    monkeypatch.setattr(mc_host, "_cast_run", _no_cast_loop)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(payload)
+    url, _ct = legacy_mod._dlna_media_url(str(clip))
+    assert urllib.request.urlopen(url, timeout=5).read() == payload,         "the media server did not serve the file it was handed"
+    return url, legacy_mod._DLNA["server"]
+
+
+def _unreachable(url):
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(url, timeout=3).read()
+    except (urllib.error.URLError, ConnectionError, OSError):
+        return True
+    return False
+
+
+@pytest.mark.parametrize("teardown", ["stop", "shutdown"])
+def test_the_cast_file_is_not_fetchable_after_stop(monkeypatch, tmp_path, teardown):
+    url, srv = _live_cast(monkeypatch, tmp_path)
+    backend = _legacy_backend(monkeypatch, lambda m: None)
+    getattr(backend, teardown)()
+    assert legacy_mod._DLNA["media"] == {},         "the token map still resolves the last cast: %r" % (legacy_mod._DLNA["media"],)
+    assert legacy_mod._DLNA["server"] is None, "the media server was left registered"
+    assert _unreachable(url), "the cast file is still fetchable from the LAN after %s()" % teardown
+    srv.server_close()      # no-op if the teardown already closed it
+
+
+def test_stop_does_not_block_on_a_request_in_flight(monkeypatch, tmp_path):
+    """server.shutdown() waits for serve_forever to return. ThreadingMixIn hands
+    each request to its own thread so the accept loop is never the one blocked,
+    and daemon_threads keeps server_close from joining them — this pins both, so
+    a partially-read response cannot wedge Stop."""
+    import socket
+    url, srv = _live_cast(monkeypatch, tmp_path, payload=b"x" * (4 << 20))
+    host, port = "127.0.0.1", legacy_mod._DLNA["port"]
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        path = url.split("/m/")[-1]
+        crlf = chr(13) + chr(10)
+        sock.sendall(("GET /m/%s HTTP/1.1%sHost: x%s%s"
+                      % (path, crlf, crlf, crlf)).encode())
+        assert sock.recv(64), "the server never started answering"   # headers only
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (_legacy_backend(monkeypatch, lambda m: None).stop(),
+                            done.set()), daemon=True).start()
+        assert done.wait(20), "stop() did not return with a request in flight"
+    finally:
+        # Let the handler finish writing before the socket goes, so the test
+        # does not manufacture the broken pipe it is not about.
+        try:
+            sock.settimeout(5)
+            while sock.recv(65536):
+                pass
+        except Exception:
+            pass
+        sock.close()
+        srv.server_close()
+
+
+def test_a_second_cast_gets_a_working_server_again(monkeypatch, tmp_path):
+    # The teardown must not be one-way: casting again has to rebuild the server.
+    _live_cast(monkeypatch, tmp_path)
+    _legacy_backend(monkeypatch, lambda m: None).stop()
+    import urllib.request
+    clip = tmp_path / "next.mp4"
+    clip.write_bytes(b"second")
+    url, _ct = legacy_mod._dlna_media_url(str(clip))
+    try:
+        assert urllib.request.urlopen(url, timeout=5).read() == b"second",             "the media server did not come back for the next cast"
+    finally:
+        legacy_mod._stop_media_server()
+
+
+def test_cast_run_timeout_cancels_the_coroutine(monkeypatch):
+    """_cast_run returned the TimeoutError and left the coroutine running, so a
+    slow connect/pair_begin reported failure to the popup and then completed
+    anyway — pairing a device the user had been told was unreachable."""
+    import asyncio
+    import concurrent.futures
+    monkeypatch.setattr(legacy_mod, "_CAST", {"loop": None, "thread": None})
+    state = {}
+
+    async def slow():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        state["completed"] = True
+
+    try:
+        with pytest.raises(concurrent.futures.TimeoutError):
+            legacy_mod._cast_run(slow(), timeout=0.2)
+        assert wait_for(lambda: state.get("cancelled"), timeout=5),             "the timed-out coroutine was never cancelled: %r" % (state,)
+        assert not state.get("completed")
+    finally:
+        loop = legacy_mod._CAST.get("loop")
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
