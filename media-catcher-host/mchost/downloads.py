@@ -858,20 +858,34 @@ def handle_pick_folder(req):
 
 
 def handle_open(req):
-    """Open a saved file with the OS default application (notification click)."""
-    path = req.get("path")
-    if not path or not os.path.isfile(path):
-        _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
-        return
-    try:
-        if os.name == "nt":
-            os.startfile(path)               # noqa: default handler
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception as e:
-        _h().send({"type": "error", "error": "open failed: %s" % e})
+    """Open a saved file with the OS default application (notification click).
+
+    On a worker. os.startfile is ShellExecuteW and has no bound: with no handler
+    registered for the extension the shell puts up an Open With dialog and the
+    call sits there until the user answers it, which inline held the read loop
+    for exactly that long. The stat moves with it - a path on a dead network
+    share blocks that too.
+
+    Nothing here is shared with another handler - no JOBS, no _PGET, no sink
+    registry, no module state at all - so what the loop's ordering was carrying
+    is the position of the error frame in the stream, and that frame names its
+    own id.
+    """
+    def worker():
+        path = req.get("path")
+        if not path or not os.path.isfile(path):
+            _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(path)               # noqa: default handler
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            _h().send({"type": "error", "error": "open failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_reveal(req):
@@ -4815,7 +4829,58 @@ def _pget_register(jid, op):
         return True
 
 
+def _pget_kill_off_loop(proc, kill_children):
+    """Take a cancelled job's processes off the message loop.
+
+    _safe_kill shells out to taskkill /T with a 15s timeout, and kill_children
+    does that once per live child, so cancelling one wedged job can hold its
+    caller for tens of seconds. Inline, that caller is the read loop and every
+    command queued behind it waits too.
+
+    Only the KILLING moves. The decision - which op this cancel names, whether
+    the token allows it, and the cancel_requested flag itself - stays on the
+    loop, because that is the ordering the loop was really providing: see
+    _pget_cancel.
+    """
+    if not proc and not kill_children:
+        return
+
+    def worker():
+        if proc:
+            _safe_kill(proc)
+        if kill_children:
+            kill_children()      # in-process yt-dlp: take what IT spawned
+
+    t = threading.Thread(target=worker, daemon=True)
+    _CANCEL_KILLERS.append(t)
+    t.start()
+
+
+# Test seam: the kill threads above are daemons with no handle. Each is dropped
+# by the join helper; nothing here grows across the life of the helper.
+_CANCEL_KILLERS = []
+
+
+def _join_cancel_killers_for_test(timeout=15.0):
+    try:
+        for t in list(_CANCEL_KILLERS):
+            t.join(timeout)
+            assert not t.is_alive(), "a cancel kill outran the %ss join" % timeout
+    finally:
+        _CANCEL_KILLERS.clear()
+
+
 def _pget_cancel(req):
+    """Cancel a registered pget / yt-dlp job.
+
+    Runs on the message loop by design, and stays there for the DECISION. The
+    registry read is what the loop's serialisation was actually buying: a cancel
+    that looked the id up later could find a DIFFERENT operation, because
+    "cancel X" followed by "retry X" is an ordinary sequence and the retry
+    registers the same id. Resolving j here pins the cancel to the op the user
+    was looking at. The flag, the stop event and the lease wake are all cheap
+    and stay too; only the process kills move (_pget_kill_off_loop).
+    """
     j = _pget_registry_get(req.get("id"))
     if not j:
         return
@@ -4837,10 +4902,7 @@ def _pget_cancel(req):
         # Kill / wake outside the op lock (never hold it across process ops).
         if j.get("stop"):
             j["stop"].set()
-        if proc:
-            _safe_kill(proc)
-        if kill_children:
-            kill_children()      # in-process yt-dlp: take what IT spawned
+        _pget_kill_off_loop(proc, kill_children)
         cv = j.get("lease_cv")
         if cv is not None:
             with cv:
@@ -4850,13 +4912,10 @@ def _pget_cancel(req):
     j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
-    if j.get("proc"):
-        _safe_kill(j["proc"])    # yt-dlp exe job: kill the process
-    if j.get("kill_children"):
-        # In-process yt-dlp: no single proc, so cancel reaches the subprocesses
-        # IT spawned. Without this a cancel of a wedged row set a flag nothing
-        # would ever poll, leaking the worker exactly as a stall did.
-        j["kill_children"]()
+    # proc is the yt-dlp exe job's process; kill_children is the in-process
+    # path, which has no single proc and must reach what IT spawned - without
+    # that, a cancel of a wedged row set a flag nothing would ever poll.
+    _pget_kill_off_loop(j.get("proc"), j.get("kill_children"))
     cv = j.get("lease_cv")
     if cv is not None:
         # Wake zero-limit waiters so they can observe cancel without busy-spin.

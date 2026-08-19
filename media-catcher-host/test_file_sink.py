@@ -43,6 +43,18 @@ FORBIDDEN_KEYS = frozenset({
 SECRET_SENTINEL = "SECRET-COOKIE-SENTINEL-DO-NOT-ECHO"
 
 
+def commit_and_join(req):
+    """handle_file_commit dispatches its fsync + replace to a worker (an
+    unbounded operation must not sit on the read loop), so a test that asserts
+    on the committed file the moment the call returns is racing it. Every commit
+    below goes through here; the join is what keeps those assertions honest
+    rather than flaky."""
+    import mchost.filesink as fs
+
+    mc.handle_file_commit(req)
+    fs._join_commit_workers_for_test()
+
+
 @pytest.fixture(autouse=True)
 def _reset_file_sinks():
     """Clear live sink registry between tests when the module exists."""
@@ -149,7 +161,7 @@ def test_commit_atomically_promotes_part(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "j", "attemptToken": "a1", "seq": 0,
         "dataB64": _b64(data), "length": len(data),
     })
-    mc.handle_file_commit({"sinkId": sink, "jobId": "j", "attemptToken": "a1"})
+    commit_and_join({"sinkId": sink, "jobId": "j", "attemptToken": "a1"})
     committed = [m for m in sent if m.get("type") == "file-committed"]
     assert committed, sent
     assert committed[0]["sinkId"] == sink
@@ -194,7 +206,7 @@ def test_stale_attempt_token_cannot_commit(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "j3", "attemptToken": "gen-1", "seq": 0,
         "dataB64": _b64(b"abc"), "length": 3,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "j3", "attemptToken": "stale-gen",
     })
     assert not any(m.get("type") == "file-committed" for m in sent)
@@ -207,7 +219,7 @@ def test_stale_attempt_token_cannot_commit(tmp_path, monkeypatch):
     assert part.exists()
     before = part.read_bytes()
     n_before = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "j3", "attemptToken": "gen-1",
     })
     assert any(m.get("type") == "file-committed" for m in sent[n_before:])
@@ -375,7 +387,7 @@ def test_omitted_dir_uses_downloads(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "jd", "attemptToken": "a1", "seq": 0,
         "dataB64": _b64(data), "length": len(data),
     })
-    mc.handle_file_commit({"sinkId": sink, "jobId": "jd", "attemptToken": "a1"})
+    commit_and_join({"sinkId": sink, "jobId": "jd", "attemptToken": "a1"})
     assert (tmp_path / "dl.mp4").read_bytes() == data
 
 
@@ -400,7 +412,7 @@ def test_filename_preserved_exactly(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "j", "attemptToken": "a1", "seq": 0,
         "dataB64": _b64(data), "length": 1,
     })
-    mc.handle_file_commit({"sinkId": sink, "jobId": "j", "attemptToken": "a1"})
+    commit_and_join({"sinkId": sink, "jobId": "j", "attemptToken": "a1"})
     committed = [m for m in sent if m.get("type") == "file-committed"][0]
     assert committed["file"].endswith(name)
     assert (tmp_path / name).exists()
@@ -540,7 +552,7 @@ def test_out_of_order_and_duplicate_seq_rejected(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "joo", "attemptToken": "a1", "seq": 1,
         "dataB64": _b64(b"B"), "length": 1,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "joo", "attemptToken": "a1",
     })
     assert (tmp_path / "oo.mp4").read_bytes() == b"AB"
@@ -568,7 +580,7 @@ def test_filename_and_dir_mutation_after_open_rejected(tmp_path, monkeypatch):
     })
     assert part.stat().st_size == size0
     # Commit with mutated filename
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jm", "attemptToken": "a1",
         "requestedFilename": "hijack.mp4",
     })
@@ -578,7 +590,7 @@ def test_filename_and_dir_mutation_after_open_rejected(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "jm", "attemptToken": "a1", "seq": 0,
         "dataB64": _b64(b"A"), "length": 1,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jm", "attemptToken": "a1",
     })
     assert (tmp_path / "mut.mp4").read_bytes() == b"A"
@@ -699,7 +711,7 @@ def test_max_four_unacked_enforced_with_blocked_ack(tmp_path, monkeypatch):
     })
     assert any(m.get("type") == "file-chunk-ack" and m.get("seq") == 4 for m in sent)
 
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jw", "attemptToken": "a1",
     })
     body = (tmp_path / "win.mp4").read_bytes()
@@ -719,8 +731,8 @@ def test_duplicate_commit_single_success(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "jdc", "attemptToken": "a1", "seq": 0,
         "dataB64": _b64(b"data"), "length": 4,
     })
-    mc.handle_file_commit({"sinkId": sink, "jobId": "jdc", "attemptToken": "a1"})
-    mc.handle_file_commit({"sinkId": sink, "jobId": "jdc", "attemptToken": "a1"})
+    commit_and_join({"sinkId": sink, "jobId": "jdc", "attemptToken": "a1"})
+    commit_and_join({"sinkId": sink, "jobId": "jdc", "attemptToken": "a1"})
     committed = [m for m in sent if m.get("type") == "file-committed"]
     assert len(committed) == 1
     assert (tmp_path / "dc.mp4").read_bytes() == b"data"
@@ -768,7 +780,7 @@ def test_commit_vs_abort_race_one_success_no_partial(tmp_path, monkeypatch):
 
     def do_commit():
         barrier.wait()
-        mc.handle_file_commit({
+        commit_and_join({
             "sinkId": sink, "jobId": "jrace", "attemptToken": "a1",
         })
 
@@ -808,7 +820,7 @@ def test_late_chunk_after_commit_rejected(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "jlate", "attemptToken": "a1", "seq": 0,
         "dataB64": _b64(b"A"), "length": 1,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jlate", "attemptToken": "a1",
     })
     n = len(sent)
@@ -828,7 +840,7 @@ def test_unknown_sink_rejected(tmp_path, monkeypatch):
         "sinkId": "no-such-sink", "jobId": "j", "attemptToken": "a1",
         "seq": 0, "dataB64": _b64(b"x"), "length": 1,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": "no-such-sink", "jobId": "j", "attemptToken": "a1",
     })
     mc.handle_file_abort({
@@ -891,7 +903,7 @@ def test_write_failure_cleans_up_local_io_no_fallback(tmp_path, monkeypatch):
     assert not (tmp_path / "wf.mp4.part").exists()
     # Further ops rejected (terminal)
     n = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jwf", "attemptToken": "a1",
     })
     assert not any(m.get("type") == "file-committed" for m in sent[n:])
@@ -917,7 +929,7 @@ def test_replace_failure_cleans_up_local_io_no_fallback(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fs.os, "replace", bad_replace)
     n = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jrf", "attemptToken": "a1",
     })
     errs = [m for m in sent[n:] if m.get("type") == "file-error"]
@@ -972,7 +984,7 @@ def test_abort_remove_failure_no_false_success(tmp_path, monkeypatch):
     with fs._LOCK:
         assert sink not in fs._SINKS
     n2 = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jarm", "attemptToken": "a1",
     })
     mc.handle_file_abort({
@@ -1054,7 +1066,7 @@ def test_abort_close_failure_no_false_success(tmp_path, monkeypatch):
     assert not part.exists()
     assert s.handle is None
     n2 = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jac", "attemptToken": "a1",
     })
     assert not any(m.get("type") == "file-committed" for m in sent[n2:])
@@ -1087,7 +1099,7 @@ def test_commit_fsync_failure_no_false_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fs.os, "fsync", boom_fsync)
     n = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jfs", "attemptToken": "a1",
     })
 
@@ -1106,7 +1118,7 @@ def test_commit_fsync_failure_no_false_success(tmp_path, monkeypatch):
     with fs._LOCK:
         assert sink not in fs._SINKS
     n2 = len(sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jfs", "attemptToken": "a1",
     })
     assert not any(m.get("type") == "file-committed" for m in sent[n2:])
@@ -1161,7 +1173,7 @@ def test_emitted_frames_allowlisted_no_input_extras(tmp_path, monkeypatch):
         "cookie": SECRET_SENTINEL,
         "url": "https://evil.example/x",
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jpriv", "attemptToken": "a1",
         "secret": SECRET_SENTINEL,
     })
@@ -1183,7 +1195,7 @@ def test_multi_chunk_byte_count(tmp_path, monkeypatch):
             "sinkId": sink, "jobId": "jmc", "attemptToken": "a1",
             "seq": i, "dataB64": _b64(p), "length": len(p),
         })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jmc", "attemptToken": "a1",
     })
     body = b"".join(parts)
@@ -1206,7 +1218,7 @@ def test_job_mismatch_does_not_disturb_sink(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "jreal", "attemptToken": "tok",
         "seq": 0, "dataB64": _b64(b"Y"), "length": 1,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jreal", "attemptToken": "tok",
     })
     assert (tmp_path / "m.mp4").read_bytes() == b"Y"
@@ -1221,7 +1233,7 @@ def test_empty_chunk_allowed(tmp_path, monkeypatch):
         "dataB64": _b64(b""), "length": 0,
     })
     assert any(m.get("type") == "file-chunk-ack" and m.get("seq") == 0 for m in sent)
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jemp", "attemptToken": "a1",
     })
     assert (tmp_path / "e.mp4").read_bytes() == b""
@@ -1486,7 +1498,7 @@ def test_after_eof_cleanup_same_filename_reopens(tmp_path, monkeypatch):
         "sinkId": o2["sinkId"], "jobId": "j2", "attemptToken": "t2", "seq": 0,
         "dataB64": _b64(b"new"), "length": 3,
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": o2["sinkId"], "jobId": "j2", "attemptToken": "t2",
     })
     assert (tmp_path / "retry.mp4").read_bytes() == b"new"
@@ -1503,7 +1515,7 @@ def test_cleanup_never_deletes_committed_final(tmp_path, monkeypatch):
         "sinkId": sink, "jobId": "jc", "attemptToken": "t1", "seq": 0,
         "dataB64": _b64(data), "length": len(data),
     })
-    mc.handle_file_commit({
+    commit_and_join({
         "sinkId": sink, "jobId": "jc", "attemptToken": "t1",
     })
     final = tmp_path / "final.mp4"
