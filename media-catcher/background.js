@@ -41,6 +41,13 @@ let settings = Object.assign({}, DEFAULT_SETTINGS);
 let liveController = null;
 let liveControllerInitialized = false;
 
+// The controller's tick drives retry_backoff expiry and the detection finalizer's
+// deadlines. Nothing else calls it, so without this clock those states never expire.
+// MV2 persistent background page (manifest "persistent": true), so a plain interval
+// survives; guarded because not every test sandbox defines one.
+const LIVE_TICK_MS = 1000;
+let liveTickTimer = null;
+
 const settingsReady = api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
   // One-time migrations to newer defaults, each guarded by its own flag so a later
@@ -148,6 +155,15 @@ function initializeLiveController() {
       "policy: " + String(diagnostic && diagnostic.code || "unknown")
     ),
   });
+  if (liveTickTimer === null && typeof setInterval === "function") {
+    liveTickTimer = setInterval(() => {
+      try {
+        liveController.tick(Date.now());
+      } catch (err) {
+        mclog("warn", "tick: " + String((err && err.message) || err));
+      }
+    }, LIVE_TICK_MS);
+  }
   return liveController;
 }
 

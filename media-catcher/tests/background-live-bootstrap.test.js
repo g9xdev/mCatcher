@@ -65,6 +65,9 @@ function createHarness() {
   const handledNative = [];
   const helperDisconnects = [];
   const assemblerCreates = [];
+  const ticks = [];
+  const timers = [];
+  let tickError = null;
 
   const controller = {
     async handleNativeMessage(message) {
@@ -76,6 +79,10 @@ function createHarness() {
       return false;
     },
     helperDisconnected() { helperDisconnects.push(true); },
+    tick(nowMs) {
+      ticks.push(nowMs);
+      if (tickError) throw tickError;
+    },
   };
 
   const nativePort = {
@@ -173,8 +180,10 @@ function createHarness() {
     Reflect,
     Proxy,
     AbortController,
-    setTimeout() { return 1; },
+    setTimeout(fn, ms) { timers.push({ kind: "timeout", fn, ms }); return timers.length; },
     clearTimeout() {},
+    setInterval(fn, ms) { timers.push({ kind: "interval", fn, ms }); return timers.length; },
+    clearInterval() {},
     fetch() { throw new Error("unexpected fetch"); },
     crypto: {
       randomUUID() { return "00000000-0000-4000-8000-000000000001"; },
@@ -216,6 +225,9 @@ function createHarness() {
     handledNative,
     helperDisconnects,
     assemblerCreates,
+    ticks,
+    timers,
+    setTickError(err) { tickError = err; },
     // background.js declares its entry points at top level, so they land on the
     // vm global — the only way to drive one directly, since runtime.onMessage
     // is a no-op event here.
@@ -368,4 +380,27 @@ test("a second click on a downloading YouTube URL does not start a second yt-dlp
   await settle();
   assert.equal(ytdls().length, 1,
     "a second click on the same URL must not spawn a competing yt-dlp");
+});
+
+test("the live controller is driven by a clock", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const clock = h.timers.find((t) => t.kind === "interval" && t.ms === 1000);
+  assert.ok(clock, "expected a 1s interval driving the controller");
+
+  const before = h.ticks.length;
+  clock.fn();
+  assert.equal(h.ticks.length, before + 1);
+  assert.equal(typeof h.ticks[h.ticks.length - 1], "number");
+
+  // A throwing tick must not stop the clock, or every later expiry goes unobserved.
+  h.setTickError(new Error("boom"));
+  assert.doesNotThrow(() => clock.fn());
+  h.setTickError(null);
+  const afterThrow = h.ticks.length;
+  clock.fn();
+  assert.equal(h.ticks.length, afterThrow + 1);
 });
