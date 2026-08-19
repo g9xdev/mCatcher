@@ -295,8 +295,12 @@ test("controller owns recognized native frames while legacy pong and disconnect 
   h.nativeDisconnects.emit();
   await settle();
   assert.equal(h.helperDisconnects.length, 1);
-  // Two listeners, because the drop triggers one automatic re-dial and this
-  // harness hands back the SAME port object every connect, so its listeners
+  // The re-dial is now scheduled rather than immediate — drive it before
+  // checking listener count.
+  h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000).forEach((t) => t.fn());
+  await settle();
+  // Two listeners, because the drop's re-dial reconnects and this harness
+  // hands back the SAME port object every connect, so its listeners
   // accumulate. Real runtime.connectNative returns a fresh Port per call, so
   // nothing accumulates in production.
   assert.equal(h.nativeDisconnects.size, 2);
@@ -313,7 +317,7 @@ test("controller owns recognized native frames while legacy pong and disconnect 
 // reconnects — connectNative runs only at extension startup or on an explicit
 // re-check — so before this, one drop left the helper unusable for the rest of
 // the session while the UI reported "Helper not installed."
-test("a dropped helper port re-dials once instead of reporting it uninstalled", async () => {
+test("a dropped helper port re-dials instead of reporting it uninstalled", async () => {
   const h = createHarness();
   h.load();
   h.settingsLoad.resolve({ settings: {} });
@@ -326,15 +330,17 @@ test("a dropped helper port re-dials once instead of reporting it uninstalled", 
 
   h.nativeDisconnects.emit();
   await settle();
+  h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000).forEach((t) => t.fn());
+  await settle();
 
-  assert.equal(pings(), before + 1, "the drop must trigger exactly one re-dial");
+  assert.equal(pings(), before + 1, "the drop must trigger a re-dial");
   const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
   const last = statuses[statuses.length - 1];
   assert.notEqual(last.helper.error, "Helper not installed.",
     "a dropped port must not be reported as a missing install");
 });
 
-test("a re-dial that also drops settles instead of looping", async () => {
+test("a re-dial that also drops backs off instead of giving up", async () => {
   const h = createHarness();
   h.load();
   h.settingsLoad.resolve({ settings: {} });
@@ -343,17 +349,44 @@ test("a re-dial that also drops settles instead of looping", async () => {
   await settle();
 
   const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000);
+
   const before = pings();
-
-  h.nativeDisconnects.emit();   // drop -> one automatic re-dial
-  await settle();
-  h.nativeDisconnects.emit();   // the re-dial drops too -> must give up, not spin
+  h.nativeDisconnects.emit();
   await settle();
 
-  assert.equal(pings(), before + 1, "only one automatic re-dial per connected session");
-  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
-  assert.equal(statuses[statuses.length - 1].helper.state, "disconnected",
-    "a re-dial that also fails settles as disconnected");
+  const first = waits();
+  assert.equal(first.length, 1, "the drop must schedule one re-dial");
+  assert.equal(first[0].ms, 1000);
+  assert.equal(pings(), before, "the re-dial must be scheduled, not immediate");
+
+  first[0].fn();
+  await settle();
+  assert.equal(pings(), before + 1, "firing the timer re-dials");
+
+  h.nativeDisconnects.emit();
+  await settle();
+  const second = waits();
+  assert.equal(second.length, 2, "the second drop must schedule another re-dial");
+  assert.ok(second[1].ms > first[0].ms, "the second wait must be longer");
+});
+
+test("automatic re-dials are bounded rather than unbounded", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000);
+  for (let i = 0; i < 6; i += 1) {
+    h.nativeDisconnects.emit();
+    await settle();
+    waits().slice(-1).forEach((t) => t.fn());
+    await settle();
+  }
+  assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");
 });
 
 // Every YouTube click minted a fresh id and spawned another yt-dlp writing to

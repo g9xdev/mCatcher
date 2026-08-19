@@ -349,11 +349,16 @@ let nativeError = null;
 // update, so a dropped port is routine rather than proof it is uninstalled.
 // Nothing else reconnects — connectNative runs only at extension startup or on
 // an explicit re-check — so one drop used to disable the helper for the whole
-// session. Re-dial once per connected session: `handshook` gates that on having
-// actually reached a live helper, and `redialled` stops a helper that is truly
-// gone from spinning.
+// session. `handshook` gates automatic re-dial on having actually reached a
+// live helper. A single immediate re-dial covered a helper replaced by an
+// update, but not one that is slow to come back. A bounded backoff replaces
+// it: four growing waits, then stop — still bounded, so a helper that is
+// truly gone cannot spin. A pong or an explicit recheck-helper resets the
+// budget.
 let nativeHandshook = false;      // a pong has been seen on some connection
-let nativeRedialled = false;      // the one automatic re-dial is spent
+const HELPER_REDIAL_MS = [1000, 4000, 15000, 60000];
+let nativeRedialAttempt = 0;
+let nativeRedialTimer = null;
 
 function setNativeState(state, error) {
   nativeState = state;
@@ -435,6 +440,14 @@ function connectNative() {
     nativePort = api.runtime.connectNative(NATIVE_HOST);
     nativePort.onMessage.addListener(onNativeMessage);
     nativePort.onDisconnect.addListener(() => {
+      // A disconnect now schedules a re-dial instead of running one inline, so
+      // the listener that reconnects outlives the event that queued it — a
+      // second onDisconnect listener can be live when the next drop happens.
+      // Each real port fires this at most once, so the only way two listeners
+      // both see a drop is a stale one left over from a connection this drop
+      // already superseded; nativePort is only null while nothing is
+      // connected, so a stale listener finds it already cleared and no-ops.
+      if (!nativePort) return;
       const controller = liveController;
       if (controller) {
         Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
@@ -451,10 +464,15 @@ function connectNative() {
       }
       // No helper means no dialog will ever answer; settle every waiter now.
       failAllFolderPicks();
-      if (nativeHandshook && !nativeRedialled) {
-        nativeRedialled = true;
-        mclog("info", "native helper disconnected — reconnecting…");
-        connectNative();          // sets state to "connecting" and re-pings
+      if (nativeHandshook && nativeRedialAttempt < HELPER_REDIAL_MS.length) {
+        const wait = HELPER_REDIAL_MS[nativeRedialAttempt];
+        nativeRedialAttempt += 1;
+        mclog("info", "native helper disconnected — reconnecting in " + wait + "ms…");
+        if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);
+        nativeRedialTimer = setTimeout(() => {
+          nativeRedialTimer = null;
+          connectNative();        // sets state to "connecting" and re-pings
+        }, wait);
       } else {
         // Only claim it is missing when we never reached a live helper; a drop
         // after a good handshake is a disconnect, and saying otherwise sent
@@ -571,10 +589,18 @@ function onLegacyNativeMessage(msg) {
   }
   if (msg.type === "pong") {
     nativeInfo = msg;
-    // A live helper answered: remember that, and restore the re-dial budget so
-    // the NEXT drop also gets one automatic retry.
+    // A live helper answered: remember that, and restore the full re-dial
+    // budget so the NEXT drop backs off from scratch. A backoff timer can
+    // still be pending here if this pong arrived on a connection made outside
+    // that timer (e.g. a manual recheck-helper beat it to a live helper) —
+    // cancel it, since the wait it was counting down is now moot and letting
+    // it fire later would just be a stray, if harmless, no-op reconnect.
     nativeHandshook = true;
-    nativeRedialled = false;
+    nativeRedialAttempt = 0;
+    if (nativeRedialTimer !== null) {
+      clearTimeout(nativeRedialTimer);
+      nativeRedialTimer = null;
+    }
     setNativeState(msg.ffmpeg ? "ready" : "no-ffmpeg",
       msg.ffmpeg ? null : "Helper is installed but ffmpeg was not found.");
     dlog("native helper", msg.ffmpeg ? "ready (ffmpeg ok)" : "connected but ffmpeg missing", msg.ffmpegPath || "");
@@ -2870,6 +2896,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "helper-status") {
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "recheck-helper") {
+        nativeRedialAttempt = 0;
+        if (nativeRedialTimer !== null) { clearTimeout(nativeRedialTimer); nativeRedialTimer = null; }
         if (nativePort) { try { nativePort.postMessage({ cmd: "ping" }); } catch (e) {} }
         else connectNative();
         sendResponse({ ok: true, helper: helperStatus() });
