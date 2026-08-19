@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import uuid
 from ctypes import wintypes
@@ -50,6 +51,11 @@ class Job:
         self.bytes = 0
         self.seconds = 0.0
         self.partial = None          # last "save now" snapshot path, if any
+        # Set under JOBS_LOCK by handle_discard. A snapshot copy runs for
+        # minutes on a worker thread, so it can still be in flight when the user
+        # discards; this is what stops it publishing a checkpoint of a recording
+        # that no longer exists.
+        self.discarded = False
         self.finished = threading.Event()
 
 
@@ -160,6 +166,16 @@ def handle_stop(req):
             pass
 
 
+def _rm_quiet(path):
+    """Best-effort unlink. Used where a failure has no remedy worth reporting -
+    a leftover the next pass meets again anyway."""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def _copy_prefix(src, dst):
     """Copy the first os.path.getsize(src) bytes — a clean prefix even while the
     source keeps growing. Fragmented mp4 stays playable up to the last whole
@@ -209,6 +225,8 @@ def handle_snapshot(req):
         return
 
     def worker():
+        if job.discarded:
+            return          # already terminal: the discard frame ended the row
         if not os.path.isfile(job.temp) or os.path.getsize(job.temp) == 0:
             _h().send({"type": "error", "id": jid, "error": "nothing recorded yet"})
             return
@@ -220,10 +238,27 @@ def handle_snapshot(req):
             dest = os.path.join(d, base + " (partial).mp4")
             with _SNAPSHOT_LOCK:
                 _copy_prefix(job.temp, dest)  # overwrites the previous partial (latest is fullest)
-                job.partial = dest
-                # Sized under the lock: outside it, the next snapshot to this
-                # same dest could have truncated the file before the read.
-                written = os.path.getsize(dest)
+                # Publish or abandon, decided under JOBS_LOCK - the lock
+                # handle_discard sets the flag under, so these are the only two
+                # orderings there are. Lock order is _SNAPSHOT_LOCK then
+                # JOBS_LOCK; nothing takes them the other way round.
+                with JOBS_LOCK:
+                    live = not job.discarded
+                    if live:
+                        job.partial = dest
+                        # Sized here: outside the lock the next snapshot to this
+                        # same dest could truncate the file before the read.
+                        written = os.path.getsize(dest)
+                if not live:
+                    # Discarded mid-copy. Take the checkpoint back out of the
+                    # user's Downloads, and the temp with it: handle_discard's
+                    # own os.remove ran while _copy_prefix still held that file
+                    # open, which on Windows fails (CPython's read handle omits
+                    # FILE_SHARE_DELETE) and is swallowed there. Whoever is last
+                    # out removes it.
+                    _rm_quiet(dest)
+                    _rm_quiet(job.temp)
+                    return
             # Never across the pipe write, which can block.
             _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": written,
                        "seconds": round(job.seconds, 1)})
@@ -860,8 +895,18 @@ def handle_reveal(req):
 
 def handle_discard(req):
     jid = req.get("id")
+    partial = None
     with JOBS_LOCK:
         job = JOBS.pop(jid, None)
+        if job:
+            # Flag and read the checkpoint path under the SAME lock a snapshot
+            # worker commits under. That leaves exactly two orderings and no
+            # third: either the worker has already published job.partial and the
+            # unlink below takes it, or it has not and it will see this flag and
+            # clean up after itself. A checkpoint of a discarded recording
+            # cannot survive either way.
+            job.discarded = True
+            partial = job.partial
     if job:
         if job.proc and job.proc.poll() is None:
             try:
@@ -870,11 +915,11 @@ def handle_discard(req):
                 try: job.proc.terminate()
                 except Exception: pass
             job.finished.wait(timeout=10)
-        try:
-            if os.path.isfile(job.temp):
-                os.remove(job.temp)
-        except Exception:
-            pass
+        # temp can still be held open by a snapshot copy in flight, which on
+        # Windows makes this fail; the snapshot worker retries it when it sees
+        # the flag. partial is the checkpoint such a copy already published.
+        _rm_quiet(job.temp)
+        _rm_quiet(partial)
     _h().send({"type": "discarded", "id": jid})
 
 
@@ -1094,11 +1139,19 @@ def _fetch_ytdlp_dir_build():
                 continue
             members.append((name, rel))
         # The whole archive is already in memory, so no write here can fail for
-        # want of network. Write the exe FIRST anyway: it is the one member a
-        # running yt-dlp holds open by itself, so if the writability probe above
-        # was overtaken by a job starting, the violation lands before any of
-        # _internal has been touched. Nothing else can be holding _internal open
-        # without having run this exe.
+        # want of network. Write the exe FIRST anyway: it is the member a running
+        # yt-dlp holds open by itself, so if the writability probe above was
+        # overtaken by a JOB starting, the violation lands before any of
+        # _internal has been touched.
+        #
+        # That orders the common case and no more. A .pyd or DLL in _internal
+        # can also be held by something that never ran yt-dlp at all - an
+        # antivirus scanner, Search Indexer, an Explorer preview - and AV
+        # rescanning is the very premise this build choice rests on. There is no
+        # rollback: a member that fails partway leaves the tree mixed, and
+        # nothing here detects that (_has_internal only asks whether _internal
+        # is populated). The remedy is another update or an installer re-run,
+        # which re-fetches the whole archive.
         members.sort(key=lambda nr: nr[1].lower() != "yt-dlp.exe")
         for name, rel in members:
             out = os.path.join(here, *rel.split("/"))
@@ -4031,7 +4084,7 @@ def _handle_ytdl_legacy(req):
     def _run():
         try:
             worker()
-        except BaseException as e:
+        except BaseException:
             # A throw that escapes worker() reaches the default excepthook: a
             # traceback on a stderr nobody reads, and a row acknowledged as
             # "resolving" with nothing ever following it. worker()'s own handlers
@@ -4052,7 +4105,12 @@ def _handle_ytdl_legacy(req):
                 except Exception:
                     pass        # a dead pipe is not something to raise about here
             try:
-                _h()._hlog("error", "yt-dlp worker died: %r" % (e,), "ytdlp")
+                # format_exc, not repr: the excepthook this replaces printed a
+                # traceback, and "RuntimeError('x')" with no frames names the
+                # error without saying where a dead worker died. It costs
+                # nothing on a path that only runs when one has.
+                _h()._hlog("error", "yt-dlp worker died:\n%s"
+                           % traceback.format_exc(), "ytdlp")
             except Exception:
                 pass
         finally:

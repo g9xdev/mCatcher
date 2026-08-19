@@ -507,3 +507,82 @@ def test_two_snapshots_never_copy_at_the_same_time(tmp_path, monkeypatch):
         with d.JOBS_LOCK:
             d.JOBS.pop("j-a", None)
             d.JOBS.pop("j-b", None)
+
+
+def test_a_discard_during_a_snapshot_leaves_no_partial_and_sends_no_frame(
+        tmp_path, monkeypatch):
+    """Threading the snapshot let its copy overlap handle_discard, which still
+    runs inline on the loop — an overlap that was impossible before. The user
+    discarded the recording, so no checkpoint of it may survive in Downloads and
+    no snapshot frame may follow the discard."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-disc")
+    dest = tmp_path / "clip (partial).mp4"
+    temp = tmp_path / "j-disc.tmp"
+    sent = []
+    real_copy = d._copy_prefix
+
+    def copy_then_discard(src, dst):
+        real_copy(src, dst)                     # the checkpoint really is written
+        d.handle_discard({"id": "j-disc"})      # ...and discarded before it commits
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", copy_then_discard)
+    try:
+        d.handle_snapshot({"id": "j-disc", "dir": str(tmp_path)})
+        assert wait_for(lambda: any(m.get("type") == "discarded" for m in sent),
+                        timeout=5), sent
+        assert wait_for(lambda: not dest.exists(), timeout=5), (
+            "a discarded recording left its checkpoint in Downloads")
+        assert not any(m.get("type") == "snapshot" for m in sent), sent
+        assert not temp.exists(), "the discarded temp file leaked"
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-disc", None)
+
+
+def test_the_snapshot_worker_removes_the_temp_the_discard_could_not(
+        tmp_path, monkeypatch):
+    """handle_discard's os.remove(job.temp) fails while a snapshot copy holds
+    that file open — CPython's read handle omits FILE_SHARE_DELETE — and the bare
+    except swallows it, so a multi-GB temp leaked. Whoever is last out removes
+    it. The sharing violation is simulated rather than provoked, so the test does
+    not turn on handle timing."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-held")
+    dest = tmp_path / "clip (partial).mp4"
+    temp = tmp_path / "j-held.tmp"
+    sent = []
+    real_copy = d._copy_prefix
+    real_remove = os.remove
+    denied = {"n": 0}
+
+    def flaky_remove(path):
+        if (os.path.normcase(str(path)) == os.path.normcase(str(temp))
+                and denied["n"] == 0):
+            denied["n"] = 1
+            raise PermissionError(32, "used by another process")
+        real_remove(path)
+
+    def copy_then_discard(src, dst):
+        real_copy(src, dst)
+        monkeypatch.setattr(os, "remove", flaky_remove)
+        d.handle_discard({"id": "j-held"})
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", copy_then_discard)
+    try:
+        d.handle_snapshot({"id": "j-held", "dir": str(tmp_path)})
+        assert wait_for(lambda: denied["n"] == 1, timeout=5), (
+            "the discard never reached its os.remove")
+        assert wait_for(lambda: not temp.exists(), timeout=5), (
+            "the temp the discard could not remove was never cleaned up")
+        assert not dest.exists(), "a discarded recording left its checkpoint behind"
+        assert not any(m.get("type") == "snapshot" for m in sent), sent
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-held", None)
