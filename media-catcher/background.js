@@ -52,9 +52,9 @@ let liveTickTimer = null;
 // ping/pong happened once at connect and never again. Keep asking.
 const HELPER_PING_MS = 30000;
 let helperPingTimer = null;
-// Sending was never the hard part. See helperHeartbeat for why four misses,
-// and why an unanswered beat means the host's message loop is blocked rather
-// than that the helper is busy.
+// Sending was never the hard part: an unanswered beat is what says the helper
+// has stopped being usable. Crossing this many makes the pill say so — see
+// helperHeartbeat for why it reports rather than disconnects.
 const HELPER_MISSED_BEATS_MAX = 4;
 let helperMissedBeats = 0;      // pings sent since the last pong
 
@@ -514,11 +514,16 @@ function connectNative() {
   }
 }
 
-// Tear one native port down. The single cleanup-and-re-dial path, reached both
-// by the port's own onDisconnect and by the heartbeat when the helper stops
-// answering — a wedged helper must be cleaned up and re-dialled exactly the way
-// a dropped one is, not by a second hand-rolled teardown. `err` is the reason
-// to report.
+// Tear one native port down: the single cleanup-and-re-dial path, reached by
+// the port's own onDisconnect. `err` is the reason to report.
+//
+// Nothing else calls this, and in particular the heartbeat does not: EOF is
+// destructive at the host end. Its read loop runs cleanup_file_sinks() in a
+// finally, which removes every live sink's .part file, and it has no handle on
+// the yt-dlp/ffmpeg/deno children it spawned, so they are orphaned still
+// writing. Before automatic re-dial existed, EOF only ever arrived because the
+// browser had gone away and the user was done; a helper that is merely slow
+// must not be handed the same ending. See helperHeartbeat.
 //
 // A disconnect schedules a re-dial instead of running one inline, so the
 // listener that reconnects outlives the event that queued it — a newer
@@ -579,36 +584,44 @@ function dropNativePort(port, err) {
 
 // One heartbeat beat. A host that wedges with the pipe still open answers
 // nothing, and with no missed-beat counter the pill stayed green and
-// nativeReady true while every job posted into it was swallowed forever. The
-// host answers ping from its own message loop and dispatches every long
-// command — ytdl, pget, record, probe, folder pick, snapshot — to a worker
-// thread. The only inline wait left is discard's bounded 10s for ffmpeg to
-// finalize, comfortably inside one beat. So an unanswered beat means that
-// loop itself is blocked, not that the helper is busy. Four consecutive
-// misses is deliberately generous — a false teardown of a working helper is
-// worse than slow detection — and puts detection at about two and a half
-// minutes, by which point the oldest unanswered ping is two full beats older
-// still.
+// nativeReady true while every job posted into it was swallowed forever — the
+// UI claimed a helper that was silently eating work.
+//
+// What an unanswered beat proves is exactly that: no answer. The host handles
+// ping inline in its read loop and hands the long commands to worker threads,
+// but some handlers still run on that loop and can outlast several beats on
+// slow or antivirus-scanned storage — file-commit fsyncs and replaces a
+// finished multi-GB file, pget-cancel waits up to 15s per process it kills,
+// and open hands the path to the shell. So silence means "not usable right
+// now", not "dead", and the response is to SAY so, never to disconnect: EOF
+// makes the host delete every live sink's .part and orphan its children (see
+// dropNativePort), which would turn a slow helper into lost downloads.
+//
+// Reporting is cheap and reversible, so the threshold can be modest: the
+// fourth consecutive ping with no answer — about two minutes of silence — is
+// enough to stop calling the helper ready, and the pill goes back to green by
+// itself the moment a pong arrives (see the pong handler). The beats keep
+// going out afterwards, because a pong is only ever an answer to one.
 function helperHeartbeat() {
   const port = nativePort;
   if (!port) return;
-  if (helperMissedBeats >= HELPER_MISSED_BEATS_MAX) {
-    mclog("warn", "native helper missed " + helperMissedBeats +
-      " heartbeats — dropping the connection");
-    // Kill the pipe first: a wedged host left running would otherwise still
-    // hold its output paths when the re-dial starts a second one.
-    try {
-      if (typeof port.disconnect === "function") port.disconnect();
-    } catch (e) {
-      dlog("native disconnect failed", e.message || e);
-    }
-    // Settle through the ordinary disconnect path so cleanup, the pill and
-    // the bounded re-dial behave exactly as they do for a real drop.
-    dropNativePort(port, nativeHandshakeApplied
-      ? "Helper stopped answering." : "Helper never answered.");
-    return;
-  }
   helperMissedBeats += 1;
+  if (helperMissedBeats === HELPER_MISSED_BEATS_MAX) {
+    // Once per silent stretch, not once per beat: this writes to the persisted
+    // log ring and broadcasts to every open surface.
+    mclog("warn", "native helper has not answered " + helperMissedBeats +
+      " pings — reporting it unusable, connection left open");
+    // "connecting" is the existing state for a port that is live but not usable
+    // yet and may become usable without the user doing anything — which is
+    // exactly this. It makes nativeReady false, so no new job is posted into a
+    // helper that is not answering, and both the popup badge and the options
+    // row already have copy for it. "disconnected" would be a lie that offers
+    // to reinstall a helper that is running, and "no-ffmpeg" still counts as
+    // usable.
+    setNativeState("connecting", nativeHandshakeApplied
+      ? "Helper has stopped answering — still connected, waiting for it."
+      : "Helper has not answered yet — still connected, waiting for it.");
+  }
   try {
     port.postMessage({ cmd: "ping" });
   } catch (err) {
@@ -725,7 +738,10 @@ function onLegacyNativeMessage(msg) {
     // cancel it, since the wait it was counting down is now moot and letting
     // it fire later would just be a stray, if harmless, no-op reconnect.
     nativeHandshook = true;
-    // An answered beat is never a missed one, however many have gone by.
+    // An answered beat is never a missed one, however many have gone by. This
+    // is also the whole recovery path for a helper the heartbeat has reported
+    // unusable: the setNativeState below runs on every pong, so a late answer
+    // puts the pill back to green with nothing asked of the user.
     helperMissedBeats = 0;
     if (Date.now() - nativePortSince >= HELPER_REDIAL_RESET_MS) nativeRedialAttempt = 0;
     if (nativeRedialTimer !== null) {
