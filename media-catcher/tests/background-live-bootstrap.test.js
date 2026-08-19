@@ -404,3 +404,20 @@ test("the live controller is driven by a clock", async () => {
   clock.fn();
   assert.equal(h.ticks.length, afterThrow + 1);
 });
+
+test("a connected helper keeps being pinged, not only at connect", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
+  const before = pings();
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  beat.fn();
+  assert.equal(pings(), before + 1, "the heartbeat must ping a connected helper");
+});

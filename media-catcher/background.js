@@ -48,6 +48,11 @@ let liveControllerInitialized = false;
 const LIVE_TICK_MS = 1000;
 let liveTickTimer = null;
 
+// A helper that is alive but silent looks exactly like a healthy slow one:
+// ping/pong happened once at connect and never again. Keep asking.
+const HELPER_PING_MS = 30000;
+let helperPingTimer = null;
+
 const settingsReady = api.storage.local.get(["settings", "pd4done", "dq1done"]).then((r) => {
   if (r && r.settings) settings = Object.assign({}, DEFAULT_SETTINGS, r.settings);
   // One-time migrations to newer defaults, each guarded by its own flag so a later
@@ -440,6 +445,10 @@ function connectNative() {
       dlog("native host disconnected", err || "");
       mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
       nativePort = null; nativeInfo = null;
+      if (helperPingTimer !== null) {
+        clearInterval(helperPingTimer);
+        helperPingTimer = null;
+      }
       // No helper means no dialog will ever answer; settle every waiter now.
       failAllFolderPicks();
       if (nativeHandshook && !nativeRedialled) {
@@ -575,6 +584,16 @@ function onLegacyNativeMessage(msg) {
         extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
       nativePort.postMessage({ cmd: "checkGithub", auto: true, extVersion: api.runtime.getManifest().version,
         extDir: settings.updateExtDir || "", zipDir: settings.updateZipDir || "" });
+    }
+    if (helperPingTimer === null && typeof setInterval === "function") {
+      helperPingTimer = setInterval(() => {
+        if (!nativePort) return;
+        try {
+          nativePort.postMessage({ cmd: "ping" });
+        } catch (err) {
+          mclog("warn", "heartbeat: " + String((err && err.message) || err));
+        }
+      }, HELPER_PING_MS);
     }
     return;
   }
