@@ -54,6 +54,14 @@ import sys, os, json, struct, subprocess, threading, tempfile, shutil, time, re
 
 VERSION = "1.10.0"
 
+# ---- the extension/host boundary ----------------------------------------
+# The schema every message is checked against before main() dispatches it, and
+# the allowlist that decides what open/reveal may hand to the shell. Imported
+# as a module (not name-by-name) so the table stays one object shared with the
+# invariant test in test_host.py — two copies would drift.
+from mchost import guard   # noqa: E402,F401
+
+
 # ---- stdio framing: moved to mchost/nm.py (Task C1) ----------------------
 # The IN/OUT globals stay OWNED by nm (init_io rebinds them there; a shim copy
 # would go stale), so only the functions are re-exported here.
@@ -933,6 +941,24 @@ def main():
                 break
             if msg is None:
                 break
+            # The schema gate — everything below this point may assume the
+            # message is an object, that its cmd is one this loop dispatches,
+            # and that every field the handler reads is of the type it expects.
+            # It may NOT assume any of those values is safe: a str is still an
+            # attacker's str (see mchost/guard.py's own note on what this buys).
+            #
+            # Above the try on purpose: `msg.get("cmd")` was here, outside it,
+            # so a frame carrying a JSON array raised AttributeError straight
+            # out of the while loop and killed the host — every live recording
+            # with it. Refusals are frames, never drops and never throws.
+            refusal = guard.validate_message(msg)
+            if refusal:
+                try:
+                    send({"type": "error", "id": guard.message_id(msg),
+                          "error": refusal})
+                except Exception:
+                    pass
+                continue
             cmd = msg.get("cmd")
             try:
                 if cmd == "ping":
