@@ -2655,6 +2655,63 @@
         return Promise.reject(err);
       }
 
+      /**
+       * Undo the singleStartedAttempts guard for one switched attempt and hand
+       * its slot back to the scheduler - releaseDirectAttempt's counterpart for
+       * the range->single switch path. Without it a start that dies before the
+       * wire leaves the key set forever, which blocks any re-post of that
+       * attempt, and leaves the job `running`, holding its global concurrency
+       * slot for the rest of the session.
+       */
+      function releaseSwitchedAttempt(activeScheduler, jobId, key) {
+        singleStartedAttempts.delete(key);
+        activeScheduler.onTransportUnavailable(jobId);
+      }
+
+      /**
+       * Build and post the single-connection attempt a capability switch just
+       * authorized. Covers the whole span the singleStartedAttempts key guards:
+       * the lease lookup and the payload build can fail exactly as capably as
+       * the post, and neither of those ever reaches the helper either. The key
+       * is added BEFORE this call on purpose - it is the re-entrancy guard that
+       * keeps a duplicate range_unsupported result from posting twice - so a
+       * start that never reaches the wire has to undo it here and hand the slot
+       * back, the way pump's direct branch already does.
+       * Error identity is preserved in both directions: handlePgetResult
+       * documents that a startSingleConnection throw propagates, so a
+       * synchronous failure rethrows the original error rather than turning it
+       * into a rejection, and a rejected effect stays a rejection of that same
+       * error for the switchEffects await to surface.
+       */
+      function postSwitchedAttempt(activeScheduler, job, binding, key) {
+        function failSwitchedStart(err) {
+          releaseSwitchedAttempt(activeScheduler, job.id, key);
+          throw err;
+        }
+        var effect;
+        try {
+          var lease = activeScheduler.nativeLeaseFor(job.id);
+          var input = {
+            kind: "pget-single",
+            jobId: job.id,
+            attemptToken: job.attemptToken,
+            intent: binding.intent,
+            url: binding.url,
+            providerGeneration: lease.providerGeneration,
+          };
+          if (binding.mirrors !== undefined) input.mirrors = binding.mirrors;
+          if (binding.referer !== undefined) input.referer = binding.referer;
+          if (binding.userAgent !== undefined) input.userAgent = binding.userAgent;
+          if (binding.effectiveDir !== undefined) {
+            input.effectiveDestinationDirectory = binding.effectiveDir;
+          }
+          effect = postNative(getMessageRouter().buildNativeStartPayload(input));
+        } catch (errSync) {
+          failSwitchedStart(errSync);
+        }
+        return Promise.resolve(effect).catch(failSwitchedStart);
+      }
+
       function enqueueDownload(message, sender) {
         return Promise.resolve().then(function () {
           requirePopupSender(sender);
@@ -2898,14 +2955,8 @@
             var binding = jobBindings.get(job.id);
             if (!binding) return;
             singleStartedAttempts.add(key);
-            var lease = getScheduler().nativeLeaseFor(job.id);
-            var input = { kind: "pget-single", jobId: job.id, attemptToken: job.attemptToken, intent: binding.intent, url: binding.url, providerGeneration: lease.providerGeneration };
-            if (binding.mirrors !== undefined) input.mirrors = binding.mirrors;
-            if (binding.referer !== undefined) input.referer = binding.referer;
-            if (binding.userAgent !== undefined) input.userAgent = binding.userAgent;
-            if (binding.effectiveDir !== undefined) input.effectiveDestinationDirectory = binding.effectiveDir;
-            var effect = postNative(getMessageRouter().buildNativeStartPayload(input));
-            switchEffects.push(Promise.resolve(effect));
+            var effect = postSwitchedAttempt(getScheduler(), job, binding, key);
+            switchEffects.push(effect);
             return effect;
           };
           try {

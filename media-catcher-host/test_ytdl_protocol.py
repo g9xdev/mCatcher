@@ -4702,20 +4702,220 @@ def test_ensure_ytdlp_refetches_when_the_local_exe_is_a_onefile(tmp_path, monkey
     assert fetched["n"] == 1
 
 
-def test_ensure_ytdlp_accepts_a_directory_build_without_refetching(tmp_path, monkeypatch):
-    import mchost.downloads as d
+def _ensure_ytdlp_fetch_attempts(d, monkeypatch, root, internal):
+    """Run ensure_ytdlp against one install and count its fetch attempts.
 
-    exe = tmp_path / "yt-dlp.exe"
-    exe.write_bytes(b"MZ dirbuild")
-    (tmp_path / "_internal").mkdir()
+    The exe bytes are IDENTICAL in every arm — the real builds ship the same
+    filename and the same MZ header, and on disk they differ only in the tree
+    beside them. internal is None for no _internal at all, or a list of
+    (name, bytes) members to put in one.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    exe = root / "yt-dlp.exe"
+    exe.write_bytes(b"MZ\x90\x00\x03 the header both builds carry")
+    if internal is not None:
+        (root / "_internal").mkdir()
+        for name, blob in internal:
+            (root / "_internal" / name).write_bytes(blob)
+    monkeypatch.setattr(mc, "HERE", str(root))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
     monkeypatch.setattr(d, "YTDLP", str(exe), raising=False)
     monkeypatch.setattr(d, "_YTDLP_REFETCHED", False, raising=False)
+    seen = {"n": 0}
+
+    def fake_urlopen(*a, **k):
+        seen["n"] += 1
+        # Fail the fetch so every arm ends on the same on-disk state: what is
+        # being measured is the DECISION, not the download.
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert d.ensure_ytdlp() == str(exe), "a failed fetch must keep the existing exe"
+    return seen["n"]
+
+
+def test_ensure_ytdlp_tells_the_two_builds_apart_by_the_internal_tree(tmp_path,
+                                                                      monkeypatch):
+    """Both arms carry byte-identical exes, so this cannot be satisfied by
+    anything that inspects the exe, and it fails if the arms are swapped — the
+    previous version asserted only the accepting arm and would have passed with
+    the onefile bug fully reintroduced."""
+    import mchost.downloads as d
+
+    directory_build = _ensure_ytdlp_fetch_attempts(
+        d, monkeypatch, tmp_path / "dirbuild",
+        [("base_library.zip", b"LIB"), ("python313.dll", b"DLL")])
+    onefile = _ensure_ytdlp_fetch_attempts(
+        d, monkeypatch, tmp_path / "onefile", None)
+
+    assert directory_build == 0, "a good directory build must not be re-fetched"
+    assert onefile == 1, \
+        "a onefile must be replaced: it is the build that stalled ~90s in DLL load"
+
+
+def test_an_empty_internal_beside_the_exe_is_not_a_directory_build(tmp_path,
+                                                                   monkeypatch):
+    """An _internal with nothing in it is a real on-disk state (an interrupted
+    install, an AV quarantine) and it is never a working one: a directory build
+    cannot start without base_library.zip and its python DLL, and a onefile with
+    a stray empty _internal is still the onefile. Both readings make accepting it
+    wrong, and being wrong the other way costs one re-fetch per process that
+    keeps the existing exe when it fails."""
+    import mchost.downloads as d
+
+    assert _ensure_ytdlp_fetch_attempts(d, monkeypatch, tmp_path / "hollow", []) == 1
+
+
+# ---------------------------------------------------------------------------
+# Updating the DIRECTORY build
+#
+# yt-dlp's own shipped README lists the artifact we install, yt-dlp_win.zip, as
+# "Unpackaged Windows (Win8+) x64 executable (no auto-update)". `-U` against it
+# cannot replace anything. An install with no python.exe beside pythonw.exe gets
+# no in-process library either, so the re-fetch below is its ONLY way to keep up
+# with YouTube — and keeping up is the whole reason the update exists.
+# ---------------------------------------------------------------------------
+
+def _ytdlp_release_zip(exe_bytes=b"MZ fresh dirbuild"):
+    """The official yt-dlp_win.zip layout, in miniature."""
+    import io as _io
+    import zipfile as _zip
+
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as z:
+        z.writestr("_internal/base_library.zip", b"NEW-LIB")
+        z.writestr("yt-dlp.exe", exe_bytes)
+    return buf.getvalue()
+
+
+def _exe_only_install(d, tmp_path, monkeypatch, internal=True):
+    """An exe-only install: no in-process library, yt-dlp.exe resolved in HERE.
+    Returns the exe path. With internal=False it is a onefile instead."""
+    from mchost import ytdlp_lib
+
+    exe = tmp_path / "yt-dlp.exe"
+    exe.write_bytes(b"MZ stale build")
+    if internal:
+        (tmp_path / "_internal").mkdir()
+        (tmp_path / "_internal" / "base_library.zip").write_bytes(b"OLD-LIB")
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "YTDLP", str(exe), raising=False)
+    monkeypatch.setattr(d, "_YTDLP_REFETCHED", False, raising=False)
+    monkeypatch.setattr(d, "_ytdlp_version", lambda: "2026.08.19")
+    # No python.exe beside pythonw.exe means no vendored library — the install
+    # this fallback exists for.
+    monkeypatch.setattr(ytdlp_lib, "available", lambda *a, **k: False)
+    return exe
+
+
+def _record_urlopen(monkeypatch, payload):
+    import io as _io
+    import urllib.request
+
+    asked = {}
+
+    def fake_urlopen(req, timeout=None):
+        asked["url"] = getattr(req, "full_url", str(req))
+        asked["n"] = asked.get("n", 0) + 1
+        return _io.BytesIO(payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return asked
+
+
+def test_ytdlp_update_refetches_the_directory_build_it_cannot_self_update(tmp_path,
+                                                                          monkeypatch):
+    """`-U` on the directory build is a no-op that reports success, so an
+    exe-only install silently rotted as YouTube changed. Re-fetch the release."""
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch)
+    asked = _record_urlopen(monkeypatch, _ytdlp_release_zip())
+
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: ran.append(cmd))
+
+    d.ytdlp_update()
+
+    assert not ran, "the directory build has no self-updater to invoke: %r" % (ran,)
+    assert asked.get("url", "").endswith("yt-dlp_win.zip"), asked
+    assert exe.read_bytes() == b"MZ fresh dirbuild", "the exe was not replaced"
+    assert (tmp_path / "_internal" / "base_library.zip").read_bytes() == b"NEW-LIB", \
+        "_internal must move with the exe or the pair is a version mismatch"
+
+
+def test_ytdlp_update_still_self_updates_a_genuine_onefile(tmp_path, monkeypatch):
+    """The onefile DOES carry an updater. Nothing here should start downloading
+    release archives over an install that can update itself in place."""
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch, internal=False)
 
     def boom(*a, **k):
-        raise AssertionError("must not fetch when the directory build is present")
+        raise AssertionError("a onefile updates itself; must not re-fetch")
 
     monkeypatch.setattr("urllib.request.urlopen", boom)
-    assert d.ensure_ytdlp() == str(exe)
+
+    ran = []
+
+    class _R:
+        stdout = b"yt-dlp is up to date"
+
+    def fake_run(cmd, *a, **k):
+        ran.append(cmd)
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    d.ytdlp_update()
+
+    assert ran == [[str(exe), "-U"]], ran
+
+
+def test_a_requested_ytdlp_update_ignores_the_once_per_process_fetch_guard(tmp_path,
+                                                                           monkeypatch):
+    """_YTDLP_REFETCHED stops a failing network re-downloading on every JOB. An
+    explicit update request is not a job, and refusing it would leave the user's
+    only remedy dead for the life of the helper."""
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "_YTDLP_REFETCHED", True, raising=False)
+    asked = _record_urlopen(monkeypatch, _ytdlp_release_zip())
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not run -U")))
+
+    d.ytdlp_update()
+
+    assert asked.get("n") == 1, "the guard swallowed a user-initiated update"
+    assert exe.read_bytes() == b"MZ fresh dirbuild"
+
+
+def test_an_unwritable_ytdlp_exe_leaves_the_whole_install_untouched(tmp_path,
+                                                                    monkeypatch):
+    """A RUNNING yt-dlp.exe is opened FILE_SHARE_READ|DELETE, so replacing it
+    while a download is in flight is a sharing violation. Detect that BEFORE
+    unpacking: a violation landing partway through leaves a fresh _internal
+    beside the old exe, which is a mismatched pair, not an install."""
+    import stat as _stat
+
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch)
+    asked = _record_urlopen(monkeypatch, _ytdlp_release_zip())
+    os.chmod(str(exe), _stat.S_IREAD)
+    try:
+        assert d.ytdlp_update() is None
+        assert asked.get("n") is None, "nothing should be downloaded to be discarded"
+        assert exe.read_bytes() == b"MZ stale build"
+        assert (tmp_path / "_internal" / "base_library.zip").read_bytes() == b"OLD-LIB", \
+            "_internal was overwritten beside an exe that could not be replaced"
+    finally:
+        os.chmod(str(exe), _stat.S_IWRITE | _stat.S_IREAD)
 
 
 def test_youtube_job_is_acknowledged_before_the_slow_preflight(tmp_path, monkeypatch):
@@ -4946,6 +5146,67 @@ def test_a_terminal_frame_is_claimed_once_when_the_watchdog_wakes_mid_send(tmp_p
     assert terminal[0]["reason"] == "cancelled"
 
 
+def test_the_watchdog_loses_the_claim_to_bytes_starting_in_its_check_then_claim_gap(
+        tmp_path, monkeypatch):
+    """Killing a download that has just started transferring is the cardinal risk
+    of this whole mechanism. The watchdog tests `progressing` at the top of its
+    loop, so bytes arriving after that test would be killed by a deadline they
+    had already beaten; the claim re-reads the event under its own lock, which is
+    the only place the two can be ordered.
+
+    Nothing else in the suite names that re-read: dropping unless_progressing
+    from the watchdog's claim leaves every other test green. This is the one that
+    goes red."""
+    import mchost.downloads as d
+
+    out = tmp_path / "v.mp4"
+    out.write_bytes(b"x" * 11)
+    sent = []
+    captured = {}
+    in_the_gap = threading.Event()
+    bytes_flowing = threading.Event()
+
+    class ExpireInsideTheGap:
+        """Stands in for the 90s deadline. It is read as
+        `idle < _YTDL_RESOLVE_STALL`, which lands here as __gt__ — the last thing
+        the watchdog evaluates before it claims. Starting the transfer from
+        inside it puts the bytes exactly in the window under test, with no sleep
+        anywhere that could lose the race by accident."""
+
+        def __gt__(self, idle):
+            in_the_gap.set()
+            assert bytes_flowing.wait(5), "the download never reported progress"
+            return False                # ...and the deadline has expired
+
+        def __str__(self):
+            return "0"
+
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", ExpireInsideTheGap())
+    _capture_lib_op(d, monkeypatch, captured)
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        assert in_the_gap.wait(5), "the watchdog never reached its claim"
+        on_progress({"stage": "downloading", "pct": 1.0, "total": 11})
+        bytes_flowing.set()
+        # Stay inside the transfer while the watchdog decides, so what the
+        # assertions below measure is that decision and not a race with this
+        # unwind reaching the wire first.
+        assert not threading.Event().wait(0.5)
+        return str(out)
+
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: FakeYtdlLib(fake_download))
+    d._ytdl_download_via_lib("j-gap", "https://youtu.be/x", "b", str(out), None, False)
+
+    assert not captured["op"]["cancel_requested"], \
+        "a download that had started transferring was cancelled by the watchdog"
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m["type"] for m in terminal] == ["ytdl-done"], terminal
+
+
 def test_a_preflight_failure_ends_the_row_it_acknowledged(tmp_path, monkeypatch):
     """The acknowledgement promises a terminal frame will follow. A throw out of
     the preflight used to kill the worker thread silently, which now reads as a
@@ -4973,6 +5234,119 @@ def test_a_preflight_failure_ends_the_row_it_acknowledged(tmp_path, monkeypatch)
     types = [m["type"] for m in sent if m["type"] != "log"]
     assert types == ["ytdl-progress", "ytdl-error"], sent
     assert sent[-1]["reason"] == "jschallenge", sent[-1]   # the mapped shape, reused
+
+
+# ---------------------------------------------------------------------------
+# A worker that DIES still owes the row a terminal frame
+#
+# The preflight wrapper above covers a throw inside it. A throw anywhere else in
+# the worker — or in the frame that calls it — reaches the default excepthook: a
+# traceback on a stderr nobody reads, and a row acknowledged as "resolving" with
+# nothing ever following it. This is exceptions only; a genuine HANG inside
+# lib.download still reaches no handler at all.
+# ---------------------------------------------------------------------------
+
+def _lib_that_is_available(download):
+    lib = FakeYtdlLib(download)
+    lib.available = lambda: True
+    return lib
+
+
+def test_a_worker_dying_outside_every_handler_still_ends_the_row(tmp_path, monkeypatch):
+    """The download call sits in worker() unwrapped: a throw out of it (or out of
+    anything the worker does around it) killed the thread silently."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: _lib_that_is_available(None))
+
+    def die(*a, **k):
+        raise RuntimeError("the worker thread died mid-flight")
+
+    monkeypatch.setattr(d, "_ytdl_download_via_lib", die)
+
+    d._handle_ytdl_legacy({"id": "j-dead", "url": "https://youtu.be/x",
+                           "dir": str(tmp_path)})
+    assert wait_for(lambda: any(m["type"] == "ytdl-error" for m in sent), timeout=5), \
+        "a dying worker emitted no terminal frame at all: %r" % (sent,)
+    d._join_ytdl_workers_for_test()
+
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert len(terminal) == 1, terminal
+    assert terminal[0]["id"] == "j-dead"
+
+
+def test_the_dying_worker_guard_never_contradicts_a_frame_already_sent(tmp_path,
+                                                                       monkeypatch):
+    """A throw AFTER a ytdl-done must not turn a saved file into an error row.
+    Reporting a completed download as failed is the failure this whole liveness
+    effort has already been burned by once, so the guard claims the same terminal
+    the download path claims rather than sending unconditionally."""
+    import mchost.downloads as d
+
+    out = tmp_path / "v.mp4"
+    out.write_bytes(b"x" * 7)
+    sent = []
+
+    def hlog(level, msg, *a, **k):
+        # The line the download path logs immediately AFTER the done frame.
+        if isinstance(msg, str) and msg.startswith("yt-dlp: saved"):
+            raise RuntimeError("the log sink blew up after the terminal frame")
+
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", hlog)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "ensure_deno", lambda: None)
+    monkeypatch.setattr(d, "start_pot_provider", lambda: False)
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        return str(out)
+
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: _lib_that_is_available(fake_download))
+
+    d._handle_ytdl_legacy({"id": "j-done-then-boom", "url": "https://youtu.be/x",
+                           "dir": str(tmp_path)})
+    assert wait_for(lambda: any(m["type"] == "ytdl-done" for m in sent), timeout=5), sent
+    d._join_ytdl_workers_for_test()
+
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m["type"] for m in terminal] == ["ytdl-done"], \
+        "a completed download was overwritten with a failure: %r" % (terminal,)
+
+
+def test_a_throw_between_registering_and_downloading_releases_the_job_id(tmp_path,
+                                                                         monkeypatch):
+    """The registration is taken before the log call and the watchdog thread
+    start, either of which can throw. Left behind, it owns the id for the life of
+    the helper and every retry of that id is refused as already in use."""
+    import mchost.downloads as d
+
+    monkeypatch.setattr(mc, "send", lambda m: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    def hlog(*a, **k):
+        raise RuntimeError("the log sink blew up before the download started")
+
+    monkeypatch.setattr(mc, "_hlog", hlog)
+    monkeypatch.setattr(d, "_ytdlp_lib",
+                        lambda: _lib_that_is_available(
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                AssertionError("must not reach the download"))))
+
+    try:
+        d._ytdl_download_via_lib("j-stuck-id", "https://youtu.be/x", "b",
+                                 str(tmp_path / "v.mp4"), None, False)
+    except RuntimeError:
+        pass                                # the throw is expected to propagate
+
+    assert d._pget_registry_get("j-stuck-id") is None, \
+        "the job id is still owned by an operation that will never run"
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,14 @@
 """Offline tests for mc_host.py: wire-protocol framing + ffmpeg command building.
 Does not require a real stream. Run:  python -m pytest test_host.py -q
 (or directly:  py test_host.py)"""
+import io
 import json
 import os
 import struct
 import subprocess
 import sys
+import threading
+import time
 
 from conftest import HERE, HOST, load_host, wait_for
 
@@ -114,6 +117,8 @@ def test_reveal_opens_containing_folder(monkeypatch, tmp_path):
     monkeypatch.setattr(mc_host, "send", sent.append)
 
     mc_host.handle_reveal({"path": tmp})
+    # Dispatched to a worker (the isfile stat has no bound), so wait for it.
+    assert wait_for(lambda: bool(calls) or bool(sent), timeout=5), "reveal never ran"
     if os.name == "nt":
         assert calls == ['explorer /select,"%s"' % tmp], \
             "reveal uses Explorer /select, on the file (exact command)"
@@ -126,6 +131,7 @@ def test_reveal_opens_containing_folder(monkeypatch, tmp_path):
 
     calls.clear(); sent.clear()
     mc_host.handle_reveal({"path": tmp + ".nope", "id": 5})
+    assert wait_for(lambda: bool(sent), timeout=5), "reveal never reported the miss"
     assert len(sent) == 1 and sent[0].get("type") == "error" and sent[0].get("id") == 5, \
         "reveal of missing file errors with the request id"
     assert not calls, "reveal of missing file spawns nothing"
@@ -406,3 +412,344 @@ def test_safe_kill_takes_the_whole_process_tree():
             p.kill()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# handle_snapshot must not run on the message loop
+#
+# It is a full-file copy of a LIVE recording, and it was the one long-running
+# command that did not dispatch to a worker (ytdl, pget, record, probe,
+# pickFolder, update and checkGithub all do). The extension now disconnects the
+# native port after four missed heartbeats (~150s); that EOFs read_message() and
+# ends main(), so a multi-GB snapshot on slow or AV-scanned storage could take
+# the in-flight recording down with it.
+# ---------------------------------------------------------------------------
+
+def _live_job(d, tmp_path, jid, payload=b"x" * 32):
+    temp = tmp_path / (str(jid) + ".tmp")
+    temp.write_bytes(payload)
+    job = d.Job(jid, str(temp))
+    job.base = "clip"
+    job.seconds = 3.0
+    with d.JOBS_LOCK:
+        d.JOBS[jid] = job
+    return job
+
+
+def test_a_snapshot_copy_does_not_block_the_message_loop(tmp_path, monkeypatch):
+    """The caller of handle_snapshot IS the read loop, so what this measures is
+    how long that loop is held: the handler must return while the copy is still
+    running, not after it."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-snap")
+    sent = []
+    copying = threading.Event()
+    copied = threading.Event()
+    real_copy = d._copy_prefix
+
+    def slow_copy(src, dst):
+        copying.set()
+        # A real one runs for minutes. A second is enough to tell the two
+        # dispatch shapes apart without making the suite slow.
+        assert not threading.Event().wait(1.0)
+        real_copy(src, dst)
+        copied.set()
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", slow_copy)
+    try:
+        started = time.monotonic()
+        d.handle_snapshot({"id": "j-snap", "dir": str(tmp_path)})
+        held = time.monotonic() - started
+
+        assert copying.wait(5), "the copy never started"
+        assert held < 0.5, (
+            "handle_snapshot held its caller for %.2fs while the copy ran" % held)
+        assert copied.wait(5), "the copy never finished"
+        assert wait_for(lambda: any(m.get("type") == "snapshot" for m in sent),
+                        timeout=5), sent
+        reply = [m for m in sent if m.get("type") == "snapshot"][0]
+        assert reply["id"] == "j-snap" and reply["bytes"] == 32, reply
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-snap", None)
+
+
+def test_two_snapshots_never_copy_at_the_same_time(tmp_path, monkeypatch):
+    """Both write one "<base> (partial).mp4". The message loop used to serialise
+    them for free; off it, two overlapping writes to one path interleave and the
+    checkpoint they leave is corrupt."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-a")
+    _live_job(d, tmp_path, "j-b")
+    sent = []
+    state = {"now": 0, "peak": 0}
+    real_copy = d._copy_prefix
+
+    def counting_copy(src, dst):
+        state["now"] += 1
+        state["peak"] = max(state["peak"], state["now"])
+        assert not threading.Event().wait(0.2)
+        state["now"] -= 1
+        real_copy(src, dst)
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", counting_copy)
+    try:
+        d.handle_snapshot({"id": "j-a", "dir": str(tmp_path)})
+        d.handle_snapshot({"id": "j-b", "dir": str(tmp_path)})
+        assert wait_for(lambda: len([m for m in sent
+                                     if m.get("type") == "snapshot"]) == 2,
+                        timeout=10), sent
+        assert state["peak"] == 1, (
+            "%d snapshot copies ran at once" % state["peak"])
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-a", None)
+            d.JOBS.pop("j-b", None)
+
+
+def test_a_discard_during_a_snapshot_leaves_no_partial_and_sends_no_frame(
+        tmp_path, monkeypatch):
+    """Threading the snapshot let its copy overlap handle_discard, which still
+    runs inline on the loop — an overlap that was impossible before. The user
+    discarded the recording, so no checkpoint of it may survive in Downloads and
+    no snapshot frame may follow the discard."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-disc")
+    dest = tmp_path / "clip (partial).mp4"
+    temp = tmp_path / "j-disc.tmp"
+    sent = []
+    real_copy = d._copy_prefix
+
+    def copy_then_discard(src, dst):
+        real_copy(src, dst)                     # the checkpoint really is written
+        d.handle_discard({"id": "j-disc"})      # ...and discarded before it commits
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", copy_then_discard)
+    try:
+        d.handle_snapshot({"id": "j-disc", "dir": str(tmp_path)})
+        assert wait_for(lambda: any(m.get("type") == "discarded" for m in sent),
+                        timeout=5), sent
+        assert wait_for(lambda: not dest.exists(), timeout=5), (
+            "a discarded recording left its checkpoint in Downloads")
+        assert not any(m.get("type") == "snapshot" for m in sent), sent
+        assert not temp.exists(), "the discarded temp file leaked"
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-disc", None)
+
+
+def test_the_snapshot_worker_removes_the_temp_the_discard_could_not(
+        tmp_path, monkeypatch):
+    """handle_discard's os.remove(job.temp) fails while a snapshot copy holds
+    that file open — CPython's read handle omits FILE_SHARE_DELETE — and the bare
+    except swallows it, so a multi-GB temp leaked. Whoever is last out removes
+    it. The sharing violation is simulated rather than provoked, so the test does
+    not turn on handle timing."""
+    import mchost.downloads as d
+
+    _live_job(d, tmp_path, "j-held")
+    dest = tmp_path / "clip (partial).mp4"
+    temp = tmp_path / "j-held.tmp"
+    sent = []
+    real_copy = d._copy_prefix
+    real_remove = os.remove
+    denied = {"n": 0}
+
+    def flaky_remove(path):
+        if (os.path.normcase(str(path)) == os.path.normcase(str(temp))
+                and denied["n"] == 0):
+            denied["n"] = 1
+            raise PermissionError(32, "used by another process")
+        real_remove(path)
+
+    def copy_then_discard(src, dst):
+        real_copy(src, dst)
+        monkeypatch.setattr(os, "remove", flaky_remove)
+        d.handle_discard({"id": "j-held"})
+
+    monkeypatch.setattr(mc_host, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc_host)
+    monkeypatch.setattr(d, "_copy_prefix", copy_then_discard)
+    try:
+        d.handle_snapshot({"id": "j-held", "dir": str(tmp_path)})
+        assert wait_for(lambda: denied["n"] == 1, timeout=5), (
+            "the discard never reached its os.remove")
+        assert wait_for(lambda: not temp.exists(), timeout=5), (
+            "the temp the discard could not remove was never cleaned up")
+        assert not dest.exists(), "a discarded recording left its checkpoint behind"
+        assert not any(m.get("type") == "snapshot" for m in sent), sent
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop("j-held", None)
+
+
+# ---------------------------------------------------------------------------
+# The read loop's shape, owned HERE
+#
+# The rule is: nothing dispatched from main()'s message loop may hold it for
+# longer than the extension's heartbeat tolerates. Until now that rule lived
+# only in a comment in background.js - on the far side of the port from the code
+# that has to honour it - and it regressed twice (handle_snapshot, then
+# handle_file_commit / _pget_cancel / handle_open) with a green suite both times.
+#
+# WHAT THIS CATCHES
+#   - a new elif branch added to the loop: the parsed set stops matching the
+#     table below and the test fails naming the command
+#   - a handler classified "worker" that stops dispatching to a thread
+#   - a handler moved between the two classes without its entry being updated
+#
+# WHAT IT DOES NOT CATCH
+#   - an inline handler that grows new unbounded work inside it (the bound is a
+#     written claim here, not a measurement)
+#   - a handler that starts a thread and then joins it
+#   - blocking work added to main() outside any handler branch
+# Those need a reader. This stops the silent case: a whole new command landing
+# on the loop with nobody having thought about it.
+# ---------------------------------------------------------------------------
+
+# cmd -> ("worker", (names that must start a thread,)) | ("inline", why bounded)
+# "<dispatch>" means the loop branch itself starts the thread.
+LOOP_DISPATCH = {
+    "ping": ("inline",
+             "one small frame, and it IS the heartbeat reply: answered anywhere "
+             "but the loop, a missed beat stops meaning 'the loop is turning'"),
+    "ytdl": ("worker", ("_handle_ytdl_legacy", "_handle_ytdl_structured")),
+    "ytmeta": ("worker", ("handle_ytmeta",)),
+    "cast": ("worker", ("handle_cast",)),
+    "ytdlUpdate": ("worker", ("<dispatch>",)),
+    "record": ("worker", ("handle_record",)),
+    "stop": ("inline",
+             "writes 'q' to ffmpeg's stdin and returns - no wait, no filesystem"),
+    "snapshot": ("worker", ("handle_snapshot",)),
+    "save": ("worker", ("handle_save",)),
+    "saveAs": ("worker", ("handle_save_as",)),
+    "pickFolder": ("worker", ("handle_pick_folder",)),
+    "open": ("worker", ("handle_open",)),
+    "reveal": ("worker", ("handle_reveal",)),
+    "update": ("worker", ("handle_update",)),
+    "watch": ("inline",
+              "reads and rewrites the small config file, then arms an OS watcher"),
+    "checkGithub": ("worker", ("handle_check_github",)),
+    "discard": ("inline",
+                "bounded 10s wait for ffmpeg to finalize, inside one beat; the "
+                "unlinks are best-effort and a snapshot worker retries the one "
+                "that can fail"),
+    "pget": ("worker", ("handle_pget",)),
+    "pget-single": ("worker", ("handle_pget_single",)),
+    "pget-set-limit": ("inline", "registry and lease bookkeeping, then one send"),
+    "getReport": ("inline", "reads a bounded tail of two small local files"),
+    "probe": ("worker", ("handle_probe",)),
+    # Decision inline (it pins WHICH op the cancel names), kills on a worker.
+    "pget-cancel": ("worker", ("_pget_kill_off_loop",)),
+    "file-open": ("inline",
+                  "one O_EXCL create of the .part under the registry lock"),
+    "file-chunk": ("inline",
+                   "one write+flush of a single chunk, bounded by MAX_UNACKED"),
+    "file-commit": ("worker", ("handle_file_commit",)),
+    "file-abort": ("inline",
+                   "closes the handle and unlinks the .part - metadata only"),
+}
+
+
+def _loop_branches():
+    """Every `cmd == "..."` branch in main(), by AST rather than by grep, with a
+    flag for whether the branch body itself starts a thread.
+
+    Matches that one shape only. `elif cmd in ("a", "b")` and
+    `elif msg.get("cmd") == "x"` would both be missed, so a command added in
+    either form slips past the table. The loop has used one shape throughout;
+    this is where to look first if it ever stops.
+    """
+    import ast
+
+    tree = ast.parse(io.open(HOST, encoding="utf-8").read())
+    main = [n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "main"]
+    assert main, "main() not found in mc_host.py"
+    found = {}
+    for node in ast.walk(main[0]):
+        if not isinstance(node, ast.If):
+            continue
+        t = node.test
+        if not (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+                and t.left.id == "cmd" and len(t.ops) == 1
+                and isinstance(t.ops[0], ast.Eq)
+                and isinstance(t.comparators[0], ast.Constant)):
+            continue
+        starts = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                     and c.func.attr == "start"
+                     for b in node.body for c in ast.walk(b))
+        found[t.comparators[0].value] = starts
+    return found
+
+
+def _module_functions():
+    """Module-level functions across the mchost package, by name."""
+    import ast
+
+    out = {}
+    root_dir = os.path.join(HERE, "mchost")
+    for root, _, files in os.walk(root_dir):
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            fp = os.path.join(root, f)
+            for n in ast.parse(io.open(fp, encoding="utf-8").read()).body:
+                if isinstance(n, ast.FunctionDef):
+                    out[n.name] = (n, os.path.relpath(fp, HERE))
+    return out
+
+
+def _starts_a_thread(fnnode):
+    import ast
+
+    return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+               and c.func.attr == "start" for c in ast.walk(fnnode))
+
+
+def test_every_loop_command_is_classified():
+    """A new command dispatched from the read loop fails here until someone has
+    decided, in writing, whether it may run on that loop."""
+    branches = _loop_branches()
+    assert set(branches) == set(LOOP_DISPATCH), (
+        "the loop's commands and this table disagree; added=%s removed=%s"
+        % (sorted(set(branches) - set(LOOP_DISPATCH)),
+           sorted(set(LOOP_DISPATCH) - set(branches))))
+
+
+def test_every_long_loop_command_really_dispatches_to_a_worker():
+    """The "worker" half of the table is a claim about code, so check the code.
+    Names the function that does the dispatching, not just the handler, because
+    several handlers delegate (ytdl to two protocol paths, pget-cancel to the
+    killer it hands the slow half to)."""
+    branches = _loop_branches()
+    funcs = _module_functions()
+    for cmd, (kind, detail) in sorted(LOOP_DISPATCH.items()):
+        if kind != "worker":
+            continue
+        for name in detail:
+            if name == "<dispatch>":
+                assert branches.get(cmd), (
+                    "%s claims the loop branch starts its own thread; it does not"
+                    % cmd)
+                continue
+            assert name in funcs, "%s names %s, which does not exist" % (cmd, name)
+            node, where = funcs[name]
+            assert _starts_a_thread(node), (
+                "%s is classified worker via %s (%s), but that function starts no "
+                "thread - it now runs on the read loop" % (cmd, name, where))
+
+
+# The inline half of the table is documentation, deliberately unasserted. A
+# "len(reason) > 20" check passes anything and would be updated reflexively the
+# first time it fired, which is worse than not having it: the reasons are there
+# for a reader, and only a reader can judge them.

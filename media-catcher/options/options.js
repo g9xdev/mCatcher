@@ -175,6 +175,12 @@ function renderHelper(h) {
   } else {
     el.classList.add("off"); txt.textContent = "Native helper not connected — click to reconnect";
   }
+  // The state alone cannot say WHY, and for a helper that has stopped
+  // answering the why includes what clicking here will cost: the row is a
+  // re-check button, and on an unresponsive helper a re-check reconnects
+  // rather than re-pings. The background's explanation carries that.
+  el.title = (h && h.error ? h.error + "  ·  " : "") +
+    "Click to install or re-check the native helper";
 }
 get("helperStatus").addEventListener("click", async () => {
   // Re-check FIRST, same as the popup badge: a dropped port is not a missing

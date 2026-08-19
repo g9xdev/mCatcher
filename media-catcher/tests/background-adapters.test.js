@@ -5715,6 +5715,105 @@ test("single native post failure preserves committed safe mode and replay fence"
   assert.equal(commands.filter((c) => c.cmd === "pget-single").length, 1);
 });
 
+// The singleStartedAttempts key is added BEFORE the switch post on purpose —
+// it is the re-entrancy guard that keeps a duplicate range_unsupported result
+// from posting twice — but nothing ever deleted it, and the whole span from
+// that add to the wire (lease lookup, payload build, post) ran unguarded. A
+// start that never reached the helper therefore left the key set forever AND
+// the job `running`, holding its global concurrency slot for the rest of the
+// session. Same shape pump's direct branch already fixes with
+// releaseDirectAttempt/postDirectAttempt/failDirectBuild.
+test("a switch post that throws releases the wedged slot to a queued sibling", async () => {
+  const commands = [];
+  const postError = new Error("switch post threw");
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(
+    fx.options({
+      maxConcurrent: 1,
+      postNative(c) {
+        commands.push(c);
+        if (c.cmd === "pget-single") throw postError;
+      },
+    })
+  );
+  const first = await enqueueNativeDirect(ctrl, fx, "switch-throw-a");
+  const second = await enqueueNativeDirect(ctrl, fx, "switch-throw-b");
+  assert.equal(commands.length, 1, "one slot admits exactly one live attempt");
+
+  await assert.rejects(
+    ctrl.handleNativeMessage({
+      type: "pget-result", id: first.id, attemptToken: commands[0].attemptToken,
+      status: "failed", mode: "multi-range",
+      failureCategory: "range_unsupported", partState: "empty",
+    }),
+    postError
+  );
+
+  const wedged = ctrl.popupJobs().find((row) => row.id === first.id);
+  assert.equal(wedged.state, "needs_user",
+    "a switch start that never reached the helper must not stay running");
+  await ctrl.pump();
+  assert.equal(
+    commands.filter((c) => c.id === second.id).length, 1,
+    "the released slot must admit the queued sibling"
+  );
+});
+
+// The lease lookup and the payload build sit inside the same guarded span: a
+// throw there is just as capable of stranding the key and the slot as a failed
+// post, and it never reaches postNative at all. The router module is swapped
+// through require.cache (its API object is frozen, so its properties cannot be
+// patched in place) and restored before the test returns.
+test("a switch payload build that throws releases the wedged slot too", async () => {
+  const routerPath = require.resolve(
+    path.join(mediaCatcherRoot, "lib", "download-message-router.js")
+  );
+  require(routerPath);
+  const entry = require.cache[routerPath];
+  const realRouter = entry.exports;
+  const buildError = new Error("switch payload build threw");
+  entry.exports = {
+    routeNativeMessage: realRouter.routeNativeMessage,
+    normalizeDownloadRequest: realRouter.normalizeDownloadRequest,
+    buildNativeStartPayload(input) {
+      if (input && input.kind === "pget-single") throw buildError;
+      return realRouter.buildNativeStartPayload(input);
+    },
+  };
+  try {
+    const commands = [];
+    const fx = makeEffects();
+    const ctrl = loadAdapters().createBackgroundAdapters(
+      fx.options({ maxConcurrent: 1, postNative(c) { commands.push(c); } })
+    );
+    const first = await enqueueNativeDirect(ctrl, fx, "switch-build-a");
+    const second = await enqueueNativeDirect(ctrl, fx, "switch-build-b");
+    assert.equal(commands.length, 1, "one slot admits exactly one live attempt");
+
+    await assert.rejects(
+      ctrl.handleNativeMessage({
+        type: "pget-result", id: first.id, attemptToken: commands[0].attemptToken,
+        status: "failed", mode: "multi-range",
+        failureCategory: "range_unsupported", partState: "empty",
+      }),
+      buildError
+    );
+
+    assert.equal(commands.filter((c) => c.cmd === "pget-single").length, 0,
+      "a build failure never reaches the helper");
+    const wedged = ctrl.popupJobs().find((row) => row.id === first.id);
+    assert.equal(wedged.state, "needs_user",
+      "a build failure must release the slot, not hold it running");
+    await ctrl.pump();
+    assert.equal(
+      commands.filter((c) => c.id === second.id).length, 1,
+      "the released slot must admit the queued sibling"
+    );
+  } finally {
+    entry.exports = realRouter;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // BA05 — opaque variant IDs bind original private URLs; replay cannot replace
 // ---------------------------------------------------------------------------

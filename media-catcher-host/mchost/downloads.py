@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import uuid
 from ctypes import wintypes
@@ -50,6 +51,11 @@ class Job:
         self.bytes = 0
         self.seconds = 0.0
         self.partial = None          # last "save now" snapshot path, if any
+        # Set under JOBS_LOCK by handle_discard. A snapshot copy runs for
+        # minutes on a worker thread, so it can still be in flight when the user
+        # discards; this is what stops it publishing a checkpoint of a recording
+        # that no longer exists.
+        self.discarded = False
         self.finished = threading.Event()
 
 
@@ -160,6 +166,16 @@ def handle_stop(req):
             pass
 
 
+def _rm_quiet(path):
+    """Best-effort unlink. Used where a failure has no remedy worth reporting -
+    a leftover the next pass meets again anyway."""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def _copy_prefix(src, dst):
     """Copy the first os.path.getsize(src) bytes — a clean prefix even while the
     source keeps growing. Fragmented mp4 stays playable up to the last whole
@@ -175,26 +191,80 @@ def _copy_prefix(src, dst):
             remaining -= len(chunk)
 
 
+# Serialises the snapshot copies against each other. The message loop used to
+# give that for free by running them one at a time; now that the copy is off the
+# loop, this is what stops two of them writing one "<base> (partial).mp4" at
+# once. Deliberately ONE lock rather than one per job: two different recordings
+# whose sanitized base names collide resolve to the SAME dest, so a per-job lock
+# would leave exactly the interleaving this exists to prevent. The copy is
+# I/O-bound on one disk, so the parallelism given up is worth little.
+_SNAPSHOT_LOCK = threading.Lock()
+
+
 def handle_snapshot(req):
-    """Save what's recorded so far WITHOUT stopping — a crash-safety checkpoint."""
+    """Save what's recorded so far WITHOUT stopping — a crash-safety checkpoint.
+
+    The copy runs on a worker thread, like every other long command (ytdl, pget,
+    record, probe, pickFolder, update, checkGithub). It is a full-file copy of a
+    LIVE recording, so on slow or antivirus-scanned storage a multi-GB one runs
+    for minutes, and this handler is called INLINE from the message loop. The
+    extension now disconnects the native port after four missed heartbeats
+    (~150s); that EOFs read_message() and ends main(), so a long snapshot on the
+    loop could take the recording it was checkpointing down with it.
+
+    Only the registry lookup stays on the loop — a dict read under a lock. Every
+    filesystem touch moves to the worker, including the stats: a destination the
+    user pointed at a dead network share can block a stat for a long time too,
+    and the loop must not be where that lands.
+    """
     jid = req.get("id")
     with JOBS_LOCK:
         job = JOBS.get(jid)
-    if not job or not os.path.isfile(job.temp) or os.path.getsize(job.temp) == 0:
+    if not job:
         _h().send({"type": "error", "id": jid, "error": "nothing recorded yet"})
         return
-    base = _h().sanitize(req.get("base") or job.base)
-    d = req.get("dir") or _h().downloads_dir()
-    if not os.path.isdir(d):
-        d = _h().downloads_dir()
-    dest = os.path.join(d, base + " (partial).mp4")
-    try:
-        _copy_prefix(job.temp, dest)      # overwrites the previous partial (latest is fullest)
-        job.partial = dest
-        _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": os.path.getsize(dest),
-                   "seconds": round(job.seconds, 1)})
-    except Exception as e:
-        _h().send({"type": "error", "id": jid, "error": "save-now failed: %s" % e})
+
+    def worker():
+        if job.discarded:
+            return          # already terminal: the discard frame ended the row
+        if not os.path.isfile(job.temp) or os.path.getsize(job.temp) == 0:
+            _h().send({"type": "error", "id": jid, "error": "nothing recorded yet"})
+            return
+        try:
+            base = _h().sanitize(req.get("base") or job.base)
+            d = req.get("dir") or _h().downloads_dir()
+            if not os.path.isdir(d):
+                d = _h().downloads_dir()
+            dest = os.path.join(d, base + " (partial).mp4")
+            with _SNAPSHOT_LOCK:
+                _copy_prefix(job.temp, dest)  # overwrites the previous partial (latest is fullest)
+                # Publish or abandon, decided under JOBS_LOCK - the lock
+                # handle_discard sets the flag under, so these are the only two
+                # orderings there are. Lock order is _SNAPSHOT_LOCK then
+                # JOBS_LOCK; nothing takes them the other way round.
+                with JOBS_LOCK:
+                    live = not job.discarded
+                    if live:
+                        job.partial = dest
+                        # Sized here: outside the lock the next snapshot to this
+                        # same dest could truncate the file before the read.
+                        written = os.path.getsize(dest)
+                if not live:
+                    # Discarded mid-copy. Take the checkpoint back out of the
+                    # user's Downloads, and the temp with it: handle_discard's
+                    # own os.remove ran while _copy_prefix still held that file
+                    # open, which on Windows fails (CPython's read handle omits
+                    # FILE_SHARE_DELETE) and is swallowed there. Whoever is last
+                    # out removes it.
+                    _rm_quiet(dest)
+                    _rm_quiet(job.temp)
+                    return
+            # Never across the pipe write, which can block.
+            _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": written,
+                       "seconds": round(job.seconds, 1)})
+        except Exception as e:
+            _h().send({"type": "error", "id": jid, "error": "save-now failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _dedup(dest):
@@ -788,45 +858,80 @@ def handle_pick_folder(req):
 
 
 def handle_open(req):
-    """Open a saved file with the OS default application (notification click)."""
-    path = req.get("path")
-    if not path or not os.path.isfile(path):
-        _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
-        return
-    try:
-        if os.name == "nt":
-            os.startfile(path)               # noqa: default handler
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception as e:
-        _h().send({"type": "error", "error": "open failed: %s" % e})
+    """Open a saved file with the OS default application (notification click).
+
+    On a worker. os.startfile is ShellExecuteW and has no bound: with no handler
+    registered for the extension the shell puts up an Open With dialog and the
+    call sits there until the user answers it, which inline held the read loop
+    for exactly that long. The stat moves with it - a path on a dead network
+    share blocks that too.
+
+    Nothing here is shared with another handler - no JOBS, no _PGET, no sink
+    registry, no module state at all - so what the loop's ordering was carrying
+    is the position of the error frame in the stream, and that frame names its
+    own id.
+    """
+    def worker():
+        path = req.get("path")
+        if not path or not os.path.isfile(path):
+            _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(path)               # noqa: default handler
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            _h().send({"type": "error", "error": "open failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_reveal(req):
-    """Show a saved file in its containing folder (popup "Folder" button)."""
-    path = req.get("path")
-    if not path or not os.path.isfile(path):
-        _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
-        return
-    try:
-        if os.name == "nt":
-            # String form on purpose: explorer's "/select," argument must not be
-            # split/re-quoted by list2cmdline. '"' can't appear in a Windows path.
-            subprocess.Popen('explorer /select,"%s"' % path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        else:
-            subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
-    except Exception as e:
-        _h().send({"type": "error", "error": "reveal failed: %s" % e})
+    """Show a saved file in its containing folder (popup "Folder" button).
+
+    On a worker, for the same reason handle_open is: the isfile() below is a
+    stat on a caller-supplied path, and a path on a dead network share blocks a
+    stat for as long as the SMB timeout takes. The Popen itself never waits, but
+    that was never the part with no bound. Shares no state with any other
+    handler; the loop was carrying only the error frame's position, and that
+    frame names its own id.
+    """
+    def worker():
+        path = req.get("path")
+        if not path or not os.path.isfile(path):
+            _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
+            return
+        try:
+            if os.name == "nt":
+                # String form on purpose: explorer's "/select," argument must not
+                # be split/re-quoted by list2cmdline. '"' can't appear in a
+                # Windows path.
+                subprocess.Popen('explorer /select,"%s"' % path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
+        except Exception as e:
+            _h().send({"type": "error", "error": "reveal failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_discard(req):
     jid = req.get("id")
+    partial = None
     with JOBS_LOCK:
         job = JOBS.pop(jid, None)
+        if job:
+            # Flag and read the checkpoint path under the SAME lock a snapshot
+            # worker commits under. That leaves exactly two orderings and no
+            # third: either the worker has already published job.partial and the
+            # unlink below takes it, or it has not and it will see this flag and
+            # clean up after itself. A checkpoint of a discarded recording
+            # cannot survive either way.
+            job.discarded = True
+            partial = job.partial
     if job:
         if job.proc and job.proc.poll() is None:
             try:
@@ -835,11 +940,11 @@ def handle_discard(req):
                 try: job.proc.terminate()
                 except Exception: pass
             job.finished.wait(timeout=10)
-        try:
-            if os.path.isfile(job.temp):
-                os.remove(job.temp)
-        except Exception:
-            pass
+        # temp can still be held open by a snapshot copy in flight, which on
+        # Windows makes this fail; the snapshot worker retries it when it sees
+        # the flag. partial is the checkpoint such a copy already published.
+        _rm_quiet(job.temp)
+        _rm_quiet(partial)
     _h().send({"type": "discarded", "id": jid})
 
 
@@ -930,7 +1035,7 @@ def _pip_upgrade_pylib():
 
 def ytdlp_update():
     """Ask yt-dlp to update itself (it breaks often as YouTube changes). Best-effort."""
-    global _YTDLP_VER
+    global _YTDLP_VER, YTDLP
     # The in-process library updates via pip, not the exe's -U (there may be no
     # exe, and updating one would not touch the other). Re-run the same targeted
     # install bootstrap uses; leave the exe -U for exe-only installs.
@@ -945,6 +1050,31 @@ def ytdlp_update():
         _h()._hlog("warn", "yt-dlp library update failed: %s" % e)
     if not YTDLP:
         return None
+    if _has_internal(YTDLP):
+        # The directory build has NO self-updater — yt-dlp's own shipped README
+        # lists yt-dlp_win.zip as "Unpackaged Windows (Win8+) x64 executable (no
+        # auto-update)" — so `-U` here reports something and replaces nothing.
+        # Re-fetch the release instead. This is the only update path an install
+        # with no python.exe beside pythonw.exe has (no python.exe means no
+        # vendored library), and yt-dlp rotting as YouTube changes is the whole
+        # reason an update exists.
+        #
+        # _YTDLP_REFETCHED is deliberately NOT consulted: that guard stops a
+        # failing network re-downloading on every JOB, and an explicit update
+        # request is not a job. Honouring it would kill the user's only remedy
+        # for the rest of the process's life after one bad fetch.
+        try:
+            _h()._hlog("info", "fetching the latest yt-dlp "
+                               "(the directory build cannot self-update)…")
+            YTDLP = _fetch_ytdlp_dir_build()
+            _YTDLP_VER = _ytdlp_version() or _YTDLP_VER
+            out = "yt-dlp updated (directory build%s)" % (
+                " " + _YTDLP_VER if _YTDLP_VER else "")
+            _h()._hlog("info", "yt-dlp update: %s" % out)
+            return out
+        except Exception as e:
+            _h()._hlog("warn", "yt-dlp update failed: %s" % e)
+            return None
     cf, si = _no_window()
     try:
         r = subprocess.run([YTDLP, "-U"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -964,14 +1094,98 @@ _YTDLP_REFETCHED = False
 
 
 def _has_internal(exe):
-    """True when exe is the directory build - yt-dlp.exe beside _internal/.
+    """True when exe is the directory build - yt-dlp.exe beside a POPULATED
+    _internal/.
 
     The onefile launcher re-extracts ~145 files to %TEMP% on every launch and,
     under a browser-descended process, each extraction is rescanned; that is the
-    ~90s DLL-load stall the UI showed as "Preparing" forever."""
+    ~90s DLL-load stall the UI showed as "Preparing" forever.
+
+    An EMPTY _internal does not count. It is a real on-disk state - an install
+    interrupted partway, a tree an AV scanner emptied - and never a working one:
+    a directory build cannot start without base_library.zip and its python DLL,
+    and a onefile with a stray empty _internal is still the onefile. Both
+    readings make "accept it" the wrong answer, while being wrong the other way
+    costs one re-fetch per process that keeps the existing exe if it fails. Not
+    a validity check: a half-extracted tree still passes. It only rejects the
+    state that is unambiguously not a directory build."""
     if not exe:
         return False
-    return os.path.isdir(os.path.join(os.path.dirname(exe), "_internal"))
+    try:
+        return bool(os.listdir(os.path.join(os.path.dirname(exe), "_internal")))
+    except OSError:
+        return False        # absent, a file, or unreadable - none is a build
+
+
+def _ytdlp_dest_is_writable(dest):
+    """False when yt-dlp.exe could not be replaced right now.
+
+    Windows opens a RUNNING image FILE_SHARE_READ|FILE_SHARE_DELETE, so a
+    download in flight denies write access to the very file an update has to
+    overwrite. Probed BEFORE the ~20MB archive is fetched so a busy exe costs a
+    log line rather than a discarded download, and r+b so the probe itself never
+    truncates anything. A job that starts between this probe and the write still
+    meets the raw violation; the exe-first write order below is what keeps that
+    case from mixing a fresh _internal with a stale exe."""
+    if not os.path.exists(dest):
+        return True                 # fresh install: nothing to be held open
+    try:
+        with open(dest, "r+b"):
+            return True
+    except OSError:
+        return False
+
+
+def _fetch_ytdlp_dir_build():
+    """Unpack the official yt-dlp_win.zip (yt-dlp.exe + _internal/) into HERE and
+    return the exe path. Raises on any failure — each caller decides what to keep.
+
+    Shared by ensure_ytdlp (first use, and replacing a onefile) and ytdlp_update
+    (the directory build has no self-updater), so there is one archive URL, one
+    traversal check and one write order rather than two drifting copies.
+    """
+    here = _h().HERE
+    dest = os.path.join(here, "yt-dlp.exe")
+    if not _ytdlp_dest_is_writable(dest):
+        raise RuntimeError("yt-dlp.exe is in use — a download is in flight")
+    import urllib.request, zipfile, io
+    req = urllib.request.Request(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip",
+        headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        blob = r.read()
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        members = []
+        for name in z.namelist():
+            rel = name.replace("\\", "/").lstrip("/")
+            # Refuse absolute/traversing members: this unpacks into the host
+            # directory, so a crafted archive must not reach outside it.
+            if not rel or rel.endswith("/") or ".." in rel.split("/"):
+                continue
+            members.append((name, rel))
+        # The whole archive is already in memory, so no write here can fail for
+        # want of network. Write the exe FIRST anyway: it is the member a running
+        # yt-dlp holds open by itself, so if the writability probe above was
+        # overtaken by a JOB starting, the violation lands before any of
+        # _internal has been touched.
+        #
+        # That orders the common case and no more. A .pyd or DLL in _internal
+        # can also be held by something that never ran yt-dlp at all - an
+        # antivirus scanner, Search Indexer, an Explorer preview - and AV
+        # rescanning is the very premise this build choice rests on. There is no
+        # rollback: a member that fails partway leaves the tree mixed, and
+        # nothing here detects that (_has_internal only asks whether _internal
+        # is populated). The remedy is another update or an installer re-run,
+        # which re-fetches the whole archive.
+        members.sort(key=lambda nr: nr[1].lower() != "yt-dlp.exe")
+        for name, rel in members:
+            out = os.path.join(here, *rel.split("/"))
+            os.makedirs(os.path.dirname(out) or here, exist_ok=True)
+            with z.open(name) as src, open(out, "wb") as f:
+                shutil.copyfileobj(src, f)
+    if not os.path.isfile(dest):
+        raise RuntimeError("yt-dlp.exe missing from archive")
+    return dest
 
 
 def ensure_ytdlp():
@@ -995,30 +1209,9 @@ def ensure_ytdlp():
     if _YTDLP_REFETCHED:
         return YTDLP
     _YTDLP_REFETCHED = True
-    here = _h().HERE
-    dest = os.path.join(here, "yt-dlp.exe")
     try:
-        import urllib.request, zipfile, io
         _h()._hlog("info", "fetching yt-dlp (first YouTube use)…")
-        req = urllib.request.Request(
-            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip",
-            headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            blob = r.read()
-        with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            for name in z.namelist():
-                rel = name.replace("\\", "/").lstrip("/")
-                # Refuse absolute/traversing members: this unpacks into the host
-                # directory, so a crafted archive must not reach outside it.
-                if not rel or rel.endswith("/") or ".." in rel.split("/"):
-                    continue
-                out = os.path.join(here, *rel.split("/"))
-                os.makedirs(os.path.dirname(out) or here, exist_ok=True)
-                with z.open(name) as src, open(out, "wb") as f:
-                    shutil.copyfileobj(src, f)
-        if not os.path.isfile(dest):
-            raise RuntimeError("yt-dlp.exe missing from archive")
-        YTDLP = dest
+        YTDLP = _fetch_ytdlp_dir_build()
         _h()._hlog("info", "yt-dlp installed (directory build)")
         return YTDLP
     except Exception as e:
@@ -3507,7 +3700,36 @@ def _ytdl_lib_argv(fmt, outtmpl, url, deno, pot):
     return argv
 
 
-def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
+class _TerminalClaim:
+    """Exactly one terminal frame per job, CLAIMED rather than ordered.
+
+    Several threads can reach the end of one job — the download unwind, the
+    resolve watchdog, and the guard around the worker thread itself — and
+    _h().send writes the native-messaging pipe and can block, so any of them
+    can reach the wire first. The loser stays silent rather than contradicting
+    the row. Shared by the whole job so a fault ABOVE the download frame cannot
+    turn a ytdl-done that already went out into a failure.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._taken = False
+
+    def take(self, veto=None):
+        """True for exactly one caller.
+
+        veto is an Event the caller agrees to lose to. It closes the watchdog's
+        check-then-claim gap: bytes can start flowing between its is_set() test
+        and the claim, and killing a job that is transferring is the one failure
+        this mechanism must never cause."""
+        with self._lock:
+            if self._taken or (veto is not None and veto.is_set()):
+                return False
+            self._taken = True
+            return True
+
+
+def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     """In-process download for the legacy (tokenless) path. Emits the same
     ytdl-progress / ytdl-done / ytdl-error wire shapes the exe worker did.
 
@@ -3529,8 +3751,14 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     and that worker stays parked. Its registration is held until the thread
     really ends rather than dropped when the watchdog reports: the registry
     means "this job still holds resources", which stays true, and a retry of
-    that id is then refused instead of racing a live writer for one path."""
+    that id is then refused instead of racing a live writer for one path.
+
+    claim is the job-wide terminal claim; the caller passes its own so a fault in
+    the frame above this one cannot contradict the frame this one already sent.
+    A direct caller that has no job around it gets a private one."""
     lib = _ytdlp_lib()
+    if claim is None:
+        claim = _TerminalClaim()
     # yt-dlp still shells out — deno for the JS challenge, ffmpeg for the merge —
     # and a wedged child is the hang "in-process" did not remove. ytdlp_lib hands
     # each launch to the thread that made it; holding them here is what gives the
@@ -3579,8 +3807,6 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
         _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn",
                    "error": "Download id already in use."})
         return
-    _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
-               % (url, "on" if pot else "off"))
     # The acknowledgement frame is sent by _handle_ytdl_legacy's worker before the
     # preflight — one per job, so none here.
     last = {"pct": -1.0}
@@ -3594,25 +3820,14 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     touched = [time.monotonic()]
     progressing = threading.Event()
     finished = threading.Event()
-    # Exactly one terminal frame per job, CLAIMED rather than ordered: the watchdog
-    # fires from its own thread while the download may be unwinding on this one,
-    # and _h().send writes the native-messaging pipe and can block, so either side
-    # can reach the wire first. The loser stays silent instead of contradicting
-    # the row.
-    claim_lock = threading.Lock()
-    claimed = []
-
     def _claim_terminal(unless_progressing=False):
-        """True for exactly one caller. unless_progressing closes the watchdog's
-        check-then-claim gap: bytes can start flowing between its is_set() test
-        and the claim, and killing a job that is transferring is the one failure
-        this mechanism must never cause. Only the watchdog passes it — a real
-        terminal frame is still owed once progress has started."""
-        with claim_lock:
-            if claimed or (unless_progressing and progressing.is_set()):
-                return False
-            claimed.append(True)
-            return True
+        """True for exactly one caller — see _TerminalClaim.
+
+        Only the watchdog passes unless_progressing: it is the one caller that
+        must lose to bytes starting, because a real terminal frame is still owed
+        once progress has started and killing a transferring job is the failure
+        this mechanism must never cause."""
+        return claim.take(progressing if unless_progressing else None)
 
     def on_progress(m):
         progressing.set()
@@ -3649,6 +3864,15 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
                 continue
             if not _claim_terminal(unless_progressing=True):
                 return                  # already terminal, or bytes just started
+            # Bytes can still start between winning that claim and the kill
+            # below, and that residue is LEFT OPEN deliberately. Re-reading
+            # progressing here could only be acted on by handing the claim back,
+            # and by then the unwind may already have tried to send and gone
+            # quiet on losing — which would leave the job with no terminal frame
+            # at all. A killed download reports "stalled" and the row ends; a
+            # silent one is the failure this whole mechanism exists to remove.
+            # The window is a few statements wide, after 90s of real silence.
+            #
             # Flag BEFORE kill: the flag is polled from yt-dlp's hooks and log
             # lines, and killing the child is what makes the next poll happen at
             # all. Both before the send, which writes the pipe and can block.
@@ -3661,7 +3885,21 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
                        "error": "yt-dlp made no progress while resolving. "
                                 "Open the log console for its output."})
             return
-    threading.Thread(target=_resolve_watchdog, daemon=True).start()
+
+    # Both of these can throw — a log sink with a broken pipe, and a thread that
+    # cannot be started under exhaustion — and the registration above is already
+    # taken. Left behind, it owns this id for the life of the helper and every
+    # retry of it is refused as already in use, so the unwind hands it back. This
+    # is the throw case only: a job that hangs INSIDE lib.download still holds
+    # its registration, deliberately, because it still holds the output path.
+    try:
+        _h()._hlog("info", "yt-dlp: downloading %s (in-process, pot=%s)"
+                   % (url, "on" if pot else "off"))
+        threading.Thread(target=_resolve_watchdog, daemon=True).start()
+    except BaseException:
+        finished.set()
+        _pget_unregister(jid, op)
+        raise
 
     try:
         path = lib.download(_ytdl_lib_argv(fmt, outtmpl, url, deno, pot),
@@ -3714,6 +3952,16 @@ def _join_ytdl_workers_for_test(timeout=5.0):
 def _handle_ytdl_legacy(req):
     """Token-omitted path: preserve title/ID template and tokenless wire shapes.
     Prefers the in-process library; falls back to the exe worker below."""
+    # One claim for the whole job, held OUTSIDE worker() so the guard around the
+    # thread can see what the worker already sent. Every terminal frame below
+    # goes through _terminal; the progress frames do not.
+    claim = _TerminalClaim()
+
+    def _terminal(msg):
+        """Send a terminal frame only if nothing has already ended this job."""
+        if claim.take():
+            _h().send(msg)
+
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
@@ -3746,15 +3994,15 @@ def _handle_ytdl_legacy(req):
             reason, msg = _map_yt_error(str(e))
             _h()._hlog("error", "yt-dlp: preflight failed (%s): %s"
                        % (reason, str(e)[:500]), "ytdlp")
-            _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+            _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             return
 
         if use_lib:
-            _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot)
+            _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=claim)
             return
 
         if not ytdlp:
-            _h().send({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
+            _terminal({"type": "ytdl-error", "id": jid, "reason": "noytdlp",
                   "error": "Couldn't get yt-dlp (needed for YouTube). Check your connection, or re-run the helper installer."})
             return
         cmd = _ytdl_build_cmd(ytdlp, fmt, outtmpl, url, deno, pot)
@@ -3769,7 +4017,7 @@ def _handle_ytdl_legacy(req):
                                  # @@FILE@@ path, failing an already-finished job.
                                  encoding="utf-8", errors="replace")
         except Exception as e:
-            _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
+            _terminal({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return
         # Tagged yt-dlp op: same CAS registry as pget; no lease_cv so set-limit ignores it.
         # Legacy keeps spawn-then-register so a duplicate id still kills the new proc.
@@ -3777,7 +4025,7 @@ def _handle_ytdl_legacy(req):
         if not _pget_register(jid, op):
             # Duplicate id owns the registry — kill the just-spawned process, do not overwrite.
             _safe_kill(p)
-            _h().send({
+            _terminal({
                 "type": "ytdl-error",
                 "id": jid,
                 "reason": "spawn",
@@ -3824,7 +4072,7 @@ def _handle_ytdl_legacy(req):
             watch.finish()
             p.wait()
             if op.get("cancel_requested"):
-                _h().send({"type": "ytdl-error", "id": jid, "reason": "cancelled",
+                _terminal({"type": "ytdl-error", "id": jid, "reason": "cancelled",
                            "error": "Cancelled."})
             elif watch.stalled.is_set():
                 # Log whatever it DID say before going quiet — the user-facing
@@ -3834,7 +4082,7 @@ def _handle_ytdl_legacy(req):
                               ("; last output:\n" + "\n".join(errbuf[-12:])[:2000])
                               if errbuf else " (it produced no output at all)"))
                 # Observation, not a guessed cause — see the structured path.
-                _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                _terminal({"type": "ytdl-error", "id": jid, "reason": "stalled",
                            "error": "yt-dlp stopped responding while preparing the download "
                                     "(no output for %ds) and was stopped. Its last output is "
                                     "in the log console." % _YTDL_RESOLVE_STALL})
@@ -3844,16 +4092,16 @@ def _handle_ytdl_legacy(req):
                 except Exception:
                     size = None
                 if type(size) is int and size >= 0:
-                    _h().send({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": size})
+                    _terminal({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": size})
                     _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
                 else:
                     reason, msg = _map_yt_error("\n".join(errbuf))
-                    _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+                    _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
             else:
                 reason, msg = _map_yt_error("\n".join(errbuf))
                 _h()._hlog("error", "yt-dlp failed (%s): %s"
                            % (reason, ("\n".join(errbuf[-12:]))[:2000]))
-                _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+                _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         finally:
             watch.finish()          # idempotent; also covers the exception path
             _pget_unregister(jid, op)
@@ -3861,6 +4109,35 @@ def _handle_ytdl_legacy(req):
     def _run():
         try:
             worker()
+        except BaseException:
+            # A throw that escapes worker() reaches the default excepthook: a
+            # traceback on a stderr nobody reads, and a row acknowledged as
+            # "resolving" with nothing ever following it. worker()'s own handlers
+            # cannot cover a fault in the frame above them, or one raised while
+            # they are unwinding, so the last frame in the thread owes the row a
+            # terminal like every other failure.
+            #
+            # Through the shared claim, never unconditionally: a throw AFTER a
+            # ytdl-done must not turn a saved file into an error row. And note
+            # what this does NOT cover — a worker that HANGS raises nothing and
+            # never reaches here.
+            if claim.take():
+                try:
+                    _h().send({"type": "ytdl-error", "id": req.get("id"),
+                               "reason": "generic",
+                               "error": "The download stopped unexpectedly — open "
+                                        "the log console for details."})
+                except Exception:
+                    pass        # a dead pipe is not something to raise about here
+            try:
+                # format_exc, not repr: the excepthook this replaces printed a
+                # traceback, and "RuntimeError('x')" with no frames names the
+                # error without saying where a dead worker died. It costs
+                # nothing on a path that only runs when one has.
+                _h()._hlog("error", "yt-dlp worker died:\n%s"
+                           % traceback.format_exc(), "ytdlp")
+            except Exception:
+                pass
         finally:
             try:
                 _YTDL_WORKERS.remove(threading.current_thread())
@@ -4563,7 +4840,42 @@ def _pget_register(jid, op):
         return True
 
 
+def _pget_kill_off_loop(proc, kill_children):
+    """Take a cancelled job's processes off the message loop.
+
+    _safe_kill shells out to taskkill /T with a 15s timeout, and kill_children
+    does that once per live child, so cancelling one wedged job can hold its
+    caller for tens of seconds. Inline, that caller is the read loop and every
+    command queued behind it waits too.
+
+    Only the KILLING moves. The decision - which op this cancel names, whether
+    the token allows it, and the cancel_requested flag itself - stays on the
+    loop, because that is the ordering the loop was really providing: see
+    _pget_cancel.
+    """
+    if not proc and not kill_children:
+        return
+
+    def worker():
+        if proc:
+            _safe_kill(proc)
+        if kill_children:
+            kill_children()      # in-process yt-dlp: take what IT spawned
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _pget_cancel(req):
+    """Cancel a registered pget / yt-dlp job.
+
+    Runs on the message loop by design, and stays there for the DECISION. The
+    registry read is what the loop's serialisation was actually buying: a cancel
+    that looked the id up later could find a DIFFERENT operation, because
+    "cancel X" followed by "retry X" is an ordinary sequence and the retry
+    registers the same id. Resolving j here pins the cancel to the op the user
+    was looking at. The flag, the stop event and the lease wake are all cheap
+    and stay too; only the process kills move (_pget_kill_off_loop).
+    """
     j = _pget_registry_get(req.get("id"))
     if not j:
         return
@@ -4585,10 +4897,7 @@ def _pget_cancel(req):
         # Kill / wake outside the op lock (never hold it across process ops).
         if j.get("stop"):
             j["stop"].set()
-        if proc:
-            _safe_kill(proc)
-        if kill_children:
-            kill_children()      # in-process yt-dlp: take what IT spawned
+        _pget_kill_off_loop(proc, kill_children)
         cv = j.get("lease_cv")
         if cv is not None:
             with cv:
@@ -4598,13 +4907,10 @@ def _pget_cancel(req):
     j["cancel_requested"] = True
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
-    if j.get("proc"):
-        _safe_kill(j["proc"])    # yt-dlp exe job: kill the process
-    if j.get("kill_children"):
-        # In-process yt-dlp: no single proc, so cancel reaches the subprocesses
-        # IT spawned. Without this a cancel of a wedged row set a flag nothing
-        # would ever poll, leaking the worker exactly as a stall did.
-        j["kill_children"]()
+    # proc is the yt-dlp exe job's process; kill_children is the in-process
+    # path, which has no single proc and must reach what IT spawned - without
+    # that, a cancel of a wedged row set a flag nothing would ever poll.
+    _pget_kill_off_loop(j.get("proc"), j.get("kill_children"))
     cv = j.get("lease_cv")
     if cv is not None:
         # Wake zero-limit waiters so they can observe cancel without busy-spin.

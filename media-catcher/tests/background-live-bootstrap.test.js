@@ -56,6 +56,18 @@ function backgroundScripts() {
 }
 
 function createHarness() {
+  // background.js measures how long a connection lasted with Date.now(), so a
+  // test that needs a connection to have been up for a while has to be able to
+  // say so. Proxy the real Date rather than replacing it: `new Date(...)` is
+  // still the genuine constructor for every other script in this context, and
+  // with no skew applied Date.now() is byte-for-byte the usual answer.
+  let clockSkew = 0;
+  const SkewableDate = new Proxy(Date, {
+    get(target, prop, receiver) {
+      if (prop === "now") return () => Date.now() + clockSkew;
+      return Reflect.get(target, prop, receiver);
+    },
+  });
   const settingsLoad = deferred();
   const nativePosts = [];
   const runtimeMessages = [];
@@ -185,7 +197,7 @@ function createHarness() {
     TextEncoder,
     URL,
     Blob,
-    Date,
+    Date: SkewableDate,
     Math,
     JSON,
     Number,
@@ -270,6 +282,7 @@ function createHarness() {
     assemblerCreates,
     ticks,
     timers,
+    advanceClock(ms) { clockSkew += ms; },
     setTickError(err) { tickError = err; },
     // background.js declares its entry points at top level, so they land on the
     // vm global — the only way to drive one directly, since runtime.onMessage
@@ -430,6 +443,111 @@ test("automatic re-dials are bounded rather than unbounded", async () => {
     await settle();
   }
   assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");
+  // Running out of re-dials has to SETTLE, not just stop scheduling: the pill
+  // is the only thing telling the user why nothing works. The equivalent
+  // assertion was dropped when the one-shot re-dial test became this one.
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const last = statuses[statuses.length - 1];
+  assert.equal(last.helper.state, "disconnected",
+    "an exhausted re-dial budget settles as disconnected");
+  assert.equal(last.helper.ready, false, "nothing is connected once the budget is gone");
+  assert.equal(last.helper.error, "Helper disconnected.",
+    "a helper that was reached is never reported as a missing install");
+});
+
+// The other arm of that same branch, which nothing covered at all: only claim
+// the helper is missing when no connection ever reached a live one. A drop
+// after a good handshake is a disconnect, and saying otherwise sent people to
+// reinstall software that was already there.
+test("a connection that never reached a helper reports the missing install", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  // No pong has ever arrived on any connection — this is what a missing host
+  // looks like: connectNative hands back a port that immediately drops.
+  h.nativeDisconnects.emit();
+  await settle();
+
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const last = statuses[statuses.length - 1];
+  assert.equal(last.helper.state, "disconnected", "an unreachable helper settles at once");
+  assert.equal(last.helper.error, "Helper not installed.",
+    "a helper that was never reached is reported as a missing install");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").length, 0,
+    "a helper that was never reached is not re-dialled automatically");
+});
+
+// The bound is only a bound if it is per-helper, not per-outage. Any pong used
+// to restore the whole budget, so a helper that answers the connect ping and
+// then dies produced connect → pong → disconnect → 1000ms → connect → … at
+// roughly 1 Hz for the entire browser session: never terminal, and two mclog
+// lines a cycle rotating the 500-entry persisted ring — the diagnostic trail
+// that ring exists for — in about four minutes. The repo's own boundedness
+// test missed it only because its single pong came BEFORE the loop.
+test("a helper that answers each connect ping and dies stays bounded", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  for (let i = 0; i < 6; i += 1) {
+    h.nativeDisconnects.emit();
+    await settle();
+    waits().filter((t) => t.active).slice(-1).forEach((t) => t.fn());
+    await settle();
+    // The flap: this connection says hello and is gone by the next loop turn.
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  assert.equal(waits().length, 4,
+    "a helper that only ever says hello must still run out of re-dials");
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses[statuses.length - 1].helper.state, "disconnected",
+    "the exhausted budget must settle, not keep flapping");
+});
+
+// The other half of the same rule: a genuinely healthy helper that drops must
+// still get a fresh budget. Pongs only come back in answer to a ping, and the
+// only ping sent long after the port was assigned is a heartbeat beat — so
+// "answered a beat" is the durability signal, and this is what proves the
+// budget is restored rather than removed.
+test("a connection that outlives a heartbeat beat earns a fresh budget", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  for (let i = 0; i < 3; i += 1) {
+    h.nativeDisconnects.emit();
+    await settle();
+    waits().filter((t) => t.active).slice(-1).forEach((t) => t.fn());
+    await settle();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+  assert.deepEqual(waits().map((t) => t.ms), [1000, 4000, 15000],
+    "three flaps burn three backoff steps");
+
+  // This connection is still answering half a minute later.
+  h.advanceClock(31000);
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  h.nativeDisconnects.emit();
+  await settle();
+
+  assert.equal(waits().length, 4, "the drop after a durable connection re-dials");
+  assert.equal(waits()[3].ms, 1000,
+    "a connection that lasted must back off from scratch, not from where the flapping left off");
 });
 
 // The scheduling site clears any pending re-dial timer before arming a new
@@ -530,6 +648,225 @@ test("a connected helper keeps being pinged, not only at connect", async () => {
   assert.ok(beat, "expected a heartbeat interval after the handshake");
   beat.fn();
   assert.equal(pings(), before + 1, "the heartbeat must ping a connected helper");
+});
+
+// The heartbeat was send-only: no last-pong timestamp, no missed-beat counter,
+// and no timer that fires when a pong does NOT arrive. Its only failure
+// handling was a log line — it never touched nativeState. A host that wedges
+// while keeping the pipe open (a hung ffmpeg subprocess, say) therefore left
+// the pill green and nativeReady true while every job posted into it was
+// swallowed forever.
+//
+// The answer is to stop CLAIMING the helper is usable, not to disconnect it.
+// EOF makes the host's read loop run cleanup_file_sinks() — which deletes every
+// live sink's .part — and orphan the children it spawned, so disconnecting a
+// helper that is merely slow destroys in-flight downloads.
+test("a helper that stops answering stops being reported as ready", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses().at(-1).helper.state, "ready", "the handshake leaves the pill green");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  // The pipe stays open and nothing ever comes back.
+  for (let i = 0; i < 6; i += 1) {
+    beat.fn();
+    await settle();
+  }
+
+  const last = statuses().at(-1);
+  assert.notEqual(last.helper.state, "ready", "a wedged helper must not still read ready");
+  assert.equal(last.helper.ready, false,
+    "nativeReady gates every new job — a silent helper must not be handed more");
+  assert.ok(last.helper.error, "the pill must say why, not just go amber");
+
+  // Nothing was destroyed: the port is still open, in-flight work still owns
+  // its files, and the policy controller was never told the helper went away.
+  assert.equal(h.helperDisconnects.length, 0,
+    "a slow helper must not be failed like a disconnected one");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").length, 0,
+    "leaving the port open means there is nothing to re-dial");
+  const pinged = h.nativePosts.filter((post) => post && post.cmd === "ping").length;
+  beat.fn();
+  await settle();
+  assert.equal(h.nativePosts.filter((post) => post && post.cmd === "ping").length, pinged + 1,
+    "the beats must keep going out, or a recovering helper could never answer");
+});
+
+// …and the recovery that leaving the port open buys: a helper that was only
+// slow answers a later beat and the pill goes back to green by itself, with
+// nothing asked of the user.
+test("a late pong restores a helper the heartbeat had reported unusable", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 6; i += 1) {
+    beat.fn();
+    await settle();
+  }
+  assert.equal(statuses().at(-1).helper.ready, false, "the silence is reported");
+
+  // The helper catches up and answers one of the beats it has been ignoring.
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const last = statuses().at(-1);
+  assert.equal(last.helper.state, "ready", "a late pong must restore the helper by itself");
+  assert.equal(last.helper.ready, true);
+  assert.equal(last.helper.error, null, "the stale explanation must be cleared with it");
+
+  // And the counter really was cleared, not merely masked by the status. The
+  // report fires on the beat that makes the count EQUAL the threshold, so a
+  // counter left holding its old value simply climbs past and never reports
+  // again — proving the reset means showing the next silent stretch takes a
+  // fresh full four beats to be noticed, no more and no fewer.
+  for (let i = 0; i < 3; i += 1) {
+    beat.fn();
+    await settle();
+  }
+  assert.equal(statuses().at(-1).helper.state, "ready",
+    "three unanswered beats are not yet enough to report again");
+  beat.fn();
+  await settle();
+  assert.equal(statuses().at(-1).helper.ready, false,
+    "the fourth is — the count restarted from zero rather than carrying on");
+});
+
+// Leaving the port open costs the user their only automatic way back: a live
+// port is never re-dialled, and re-pinging one the heartbeat has already given
+// up on is exactly what the beats are doing. So the manual re-check reconnects
+// instead. It is the ONE place allowed to drop a live port, and only because a
+// person asked for it — the drop ends in-flight work, which is why no timer
+// may ever reach for it.
+test("an explicit re-check reconnects a helper the heartbeat gave up on", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  for (let i = 0; i < 4; i += 1) {
+    beat.fn();
+    await settle();
+  }
+  assert.equal(statuses().at(-1).helper.ready, false, "the helper is reported unusable");
+  assert.match(statuses().at(-1).helper.error, /re-check/i,
+    "the pill must say what the user can do, and what it costs");
+
+  const listenersBefore = h.nativeDisconnects.size;
+  h.sandbox.recheckHelper();
+  await settle();
+
+  // A fresh port, not another ping into the one that stopped answering.
+  assert.equal(h.nativeDisconnects.size, 1,
+    "the re-check must dial a new port rather than re-ping the wedged one");
+  assert.equal(listenersBefore, 1, "(the wedged port had one listener of its own)");
+  assert.equal(h.helperDisconnects.length, 1,
+    "the drop the user asked for runs the ordinary disconnect cleanup");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active).length, 0,
+    "an immediate reconnect must not also leave a backoff timer ticking");
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(statuses().at(-1).helper.state, "ready", "the new connection comes up ready");
+});
+
+// The same re-check on a helper that is merely between connections, or
+// answering normally, must stay the cheap one it has always been: no port is
+// dropped and nothing in flight is disturbed.
+test("an explicit re-check on an answering helper only re-pings it", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const pings = () => h.nativePosts.filter((post) => post && post.cmd === "ping").length;
+  const before = pings();
+  h.sandbox.recheckHelper();
+  await settle();
+
+  assert.equal(pings(), before + 1, "a healthy helper is simply pinged");
+  assert.equal(h.helperDisconnects.length, 0, "nothing in flight may be disturbed");
+  const last = h.runtimeMessages.filter((m) => m && m.type === "helper-status").at(-1);
+  assert.equal(last.helper.state, "ready", "and the pill is left alone");
+});
+
+// Falsely reporting a working helper unusable would refuse new jobs for no
+// reason, so the counter has to clear on every pong: an answered beat is never
+// a missed one, however many beats have gone by.
+test("a helper that keeps answering is never reported unusable", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 12; i += 1) {
+    beat.fn();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses[statuses.length - 1].helper.state, "ready",
+    "an answering helper must stay ready");
+  assert.equal(h.helperDisconnects.length, 0, "an answering helper must not be dropped");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").length, 0,
+    "an answering helper must not be re-dialled");
+});
+
+// The mirror of the same hole: the heartbeat used to be armed inside the pong
+// handler, so a port that connected and never answered the FIRST ping armed no
+// heartbeat at all and sat on a bare "connecting" with nothing ever said about
+// it again. Arming at the one site that assigns a port covers it with the same
+// counter — and, like the wedge case, the answer is to explain rather than to
+// disconnect: a host can be slow to start for the same reasons it can be slow
+// to answer.
+test("a port that never answers its first ping says so instead of waiting silently", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses().at(-1).helper.state, "connecting", "the connect attempt is pending");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "a connection must arm the heartbeat before it is ever answered");
+  for (let i = 0; i < 6; i += 1) {
+    beat.fn();
+    await settle();
+  }
+
+  const last = statuses().at(-1);
+  assert.equal(last.helper.ready, false, "an unanswered connection is never usable");
+  assert.ok(last.helper.error,
+    "a connection that never answers must explain itself, not wait in silence");
+  assert.equal(h.helperDisconnects.length, 0, "and must not be torn down for it");
 });
 
 // The heartbeat sends the same `{cmd:"ping"}` the connect path does, so the

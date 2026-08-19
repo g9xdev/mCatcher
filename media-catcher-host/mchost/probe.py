@@ -131,8 +131,16 @@ def internal_dir_for(exe):
 
 
 def has_internal_for(exe):
+    """Populated, not merely present — the same test downloads._has_internal
+    applies, so the diagnostic never calls an install sound while the downloader
+    is re-fetching it."""
     d = internal_dir_for(exe)
-    return bool(d) and os.path.isdir(d)
+    if not d:
+        return False
+    try:
+        return bool(os.listdir(d))
+    except OSError:
+        return False
 
 
 def check_ytdlp_build(has_internal, exe_bytes, exe_present=True):
@@ -150,7 +158,9 @@ def check_ytdlp_build(has_internal, exe_bytes, exe_present=True):
         return _verdict("ytdlpBuild", "yt-dlp packaging", "pass",
                         "directory build (_internal present) — nothing extracted per launch")
     return _verdict("ytdlpBuild", "yt-dlp packaging", "fail",
-                    "onefile build (%.1f MB, no _internal) — re-extracts ~145 files every launch"
+                    "not a directory build (%.1f MB, no populated _internal) — a "
+                    "onefile re-extracts ~145 files every launch, and an empty "
+                    "_internal cannot start at all"
                     % (exe_bytes / 1048576.0),
                     fix="Replace with the yt-dlp_win.zip directory build.", fixable=True)
 

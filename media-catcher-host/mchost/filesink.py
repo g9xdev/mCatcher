@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import os
 import threading
+import time
 import uuid
 
 # Firefox native-messaging payload ceiling is 1 MiB framed. Base64 expands by
@@ -38,7 +39,7 @@ def _h():
     return mc_host
 
 
-def cleanup_file_sinks():
+def cleanup_file_sinks(drain_timeout=30.0):
     """Detach and close every live file sink without emitting native frames.
 
     Used on native-messaging EOF / host exit so this process's bound .part
@@ -46,7 +47,16 @@ def cleanup_file_sinks():
     then closes handles and removes only each detached sink's exact .part
     path outside the registry lock. Never removes final paths, never emits
     frames (stdout may be unavailable), and never raises.
+
+    Commits in flight are waited for FIRST, and a sink that is already terminal
+    on entry keeps its .part. Those two are not alternatives: the wait is what
+    lets a finished download land, and the skip is what makes a wait that times
+    out harmless. Without the skip this function raced os.replace and deleted a
+    completed download; without the wait the .part of a commit killed at
+    interpreter exit would be orphaned, and blocking a retry is the very thing
+    this function exists to prevent.
     """
+    drain_commit_workers(drain_timeout)
     try:
         with _LOCK:
             sinks = list(_SINKS.values())
@@ -56,8 +66,14 @@ def cleanup_file_sinks():
         for s in sinks:
             try:
                 with s.lock:
-                    if s.state == "open":
-                        s.state = "terminal"
+                    if s.state != "open":
+                        # Already terminal means some other path owns this
+                        # sink's disposal: a commit worker owns the .part it is
+                        # about to os.replace, and abort / _terminalize_cleanup
+                        # have already removed theirs. Taking it here deleted a
+                        # finished download out from under the replace.
+                        continue
+                    s.state = "terminal"
                     # Close and remove are independent best-effort steps: a
                     # close exception must not skip this sink's exact .part,
                     # and a remove exception must not block later sinks.
@@ -519,6 +535,41 @@ def handle_file_chunk(req):
             sink.unacked = max(0, sink.unacked - 1)
 
 
+# Commits in flight. Not a test seam: cleanup_file_sinks drains this at EOF so a
+# commit mid-replace is not torn down under. Each worker drops its own entry as
+# it ends, so this holds live commits only.
+_COMMIT_WORKERS = []
+_COMMIT_WORKERS_LOCK = threading.Lock()
+
+
+def drain_commit_workers(timeout=30.0):
+    """Wait out the commits still running, up to timeout in total.
+
+    Best effort by design. One that outlives the bound is not abandoned - it
+    keeps running, and cleanup_file_sinks leaves its .part alone because the
+    sink is terminal. That skip is what makes a bound safe here: a deadline that
+    can only stop WAITING, never stop the work or discard its result.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _COMMIT_WORKERS_LOCK:
+        pending = list(_COMMIT_WORKERS)
+    for t in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            t.join(remaining)
+        except Exception:
+            return
+
+
+def _join_commit_workers_for_test(timeout=15.0):
+    drain_commit_workers(timeout)
+    with _COMMIT_WORKERS_LOCK:
+        alive = [t for t in _COMMIT_WORKERS if t.is_alive()]
+    assert not alive, "a file-commit outran the %ss join" % timeout
+
+
 def handle_file_commit(req):
     sink_id = req.get("sinkId")
     if not _nonblank_str(sink_id):
@@ -541,72 +592,102 @@ def handle_file_commit(req):
                attempt_token=req.get("attemptToken") if isinstance(req.get("attemptToken"), str) else None)
         return
 
-    final_path = None
-    byte_count = 0
-    fail_reason = None
-
+    # Claim terminal INLINE, before flush/replace, so a concurrent abort/commit
+    # loses. This claim is the linearization point the message loop used to
+    # provide for free, and it is the only part of a commit that has to keep it:
+    # a file-chunk that arrives after the client asked to commit must lose, and
+    # it can only lose to a state that is already set. Cheap - a lock and five
+    # assignments - so it stays on the loop.
     with sink.lock:
-        if sink.state != "open":
-            fail_reason = "terminal-sink"
-        else:
-            # Claim terminal before flush/replace so a concurrent abort/commit loses.
+        already_terminal = sink.state != "open"
+        if not already_terminal:
             sink.state = "terminal"
             handle = sink.handle
             sink.handle = None
             byte_count = sink.bytes_written
             part = sink.part_path
             final_path = sink.final_path
-            try:
-                if handle is not None:
-                    handle.flush()
-                    # Skip fsync only when the platform lacks the capability.
-                    # A real OSError from fsync is a durability failure — fail closed.
-                    if hasattr(os, "fsync"):
-                        try:
-                            os.fsync(handle.fileno())
-                        except NotImplementedError:
-                            pass
-                    handle.close()
-                os.replace(part, final_path)
-            except Exception:
-                # Close if still open; remove partial when possible; never
-                # remove a successfully replaced final; never claim committed.
-                if handle is not None:
-                    try:
-                        handle.close()
-                    except Exception:
-                        pass
-                if part:
-                    try:
-                        os.remove(part)
-                    except FileNotFoundError:
-                        pass
-                    except Exception:
-                        pass
-                fail_reason = "commit-failed"
-                final_path = None
 
-    if fail_reason == "terminal-sink":
+    if already_terminal:
+        # Outside the lock: nothing here is held over a send.
         _error("terminal-sink", sink_id=sink_id, job_id=sink.job_id,
                attempt_token=sink.attempt_token)
         return
 
-    # Unregister after terminal claim (success or failure) exactly once.
-    with _LOCK:
-        if _SINKS.get(sink_id) is sink:
-            _unregister_unlocked(sink)
+    def worker():
+        # fsync forces every dirty page of what may be a multi-GB file, and the
+        # replace behind it can meet an antivirus scanner still holding the
+        # .part. Neither is bounded, and inline both held the read loop.
+        #
+        # Run with NO lock held: the sink is already terminal and its handle is
+        # already detached, so nothing else can touch either. That is also
+        # strictly better than the shape this replaces, where a late chunk BLOCKED
+        # on sink.lock for the whole fsync; now it takes the lock, sees terminal,
+        # and is refused at once. _PART_OWNERS still holds the part key until the
+        # unregister below, so no new sink can claim this path mid-replace.
+        fail_reason = None
+        committed = final_path
+        try:
+            if handle is not None:
+                handle.flush()
+                # Skip fsync only when the platform lacks the capability.
+                # A real OSError from fsync is a durability failure — fail closed.
+                if hasattr(os, "fsync"):
+                    try:
+                        os.fsync(handle.fileno())
+                    except NotImplementedError:
+                        pass
+                handle.close()
+            os.replace(part, committed)
+        except Exception:
+            # Close if still open; remove partial when possible; never
+            # remove a successfully replaced final; never claim committed.
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            if part:
+                try:
+                    os.remove(part)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+            fail_reason = "commit-failed"
+            committed = None
 
-    if fail_reason:
-        _error(fail_reason, sink_id=sink_id, job_id=sink.job_id,
-               attempt_token=sink.attempt_token)
-        return
+        # Unregister after terminal claim (success or failure) exactly once.
+        with _LOCK:
+            if _SINKS.get(sink_id) is sink:
+                _unregister_unlocked(sink)
 
-    _send({
-        "type": "file-committed",
-        "sinkId": sink_id,
-        "file": final_path,
-        "bytes": byte_count,
-    })
+        if fail_reason:
+            _error(fail_reason, sink_id=sink_id, job_id=sink.job_id,
+                   attempt_token=sink.attempt_token)
+            return
+
+        _send({
+            "type": "file-committed",
+            "sinkId": sink_id,
+            "file": committed,
+            "bytes": byte_count,
+        })
+
+    def run():
+        try:
+            worker()
+        finally:
+            with _COMMIT_WORKERS_LOCK:
+                try:
+                    _COMMIT_WORKERS.remove(threading.current_thread())
+                except ValueError:
+                    pass        # already drained
+
+    t = threading.Thread(target=run, daemon=True)
+    with _COMMIT_WORKERS_LOCK:
+        _COMMIT_WORKERS.append(t)
+    t.start()
 
 
 def handle_file_abort(req):

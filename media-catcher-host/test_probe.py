@@ -230,12 +230,25 @@ def test_internal_dir_is_derived_from_the_exe_not_the_host_dir(tmp_path):
     onefile — caught by running the probe for real against a checkout."""
     elsewhere = tmp_path / "somewhere"
     (elsewhere / "_internal").mkdir(parents=True)
+    # Populated: an empty _internal is not a directory build (see below).
+    (elsewhere / "_internal" / "base_library.zip").write_bytes(b"LIB")
     exe = elsewhere / "yt-dlp.exe"
     exe.write_bytes(b"x")
     assert probe.internal_dir_for(str(exe)) == str(elsewhere / "_internal")
     assert probe.has_internal_for(str(exe)) is True
     assert probe.has_internal_for(str(tmp_path / "nope" / "yt-dlp.exe")) is False
     assert probe.has_internal_for(None) is False
+
+
+def test_probe_calls_an_empty_internal_what_the_downloader_calls_it(tmp_path):
+    """The probe is the page a user reads to decide whether their install is
+    sound. If it reported "directory build" for a state ensure_ytdlp re-fetches,
+    the diagnostic would contradict the behaviour it is describing."""
+    hollow = tmp_path / "hollow"
+    (hollow / "_internal").mkdir(parents=True)
+    exe = hollow / "yt-dlp.exe"
+    exe.write_bytes(b"x")
+    assert probe.has_internal_for(str(exe)) is False
 
 
 # ---------------------------------------------------------------------------
