@@ -279,6 +279,17 @@ def _codec_args(codec, encoder, quality):
         return ["-c:v", "hevc_amf", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
     return ["-c:v", "libx265", "-crf", str(q), "-preset", "slow"]
 
+
+def _proc_alive(p):
+    """True while p is still running. A process object that cannot answer is
+    treated as gone: the callers use this to decide what is worth killing, and
+    guessing "alive" there would report kills that never happened."""
+    try:
+        return p.poll() is None
+    except Exception:
+        return False
+
+
 def _safe_kill(p):
     """Kill p AND its descendants.
 
@@ -3473,14 +3484,54 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     _YTDL_RESOLVE_STALL deadline the exe path's _StallWatch applies, rolling on
     every note the way _StallWatch.touch() rolls on every output line, because
     --js-runtimes still launches deno and "in-process" does not make this phase
-    unstallable. The REMEDY is weaker than _StallWatch's, though: that one kills
-    the child and unblocks its reader, while this only bounds the silence and
-    reports it. The flag it sets is seen when yt-dlp next reaches a hook or logs
-    a line, so a genuinely wedged deno leaves this worker and its _pget entry
-    alive for the life of the helper — the row stops lying, the thread still
-    leaks."""
+    unstallable. The remedy now matches _StallWatch's: ytdlp_lib announces every
+    subprocess yt-dlp launches for this job, and the watchdog takes their trees
+    with the same _safe_kill the exe path uses. That kill is what makes the flag
+    reachable again — it unblocks the communicate() deno is parked in, yt-dlp
+    then raises or logs, the log sink polls, and the unwind releases the _pget
+    entry and ends this thread.
+
+    A wedge with no live child — blocked inside Python itself, which
+    --socket-timeout bounds but does not eliminate — still has only the flag,
+    and that worker stays parked. Its registration is held until the thread
+    really ends rather than dropped when the watchdog reports: the registry
+    means "this job still holds resources", which stays true, and a retry of
+    that id is then refused instead of racing a live writer for one path."""
     lib = _ytdlp_lib()
+    # yt-dlp still shells out — deno for the JS challenge, ffmpeg for the merge —
+    # and a wedged child is the hang "in-process" did not remove. ytdlp_lib hands
+    # each launch to the thread that made it; holding them here is what gives the
+    # watchdog and _pget_cancel something to act on.
+    children = []
+    children_lock = threading.Lock()
     op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
+
+    def on_child(proc):
+        with children_lock:
+            # Prune while appending: a job launches several over its life, and a
+            # finished one holds an OS handle open until it is dropped.
+            children[:] = [p for p in children if _proc_alive(p)]
+            children.append(proc)
+        # Already cancelled means a kill pass has been and gone. yt-dlp's JS
+        # challenge director wraps each provider in `except Exception`, so it can
+        # absorb the Cancelled the log sink raises and spawn again; take this one
+        # now rather than let the worker park on it as if nothing had happened.
+        if op.get("cancel_requested"):
+            _safe_kill(proc)
+
+    def kill_children():
+        """Take the whole tree of everything yt-dlp spawned for this job. Returns
+        how many were still running, so the caller can report what it did rather
+        than what it attempted."""
+        with children_lock:
+            live = [p for p in children if _proc_alive(p)]
+        for p in live:
+            _safe_kill(p)
+        return len(live)
+
+    # _pget_cancel reaches the exe path's child through "proc". This path has no
+    # single process, so it carries a killer instead.
+    op["kill_children"] = kill_children
     if not _pget_register(jid, op):
         _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn",
                    "error": "Download id already in use."})
@@ -3555,9 +3606,15 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
                 continue
             if not _claim_terminal(unless_progressing=True):
                 return                  # already terminal, or bytes just started
+            # Flag BEFORE kill: the flag is polled from yt-dlp's hooks and log
+            # lines, and killing the child is what makes the next poll happen at
+            # all. Both before the send, which writes the pipe and can block.
             op["cancel_requested"] = True
-            _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling"
-                       % _YTDL_RESOLVE_STALL, "ytdlp")
+            killed = kill_children()
+            _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling (%s)"
+                       % (_YTDL_RESOLVE_STALL,
+                          "killed %d subprocess(es)" % killed if killed
+                          else "no live subprocess to kill"), "ytdlp")
             _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
                        "error": "yt-dlp made no progress while resolving. "
                                 "Open the log console for its output."})
@@ -3567,7 +3624,8 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     try:
         path = lib.download(_ytdl_lib_argv(fmt, outtmpl, url, deno, pot),
                             on_progress=on_progress, on_note=on_note,
-                            should_cancel=lambda: op.get("cancel_requested"))
+                            should_cancel=lambda: op.get("cancel_requested"),
+                            on_child=on_child)
     except lib.Cancelled:
         _cancelled()
         return
@@ -4481,11 +4539,14 @@ def _pget_cancel(req):
                 return  # success already linearized — cancel is inert
             j["cancel_requested"] = True
             proc = j.get("proc")
+            kill_children = j.get("kill_children")
         # Kill / wake outside the op lock (never hold it across process ops).
         if j.get("stop"):
             j["stop"].set()
         if proc:
             _safe_kill(proc)
+        if kill_children:
+            kill_children()      # in-process yt-dlp: take what IT spawned
         cv = j.get("lease_cv")
         if cv is not None:
             with cv:
@@ -4496,7 +4557,12 @@ def _pget_cancel(req):
     if j.get("stop"):
         j["stop"].set()          # segmented pget: signal the workers
     if j.get("proc"):
-        _safe_kill(j["proc"])    # yt-dlp job: kill the process
+        _safe_kill(j["proc"])    # yt-dlp exe job: kill the process
+    if j.get("kill_children"):
+        # In-process yt-dlp: no single proc, so cancel reaches the subprocesses
+        # IT spawned. Without this a cancel of a wedged row set a flag nothing
+        # would ever poll, leaking the worker exactly as a stall did.
+        j["kill_children"]()
     cv = j.get("lease_cv")
     if cv is not None:
         # Wake zero-limit waiters so they can observe cancel without busy-spin.

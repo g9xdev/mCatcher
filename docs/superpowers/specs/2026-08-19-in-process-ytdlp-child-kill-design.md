@@ -85,6 +85,17 @@ what actually ends the worker — the kill only makes the poll reachable again.
 The kill goes before the send because `_h().send` writes the native-messaging
 pipe and can block; the worker should start moving first.
 
+### One kill pass is not enough
+
+`jsc/_director.py:bulk_solve` wraps each provider in `except Exception`, so the
+`Cancelled` the log sink raises can be absorbed there and yt-dlp can spawn
+again before the flag is next polled. A single pass over the child list would
+leave that respawn running and the worker parked on it exactly as before.
+
+So `on_child` also checks the flag: a child announced after the job is already
+cancelled is killed on arrival. One mechanism covers both triggers, because
+`_pget_cancel` sets the same flag before calling the killer.
+
 ### The false-positive guarantee is inherited, not re-argued
 
 Every kill sits inside the branch guarded by `_claim_terminal(unless_progressing=
@@ -128,6 +139,7 @@ that the remedy is weaker than `_StallWatch`'s.
 
 - a wedged resolve kills the children yt-dlp spawned, after setting the flag
 - a progressing download's children are never killed
+- a child spawned after the kill pass is taken too
 - a user cancel kills them too
 - the `_pget` registration is released once the killed worker unwinds
 

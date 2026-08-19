@@ -5,6 +5,8 @@ The network calls (extract_info, download) are verified end-to-end, not here —
 these tests pin the translation layer that has to match _parse_yt_progress
 byte-for-byte so the extension sees no difference between the exe and the library.
 """
+import threading
+
 from conftest import load_host
 
 load_host()
@@ -135,9 +137,14 @@ def test_the_logger_routes_lines_to_a_sink_not_stdout():
 # yt-dlp's progress hooks do not fire until bytes flow, so the log sink is the
 # only poll that can see a cancel while the job is still resolving.
 
-def _fake_yt(on_extract):
+def _fake_yt(on_extract, popen=None):
     """Minimal stand-in for the yt_dlp module: just enough of parse_options and
-    YoutubeDL for download() to run without the vendored library present."""
+    YoutubeDL for download() to run without the vendored library present.
+
+    `popen` becomes utils.Popen — the single class every real yt-dlp spawn site
+    binds. Omitted, the module has no utils at all, which is the shape the child
+    hook has to tolerate.
+    """
 
     class YoutubeDL:
         def __init__(self, opts):
@@ -155,11 +162,14 @@ def _fake_yt(on_extract):
         def sanitize_info(self, info):
             return info
 
-    return type("yt_dlp", (), {
+    mod = type("yt_dlp", (), {
         "parse_options": staticmethod(
             lambda argv: type("P", (), {"ydl_opts": {}, "urls": ["u"]})()),
         "YoutubeDL": YoutubeDL,
     })
+    if popen is not None:
+        mod.utils = type("utils", (), {"Popen": popen})
+    return mod
 
 
 def test_a_cancel_is_seen_from_the_log_sink_before_any_bytes_flow(monkeypatch):
@@ -186,3 +196,124 @@ def test_the_sink_cancel_poll_is_inert_when_no_poll_was_given(monkeypatch):
     monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract))
     assert lib.download(["u"], on_note=notes.append) == r"C:\out.mp4"
     assert notes == ["Reading page"]
+
+
+# ---- the subprocesses yt-dlp still spawns ----------------------------------
+# "In-process" removes yt-dlp's own exe, not the ones it shells out to. deno
+# solves the JS challenge through yt_dlp.utils.Popen and blocks the calling
+# thread in communicate_or_kill with no timeout, so a hung deno is the one wedge
+# no hook and no log line can reach. The caller needs a handle to what was
+# spawned before it can do anything about it.
+
+def _popen_class():
+    """A FRESH stand-in per test. The hook wraps the class in place — a shared
+    one would carry the wrap from the test that installed it into every test
+    after, and they would pass on each other's work."""
+
+    class _FakePopen:
+        def __init__(self, args, **kw):
+            self.args = args
+
+        def poll(self):
+            return None
+
+    return _FakePopen
+
+
+def _saved(path=r"C:\out.mp4"):
+    return lambda opts: {"filepath": path}
+
+
+def test_a_subprocess_yt_dlp_launches_is_handed_to_the_caller(monkeypatch):
+    seen = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        popen(["deno", "run", "-"])            # the JS challenge solver
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=seen.append)
+    assert [p.args for p in seen] == [["deno", "run", "-"]]
+
+
+def test_a_subprocess_from_another_thread_is_not_this_jobs_child(monkeypatch):
+    """Downloads run concurrently, one worker thread each. A process-wide hook
+    would let one job's stall kill another job's healthy deno."""
+    seen = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        t = threading.Thread(target=lambda: popen(["deno", "other-job"]))
+        t.start()
+        t.join()
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=seen.append)
+    assert seen == [], "a child of another job was reported as this job's"
+
+
+def test_the_hook_is_disarmed_once_the_download_returns(monkeypatch):
+    """The worker thread outlives the call and goes on to other work; a still-armed
+    hook would keep feeding a list nothing will ever drain."""
+    seen = []
+    popen = _popen_class()
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved(), popen))
+
+    lib.download(["u"], on_child=seen.append)
+    popen(["ffmpeg", "-i", "x"])              # a later, unrelated spawn
+    assert seen == []
+
+
+def test_the_wrap_still_constructs_the_process(monkeypatch):
+    """The hook observes. It must not change what yt-dlp spawns or how."""
+    made = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        made.append(popen(["deno", "run", "-"], stdin=-1).args)
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=lambda p: None)
+    assert made == [["deno", "run", "-"]]
+
+
+def test_a_yt_dlp_without_utils_popen_still_downloads(monkeypatch):
+    """yt-dlp could rename or drop the spawn funnel. A download that works today
+    must not start failing in order to gain a watchdog."""
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved()))
+    assert lib.download(["u"], on_child=lambda p: None) == r"C:\out.mp4"
+
+
+def test_a_sink_that_raises_does_not_break_the_download(monkeypatch):
+    """Same rule: observing is never worth failing a job that would have worked."""
+    popen = _popen_class()
+
+    def on_extract(opts):
+        popen(["deno", "run", "-"])
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+
+    def boom(proc):
+        raise RuntimeError("sink is broken")
+
+    assert lib.download(["u"], on_child=boom) == r"C:\out.mp4"
+
+
+def test_arming_the_hook_twice_does_not_announce_a_child_twice(monkeypatch):
+    """Every download arms it. A wrap layered on a wrap would report each child
+    once per download the process had ever run."""
+    seen = []
+    popen = _popen_class()
+
+    def on_extract(opts):
+        popen(["deno", "run", "-"])
+        return {"filepath": r"C:\out.mp4"}
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(on_extract, popen))
+    lib.download(["u"], on_child=lambda p: None)      # installs
+    lib.download(["u"], on_child=seen.append)         # must not install again
+    assert len(seen) == 1, "the child was announced %d times" % len(seen)

@@ -173,24 +173,124 @@ def extract_info(argv, pylib=None):
         return ydl.sanitize_info(info)
 
 
+# ---- the subprocesses yt-dlp still spawns ---------------------------------
+# "In-process" removed yt-dlp's own exe, not the ones it shells out to. deno
+# solves the JS challenge through `Popen.communicate_or_kill` with NO timeout,
+# so a hung deno parks the calling thread emitting nothing — no progress hook,
+# no log line, and therefore no poll of the caller's cancel flag. Bounding that
+# silence is not enough; something has to take the child away.
+#
+# Every yt-dlp spawn site — the JS runtimes, ffmpeg, the cookie helpers — writes
+# `from yt_dlp.utils import Popen`, which binds the CLASS OBJECT. So wrapping
+# that class's __init__ IN PLACE reaches all of them whatever the import order,
+# where rebinding yt_dlp.utils.Popen would miss everything already imported.
+#
+# This module only watches. _safe_kill and the process-tree policy live in
+# downloads.py, and the caller decides what a child is worth doing anything to.
+
+_child_lock = threading.Lock()
+_child_sinks = {}               # launching thread ident -> sink(proc)
+_HOOK_MARK = "_mchost_child_hook"
+_hook_warned = [False]
+
+
+def _announce_child(proc):
+    """Hand a just-spawned process to whatever the LAUNCHING thread registered.
+
+    Keyed by thread because each download owns a worker thread and yt-dlp does
+    its resolve work, JS challenge included, on the thread that called
+    extract_info. Concurrent jobs therefore never see each other's children, so
+    one job's stall cannot take another job's healthy deno. A thread with no
+    entry is a thread nobody asked about.
+    """
+    with _child_lock:
+        sink = _child_sinks.get(threading.get_ident())
+    if sink is None:
+        return
+    try:
+        sink(proc)
+    except Exception:
+        pass        # watching is never worth failing a download that would work
+
+
+def _install_child_hook(pylib=None):
+    """Wrap yt_dlp.utils.Popen.__init__ in place, once. True if it is in effect.
+
+    Fails soft on every path: a yt-dlp that renames or drops the spawn funnel
+    leaves downloads working exactly as they do today, minus this lever.
+    """
+    try:
+        cls = getattr(getattr(_yt(pylib), "utils", None), "Popen", None)
+        if cls is None:
+            if not _hook_warned[0]:
+                _hook_warned[0] = True
+                try:
+                    _h()._hlog("warn", "yt-dlp: no utils.Popen to watch; a wedged "
+                                       "child cannot be killed", "ytdlp")
+                except Exception:
+                    pass
+            return False
+        # __dict__, not getattr: a subclass would inherit the mark and go unwrapped.
+        if cls.__dict__.get(_HOOK_MARK):
+            return True
+        original = cls.__init__
+
+        def __init__(self, *args, **kwargs):
+            original(self, *args, **kwargs)
+            _announce_child(self)       # only once a spawn has actually happened
+
+        cls.__init__ = __init__
+        setattr(cls, _HOOK_MARK, True)
+        return True
+    except Exception:
+        return False
+
+
+def _arm_child_sink(sink, pylib=None):
+    """Report this thread's yt-dlp spawns to `sink` until disarmed."""
+    _install_child_hook(pylib)
+    with _child_lock:
+        _child_sinks[threading.get_ident()] = sink
+
+
+def _disarm_child_sink():
+    with _child_lock:
+        _child_sinks.pop(threading.get_ident(), None)
+
+
 # ---- download (in-process, with progress + cancellation) ------------------
 
 class Cancelled(Exception):
     pass
 
 
-def download(argv, on_progress=None, on_note=None, should_cancel=None, pylib=None):
+def download(argv, on_progress=None, on_note=None, should_cancel=None,
+             on_child=None, pylib=None):
     """Run a download in-process.
 
     on_progress(msg): the {stage,pct,...} dicts, ready to forward as ytdl-progress.
     on_note(text):    a resolution-phase label (Reading page, Choosing format, …).
     should_cancel():  polled inside the hook; when it returns True the download is
                       aborted by raising, which yt-dlp unwinds cleanly.
+    on_child(proc):   each subprocess yt-dlp spawns for THIS call — deno for the
+                      JS challenge, ffmpeg for the merge. The lever for a wedge
+                      no hook and no log line can reach; see _announce_child.
 
     Returns the saved file path, or None. Raises Cancelled on user cancel.
     """
     yt = _yt(pylib)
+    if on_child is not None:
+        _arm_child_sink(on_child, pylib)
+    try:
+        return _download(yt, argv, on_progress, on_note, should_cancel, pylib)
+    finally:
+        if on_child is not None:
+            _disarm_child_sink()
 
+
+def _download(yt, argv, on_progress, on_note, should_cancel, pylib):
+    """The body of download(), split out so the child sink is disarmed on every
+    exit — return, cancel, and throw alike."""
     # The logger sink doubles as the resolution-phase note source: yt-dlp's
     # "[youtube] Downloading webpage" etc. arrive here as info lines, the same
     # text _yt_stage_note mapped from stdout. Anything not a note still gets
