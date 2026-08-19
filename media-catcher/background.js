@@ -580,13 +580,15 @@ function dropNativePort(port, err) {
 // One heartbeat beat. A host that wedges with the pipe still open answers
 // nothing, and with no missed-beat counter the pill stayed green and
 // nativeReady true while every job posted into it was swallowed forever. The
-// host answers ping from its own message loop and runs every long command
-// (ytdl, pget, record, probe, folder pick) on a worker thread, so an
-// unanswered beat means that loop itself is blocked, not that the helper is
-// busy. Four consecutive misses is deliberately generous — a false teardown of
-// a working helper is worse than slow detection — and puts detection at about
-// two and a half minutes, by which point the oldest unanswered ping is two
-// full beats older still.
+// host answers ping from its own message loop and dispatches every long
+// command — ytdl, pget, record, probe, folder pick, snapshot — to a worker
+// thread. The only inline wait left is discard's bounded 10s for ffmpeg to
+// finalize, comfortably inside one beat. So an unanswered beat means that
+// loop itself is blocked, not that the helper is busy. Four consecutive
+// misses is deliberately generous — a false teardown of a working helper is
+// worse than slow detection — and puts detection at about two and a half
+// minutes, by which point the oldest unanswered ping is two full beats older
+// still.
 function helperHeartbeat() {
   const port = nativePort;
   if (!port) return;
