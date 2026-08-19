@@ -117,6 +117,8 @@ def test_reveal_opens_containing_folder(monkeypatch, tmp_path):
     monkeypatch.setattr(mc_host, "send", sent.append)
 
     mc_host.handle_reveal({"path": tmp})
+    # Dispatched to a worker (the isfile stat has no bound), so wait for it.
+    assert wait_for(lambda: bool(calls) or bool(sent), timeout=5), "reveal never ran"
     if os.name == "nt":
         assert calls == ['explorer /select,"%s"' % tmp], \
             "reveal uses Explorer /select, on the file (exact command)"
@@ -129,6 +131,7 @@ def test_reveal_opens_containing_folder(monkeypatch, tmp_path):
 
     calls.clear(); sent.clear()
     mc_host.handle_reveal({"path": tmp + ".nope", "id": 5})
+    assert wait_for(lambda: bool(sent), timeout=5), "reveal never reported the miss"
     assert len(sent) == 1 and sent[0].get("type") == "error" and sent[0].get("id") == 5, \
         "reveal of missing file errors with the request id"
     assert not calls, "reveal of missing file spawns nothing"
@@ -631,8 +634,7 @@ LOOP_DISPATCH = {
     "saveAs": ("worker", ("handle_save_as",)),
     "pickFolder": ("worker", ("handle_pick_folder",)),
     "open": ("worker", ("handle_open",)),
-    "reveal": ("inline",
-               "one stat, then a Popen of the file manager, which never waits"),
+    "reveal": ("worker", ("handle_reveal",)),
     "update": ("worker", ("handle_update",)),
     "watch": ("inline",
               "reads and rewrites the small config file, then arms an OS watcher"),
@@ -660,7 +662,13 @@ LOOP_DISPATCH = {
 
 def _loop_branches():
     """Every `cmd == "..."` branch in main(), by AST rather than by grep, with a
-    flag for whether the branch body itself starts a thread."""
+    flag for whether the branch body itself starts a thread.
+
+    Matches that one shape only. `elif cmd in ("a", "b")` and
+    `elif msg.get("cmd") == "x"` would both be missed, so a command added in
+    either form slips past the table. The loop has used one shape throughout;
+    this is where to look first if it ever stops.
+    """
     import ast
 
     tree = ast.parse(io.open(HOST, encoding="utf-8").read())
@@ -741,11 +749,7 @@ def test_every_long_loop_command_really_dispatches_to_a_worker():
                 "thread - it now runs on the read loop" % (cmd, name, where))
 
 
-def test_every_inline_loop_command_states_its_bound():
-    """The inline half cannot be checked mechanically, so it is checked
-    editorially: an exemption with no stated bound is not an exemption."""
-    for cmd, (kind, detail) in sorted(LOOP_DISPATCH.items()):
-        if kind != "inline":
-            continue
-        assert isinstance(detail, str) and len(detail) > 20, (
-            "%s is exempt from the worker rule with no bound written down" % cmd)
+# The inline half of the table is documentation, deliberately unasserted. A
+# "len(reason) > 20" check passes anything and would be updated reflexively the
+# first time it fired, which is worse than not having it: the reasons are there
+# for a reader, and only a reader can judge them.

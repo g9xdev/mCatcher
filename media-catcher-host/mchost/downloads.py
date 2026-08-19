@@ -889,22 +889,33 @@ def handle_open(req):
 
 
 def handle_reveal(req):
-    """Show a saved file in its containing folder (popup "Folder" button)."""
-    path = req.get("path")
-    if not path or not os.path.isfile(path):
-        _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
-        return
-    try:
-        if os.name == "nt":
-            # String form on purpose: explorer's "/select," argument must not be
-            # split/re-quoted by list2cmdline. '"' can't appear in a Windows path.
-            subprocess.Popen('explorer /select,"%s"' % path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        else:
-            subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
-    except Exception as e:
-        _h().send({"type": "error", "error": "reveal failed: %s" % e})
+    """Show a saved file in its containing folder (popup "Folder" button).
+
+    On a worker, for the same reason handle_open is: the isfile() below is a
+    stat on a caller-supplied path, and a path on a dead network share blocks a
+    stat for as long as the SMB timeout takes. The Popen itself never waits, but
+    that was never the part with no bound. Shares no state with any other
+    handler; the loop was carrying only the error frame's position, and that
+    frame names its own id.
+    """
+    def worker():
+        path = req.get("path")
+        if not path or not os.path.isfile(path):
+            _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
+            return
+        try:
+            if os.name == "nt":
+                # String form on purpose: explorer's "/select," argument must not
+                # be split/re-quoted by list2cmdline. '"' can't appear in a
+                # Windows path.
+                subprocess.Popen('explorer /select,"%s"' % path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
+        except Exception as e:
+            _h().send({"type": "error", "error": "reveal failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def handle_discard(req):
@@ -4851,23 +4862,7 @@ def _pget_kill_off_loop(proc, kill_children):
         if kill_children:
             kill_children()      # in-process yt-dlp: take what IT spawned
 
-    t = threading.Thread(target=worker, daemon=True)
-    _CANCEL_KILLERS.append(t)
-    t.start()
-
-
-# Test seam: the kill threads above are daemons with no handle. Each is dropped
-# by the join helper; nothing here grows across the life of the helper.
-_CANCEL_KILLERS = []
-
-
-def _join_cancel_killers_for_test(timeout=15.0):
-    try:
-        for t in list(_CANCEL_KILLERS):
-            t.join(timeout)
-            assert not t.is_alive(), "a cancel kill outran the %ss join" % timeout
-    finally:
-        _CANCEL_KILLERS.clear()
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _pget_cancel(req):
