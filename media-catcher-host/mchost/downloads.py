@@ -3760,6 +3760,38 @@ class _TerminalClaim:
             return True
 
 
+def _ytdl_dest_key(outtmpl, url):
+    """The output-path claim two legacy yt-dlp jobs would collide on.
+
+    NOT the resolved filename: yt-dlp does not produce that until it has opened
+    the file, which is already too late. The key is what DECIDES it — the output
+    template and the URL — so the case this refuses is exactly a retry of the
+    same video into the same folder, which is the one the extension can produce
+    once it settles a wedged row locally. Two different spellings of one video's
+    URL are two different keys and are NOT caught; the same video into two
+    folders is correctly two claims.
+
+    Only the legacy tokenless path sets this. The structured path stages through
+    a token-bound path of its own and needs no template claim.
+    """
+    return (os.path.normcase(outtmpl or ""), url or "")
+
+
+def _ytdl_refusal_frame(jid, op):
+    """The terminal frame for a legacy job _pget_register turned away.
+
+    "dest" is the retry-of-a-wedge case, where the id really is new and saying
+    otherwise would point the reader at the wrong thing.
+    """
+    if op.get("refused") == "dest":
+        return {"type": "ytdl-error", "id": jid, "reason": "busy",
+                "error": "Another download is still writing that video's file. "
+                         "It will free up on its own, or restart the helper "
+                         "to clear it."}
+    return {"type": "ytdl-error", "id": jid, "reason": "spawn",
+            "error": "Download id already in use."}
+
+
 def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     """In-process download for the legacy (tokenless) path. Emits the same
     ytdl-progress / ytdl-done / ytdl-error wire shapes the exe worker did.
@@ -3781,8 +3813,10 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     --socket-timeout bounds but does not eliminate — still has only the flag,
     and that worker stays parked. Its registration is held until the thread
     really ends rather than dropped when the watchdog reports: the registry
-    means "this job still holds resources", which stays true, and a retry of
-    that id is then refused instead of racing a live writer for one path.
+    means "this job still holds resources", which stays true. The registration
+    carries a "dest" as well as the id, because the retry that follows a
+    locally-settled cancel arrives with a NEW id — the id claim would let it
+    through and the two would race for one path (_ytdl_dest_key).
 
     claim is the job-wide terminal claim; the caller passes its own so a fault in
     the frame above this one cannot contradict the frame this one already sent.
@@ -3796,7 +3830,10 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     # watchdog and _pget_cancel something to act on.
     children = []
     children_lock = threading.Lock()
-    op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
+    # "dest" is the second CAS: a retry after a locally-settled cancel arrives
+    # with a NEW id, and this worker may still be parked holding the file.
+    op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None,
+          "dest": _ytdl_dest_key(outtmpl, url)}
 
     def on_child(proc):
         with children_lock:
@@ -3835,8 +3872,7 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     # single process, so it carries a killer instead.
     op["kill_children"] = kill_children
     if not _pget_register(jid, op):
-        _h().send({"type": "ytdl-error", "id": jid, "reason": "spawn",
-                   "error": "Download id already in use."})
+        _h().send(_ytdl_refusal_frame(jid, op))
         return
     # The acknowledgement frame is sent by _handle_ytdl_legacy's worker before the
     # preflight — one per job, so none here.
@@ -4054,17 +4090,18 @@ def _handle_ytdl_legacy(req):
             _terminal({"type": "ytdl-error", "id": jid, "reason": "spawn", "error": str(e)})
             return
         # Tagged yt-dlp op: same CAS registry as pget; no lease_cv so set-limit ignores it.
-        # Legacy keeps spawn-then-register so a duplicate id still kills the new proc.
-        op = {"proc": p, "kind": "ytdl", "cancel_requested": False, "attemptToken": None}
+        # Legacy keeps spawn-then-register so a duplicate id still kills the new
+        # proc: registering first would leave a cancel arriving in the gap with
+        # no "proc" to kill, and the spawn would then outlive it. The cost is a
+        # yt-dlp that exists for the length of a dict CAS — it is still opening
+        # its network connection, not the output file — and is killed below.
+        op = {"proc": p, "kind": "ytdl", "cancel_requested": False,
+              "attemptToken": None, "dest": _ytdl_dest_key(outtmpl, url)}
         if not _pget_register(jid, op):
-            # Duplicate id owns the registry — kill the just-spawned process, do not overwrite.
+            # Someone else owns the id, or the output path — kill the
+            # just-spawned process, do not overwrite either claim.
             _safe_kill(p)
-            _terminal({
-                "type": "ytdl-error",
-                "id": jid,
-                "reason": "spawn",
-                "error": "Download id already in use.",
-            })
+            _terminal(_ytdl_refusal_frame(jid, op))
             return
         errbuf = []
         filepath = None
@@ -4188,6 +4225,13 @@ def _handle_ytdl_legacy(req):
 # stitched into a sibling .part path and committed with os.replace. Terminal
 # outcomes are structured pget-result messages (never browser handoff).
 _PGET = {}  # id -> operation dict (stop Event, cancel flag, optional yt-dlp proc)
+# Second index over the same entries: output-path claim -> the op holding it,
+# for ops that set a "dest" (see _ytdl_dest_key). Registering by id alone is
+# not enough on the legacy yt-dlp path, where a retry mints a FRESH id and the
+# output template is deterministic, so two writers can reach one file. Both
+# maps are written under _PGET_LOCK inside _pget_register/_pget_unregister and
+# nowhere else, so an entry is never in one and not the other.
+_PGET_DEST = {}
 _PGET_LOCK = threading.Lock()  # short CAS only: register / lookup / unregister
 _PGET_MAX_CONN = 6
 _PGET_CR_PROBE = re.compile(r"^bytes 0-0/(\d+)$")
@@ -4878,11 +4922,34 @@ def _pget_registry_is(jid, op):
 
 
 def _pget_register(jid, op):
-    """CAS-register a pget op. False if another active entry already owns jid."""
+    """CAS-register a pget op. False if another active entry already owns it.
+
+    Two claims, both taken or neither: the job id, and — when op names one in
+    "dest" — the output path. The second exists because the id alone does not
+    keep two yt-dlps off one file: the extension settles a cancelled row
+    locally (a wedged worker cannot be killed, so waiting for the host would
+    strand the user), the retry mints a new id, and the legacy output template
+    is the same for the same URL and folder. Refusing here is what stops the
+    second writer, and it is refused at the door rather than left to collide
+    on the .part file and the ffmpeg merge.
+
+    Which claim failed is recorded in op["refused"] ("id" or "dest"), because a
+    caller that reported "id already in use" for a freshly minted id would send
+    whoever reads it after the wrong thing. Looking it up afterwards instead
+    would be a second, unlocked read.
+    """
+    dest = op.get("dest") if isinstance(op, dict) else None
     with _PGET_LOCK:
         if jid in _PGET:
+            if isinstance(op, dict):
+                op["refused"] = "id"
+            return False
+        if dest is not None and dest in _PGET_DEST:
+            op["refused"] = "dest"
             return False
         _PGET[jid] = op
+        if dest is not None:
+            _PGET_DEST[dest] = op
         return True
 
 
@@ -4964,6 +5031,15 @@ def _pget_cancel(req):
             cv.notify_all()
 
 
+def _pget_drop_locked(jid, op):
+    """Both claims _pget_register took, released together. Call under _PGET_LOCK."""
+    if _PGET.get(jid) is op:
+        _PGET.pop(jid, None)
+    dest = op.get("dest") if isinstance(op, dict) else None
+    if dest is not None and _PGET_DEST.get(dest) is op:
+        _PGET_DEST.pop(dest, None)
+
+
 def _pget_unregister(jid, op):
     """Pop registry only if it still points at this exact operation.
 
@@ -4974,19 +5050,16 @@ def _pget_unregister(jid, op):
     """
     if not isinstance(op, dict):
         with _PGET_LOCK:
-            if _PGET.get(jid) is op:
-                _PGET.pop(jid, None)
+            _pget_drop_locked(jid, op)
         return
     ack_lock = op.get("ack_lock")
     if ack_lock is not None:
         with ack_lock:
             with _PGET_LOCK:
-                if _PGET.get(jid) is op:
-                    _PGET.pop(jid, None)
+                _pget_drop_locked(jid, op)
         return
     with _PGET_LOCK:
-        if _PGET.get(jid) is op:
-            _PGET.pop(jid, None)
+        _pget_drop_locked(jid, op)
 
 
 def _pget_lease(req, size):
