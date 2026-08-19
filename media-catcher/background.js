@@ -358,8 +358,10 @@ let nativeError = null;
 // live helper. A single immediate re-dial covered a helper replaced by an
 // update, but not one that is slow to come back. A bounded backoff replaces
 // it: four growing waits, then stop — still bounded, so a helper that is
-// truly gone cannot spin. A pong or an explicit recheck-helper resets the
-// budget.
+// truly gone cannot spin. An explicit recheck-helper resets the budget, and
+// so does a pong - but only one from a connection that lasted (see
+// HELPER_REDIAL_RESET_MS), or the bound would be per-outage rather than per
+// helper.
 let nativeHandshook = false;      // a pong has been seen on some connection
 // The heartbeat below sends the same {cmd:"ping"} the connect path does, so the
 // host answers EVERY beat with a full pong. Pong is therefore no longer a
