@@ -147,7 +147,14 @@ def handle_record(req):
         _h().send({"type": "error", "id": req.get("id"), "error": "ffmpeg not found. Re-run the installer or put ffmpeg.exe next to the helper."})
         return
     jid = req.get("id")
-    temp = os.path.join(_h().TMPDIR, "mc_%s.mp4" % jid)
+    # The id is the extension's correlation token, not a path component. It used
+    # to be interpolated straight in here, so "../.." walked out of TMPDIR: an
+    # arbitrary .mp4 create-or-overwrite anywhere the user can write, and
+    # handle_discard's _rm_quiet followed the same path back out to delete it.
+    # (Win32 also strips a trailing dot, so "mc_.." normalised to a literal
+    # "mc_" directory — the attacker just spent one extra "..".) The registry
+    # still keys on the raw id; only the filename is derived.
+    temp = guard.temp_path(_h().TMPDIR, jid)
     job = Job(jid, temp)
     job.base = _h().sanitize(req.get("base"))
     with JOBS_LOCK:

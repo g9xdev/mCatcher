@@ -16,6 +16,7 @@ string safe to use as a path — containment at the point of use is what does
 that.
 """
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -235,3 +236,47 @@ def test_refuse_open_covers_the_windows_shapes(tmp_path):
     # while any suffix check saw something else. Refuse the shape outright.
     assert r(str(tmp_path / "a.exe.")) is not None
     assert r(str(tmp_path / "a.exe ")) is not None
+
+
+# ---------------------------------------------------------------------------
+# 3. A recording id is not a path component
+# ---------------------------------------------------------------------------
+
+def test_recording_id_cannot_escape_tmpdir(monkeypatch):
+    """H5. handle_record interpolated the caller's `id` straight into the temp
+    path, so `../..` walked out of TMPDIR — an arbitrary .mp4 create/overwrite,
+    and handle_discard's os.remove followed it back out."""
+    import mchost.downloads as d
+
+    monkeypatch.setattr(d, "run_job", lambda job, req: None)
+    monkeypatch.setattr(mc, "FFMPEG", "ffmpeg")
+
+    tmproot = os.path.realpath(mc.TMPDIR)
+    hostile = ["../../../../Windows/Temp/pwn",
+               "..\\..\\..\\..\\Windows\\Temp\\pwn",
+               "mc_..",            # Win32 strips trailing dots -> a literal "mc_"
+               "a/b", "C:\\abs", "\\\\unc\\share\\x", "con", ""]
+    for jid in hostile:
+        try:
+            mc.handle_record({"id": jid, "videoUrl": "http://v/x.m3u8"})
+            job = d.JOBS.get(jid)
+            assert job is not None, jid
+            base = os.path.basename(job.temp)
+            assert os.path.dirname(job.temp) == mc.TMPDIR, (jid, job.temp)
+            assert os.path.dirname(os.path.realpath(job.temp)) == tmproot, \
+                (jid, job.temp)
+            assert "/" not in base and "\\" not in base and ".." not in base, \
+                (jid, base)
+        finally:
+            with d.JOBS_LOCK:
+                d.JOBS.pop(jid, None)
+
+
+def test_distinct_recording_ids_get_distinct_temp_files():
+    """Sanitizing a caller-supplied id collapses characters, so two live
+    recordings must not be handed the same temp file by that collapse."""
+    a = guard.temp_basename("a/b")
+    b = guard.temp_basename("a\\b")
+    c = guard.temp_basename("a_b")
+    assert len({a, b, c}) == 3, (a, b, c)
+    assert guard.temp_basename("x") == guard.temp_basename("x"), "stable"

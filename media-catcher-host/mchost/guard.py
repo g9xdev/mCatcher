@@ -21,10 +21,15 @@ executable suffixes to blocklist (.exe .bat .cmd .ps1 .lnk .scr .hta .msi .js
 shell integration adds), so this is an ALLOWLIST of the media, container,
 subtitle and thumbnail suffixes this host actually produces.
 
+temp_basename turns a caller-supplied job id into a single contained filename.
+A job id is an opaque correlation token, not a path component.
+
 No mchost sibling is imported here: guard sits under everything else so any
 module can use it without an import-order hazard.
 """
+import hashlib
 import os
+import re
 
 # ---------------------------------------------------------------------------
 # Field kinds
@@ -249,3 +254,39 @@ def refuse_open(path):
         return ("refused: %s resolves to something this helper cannot open"
                 % os.path.basename(path))
     return None
+
+
+# ---------------------------------------------------------------------------
+# A job id is not a path component
+# ---------------------------------------------------------------------------
+
+_UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def temp_basename(job_id, prefix="mc_", ext=".mp4"):
+    """One contained filename for a caller-supplied job id.
+
+    Dots go too, not just separators: on Win32 a trailing dot is stripped by the
+    filesystem, so "mc_.." normalises to a literal "mc_" directory and an
+    attacker buys a level of traversal with one extra "..".
+
+    The collapse is lossy, so a short digest of the ORIGINAL id is appended:
+    two live recordings whose ids differ only in collapsed characters would
+    otherwise share one temp file and overwrite each other.
+    """
+    raw = job_id if isinstance(job_id, str) else ("" if job_id is None else str(job_id))
+    token = _UNSAFE_ID.sub("_", raw)[:64].strip("_")
+    digest = hashlib.sha1(raw.encode("utf-8", "surrogatepass")).hexdigest()[:10]
+    return "%s%s%s%s" % (prefix, (token + "_") if token else "", digest, ext)
+
+
+def temp_path(tmpdir, job_id, prefix="mc_", ext=".mp4"):
+    """temp_basename joined under `tmpdir`, with the containment re-checked.
+
+    The basename cannot carry a separator by construction; the check is here so
+    that stays true if the character class above is ever widened.
+    """
+    name = temp_basename(job_id, prefix=prefix, ext=ext)
+    if os.path.basename(name) != name:          # pragma: no cover - invariant
+        raise ValueError("temp_basename produced a path, not a name: %r" % name)
+    return os.path.join(tmpdir, name)
