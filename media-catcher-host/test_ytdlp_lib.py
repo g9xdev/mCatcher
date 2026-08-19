@@ -9,7 +9,7 @@ import threading
 
 from conftest import load_host
 
-load_host()
+mc = load_host()
 import mchost.ytdlp_lib as lib   # noqa: E402
 
 
@@ -317,3 +317,32 @@ def test_arming_the_hook_twice_does_not_announce_a_child_twice(monkeypatch):
     lib.download(["u"], on_child=lambda p: None)      # installs
     lib.download(["u"], on_child=seen.append)         # must not install again
     assert len(seen) == 1, "the child was announced %d times" % len(seen)
+
+
+def test_a_hook_that_cannot_be_installed_says_so(monkeypatch):
+    """Failing silently would leave the kill lever off for the life of the helper,
+    with the only symptom being the very leak it exists to prevent. The missing-
+    Popen path already says so; a failure to wrap has to say so too."""
+    warnings = []
+    monkeypatch.setattr(mc, "_hlog",
+                        lambda level, msg, src=None: warnings.append((level, msg)))
+    monkeypatch.setattr(lib, "_hook_warned", [False])
+    # A built-in type refuses __init__ assignment, which is how a future yt-dlp
+    # with a C-implemented Popen would fail.
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved(), int))
+
+    assert lib._install_child_hook() is False
+    assert [l for l, _m in warnings] == ["warn"], warnings
+    assert "cannot be killed" in warnings[0][1], warnings
+
+
+def test_a_missing_popen_says_so_too(monkeypatch):
+    """Same warning, the other way the funnel can go away."""
+    warnings = []
+    monkeypatch.setattr(mc, "_hlog",
+                        lambda level, msg, src=None: warnings.append((level, msg)))
+    monkeypatch.setattr(lib, "_hook_warned", [False])
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved()))
+
+    assert lib._install_child_hook() is False
+    assert [l for l, _m in warnings] == ["warn"], warnings

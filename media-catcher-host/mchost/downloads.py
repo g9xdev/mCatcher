@@ -290,6 +290,39 @@ def _proc_alive(p):
         return False
 
 
+# How long to let a killed process actually exit before calling it a survivor.
+# Termination is not instantaneous, and asking the instant after the kill would
+# report healthy kills as failures.
+_KILL_GRACE = 1.0
+
+
+def _kill_summary(killed, survived):
+    """What the kill actually achieved, for the log. A survivor is named rather
+    than folded into the total: it means the worker is still parked and the id
+    still held, which is a different situation to explain."""
+    if survived:
+        return "killed %d, %d would not die" % (killed, survived)
+    if killed:
+        return "killed %d subprocess(es)" % killed
+    return "no live subprocess to kill"
+
+
+def _survivors(procs, grace=None):
+    """Which of procs are STILL alive after up to `grace` seconds.
+
+    _safe_kill swallows every failure it meets — a taskkill that will not run, a
+    process that will not die — so the only way to know whether a kill worked is
+    to look afterwards. Callers report from this, never from what they attempted.
+    """
+    grace = _KILL_GRACE if grace is None else grace
+    alive = [p for p in procs if _proc_alive(p)]
+    deadline = time.monotonic() + grace
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.05)
+        alive = [p for p in alive if _proc_alive(p)]
+    return alive
+
+
 def _safe_kill(p):
     """Kill p AND its descendants.
 
@@ -3519,15 +3552,25 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
         if op.get("cancel_requested"):
             _safe_kill(proc)
 
-    def kill_children():
-        """Take the whole tree of everything yt-dlp spawned for this job. Returns
-        how many were still running, so the caller can report what it did rather
-        than what it attempted."""
+    def kill_children(confirm=False):
+        """Take the whole tree of everything yt-dlp spawned for this job.
+
+        Returns (killed, survived). With confirm, those are counted AFTER giving
+        the kill time to land: _safe_kill swallows a taskkill that fails, so the
+        count going in would call a kill that never happened a success, and a
+        stall that reads as handled while the child still runs sends whoever
+        reads the log anywhere but at it.
+
+        Confirming costs up to _KILL_GRACE, so only a caller that REPORTS the
+        numbers asks for it. _pget_cancel runs inline on the native-messaging
+        read loop and reports nothing, so it takes the default and every command
+        queued behind it is spared the wait."""
         with children_lock:
             live = [p for p in children if _proc_alive(p)]
         for p in live:
             _safe_kill(p)
-        return len(live)
+        survived = _survivors(live) if confirm else []
+        return len(live) - len(survived), len(survived)
 
     # _pget_cancel reaches the exe path's child through "proc". This path has no
     # single process, so it carries a killer instead.
@@ -3610,11 +3653,10 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
             # lines, and killing the child is what makes the next poll happen at
             # all. Both before the send, which writes the pipe and can block.
             op["cancel_requested"] = True
-            killed = kill_children()
+            killed, survived = kill_children(confirm=True)
             _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling (%s)"
                        % (_YTDL_RESOLVE_STALL,
-                          "killed %d subprocess(es)" % killed if killed
-                          else "no live subprocess to kill"), "ytdlp")
+                          _kill_summary(killed, survived)), "ytdlp")
             _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
                        "error": "yt-dlp made no progress while resolving. "
                                 "Open the log console for its output."})

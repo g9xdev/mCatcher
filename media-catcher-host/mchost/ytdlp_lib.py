@@ -213,22 +213,31 @@ def _announce_child(proc):
         pass        # watching is never worth failing a download that would work
 
 
+def _warn_hook_off(why):
+    """Say once that the hook is not in effect. Silence here would be the worst
+    kind: downloads keep working, so nothing looks wrong, while every stall goes
+    back to leaking a worker thread — the very symptom the hook exists to end."""
+    if _hook_warned[0]:
+        return
+    _hook_warned[0] = True
+    try:
+        _h()._hlog("warn", "yt-dlp: not watching subprocesses (%s); a wedged "
+                           "child cannot be killed" % why, "ytdlp")
+    except Exception:
+        pass
+
+
 def _install_child_hook(pylib=None):
     """Wrap yt_dlp.utils.Popen.__init__ in place, once. True if it is in effect.
 
     Fails soft on every path: a yt-dlp that renames or drops the spawn funnel
-    leaves downloads working exactly as they do today, minus this lever.
+    leaves downloads working exactly as they do today, minus this lever — but
+    never quietly, because the lever going missing is invisible otherwise.
     """
     try:
         cls = getattr(getattr(_yt(pylib), "utils", None), "Popen", None)
         if cls is None:
-            if not _hook_warned[0]:
-                _hook_warned[0] = True
-                try:
-                    _h()._hlog("warn", "yt-dlp: no utils.Popen to watch; a wedged "
-                                       "child cannot be killed", "ytdlp")
-                except Exception:
-                    pass
+            _warn_hook_off("no utils.Popen")
             return False
         # __dict__, not getattr: a subclass would inherit the mark and go unwrapped.
         if cls.__dict__.get(_HOOK_MARK):
@@ -242,7 +251,9 @@ def _install_child_hook(pylib=None):
         cls.__init__ = __init__
         setattr(cls, _HOOK_MARK, True)
         return True
-    except Exception:
+    except Exception as e:
+        # e.g. a C-implemented Popen, whose __init__ cannot be assigned.
+        _warn_hook_off("could not wrap utils.Popen: %s" % e)
         return False
 
 

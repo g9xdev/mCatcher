@@ -96,6 +96,33 @@ So `on_child` also checks the flag: a child announced after the job is already
 cancelled is killed on arrival. One mechanism covers both triggers, because
 `_pget_cancel` sets the same flag before calling the killer.
 
+### Report the kill, not the attempt
+
+`_safe_kill` swallows every failure it meets — a `taskkill` that will not run, a
+process that will not die. So the number of children alive going *in* is the
+number of kills **attempted**, and logging it as "killed N" would let a kill
+that never happened read as one that did. That is the failure this branch keeps
+fixing elsewhere; it must not be reintroduced by the fix for it.
+
+`kill_children(confirm=True)` therefore re-checks liveness after the attempt,
+allowing `_KILL_GRACE` for termination to land (asking the instant after the
+kill would call a dying process a survivor), and reports survivors separately:
+a survivor means the worker is still parked and the id still held, which is a
+different situation to explain.
+
+Confirming costs up to that grace, so it is opt-in. The watchdog reports the
+numbers and asks for it; `_pget_cancel` reports nothing and runs inline on the
+native-messaging read loop (`mc_host.py:987`), so it takes the default and
+every command queued behind it is spared the wait.
+
+### Failing quietly is the one unacceptable failure
+
+`_install_child_hook` fails soft on every path, but never silently. If the hook
+is not in effect, downloads keep working and nothing looks wrong, while every
+stall reverts to leaking a worker thread — the exact symptom the hook exists to
+end. Both ways it can fail (no `utils.Popen`; a `Popen` whose `__init__` cannot
+be assigned) route through one `_warn_hook_off`, which says so once.
+
 ### The false-positive guarantee is inherited, not re-argued
 
 Every kill sits inside the branch guarded by `_claim_terminal(unless_progressing=
@@ -141,7 +168,12 @@ that the remedy is weaker than `_StallWatch`'s.
 - a progressing download's children are never killed
 - a child spawned after the kill pass is taken too
 - a user cancel kills them too
+- a child that outlives the kill is not reported as killed
+- a cancel does not wait to see whether the child died
 - the `_pget` registration is released once the killed worker unwinds
+
+`test_ytdlp_lib.py` also covers both ways the hook can fail to install, each of
+which must produce the warning.
 
 The existing `fake_download` stand-ins take explicit keyword arguments, so each
 gains `on_child=None`. Without that the new call site raises `TypeError` and the

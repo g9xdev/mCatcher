@@ -5011,6 +5011,7 @@ def test_a_wedged_resolve_kills_the_child_yt_dlp_spawned(tmp_path, monkeypatch):
     import mchost.downloads as d
 
     sent = []
+    logs = []
     killed = []
     captured = {}
     flag_at_kill = []
@@ -5022,6 +5023,7 @@ def test_a_wedged_resolve_kills_the_child_yt_dlp_spawned(tmp_path, monkeypatch):
             saw_stalled.set()
 
     monkeypatch.setattr(mc, "send", fake_send)
+    monkeypatch.setattr(mc, "_hlog", lambda level, msg, src=None: logs.append(msg))
     monkeypatch.setattr(d, "_h", lambda: mc)
     monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.05)
     _capture_lib_op(d, monkeypatch, captured)
@@ -5047,6 +5049,7 @@ def test_a_wedged_resolve_kills_the_child_yt_dlp_spawned(tmp_path, monkeypatch):
 
     assert killed == [child]
     assert flag_at_kill == [True], "the kill ran before the cancel flag was set"
+    assert [m for m in logs if "killed 1 subprocess" in m], logs
     terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
     assert [m["reason"] for m in terminal] == ["stalled"], terminal
 
@@ -5212,3 +5215,95 @@ def test_a_child_spawned_after_the_kill_is_taken_too(tmp_path, monkeypatch):
                              str(tmp_path / "v.mp4"), None, False)
 
     assert killed == [first, respawned]
+
+
+def test_a_child_that_outlives_the_kill_is_not_reported_as_killed(tmp_path,
+                                                                 monkeypatch):
+    """_safe_kill swallows a taskkill that fails, so counting what was alive going
+    IN would call a kill that never happened a success. A stall that reads as
+    handled while the child still runs is the one way this can mislead: it sends
+    whoever reads the log looking anywhere but at the child."""
+    import mchost.downloads as d
+
+    sent = []
+    logs = []
+    saw_stalled = threading.Event()
+
+    def fake_send(m):
+        sent.append(m)
+        if m.get("reason") == "stalled":
+            saw_stalled.set()
+
+    monkeypatch.setattr(mc, "send", fake_send)
+    monkeypatch.setattr(mc, "_hlog", lambda level, msg, src=None: logs.append(msg))
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 0.05)
+    monkeypatch.setattr(d, "_KILL_GRACE", 0.1)      # keep the test brisk
+    # A child taskkill cannot take: _safe_kill tries, swallows, and returns.
+    monkeypatch.setattr(d, "_safe_kill", lambda p: None)
+
+    child = FakeChild()
+    lib = None
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        on_child(child)
+        assert saw_stalled.wait(5), "the watchdog never fired"
+        raise lib.Cancelled()
+
+    lib = FakeYtdlLib(fake_download)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib)
+    d._ytdl_download_via_lib("j-immortal", "https://youtu.be/x", "b",
+                             str(tmp_path / "v.mp4"), None, False)
+
+    stall = [m for m in logs if "no resolve progress" in m]
+    assert stall, logs
+    assert "killed 1" not in stall[0], stall[0]
+    assert "would not die" in stall[0], stall[0]
+    # The row still closes: an unkillable child is a worse outcome, not a silent one.
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m["reason"] for m in terminal] == ["stalled"], terminal
+
+
+def test_a_cancel_does_not_wait_to_see_whether_the_child_died(tmp_path, monkeypatch):
+    """_pget_cancel runs inline on the native-messaging read loop (mc_host.py:987),
+    so every command queued behind it waits too. The survivor check exists so the
+    WATCHDOG can report honestly; a cancel reports nothing and must not pay for it."""
+    import mchost.downloads as d
+
+    sent = []
+    started = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 30)   # the watchdog must not fire
+    monkeypatch.setattr(d, "_KILL_GRACE", 5)            # a wait here would be plain
+    monkeypatch.setattr(d, "_safe_kill", lambda p: None)   # the child never dies
+
+    child = FakeChild()
+    lib = None
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        on_child(child)
+        started.set()
+        assert release.wait(20), "the test never released the worker"
+        raise lib.Cancelled()
+
+    lib = FakeYtdlLib(fake_download)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib)
+    t = threading.Thread(target=d._ytdl_download_via_lib, daemon=True,
+                         args=("j-nowait", "https://youtu.be/x", "b",
+                               str(tmp_path / "v.mp4"), None, False))
+    t.start()
+    assert started.wait(5), "the download never started"
+
+    t0 = time.monotonic()
+    d._pget_cancel({"id": "j-nowait"})
+    elapsed = time.monotonic() - t0
+
+    release.set()                       # let the worker unwind before asserting
+    t.join(5)
+    assert not t.is_alive()
+    assert elapsed < 2, "cancel sat on the message loop for %.1fs" % elapsed
