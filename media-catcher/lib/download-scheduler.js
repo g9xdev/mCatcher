@@ -157,10 +157,6 @@
     return Math.max(1, Math.floor(n / 2));
   }
 
-  // A drain that never quiesces holds the only non-running slot forever. Generous:
-  // this bounds a lost owner terminal, not an ordinary slow pause.
-  var PAUSE_DRAIN_DEADLINE_MS = 120000;
-
   /**
    * Pure synchronous download scheduler — global admission, provider saturation,
    * finite retries, cancel drain, capability switch, and explicit Firefox handoff
@@ -354,19 +350,6 @@
       job.drainingAttemptToken = null;
       job.pendingDrainTerminal = null;
       job.drainTransportUnavailable = false;
-      job.pauseDeadlineMs = null;
-    }
-
-    /**
-     * Stamp the bounded-drain deadline on pausing_provider entry, from the injected
-     * clock only. Scheduler-private — never projected. Every entry restamps, so a
-     * value left behind on a job that has since moved on can never be inherited.
-     */
-    function setPauseDrainDeadline(job) {
-      if (!job) return;
-      var nowP = now();
-      if (typeof nowP !== "number" || !Number.isFinite(nowP)) nowP = 0;
-      job.pauseDeadlineMs = nowP + PAUSE_DRAIN_DEADLINE_MS;
     }
 
     /**
@@ -1442,8 +1425,7 @@
       job.state = "pausing_provider";
       job.stateVersion += 1;
       job.attemptToken = null;
-      // retains global slot — bounded by the drain deadline, checked in tick
-      setPauseDrainDeadline(job);
+      // retains global slot
       if (opts.consumeRetryOnWake === true) {
         job.consumeRetryOnWake = true;
       }
@@ -1833,8 +1815,6 @@
         // while public attemptToken is nulled in pausing_provider. Never projected.
         drainingAttemptToken: null,
         pendingDrainTerminal: null,
-        // Private: bounded-drain deadline while in pausing_provider. Never projected.
-        pauseDeadlineMs: null,
         // Private: helper disconnected after an authenticated pending drain
         // terminal was accepted. Never projected or echoed in errors.
         drainTransportUnavailable: false,
@@ -2378,72 +2358,16 @@
     }
 
     /**
-     * Expire one pausing_provider drain whose deadline has passed.
-     * The premise of the deadline is that the acknowledgement will never arrive,
-     * so force the quiescence that ack would have produced and then settle exactly
-     * as onTransportUnavailable does for an already-quiescent job. Calling
-     * onTransportUnavailable instead would take its hold branch and keep the slot.
-     *
-     * Native opens are confirmed zero through the ProviderGate first, never
-     * projected zero on the job while the gate still records more — an
-     * unconfirmable gate leaves the job pausing and the deadline live, so the
-     * next tick retries rather than publishing a false zero.
-     *
-     * Observation-adapter permits are scheduler-side bookkeeping and are zeroed
-     * here. Wrapper-owned permits are not: each is backed by a live ProviderGate
-     * lease whose only correct release is its own wrapper release(), and forging
-     * that count would desync the gate and block the whole provider — a worse
-     * starvation than the one being fixed. The slot, which is what the invariant
-     * protects, is released either way.
-     */
-    function expirePauseDrain(job) {
-      if (!job || job.state !== "pausing_provider") return false;
-      if (job.nativeOpenConnections > 0) {
-        var nativeZero = false;
-        try {
-          nativeZero = confirmNativeOpenZero(job);
-        } catch (errExpireNative) {
-          // Throw-before-mutation: gate/job stay coherent; retry on a later tick.
-          nativeZero = false;
-        }
-        if (!nativeZero) return false;
-      }
-      invalidateLocalActivities(job);
-      job.observedPermits = 0;
-      clearDrainingState(job);
-      return enterNeedsUser(job);
-    }
-
-    /**
-     * Expire overdue pausing_provider drains, move due retry_backoff jobs to
-     * queued, then central drain.
-     * Both sweeps collect first and sort by (deadline asc, creation order) so
-     * staggered same-provider deadlines are deterministic after a large clock jump.
-     * Expiry runs before the retry sweep so freed slots are available to the same
-     * central drain. Central drain still enforces provider FIFO / global
-     * round-robin.
+     * Move due retry_backoff jobs to queued, then central drain.
+     * Collect all due jobs first and sort by (retryDeadlineMs asc, creation order)
+     * so staggered same-provider deadlines are deterministic after a large clock jump.
+     * Central drain still enforces provider FIFO / global round-robin.
      * Invalid / non-finite nowMs is a no-op. Duplicate ticks after admission
      * cannot double-admit (state is no longer retry_backoff). No real timers.
      */
     function tick(nowMs) {
       if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) return;
       lastTickMs = nowMs;
-      var overdue = [];
-      jobs.forEach(function (job) {
-        if (job.state !== "pausing_provider") return;
-        if (job.pauseDeadlineMs == null) return;
-        if (nowMs < job.pauseDeadlineMs) return;
-        overdue.push(job);
-      });
-      overdue.sort(function (a, b) {
-        if (a.pauseDeadlineMs !== b.pauseDeadlineMs) {
-          return a.pauseDeadlineMs - b.pauseDeadlineMs;
-        }
-        return jobOrder.indexOf(a.id) - jobOrder.indexOf(b.id);
-      });
-      for (var xi = 0; xi < overdue.length; xi++) {
-        expirePauseDrain(overdue[xi]);
-      }
       var due = [];
       jobs.forEach(function (job) {
         if (job.state !== "retry_backoff") return;
@@ -2660,12 +2584,9 @@
         job.state = "pausing_provider";
         job.stateVersion += 1;
         job.attemptToken = null;
-        // retains global slot and cancelRequested — bounded by the drain deadline
-        setPauseDrainDeadline(job);
+        // retains global slot and cancelRequested
       } else {
         // Already pausing: keep slot/cancelRequested; public token stays null.
-        // The deadline keeps running from the original pause entry — a helper
-        // disconnect is not a reason to grant the drain a fresh budget.
         job.attemptToken = null;
       }
       return true;
