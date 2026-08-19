@@ -3469,10 +3469,11 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
 
     Cancellation is by flag, polled inside yt-dlp's hooks and inside the log
     sink — the hooks do not fire until bytes flow, so the sink is what makes a
-    cancel visible during resolve. The resolve phase also gets the same
-    _YTDL_RESOLVE_STALL deadline the exe path's _StallWatch applies, reported
-    with the same reason: "in-process" does not make it unstallable, because
-    --js-runtimes still launches deno while resolving."""
+    cancel visible during resolve. The resolve phase carries the same
+    _YTDL_RESOLVE_STALL deadline the exe path's _StallWatch applies, rolling on
+    every note the way _StallWatch.touch() rolls on every output line, and
+    reported with the same reason: "in-process" does not make it unstallable,
+    because --js-runtimes still launches deno while resolving."""
     lib = _ytdlp_lib()
     op = {"kind": "ytdl", "cancel_requested": False, "attemptToken": None}
     if not _pget_register(jid, op):
@@ -3484,15 +3485,33 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
     # The acknowledgement frame is sent by _handle_ytdl_legacy's worker before the
     # preflight — one per job, so none here.
     last = {"pct": -1.0}
-    # Resolve-phase liveness only. Bytes flowing means yt-dlp's hooks are firing,
-    # and a slow download must never be killed - the watchdog below disarms on the
-    # first callback. It exists because --js-runtimes still launches deno on the
-    # resolve path, so "in-process" does not make this phase unstallable.
-    resolved = threading.Event()
-    stalled = threading.Event()
+    # Resolve-phase liveness only, and ROLLING: every note pushes the deadline out
+    # again, which is what _StallWatch.touch() gives the exe path. A one-shot
+    # deadline would be disarmed by the first "[youtube] ..." line ~1s in and would
+    # never see the wedge this guards - deno hanging partway through the JS
+    # challenge, which is a subprocess even here, so "in-process" does not make
+    # this phase unstallable. The first progress callback disarms it for good:
+    # once bytes flow, a slow download or a long merge is healthy.
+    touched = [time.monotonic()]
+    progressing = threading.Event()
+    finished = threading.Event()
+    # Exactly one terminal frame per job, CLAIMED rather than ordered: the watchdog
+    # fires from its own thread while the download may be unwinding on this one,
+    # and _h().send writes the native-messaging pipe and can block, so either side
+    # can reach the wire first. The loser stays silent instead of contradicting
+    # the row.
+    claim_lock = threading.Lock()
+    claimed = []
+
+    def _claim_terminal():
+        with claim_lock:
+            if claimed:
+                return False
+            claimed.append(True)
+            return True
 
     def on_progress(m):
-        resolved.set()
+        progressing.set()
         if m.get("stage") == "merging" or m.get("pct") is None:
             _h().send({"type": "ytdl-progress", "id": jid, **m})
             return
@@ -3503,33 +3522,36 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
             _h().send({"type": "ytdl-progress", "id": jid, **m})
 
     def on_note(note):
-        resolved.set()
+        touched[0] = time.monotonic()
         if last["pct"] < 0:
             _h().send({"type": "ytdl-progress", "id": jid, "pct": 0,
                        "stage": "resolving", "note": note})
 
     def _terminal(msg):
-        """One terminal frame per job. The watchdog speaks from its own thread
-        while yt-dlp may still be unwinding, and whatever that unwind reports
-        (usually Cancelled, since the watchdog sets the cancel flag) must not
-        contradict the stall already on the row."""
-        if stalled.is_set():
-            return
-        _h().send(msg)
+        """Send a terminal frame only if this side won the claim."""
+        if _claim_terminal():
+            _h().send(msg)
 
     def _cancelled():
         _terminal({"type": "ytdl-error", "id": jid, "reason": "cancelled", "error": "Cancelled."})
 
     def _resolve_watchdog():
-        if resolved.wait(_YTDL_RESOLVE_STALL):
+        while not progressing.is_set():
+            idle = time.monotonic() - touched[0]
+            if idle < _YTDL_RESOLVE_STALL:
+                # Sleep out the remainder; a note that lands meanwhile moves it.
+                if finished.wait(_YTDL_RESOLVE_STALL - idle):
+                    return              # done, failed, or cancelled
+                continue
+            if not _claim_terminal():
+                return                  # the job already reached the wire
+            op["cancel_requested"] = True
+            _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling"
+                       % _YTDL_RESOLVE_STALL, "ytdlp")
+            _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
+                       "error": "yt-dlp made no progress while resolving. "
+                                "Open the log console for its output."})
             return
-        stalled.set()
-        op["cancel_requested"] = True
-        _h()._hlog("error", "yt-dlp: no resolve progress in %ss; cancelling"
-                   % _YTDL_RESOLVE_STALL, "ytdlp")
-        _h().send({"type": "ytdl-error", "id": jid, "reason": "stalled",
-                   "error": "yt-dlp made no progress while resolving. "
-                            "Open the log console for its output."})
     threading.Thread(target=_resolve_watchdog, daemon=True).start()
 
     try:
@@ -3548,7 +3570,7 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot):
         _terminal({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
         return
     finally:
-        resolved.set()          # release the watchdog on every path, fast or failed
+        finished.set()          # release the watchdog on every path, fast or failed
         _pget_unregister(jid, op)
 
     if op.get("cancel_requested"):
@@ -3571,6 +3593,9 @@ _YTDL_WORKERS = []
 def _join_ytdl_workers_for_test(timeout=5.0):
     for t in list(_YTDL_WORKERS):
         t.join(timeout)
+        # Never drop a live worker: it would go on sending into whatever the NEXT
+        # test monkeypatched, which reads as that test's own frames.
+        assert not t.is_alive(), "a yt-dlp worker outran the %ss join" % timeout
     _YTDL_WORKERS.clear()
 
 
@@ -3585,16 +3610,27 @@ def _handle_ytdl_legacy(req):
         # frames lands the row is indistinguishable from a dead helper.
         _h().send({"type": "ytdl-progress", "id": jid, "pct": 0, "stage": "resolving",
                    "note": "Preparing"})
-        deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
-        outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
+        # Any throw in here used to kill the thread silently. That merely looked
+        # unstarted before the acknowledgement above existed; now it would be a row
+        # acknowledged as "resolving" with nothing ever following it, so the
+        # preflight owes the caller a terminal frame like every other failure.
         try:
-            os.makedirs(outdir, exist_ok=True)
-        except Exception:
-            pass
-        pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
-        outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
-        # Optional format selector from the popup's quality picker; default = best.
-        fmt = req.get("format") or "bv*+ba/b"
+            deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
+            outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
+            try:
+                os.makedirs(outdir, exist_ok=True)
+            except Exception:
+                pass
+            pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
+            outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
+            # Optional format selector from the popup's quality picker; default = best.
+            fmt = req.get("format") or "bv*+ba/b"
+        except Exception as e:
+            reason, msg = _map_yt_error(str(e))
+            _h()._hlog("error", "yt-dlp: preflight failed (%s): %s"
+                       % (reason, str(e)[:500]), "ytdlp")
+            _h().send({"type": "ytdl-error", "id": jid, "reason": reason, "error": msg})
+            return
 
         if _ytdlp_lib().available():
             _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot)
