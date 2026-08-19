@@ -21,6 +21,10 @@ AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\MediaCatcher\Host
 DisableProgramGroupPage=yes
 DisableDirPage=yes
+; Per-user by design: everything lands in {localappdata} and the native host is
+; registered under HKCU, so no admin is needed. This is also why the Settings
+; probe reports an antivirus exclusion for the user to apply rather than applying
+; it itself - the installer never has the rights to, and should not ask for them.
 PrivilegesRequired=lowest
 OutputDir=dist
 OutputBaseFilename=MediaCatcherHostSetup

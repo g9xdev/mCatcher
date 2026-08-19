@@ -29,6 +29,17 @@ recordings.
    2 MB). The setup program installs per-user and downloads Python and ffmpeg as
    needed during installation.
 
+   ### Signing (optional)
+
+   Builds are unsigned by default; no certificate belongs in this repository. To sign:
+
+       $env:MC_SIGN_PFX = "C:\path\to\cert.pfx"
+       $env:MC_SIGN_PASS = "..."
+       powershell -ExecutionPolicy Bypass -File build.ps1
+
+   Requires `signtool.exe` on PATH (Windows SDK). The build fails rather than
+   producing a silently-unsigned installer if the certificate cannot be used.
+
 2. **The double-click batch file (installs from this folder).**
    Run `Install Media Catcher Host.bat`. It runs `bootstrap.ps1`, which performs the
    same dependency install and registration without building a setup.exe.
