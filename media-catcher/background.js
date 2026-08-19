@@ -582,19 +582,55 @@ function dropNativePort(port, err) {
   for (const [id, res] of pendingCastDiscover) { pendingCastDiscover.delete(id); res(null); }
 }
 
+// The user's manual re-check, from the popup badge or the options row.
+//
+// Re-pinging a port the heartbeat has already reported unresponsive is
+// pointless — that is precisely what the beats have been doing — and with the
+// port left open nothing else would ever re-dial it, so before this a wedged
+// helper could not be recovered without restarting Firefox. An explicit
+// re-check therefore drops that port and dials again.
+//
+// This is the one place allowed to do that, and only because a person asked:
+// the drop ends in-flight work (dropNativePort fails the running jobs to
+// needs_user, and the host deletes every live sink's .part on EOF), which is
+// exactly why the heartbeat must never reach for it on its own. The pill says
+// so before the click.
+function recheckHelper() {
+  nativeRedialAttempt = 0;
+  if (nativeRedialTimer !== null) { clearTimeout(nativeRedialTimer); nativeRedialTimer = null; }
+  if (nativePort && helperMissedBeats >= HELPER_MISSED_BEATS_MAX) {
+    const port = nativePort;
+    mclog("info", "re-check on a helper that stopped answering — reconnecting");
+    try {
+      if (typeof port.disconnect === "function") port.disconnect();
+    } catch (e) {
+      dlog("native disconnect failed", e.message || e);
+    }
+    dropNativePort(port, "Helper was not answering — reconnected at your request.");
+    // dropNativePort arms the backoff timer an unplanned drop needs. This drop
+    // was planned and the user is waiting, so reconnect now, with a full
+    // budget and no stray timer left behind.
+    if (nativeRedialTimer !== null) { clearTimeout(nativeRedialTimer); nativeRedialTimer = null; }
+    nativeRedialAttempt = 0;
+    connectNative();
+    return;
+  }
+  if (nativePort) { try { nativePort.postMessage({ cmd: "ping" }); } catch (e) {} }
+  else connectNative();
+}
+
 // One heartbeat beat. A host that wedges with the pipe still open answers
 // nothing, and with no missed-beat counter the pill stayed green and
 // nativeReady true while every job posted into it was swallowed forever — the
 // UI claimed a helper that was silently eating work.
 //
-// What an unanswered beat proves is exactly that: no answer. The host handles
-// ping inline in its read loop and hands the long commands to worker threads,
-// but some handlers still run on that loop and can outlast several beats on
-// slow or antivirus-scanned storage — file-commit fsyncs and replaces a
-// finished multi-GB file, pget-cancel waits up to 15s per process it kills,
-// and open hands the path to the shell. So silence means "not usable right
-// now", not "dead", and the response is to SAY so, never to disconnect: EOF
-// makes the host delete every live sink's .part and orphan its children (see
+// What an unanswered beat proves is exactly that: no answer. It does not say
+// whether the host is dead, or merely busy on its own read loop — this side of
+// the port cannot tell those apart, and which handlers the host happens to run
+// inline is its business and changes release to release, so nothing here may
+// depend on that. Silence therefore means "not usable right now", never
+// "dead", and the response is to SAY so rather than to disconnect: EOF makes
+// the host delete every live sink's .part and orphan its children (see
 // dropNativePort), which would turn a slow helper into lost downloads.
 //
 // Reporting is cheap and reversible, so the threshold can be modest: the
@@ -619,8 +655,10 @@ function helperHeartbeat() {
     // to reinstall a helper that is running, and "no-ffmpeg" still counts as
     // usable.
     setNativeState("connecting", nativeHandshakeApplied
-      ? "Helper has stopped answering — still connected, waiting for it."
-      : "Helper has not answered yet — still connected, waiting for it.");
+      ? "Helper has stopped answering — still connected, waiting for it. " +
+        "Re-check to reconnect; anything still transferring is lost if you do."
+      : "Helper has not answered yet — still connected, waiting for it. " +
+        "Re-check to reconnect.");
   }
   try {
     port.postMessage({ cmd: "ping" });
@@ -3040,10 +3078,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "helper-status") {
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "recheck-helper") {
-        nativeRedialAttempt = 0;
-        if (nativeRedialTimer !== null) { clearTimeout(nativeRedialTimer); nativeRedialTimer = null; }
-        if (nativePort) { try { nativePort.postMessage({ cmd: "ping" }); } catch (e) {} }
-        else connectNative();
+        recheckHelper();
         sendResponse({ ok: true, helper: helperStatus() });
       } else if (msg.type === "open-helper-setup") {
         openSetupPage();

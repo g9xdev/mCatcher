@@ -729,13 +729,86 @@ test("a late pong restores a helper the heartbeat had reported unusable", async 
   assert.equal(last.helper.ready, true);
   assert.equal(last.helper.error, null, "the stale explanation must be cleared with it");
 
-  // And the counter really was cleared, not merely masked by the status.
+  // And the counter really was cleared, not merely masked by the status. The
+  // report fires on the beat that makes the count EQUAL the threshold, so a
+  // counter left holding its old value simply climbs past and never reports
+  // again — proving the reset means showing the next silent stretch takes a
+  // fresh full four beats to be noticed, no more and no fewer.
   for (let i = 0; i < 3; i += 1) {
     beat.fn();
     await settle();
   }
   assert.equal(statuses().at(-1).helper.state, "ready",
-    "a recovered helper starts its next silent stretch from scratch");
+    "three unanswered beats are not yet enough to report again");
+  beat.fn();
+  await settle();
+  assert.equal(statuses().at(-1).helper.ready, false,
+    "the fourth is — the count restarted from zero rather than carrying on");
+});
+
+// Leaving the port open costs the user their only automatic way back: a live
+// port is never re-dialled, and re-pinging one the heartbeat has already given
+// up on is exactly what the beats are doing. So the manual re-check reconnects
+// instead. It is the ONE place allowed to drop a live port, and only because a
+// person asked for it — the drop ends in-flight work, which is why no timer
+// may ever reach for it.
+test("an explicit re-check reconnects a helper the heartbeat gave up on", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  for (let i = 0; i < 4; i += 1) {
+    beat.fn();
+    await settle();
+  }
+  assert.equal(statuses().at(-1).helper.ready, false, "the helper is reported unusable");
+  assert.match(statuses().at(-1).helper.error, /re-check/i,
+    "the pill must say what the user can do, and what it costs");
+
+  const listenersBefore = h.nativeDisconnects.size;
+  h.sandbox.recheckHelper();
+  await settle();
+
+  // A fresh port, not another ping into the one that stopped answering.
+  assert.equal(h.nativeDisconnects.size, 1,
+    "the re-check must dial a new port rather than re-ping the wedged one");
+  assert.equal(listenersBefore, 1, "(the wedged port had one listener of its own)");
+  assert.equal(h.helperDisconnects.length, 1,
+    "the drop the user asked for runs the ordinary disconnect cleanup");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial" && t.active).length, 0,
+    "an immediate reconnect must not also leave a backoff timer ticking");
+
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+  assert.equal(statuses().at(-1).helper.state, "ready", "the new connection comes up ready");
+});
+
+// The same re-check on a helper that is merely between connections, or
+// answering normally, must stay the cheap one it has always been: no port is
+// dropped and nothing in flight is disturbed.
+test("an explicit re-check on an answering helper only re-pings it", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const pings = () => h.nativePosts.filter((post) => post && post.cmd === "ping").length;
+  const before = pings();
+  h.sandbox.recheckHelper();
+  await settle();
+
+  assert.equal(pings(), before + 1, "a healthy helper is simply pinged");
+  assert.equal(h.helperDisconnects.length, 0, "nothing in flight may be disturbed");
+  const last = h.runtimeMessages.filter((m) => m && m.type === "helper-status").at(-1);
+  assert.equal(last.helper.state, "ready", "and the pill is left alone");
 });
 
 // Falsely reporting a working helper unusable would refuse new jobs for no
