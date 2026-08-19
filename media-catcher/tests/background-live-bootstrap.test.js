@@ -57,8 +57,6 @@ function backgroundScripts() {
 
 function createHarness() {
   const settingsLoad = deferred();
-  const nativeMessages = event();
-  const nativeDisconnects = event();
   const nativePosts = [];
   const runtimeMessages = [];
   const controllerCreates = [];
@@ -85,10 +83,31 @@ function createHarness() {
     },
   };
 
-  const nativePort = {
-    onMessage: nativeMessages,
-    onDisconnect: nativeDisconnects,
-    postMessage(message) { nativePosts.push(message); },
+  // Real runtime.connectNative() returns an independent Port per call — its
+  // onDisconnect fires at most once, for its own lifetime, and never again
+  // once superseded. Mirror that here instead of handing back one shared
+  // object: each connectNative() call gets its own fresh onMessage/
+  // onDisconnect event lists, so a listener registered by an earlier
+  // connection is simply never reached by a later drop — no accumulation to
+  // route around. nativeMessages/nativeDisconnects stay the stable handles
+  // tests already drive; they proxy to whichever port is current.
+  let currentPort = null;
+  function makeNativePort() {
+    const port = {
+      onMessage: event(),
+      onDisconnect: event(),
+      postMessage(message) { nativePosts.push(message); },
+    };
+    currentPort = port;
+    return port;
+  }
+  const nativeMessages = {
+    emit(...args) { if (currentPort) currentPort.onMessage.emit(...args); },
+    get size() { return currentPort ? currentPort.onMessage.size : 0; },
+  };
+  const nativeDisconnects = {
+    emit(...args) { if (currentPort) currentPort.onDisconnect.emit(...args); },
+    get size() { return currentPort ? currentPort.onDisconnect.size : 0; },
   };
 
   const noOpEvent = () => event();
@@ -108,7 +127,7 @@ function createHarness() {
       lastError: null,
       onMessage: noOpEvent(),
       onInstalled: noOpEvent(),
-      connectNative() { return nativePort; },
+      connectNative() { return makeNativePort(); },
       sendMessage(message) {
         runtimeMessages.push(message);
         return Promise.resolve();
@@ -180,10 +199,34 @@ function createHarness() {
     Reflect,
     Proxy,
     AbortController,
-    setTimeout(fn, ms) { timers.push({ kind: "timeout", fn, ms }); return timers.length; },
-    clearTimeout() {},
-    setInterval(fn, ms) { timers.push({ kind: "interval", fn, ms }); return timers.length; },
-    clearInterval() {},
+    // `active` starts true and goes false the moment the timer is either
+    // fired (setTimeout only — setInterval keeps firing) or cleared, so
+    // tests can tell a still-pending re-dial from one that already ran or
+    // was cancelled, instead of treating every entry ever pushed as live.
+    // `name` carries the callback's declared function name (background.js
+    // names the ones tests need to pick out, e.g. `nativeRedial`) so tests
+    // can identify a specific timer without guessing from its duration.
+    setTimeout(fn, ms) {
+      const entry = { kind: "timeout", ms, name: fn.name, active: true };
+      entry.fn = function timerFn() {
+        entry.active = false;
+        return fn.apply(null, arguments);
+      };
+      timers.push(entry);
+      return entry;
+    },
+    clearTimeout(handle) {
+      if (handle && typeof handle === "object") handle.active = false;
+    },
+    setInterval(fn, ms) {
+      const entry = { kind: "interval", ms, name: fn.name, active: true };
+      entry.fn = function timerFn() { return fn.apply(null, arguments); };
+      timers.push(entry);
+      return entry;
+    },
+    clearInterval(handle) {
+      if (handle && typeof handle === "object") handle.active = false;
+    },
     fetch() { throw new Error("unexpected fetch"); },
     crypto: {
       randomUUID() { return "00000000-0000-4000-8000-000000000001"; },
@@ -297,13 +340,13 @@ test("controller owns recognized native frames while legacy pong and disconnect 
   assert.equal(h.helperDisconnects.length, 1);
   // The re-dial is now scheduled rather than immediate — drive it before
   // checking listener count.
-  h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000).forEach((t) => t.fn());
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").forEach((t) => t.fn());
   await settle();
-  // Two listeners, because the drop's re-dial reconnects and this harness
-  // hands back the SAME port object every connect, so its listeners
-  // accumulate. Real runtime.connectNative returns a fresh Port per call, so
-  // nothing accumulates in production.
-  assert.equal(h.nativeDisconnects.size, 2);
+  // One listener: the re-dial's reconnect gets its own fresh port (matching
+  // real runtime.connectNative, which returns an independent Port per call),
+  // so the dropped port's now-orphaned listener is not watching this one —
+  // nothing accumulates, in the harness or in production.
+  assert.equal(h.nativeDisconnects.size, 1);
   assert.equal(
     h.runtimeMessages.some((message) => message && message.type === "cast-update" &&
       message.cast && message.cast.state === "idle" && /disconnected/i.test(message.error)),
@@ -330,7 +373,7 @@ test("a dropped helper port re-dials instead of reporting it uninstalled", async
 
   h.nativeDisconnects.emit();
   await settle();
-  h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000).forEach((t) => t.fn());
+  h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").forEach((t) => t.fn());
   await settle();
 
   assert.equal(pings(), before + 1, "the drop must trigger a re-dial");
@@ -349,7 +392,7 @@ test("a re-dial that also drops backs off instead of giving up", async () => {
   await settle();
 
   const pings = () => h.nativePosts.filter((p) => p && p.cmd === "ping").length;
-  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000);
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
 
   const before = pings();
   h.nativeDisconnects.emit();
@@ -379,7 +422,7 @@ test("automatic re-dials are bounded rather than unbounded", async () => {
   h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
   await settle();
 
-  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.ms >= 1000);
+  const waits = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
   for (let i = 0; i < 6; i += 1) {
     h.nativeDisconnects.emit();
     await settle();
@@ -387,6 +430,40 @@ test("automatic re-dials are bounded rather than unbounded", async () => {
     await settle();
   }
   assert.equal(waits().length, 4, "a helper that is truly gone must stop being re-dialled");
+});
+
+// The scheduling site clears any pending re-dial timer before arming a new
+// one (`if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);`),
+// so two overlapping schedule attempts cannot leave two live timers ticking
+// at once. Reaching a second schedule attempt while the first is still
+// pending needs a reconnect that did NOT come from that pending timer
+// itself — the timer always clears its own handle before it reconnects, so
+// nothing else is ever waiting to race it. background.js's own entry points
+// land on the vm global (see createHarness's `sandbox`), so connectNative()
+// is driven directly here to stand in for such a reconnect.
+test("overlapping disconnects clear the previous re-dial instead of stacking it", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const redials = () => h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial");
+  const pending = () => redials().filter((t) => t.active);
+
+  h.nativeDisconnects.emit();
+  await settle();
+  assert.equal(pending().length, 1, "the first drop schedules one pending re-dial");
+  const firstTimer = pending()[0];
+
+  h.sandbox.connectNative();
+  await settle();
+  h.nativeDisconnects.emit();
+  await settle();
+
+  assert.equal(firstTimer.active, false, "the earlier pending re-dial must be cleared, not left live");
+  assert.equal(pending().length, 1, "the second drop must not stack a second live re-dial");
 });
 
 // Every YouTube click minted a fresh id and spawned another yt-dlp writing to

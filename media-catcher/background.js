@@ -436,63 +436,76 @@ function connectNative() {
   if (nativePort) return;
   setNativeState("connecting");
   mclog("info", "connecting to the native helper…");
+  let port;
   try {
-    nativePort = api.runtime.connectNative(NATIVE_HOST);
-    nativePort.onMessage.addListener(onNativeMessage);
-    nativePort.onDisconnect.addListener(() => {
-      // A disconnect now schedules a re-dial instead of running one inline, so
-      // the listener that reconnects outlives the event that queued it — a
-      // second onDisconnect listener can be live when the next drop happens.
-      // Each real port fires this at most once, so the only way two listeners
-      // both see a drop is a stale one left over from a connection this drop
-      // already superseded; nativePort is only null while nothing is
-      // connected, so a stale listener finds it already cleared and no-ops.
-      if (!nativePort) return;
-      const controller = liveController;
-      if (controller) {
-        Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
-          mclog("warn", "policy disconnect: " + (e && e.message ? e.message : String(e)));
-        });
-      }
-      const err = api.runtime.lastError && api.runtime.lastError.message;
-      dlog("native host disconnected", err || "");
-      mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
-      nativePort = null; nativeInfo = null;
-      if (helperPingTimer !== null) {
-        clearInterval(helperPingTimer);
-        helperPingTimer = null;
-      }
-      // No helper means no dialog will ever answer; settle every waiter now.
-      failAllFolderPicks();
-      if (nativeHandshook && nativeRedialAttempt < HELPER_REDIAL_MS.length) {
-        const wait = HELPER_REDIAL_MS[nativeRedialAttempt];
-        nativeRedialAttempt += 1;
-        mclog("info", "native helper disconnected — reconnecting in " + wait + "ms…");
-        if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);
-        nativeRedialTimer = setTimeout(() => {
-          nativeRedialTimer = null;
-          connectNative();        // sets state to "connecting" and re-pings
-        }, wait);
-      } else {
-        // Only claim it is missing when we never reached a live helper; a drop
-        // after a good handshake is a disconnect, and saying otherwise sent
-        // people to reinstall software that was already there.
-        setNativeState("disconnected", err ||
-          (nativeHandshook ? "Helper disconnected." : "Helper not installed."));
-      }
-      // The host owned the cast session and its status poller — without it the
-      // session is gone; don't leave the popup showing a live transport forever.
-      if (castState.state !== "idle") {
-        castState = { state: "idle" };
-        broadcast({ type: "cast-update", cast: castState, error: "Casting ended — the helper disconnected." });
-      }
-      for (const [id, res] of pendingCastDiscover) { pendingCastDiscover.delete(id); res(null); }
-    });
-    nativePort.postMessage({ cmd: "ping" });
+    port = api.runtime.connectNative(NATIVE_HOST);
   } catch (e) {
     dlog("native connect failed", e.message || e);
-    nativePort = null;
     setNativeState("disconnected", e.message || String(e));
+    return;
+  }
+  nativePort = port;
+  port.onMessage.addListener(onNativeMessage);
+  port.onDisconnect.addListener(function nativeDisconnect() {
+    // A disconnect now schedules a re-dial instead of running one inline, so
+    // the listener that reconnects outlives the event that queued it — a
+    // newer connection's listener can already be live when an older one's
+    // real disconnect arrives. Compare against the exact port THIS listener
+    // was registered for, not whether the mutable nativePort variable
+    // currently holds any value: the ping send below can fail while this
+    // same port and its listeners are still very much live (see the ping
+    // try/catch), so "nativePort is null" does not reliably mean "port is
+    // gone" — only "nativePort points at a different port" does.
+    if (nativePort !== port) return;
+    const controller = liveController;
+    if (controller) {
+      Promise.resolve().then(() => controller.helperDisconnected()).catch((e) => {
+        mclog("warn", "policy disconnect: " + (e && e.message ? e.message : String(e)));
+      });
+    }
+    const err = api.runtime.lastError && api.runtime.lastError.message;
+    dlog("native host disconnected", err || "");
+    mclog("warn", "native helper disconnected" + (err ? ": " + err : ""));
+    nativePort = null; nativeInfo = null;
+    if (helperPingTimer !== null) {
+      clearInterval(helperPingTimer);
+      helperPingTimer = null;
+    }
+    // No helper means no dialog will ever answer; settle every waiter now.
+    failAllFolderPicks();
+    if (nativeHandshook && nativeRedialAttempt < HELPER_REDIAL_MS.length) {
+      const wait = HELPER_REDIAL_MS[nativeRedialAttempt];
+      nativeRedialAttempt += 1;
+      mclog("info", "native helper disconnected — reconnecting in " + wait + "ms…");
+      if (nativeRedialTimer !== null) clearTimeout(nativeRedialTimer);
+      nativeRedialTimer = setTimeout(function nativeRedial() {
+        nativeRedialTimer = null;
+        connectNative();        // sets state to "connecting" and re-pings
+      }, wait);
+    } else {
+      // Only claim it is missing when we never reached a live helper; a drop
+      // after a good handshake is a disconnect, and saying otherwise sent
+      // people to reinstall software that was already there.
+      setNativeState("disconnected", err ||
+        (nativeHandshook ? "Helper disconnected." : "Helper not installed."));
+    }
+    // The host owned the cast session and its status poller — without it the
+    // session is gone; don't leave the popup showing a live transport forever.
+    if (castState.state !== "idle") {
+      castState = { state: "idle" };
+      broadcast({ type: "cast-update", cast: castState, error: "Casting ended — the helper disconnected." });
+    }
+    for (const [id, res] of pendingCastDiscover) { pendingCastDiscover.delete(id); res(null); }
+  });
+  try {
+    port.postMessage({ cmd: "ping" });
+  } catch (e) {
+    // The port and both listeners above are already live; a failed initial
+    // ping (the helper is already gone, or about to be) is not the same as
+    // "nothing is connected" — leave nativePort and state alone and let the
+    // real onDisconnect event above drive cleanup and the re-dial backoff,
+    // exactly like any other disconnect.
+    dlog("native ping failed", e.message || e);
   }
 }
 
@@ -594,10 +607,14 @@ function onLegacyNativeMessage(msg) {
     // still be pending here if this pong arrived on a connection made outside
     // that timer (e.g. a manual recheck-helper beat it to a live helper) —
     // cancel it, since the wait it was counting down is now moot and letting
-    // it fire later would just be a stray, if harmless, no-op reconnect.
+    // it fire later would just be a stray, if harmless, no-op reconnect. Only
+    // do that while a port is actually connected, though: a pong with no
+    // nativePort is not a live connection to trust, and cancelling the one
+    // scheduled re-dial in that case would silently drop the reconnect that
+    // was still needed, leaving nothing to bring the helper back.
     nativeHandshook = true;
     nativeRedialAttempt = 0;
-    if (nativeRedialTimer !== null) {
+    if (nativePort && nativeRedialTimer !== null) {
       clearTimeout(nativeRedialTimer);
       nativeRedialTimer = null;
     }
