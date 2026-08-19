@@ -2606,6 +2606,31 @@
         return true;
       }
 
+      /**
+       * Post one direct attempt. The key was added to startedAttempts BEFORE the
+       * post on purpose - it is the re-entrancy guard that keeps overlapping pumps
+       * to one live attempt - so a start that never reaches the helper has to undo
+       * it here and hand the slot back, the way manualRetry already does.
+       * Always returns a promise: a synchronous throw must not abort pump's loop
+       * and strand the still-unstarted jobs behind it in the same snapshot.
+       */
+      function postDirectAttempt(activeScheduler, jobId, key, command) {
+        function failStart(err) {
+          startedAttempts.delete(key);
+          activeScheduler.onTransportUnavailable(jobId);
+          throw err;
+        }
+        var effect;
+        try {
+          effect = postNative(command);
+        } catch (errSync) {
+          return Promise.resolve().then(function () {
+            failStart(errSync);
+          });
+        }
+        return Promise.resolve(effect).catch(failStart);
+      }
+
       function enqueueDownload(message, sender) {
         return Promise.resolve().then(function () {
           requirePopupSender(sender);
@@ -3244,7 +3269,7 @@
               input.effectiveDestinationDirectory = binding.effectiveDir;
             }
             var command = getMessageRouter().buildNativeStartPayload(input);
-            pending.push(Promise.resolve(postNative(command)));
+            pending.push(postDirectAttempt(scheduler, job.id, key, command));
           }
           return Promise.all(pending).then(function () {});
         });

@@ -573,11 +573,11 @@ test("enqueue publishes its committed safe running job when native post rejects"
   assert.equal(h.counts.publishJobs, 1);
   assert.equal(h.published.length, 1);
   assert.equal(h.published[0].length, 1);
-  assert.equal(h.published[0][0].state, "running");
+  assert.equal(h.published[0][0].state, "needs_user");
   assertSafeProjection(h.published[0], "failed enqueue publication");
 });
 
-test("raising capacity publishes committed running jobs when native post rejects", async () => {
+test("raising capacity parks the job whose native post rejects", async () => {
   const effectError = new Error("raised native post rejected");
   let calls = 0;
   const h = makeHarness({
@@ -610,7 +610,7 @@ test("raising capacity publishes committed running jobs when native post rejects
 
   assert.equal(h.published.length, publishedBeforeRaise + 1);
   const rows = h.published[h.published.length - 1];
-  assert.deepEqual(rows.map((row) => row.state), ["running", "running"]);
+  assert.deepEqual(rows.map((row) => row.state), ["running", "needs_user"]);
   assertSafeProjection(rows, "failed capacity publication");
 });
 
@@ -644,4 +644,51 @@ test("overlapping pumps post one live attempt while the first effect is unsettle
 
   await Promise.all([enqueue, secondPump]);
   assert.equal(commands.length, 1);
+});
+
+test("a direct start that never reaches the helper releases its slot", async () => {
+  const effectError = new Error("native post rejected");
+  let calls = 0;
+  const commands = [];
+  const h = makeHarness({
+    maxConcurrent: 1,
+    postNative(command) {
+      calls += 1;
+      if (calls === 1) throw effectError;
+      commands.push(command);
+      return command;
+    },
+  });
+  const firstId = captureDirect(h.ctrl, {
+    url: YT_SIGNED,
+    pageUrl: YT_PAGE,
+    tabId: 60,
+    docId: "doc-slot-a",
+    filename: "a.mp4",
+  });
+  const secondId = captureDirect(h.ctrl, {
+    url: VM_SIGNED,
+    pageUrl: VM_PAGE,
+    tabId: 61,
+    docId: "doc-slot-b",
+    filename: "b.mp4",
+  });
+
+  await assert.rejects(
+    h.ctrl.enqueueDownload(
+      { type: "download", tabId: 60, item: { id: firstId }, intent: defaultIntent("a.mp4") },
+      {}
+    ),
+    (err) => err === effectError
+  );
+
+  // The wedged job must not still hold the only slot: the next enqueue must start.
+  await h.ctrl.enqueueDownload(
+    { type: "download", tabId: 61, item: { id: secondId }, intent: defaultIntent("b.mp4") },
+    {}
+  );
+
+  assert.equal(commands.length, 1);
+  const rows = h.published[h.published.length - 1];
+  assert.deepEqual(rows.map((row) => row.state).sort(), ["needs_user", "running"]);
 });
