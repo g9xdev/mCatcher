@@ -1302,3 +1302,14 @@ def test_guardian_does_not_write_through_a_hardlinked_destination(tmp_path):
 
     assert outside.read_text(encoding="utf-8") == "DO-NOT-TOUCH\n", \
         "guardian wrote through a hard link into a file outside the host directory"
+
+
+def test_bootstrap_fetches_the_ytdlp_directory_build_not_the_onefile():
+    """The onefile re-extracts ~145 files per launch and stalled ~90s under AV.
+    The installer must not put one on disk (see commit a1016a6)."""
+    src = (Path(__file__).parent / "installer" / "bootstrap.ps1").read_text(encoding="utf-8")
+
+    assert "releases/latest/download/yt-dlp_win.zip" in src
+    assert "releases/latest/download/yt-dlp.exe" not in src
+    # The presence check must require _internal/, so re-running upgrades a onefile.
+    assert "_internal" in src

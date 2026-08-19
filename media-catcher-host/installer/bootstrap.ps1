@@ -160,20 +160,37 @@ if (Test-Path $localFfmpeg) {
 }
 
 # ---------- 3b. yt-dlp (YouTube + many other sites) ----------
-# One self-contained binary. It self-updates (yt-dlp -U, triggered by the host) because
-# YouTube breaks it often. YouTube Premium cookies unlock 4K without a PO-token provider,
-# so no Node runtime is bundled.
+# The DIRECTORY build (yt-dlp.exe + _internal\), never the onefile. The onefile
+# launcher re-extracts ~145 files to %TEMP% on every launch; under a browser-
+# descended process each extraction is rescanned and the launch blocked ~90s in
+# DLL load, which the UI showed as "Preparing" forever. It self-updates
+# (yt-dlp -U, triggered by the host) because YouTube breaks it often.
 $localYtdlp = Join-Path $InstallDir "yt-dlp.exe"
-if (Test-Path $localYtdlp) {
-  Step "yt-dlp: present (self-updates)"
+$localInternal = Join-Path $InstallDir "_internal"
+if ((Test-Path $localYtdlp) -and (Test-Path $localInternal)) {
+  Step "yt-dlp: present (directory build, self-updates)"
 } elseif ($SkipYtdlp) {
   Warn "yt-dlp: skipped - YouTube downloads will be unavailable"
 } else {
-  Warn "yt-dlp: downloading the latest release..."
+  if (Test-Path $localYtdlp) { Warn "yt-dlp: replacing the onefile with the directory build..." }
+  else { Warn "yt-dlp: downloading the latest release..." }
   try {
-    Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile $localYtdlp
-    if (Test-Path $localYtdlp) { Step "yt-dlp: installed" } else { throw "yt-dlp.exe not written" }
-  } catch { Warn ("yt-dlp: download failed (" + $_ + "). Put yt-dlp.exe in " + $InstallDir + " to enable YouTube.") }
+    $yz = Join-Path $env:TEMP "ytdlp-mc.zip"
+    Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip" -OutFile $yz
+    $yex = Join-Path $env:TEMP "ytdlp-mc"
+    if (Test-Path $yex) { Remove-Item $yex -Recurse -Force }
+    Expand-Archive -Path $yz -DestinationPath $yex -Force
+    $hit = Get-ChildItem -Path $yex -Recurse -Filter "yt-dlp.exe" | Select-Object -First 1
+    if (-not $hit) { throw "yt-dlp.exe missing from archive" }
+    $staged = Split-Path -Parent $hit.FullName
+    if (-not (Test-Path (Join-Path $staged "_internal"))) { throw "_internal missing from archive" }
+    Copy-Item $hit.FullName $localYtdlp -Force
+    if (Test-Path $localInternal) { Remove-Item $localInternal -Recurse -Force }
+    Copy-Item (Join-Path $staged "_internal") $InstallDir -Recurse -Force
+    Remove-Item $yz -Force; Remove-Item $yex -Recurse -Force
+    if ((Test-Path $localYtdlp) -and (Test-Path $localInternal)) { Step "yt-dlp: installed (directory build)" }
+    else { throw "yt-dlp not complete after copy" }
+  } catch { Warn ("yt-dlp: download failed (" + $_ + "). Put the yt-dlp directory build in " + $InstallDir + " to enable YouTube.") }
 }
 
 # ---------- 3b-lib. yt-dlp as an in-process library ----------
