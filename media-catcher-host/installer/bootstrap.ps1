@@ -184,9 +184,15 @@ if ((Test-Path $localYtdlp) -and (Test-Path $localInternal)) {
     if (-not $hit) { throw "yt-dlp.exe missing from archive" }
     $staged = Split-Path -Parent $hit.FullName
     if (-not (Test-Path (Join-Path $staged "_internal"))) { throw "_internal missing from archive" }
-    Copy-Item $hit.FullName $localYtdlp -Force
+    # Remove old artifacts, then write _internal, then yt-dlp.exe last: the exe
+    # is the completion marker the presence check keys on, so an interruption
+    # anywhere before its copy lands leaves no exe - not a stale exe beside a
+    # fresh _internal, or a fresh exe beside a stale _internal - and the next
+    # run redownloads and repairs cleanly.
+    if (Test-Path $localYtdlp) { Remove-Item $localYtdlp -Force }
     if (Test-Path $localInternal) { Remove-Item $localInternal -Recurse -Force }
     Copy-Item (Join-Path $staged "_internal") $InstallDir -Recurse -Force
+    Copy-Item $hit.FullName $localYtdlp -Force
     Remove-Item $yz -Force; Remove-Item $yex -Recurse -Force
     if ((Test-Path $localYtdlp) -and (Test-Path $localInternal)) { Step "yt-dlp: installed (directory build)" }
     else { throw "yt-dlp not complete after copy" }
