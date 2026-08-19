@@ -63,20 +63,21 @@ _KINDS = {
     "scalar": (lambda v: isinstance(v, str) or _is_num(v), "a string or a number"),
     "strlist": (lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
                 "a list of strings"),
-    "dict": (lambda v: isinstance(v, dict), "an object"),
 }
 
 STR, ID, INT, NUM, BOOL = "str", "id", "int", "num", "bool"
 SCALAR, STRLIST = "scalar", "strlist"
 
 # A field's spec may also be a DICT OF SUB-SPECS, which types the object's
-# contents instead of only its outer shape. There is no bare "dict" kind on
-# purpose: `convert` used to have one, so {"codec":"h265","quality":{}}
-# passed the gate, reached _finalize_move and raised TypeError on an
-# un-try'd worker AFTER shutil.move had already run -- the file landed, the
-# `saved` frame never did, and the row hung. A container whose values nobody
-# typed is a hole the gate cannot see into; test_boundary.py asserts no
-# schema entry has one.
+# contents instead of only its outer shape. That is the ONLY way to declare a
+# container: _KINDS above has no "dict" and no "list" entry, so an untyped one
+# cannot be written down -- _assert_kinds_declared refuses the table at import
+# and _check_fields has no checker to consult. `convert` used to be a bare
+# "dict", so {"codec":"h265","quality":{}} passed the gate, reached
+# _finalize_move and raised TypeError on an un-try'd worker AFTER shutil.move
+# had already run -- the file landed, the `saved` frame never did, and the row
+# hung. A container whose values nobody typed is a hole the gate cannot see
+# into.
 CONVERT = {"codec": STR, "quality": STR, "encoder": STR}
 
 
@@ -94,6 +95,26 @@ CONVERT = {"codec": STR, "quality": STR, "encoder": STR}
 # a hard break. The security property is that no LISTED field can arrive as the
 # wrong type, and that nothing dispatches on an unlisted `cmd`.
 # ---------------------------------------------------------------------------
+
+def _assert_kinds_declared(schema):
+    """Raise unless every spec in `schema` is a known kind or a nested spec.
+
+    Runs on MESSAGE_SCHEMA at import, so a typo or a resurrected untyped
+    container is an ImportError at startup rather than a KeyError on the first
+    message that happens to carry the field. One level of nesting is all the
+    schema has, but the walk is recursive so that stays true if it grows.
+    """
+    for cmd, fields in schema.items():
+        for name, spec in fields.items():
+            if isinstance(spec, dict):
+                _assert_kinds_declared({"%s.%s" % (cmd, name): spec})
+            elif spec not in _KINDS:
+                raise ValueError(
+                    "schema field %s.%s declares unknown kind %r; an "
+                    "untyped container is not declarable - nest a dict of "
+                    "sub-specs instead"
+                    % (cmd, name, spec))
+
 
 MESSAGE_SCHEMA = {
     "ping": {},
@@ -136,6 +157,9 @@ MESSAGE_SCHEMA = {
     "file-commit": {"sinkId": STR, "jobId": STR, "attemptToken": STR},
     "file-abort": {"sinkId": STR, "jobId": STR, "attemptToken": STR},
 }
+
+_assert_kinds_declared(MESSAGE_SCHEMA)
+
 
 # Fields whose absence is not a default but a fault. Kept deliberately small:
 # every handler below already answers a missing optional field with its own,

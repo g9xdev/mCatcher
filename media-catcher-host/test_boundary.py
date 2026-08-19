@@ -567,3 +567,27 @@ def test_media_exts_cover_every_ytdlp_remux_target():
     assert missing == [], missing
     # vorbis is a codec yt-dlp writes into .ogg, not a suffix of its own
     assert ".vorbis" not in guard.MEDIA_EXTS
+
+
+def test_no_untyped_container_kind_can_be_declared():
+    """Item 1 again, in the fix for item 1: the comment said there was no bare
+    "dict" kind while _KINDS still defined one, so a spec of "dict" typed an
+    object's outer shape and nothing inside it. Only the DICT alias had gone.
+
+    Made true by construction rather than by comment — the kind is not in
+    _KINDS, so declaring one is not a weaker check, it is not a check at all
+    and the table refuses to import. The schema scan stays as the backstop.
+    """
+    assert "dict" not in guard._KINDS and "list" not in guard._KINDS
+
+    # A leftover spec cannot quietly pass: it has no checker to consult.
+    with pytest.raises(KeyError):
+        guard._check_fields({"convert": {"quality": {}}},
+                            {"convert": "dict"}, "save")
+
+    # ...and the table is checked at import, so it cannot ship in the first place.
+    guard._assert_kinds_declared(guard.MESSAGE_SCHEMA)
+    with pytest.raises(ValueError):
+        guard._assert_kinds_declared({"save": {"convert": "dict"}})
+    with pytest.raises(ValueError):
+        guard._assert_kinds_declared({"save": {"convert": {"quality": "dict"}}})
