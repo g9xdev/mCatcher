@@ -30,6 +30,12 @@ import unicodedata
 import uuid
 from ctypes import wintypes
 
+# The boundary rules (mchost/guard.py). Imported directly rather than through
+# the shim: it holds no mutable or patched state — it is tables and pure
+# functions — and it imports no mchost sibling, so there is no import-order or
+# stale-copy hazard to route around.
+from mchost import guard
+
 
 def _h():
     """Call-time shim lookup (same convention as hlog/config/updates after the
@@ -141,7 +147,14 @@ def handle_record(req):
         _h().send({"type": "error", "id": req.get("id"), "error": "ffmpeg not found. Re-run the installer or put ffmpeg.exe next to the helper."})
         return
     jid = req.get("id")
-    temp = os.path.join(_h().TMPDIR, "mc_%s.mp4" % jid)
+    # The id is the extension's correlation token, not a path component. It used
+    # to be interpolated straight in here, so "../.." walked out of TMPDIR: an
+    # arbitrary .mp4 create-or-overwrite anywhere the user can write, and
+    # handle_discard's _rm_quiet followed the same path back out to delete it.
+    # (Win32 also strips a trailing dot, so "mc_.." normalised to a literal
+    # "mc_" directory — the attacker just spent one extra "..".) The registry
+    # still keys on the raw id; only the filename is derived.
+    temp = guard.temp_path(_h().TMPDIR, jid)
     job = Job(jid, temp)
     job.base = _h().sanitize(req.get("base"))
     with JOBS_LOCK:
@@ -873,7 +886,16 @@ def handle_open(req):
     """
     def worker():
         path = req.get("path")
-        if not path or not os.path.isfile(path):
+        # BEFORE the stat, deliberately. os.startfile is ShellExecuteW, so the
+        # only gate here used to be "does this file exist" — meaning any .exe,
+        # .bat, .ps1, .lnk, .scr or .hta the extension could name, it could RUN.
+        # Checking the suffix first also stops `open` doubling as a
+        # file-existence oracle for paths this helper has no business touching.
+        refusal = guard.refuse_open(path)
+        if refusal:
+            _h().send({"type": "error", "id": req.get("id"), "error": refusal})
+            return
+        if not os.path.isfile(path):
             _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
             return
         try:
@@ -900,7 +922,16 @@ def handle_reveal(req):
     """
     def worker():
         path = req.get("path")
-        if not path or not os.path.isfile(path):
+        # Same allowlist as handle_open. Revealing is the milder verb — Explorer
+        # selects the file rather than launching it — but the shape is
+        # identical: a caller-supplied absolute path handed to a shell command,
+        # gated only on existence. Holding both to one rule is also what keeps
+        # "which paths may this helper act on" a single answer.
+        refusal = guard.refuse_open(path)
+        if refusal:
+            _h().send({"type": "error", "id": req.get("id"), "error": refusal})
+            return
+        if not os.path.isfile(path):
             _h().send({"type": "error", "id": req.get("id"), "error": "file not found: %s" % path})
             return
         try:
@@ -3976,11 +4007,14 @@ def _handle_ytdl_legacy(req):
         # preflight owes the caller a terminal frame like every other failure.
         try:
             deno = ensure_deno()   # yt-dlp needs a JS runtime to solve YouTube's 'n' challenge
-            outdir = req.get("dir") or (_h().load_config().get("saveFolder") or "") or _h().downloads_dir()
-            try:
-                os.makedirs(outdir, exist_ok=True)
-            except Exception:
-                pass
+            outdir, dir_err = guard.resolve_existing_dir(
+                req.get("dir"),
+                (_h().load_config().get("saveFolder") or "") or _h().downloads_dir())
+            if dir_err:
+                # Raised, not swallowed: this whole block is already inside
+                # the preflight try that owes the row a terminal frame, and a
+                # destination that does not exist used to be built here.
+                raise RuntimeError(dir_err)
             pot = start_pot_provider()            # best-effort; without it, quality caps ~1080p
             outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
             # Optional format selector from the popup's quality picker; default = best.
@@ -4241,30 +4275,42 @@ def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState
 
 
 _PGET_NAME_MAX = 150
+# The fallback carries a suffix because every name this host writes must;
+# the extension's own guessExt() defaults to .mp4 for the same reason.
+_PGET_DEFAULT_NAME = "download.mp4"
 _PGET_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|]+')
 
 
 def _pget_safe_filename(name):
-    """Pget-local basename normalizer capped at 150 characters.
+    """Pget-local basename normalizer capped at 150 characters, or None.
 
-    Already-safe basenames of length <=150 are preserved exactly. Invalid
-    path characters are replaced like the legacy host sanitizer; empty
-    results fall back to "download". Does not call or mutate tools.sanitize.
+    Already-safe basenames of length <=150 are preserved exactly. Invalid path
+    characters are replaced like the legacy host sanitizer. Does not call or
+    mutate tools.sanitize.
+
+    Returns None when the normalized result is not a name this host may create
+    — a suffix outside guard.MEDIA_EXTS, or a Windows device name. Normalizing
+    was never enough on its own: the suffix survived verbatim, so "payload.exe"
+    came out of here unchanged and every caller wrote it. Callers must treat
+    None as a refusal; the ytdl structured path already did, because its
+    `download` fallback could not be reached from a nonblank name.
     """
     raw = name if isinstance(name, str) else ("" if name is None else str(name))
-    cleaned = _PGET_UNSAFE_NAME.sub("_", raw or "download").strip()
+    cleaned = _PGET_UNSAFE_NAME.sub("_", raw or _PGET_DEFAULT_NAME).strip()
     if not cleaned:
-        cleaned = "download"
-    if len(cleaned) <= _PGET_NAME_MAX:
-        return cleaned
-    root, ext = os.path.splitext(cleaned)
-    if ext and len(ext) < _PGET_NAME_MAX:
-        keep = _PGET_NAME_MAX - len(ext)
-        root = root[:keep]
-        cleaned = (root + ext) if root else cleaned[:_PGET_NAME_MAX]
-    else:
-        cleaned = cleaned[:_PGET_NAME_MAX]
-    return cleaned or "download"
+        cleaned = _PGET_DEFAULT_NAME
+    if len(cleaned) > _PGET_NAME_MAX:
+        root, ext = os.path.splitext(cleaned)
+        if ext and len(ext) < _PGET_NAME_MAX:
+            keep = _PGET_NAME_MAX - len(ext)
+            root = root[:keep]
+            cleaned = (root + ext) if root else cleaned[:_PGET_NAME_MAX]
+        else:
+            cleaned = cleaned[:_PGET_NAME_MAX]
+    cleaned = cleaned or _PGET_DEFAULT_NAME
+    # Checked AFTER the cap, not before: truncation can itself produce a
+    # name this host may not create.
+    return None if guard.refuse_basename(cleaned) else cleaned
 
 
 def _pget_terminal_file_bytes(op):
@@ -5167,15 +5213,25 @@ def handle_pget(req):
             urls = [u for u in (req.get("urls") or []) if u]
             referer = req.get("referer") or ""
             ua = req.get("userAgent") or ""
-            name = _pget_safe_filename(req.get("name") or "download")
-            out_dir = req.get("dir") or _h().downloads_dir()
+            # A refused name is a permanent failure, not a coerced one:
+            # silently renaming a download is worse than telling the caller,
+            # and the extension already falls back to a browser download for
+            # a permanent pget failure — which is where a non-media file
+            # belongs anyway, with Firefox's own warnings around it.
+            name = _pget_safe_filename(req.get("name"))
+            out_dir, dir_err = guard.resolve_existing_dir(
+                req.get("dir"), _h().downloads_dir())
 
             if op.get("cancel_requested") or stop.is_set():
                 finish("cancelled", "cancelled", "empty")
                 return
 
-            if not urls:
+            if not urls or not name:
                 finish("failed", "permanent", "empty")
+                return
+
+            if dir_err:
+                finish("failed", "local_io", "empty")
                 return
 
             try:
@@ -5193,7 +5249,9 @@ def handle_pget(req):
                 return
 
             try:
-                os.makedirs(out_dir, exist_ok=True)
+                # No makedirs: resolve_existing_dir already required the
+                # destination to exist, so nothing on THIS path builds a
+                # tree (the structured ytdl lease still does, by design).
                 final_path = _dedup(os.path.join(out_dir, name))
                 op["final_path"] = final_path
             except Exception:
@@ -5471,22 +5529,31 @@ def handle_pget_single(req):
             urls = [u for u in (req.get("urls") or []) if u]
             referer = req.get("referer") or ""
             ua = req.get("userAgent") or ""
-            name = _pget_safe_filename(req.get("name") or "download")
-            out_dir = req.get("dir") or _h().downloads_dir()
+            # Same two rules as handle_pget: a name this host may create,
+            # and a destination that already exists.
+            name = _pget_safe_filename(req.get("name"))
+            out_dir, dir_err = guard.resolve_existing_dir(
+                req.get("dir"), _h().downloads_dir())
 
             if op.get("cancel_requested") or stop.is_set():
                 finish("cancelled", "cancelled", "empty")
                 return
 
-            if not urls:
+            if not urls or not name:
                 finish("failed", "permanent", "empty")
+                return
+
+            if dir_err:
+                finish("failed", "local_io", "empty")
                 return
 
             # Scheduler-issued single-connection: one selected candidate only.
             url = urls[0]
 
             try:
-                os.makedirs(out_dir, exist_ok=True)
+                # No makedirs: resolve_existing_dir already required the
+                # destination to exist, so nothing on THIS path builds a
+                # tree (the structured ytdl lease still does, by design).
                 final_path = _dedup(os.path.join(out_dir, name))
                 op["final_path"] = final_path
                 op["n"] = n

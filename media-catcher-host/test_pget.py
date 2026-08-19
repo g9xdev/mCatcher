@@ -648,10 +648,13 @@ def test_path_failure_is_local_io(tmp_path, monkeypatch):
         url = server_url(httpd)
         import mchost.downloads as d
 
-        def bad_makedirs(*_a, **_k):
+        # Injected into _dedup, not os.makedirs: the handlers no longer
+        # create a missing destination tree, so makedirs is never called.
+        # _dedup is now the first filesystem touch inside the same try.
+        def bad_path(*_a, **_k):
             raise OSError(errno.EACCES, "denied")
 
-        monkeypatch.setattr(d.os, "makedirs", bad_makedirs)
+        monkeypatch.setattr(d, "_dedup", bad_path)
         mc.handle_pget({
             "id": "jobPath",
             "attemptToken": "atk-path",
@@ -1346,10 +1349,13 @@ def test_pget_single_http_categories_and_no_firefox(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
     httpd, _ = run_server("no-range")
     try:
-        def bad_makedirs(*_a, **_k):
+        # Injected into _dedup, not os.makedirs: the handlers no longer
+        # create a missing destination tree, so makedirs is never called.
+        # _dedup is now the first filesystem touch inside the same try.
+        def bad_path(*_a, **_k):
             raise OSError(errno.EACCES, "denied")
 
-        monkeypatch.setattr(d.os, "makedirs", bad_makedirs)
+        monkeypatch.setattr(d, "_dedup", bad_path)
         mc.handle_pget_single({
             "id": "sIO", "attemptToken": "tIO",
             "urls": [server_url(httpd)],
@@ -2701,7 +2707,7 @@ def test_set_limit_replacement_waits_for_old_ack_serializer(monkeypatch):
     assert d._PGET.get(jid) is None
 
 
-def test_ytdl_registry_cas_and_identity_unregister(monkeypatch):
+def test_ytdl_registry_cas_and_identity_unregister(monkeypatch, tmp_path):
     """yt-dlp must use registry CAS; duplicate id kills the new proc without overwrite."""
     import mchost.downloads as d
 
@@ -2745,7 +2751,8 @@ def test_ytdl_registry_cas_and_identity_unregister(monkeypatch):
     owner = _make_lease_op(gen=0, limit=1, cap=1)
     assert d._pget_register(jid, owner)
 
-    d.handle_ytdl({"id": jid, "url": "https://example.test/v", "dir": "."})
+    d.handle_ytdl({"id": jid, "url": "https://example.test/v",
+                   "dir": str(tmp_path)})
     assert wait_for(lambda: any(m.get("type") == "ytdl-error" for m in sent), timeout=5)
     err = [m for m in sent if m.get("type") == "ytdl-error" and m.get("id") == jid][-1]
     assert err["reason"]

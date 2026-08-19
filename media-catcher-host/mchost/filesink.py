@@ -15,6 +15,8 @@ import threading
 import time
 import uuid
 
+from mchost import guard
+
 # Firefox native-messaging payload ceiling is 1 MiB framed. Base64 expands by
 # 4/3 plus JSON envelope, so keep decoded chunks well under that.
 MAX_CHUNK_BYTES = 512 * 1024
@@ -352,7 +354,15 @@ def handle_file_open(req):
         _error("invalid-identity")
         return
     # Use the exact requested filename (no strip/sanitize) once nonblank.
+    # _is_safe_basename vets the SHAPE of the name; guard.refuse_basename adds
+    # the half it never had — the suffix. This sink writes the requested name
+    # verbatim, so "payload.exe" passed every check here and landed on disk.
+    # Same list the shell handlers use: what this host writes and what it will
+    # later open are one category.
     if not isinstance(name, str) or not _is_safe_basename(name):
+        _error("invalid-filename", job_id=job, attempt_token=token)
+        return
+    if guard.refuse_basename(name):
         _error("invalid-filename", job_id=job, attempt_token=token)
         return
 

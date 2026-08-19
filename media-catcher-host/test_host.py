@@ -726,6 +726,34 @@ def test_every_loop_command_is_classified():
            sorted(set(LOOP_DISPATCH) - set(branches))))
 
 
+def test_every_loop_command_has_a_schema():
+    """The same enumeration, for the OTHER table that has to stay in step.
+
+    guard.MESSAGE_SCHEMA says what each command's fields may be; this loop is
+    what feeds it. A command added to one and not the other is either
+    undispatchable or unvalidated, and unvalidated is the one that matters — the
+    whole point of the gate is that no branch runs on a message nobody typed.
+    Asserted against the AST of main() rather than against LOOP_DISPATCH so the
+    two tables are pinned to the CODE, not to each other."""
+    from mchost import guard
+
+    branches = _loop_branches()
+    assert set(branches) == set(guard.MESSAGE_SCHEMA), (
+        "the loop's commands and guard.MESSAGE_SCHEMA disagree; "
+        "unvalidated=%s stale=%s"
+        % (sorted(set(branches) - set(guard.MESSAGE_SCHEMA)),
+           sorted(set(guard.MESSAGE_SCHEMA) - set(branches))))
+
+
+def test_the_gate_runs_before_the_dispatch_chain():
+    """Validation placed after the first `cmd ==` branch would leave that branch
+    unguarded, which is exactly the shape this is meant to make impossible."""
+    src = io.open(HOST, encoding="utf-8").read()
+    gate = src.index("guard.validate_message(msg)")
+    first_branch = src.index('if cmd == "ping"')
+    assert gate < first_branch, "the schema gate must precede the dispatch chain"
+
+
 def test_every_long_loop_command_really_dispatches_to_a_worker():
     """The "worker" half of the table is a claim about code, so check the code.
     Names the function that does the dispatching, not just the handler, because
