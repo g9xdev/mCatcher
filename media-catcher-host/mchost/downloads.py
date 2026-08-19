@@ -989,14 +989,27 @@ _YTDLP_REFETCHED = False
 
 
 def _has_internal(exe):
-    """True when exe is the directory build - yt-dlp.exe beside _internal/.
+    """True when exe is the directory build - yt-dlp.exe beside a POPULATED
+    _internal/.
 
     The onefile launcher re-extracts ~145 files to %TEMP% on every launch and,
     under a browser-descended process, each extraction is rescanned; that is the
-    ~90s DLL-load stall the UI showed as "Preparing" forever."""
+    ~90s DLL-load stall the UI showed as "Preparing" forever.
+
+    An EMPTY _internal does not count. It is a real on-disk state - an install
+    interrupted partway, a tree an AV scanner emptied - and never a working one:
+    a directory build cannot start without base_library.zip and its python DLL,
+    and a onefile with a stray empty _internal is still the onefile. Both
+    readings make "accept it" the wrong answer, while being wrong the other way
+    costs one re-fetch per process that keeps the existing exe if it fails. Not
+    a validity check: a half-extracted tree still passes. It only rejects the
+    state that is unambiguously not a directory build."""
     if not exe:
         return False
-    return os.path.isdir(os.path.join(os.path.dirname(exe), "_internal"))
+    try:
+        return bool(os.listdir(os.path.join(os.path.dirname(exe), "_internal")))
+    except OSError:
+        return False        # absent, a file, or unreadable - none is a build
 
 
 def _ytdlp_dest_is_writable(dest):

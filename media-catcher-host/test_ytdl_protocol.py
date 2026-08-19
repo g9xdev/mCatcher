@@ -4702,20 +4702,69 @@ def test_ensure_ytdlp_refetches_when_the_local_exe_is_a_onefile(tmp_path, monkey
     assert fetched["n"] == 1
 
 
-def test_ensure_ytdlp_accepts_a_directory_build_without_refetching(tmp_path, monkeypatch):
-    import mchost.downloads as d
+def _ensure_ytdlp_fetch_attempts(d, monkeypatch, root, internal):
+    """Run ensure_ytdlp against one install and count its fetch attempts.
 
-    exe = tmp_path / "yt-dlp.exe"
-    exe.write_bytes(b"MZ dirbuild")
-    (tmp_path / "_internal").mkdir()
+    The exe bytes are IDENTICAL in every arm — the real builds ship the same
+    filename and the same MZ header, and on disk they differ only in the tree
+    beside them. internal is None for no _internal at all, or a list of
+    (name, bytes) members to put in one.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    exe = root / "yt-dlp.exe"
+    exe.write_bytes(b"MZ\x90\x00\x03 the header both builds carry")
+    if internal is not None:
+        (root / "_internal").mkdir()
+        for name, blob in internal:
+            (root / "_internal" / name).write_bytes(blob)
+    monkeypatch.setattr(mc, "HERE", str(root))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
     monkeypatch.setattr(d, "YTDLP", str(exe), raising=False)
     monkeypatch.setattr(d, "_YTDLP_REFETCHED", False, raising=False)
+    seen = {"n": 0}
 
-    def boom(*a, **k):
-        raise AssertionError("must not fetch when the directory build is present")
+    def fake_urlopen(*a, **k):
+        seen["n"] += 1
+        # Fail the fetch so every arm ends on the same on-disk state: what is
+        # being measured is the DECISION, not the download.
+        raise RuntimeError("network down")
 
-    monkeypatch.setattr("urllib.request.urlopen", boom)
-    assert d.ensure_ytdlp() == str(exe)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert d.ensure_ytdlp() == str(exe), "a failed fetch must keep the existing exe"
+    return seen["n"]
+
+
+def test_ensure_ytdlp_tells_the_two_builds_apart_by_the_internal_tree(tmp_path,
+                                                                      monkeypatch):
+    """Both arms carry byte-identical exes, so this cannot be satisfied by
+    anything that inspects the exe, and it fails if the arms are swapped — the
+    previous version asserted only the accepting arm and would have passed with
+    the onefile bug fully reintroduced."""
+    import mchost.downloads as d
+
+    directory_build = _ensure_ytdlp_fetch_attempts(
+        d, monkeypatch, tmp_path / "dirbuild",
+        [("base_library.zip", b"LIB"), ("python313.dll", b"DLL")])
+    onefile = _ensure_ytdlp_fetch_attempts(
+        d, monkeypatch, tmp_path / "onefile", None)
+
+    assert directory_build == 0, "a good directory build must not be re-fetched"
+    assert onefile == 1, \
+        "a onefile must be replaced: it is the build that stalled ~90s in DLL load"
+
+
+def test_an_empty_internal_beside_the_exe_is_not_a_directory_build(tmp_path,
+                                                                   monkeypatch):
+    """An _internal with nothing in it is a real on-disk state (an interrupted
+    install, an AV quarantine) and it is never a working one: a directory build
+    cannot start without base_library.zip and its python DLL, and a onefile with
+    a stray empty _internal is still the onefile. Both readings make accepting it
+    wrong, and being wrong the other way costs one re-fetch per process that
+    keeps the existing exe when it fails."""
+    import mchost.downloads as d
+
+    assert _ensure_ytdlp_fetch_attempts(d, monkeypatch, tmp_path / "hollow", []) == 1
 
 
 # ---------------------------------------------------------------------------

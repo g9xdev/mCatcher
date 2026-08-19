@@ -131,8 +131,16 @@ def internal_dir_for(exe):
 
 
 def has_internal_for(exe):
+    """Populated, not merely present — the same test downloads._has_internal
+    applies, so the diagnostic never calls an install sound while the downloader
+    is re-fetching it."""
     d = internal_dir_for(exe)
-    return bool(d) and os.path.isdir(d)
+    if not d:
+        return False
+    try:
+        return bool(os.listdir(d))
+    except OSError:
+        return False
 
 
 def check_ytdlp_build(has_internal, exe_bytes, exe_present=True):
