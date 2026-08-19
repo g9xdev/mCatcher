@@ -189,6 +189,11 @@ def extract_info(argv, pylib=None):
 # downloads.py, and the caller decides what a child is worth doing anything to.
 
 _child_lock = threading.Lock()
+# Deliberately NOT _child_lock. _warn_hook_off, reachable from inside the
+# install, goes on to nm.send under the writer lock; keeping the install's lock
+# disjoint from the one _announce_child takes leaves that critical section
+# untouched, so no lock ordering can invert between an announce and an install.
+_hook_lock = threading.Lock()
 _child_sinks = {}               # launching thread ident -> sink(proc)
 _HOOK_MARK = "_mchost_child_hook"
 _hook_warned = [False]
@@ -235,22 +240,31 @@ def _install_child_hook(pylib=None):
     never quietly, because the lever going missing is invisible otherwise.
     """
     try:
-        cls = getattr(getattr(_yt(pylib), "utils", None), "Popen", None)
-        if cls is None:
-            _warn_hook_off("no utils.Popen")
-            return False
-        # __dict__, not getattr: a subclass would inherit the mark and go unwrapped.
-        if cls.__dict__.get(_HOOK_MARK):
+        # Held across the whole check-and-install. Every download arms the hook
+        # and four run at once by default, so two installers overlapping is
+        # ordinary. Unsynchronised, the second reads an __init__ the first has
+        # already replaced but not yet marked, and wraps the wrapper: from then
+        # on, for the life of the helper, one spawn is announced twice, the same
+        # proc is appended to `children` twice, and kill_children reports two
+        # kills for one deno — an attempt count wearing the clothes of an
+        # achievement count.
+        with _hook_lock:
+            cls = getattr(getattr(_yt(pylib), "utils", None), "Popen", None)
+            if cls is None:
+                _warn_hook_off("no utils.Popen")
+                return False
+            # __dict__, not getattr: a subclass would inherit the mark and go unwrapped.
+            if cls.__dict__.get(_HOOK_MARK):
+                return True
+            original = cls.__init__
+
+            def __init__(self, *args, **kwargs):
+                original(self, *args, **kwargs)
+                _announce_child(self)   # only once a spawn has actually happened
+
+            cls.__init__ = __init__
+            setattr(cls, _HOOK_MARK, True)
             return True
-        original = cls.__init__
-
-        def __init__(self, *args, **kwargs):
-            original(self, *args, **kwargs)
-            _announce_child(self)       # only once a spawn has actually happened
-
-        cls.__init__ = __init__
-        setattr(cls, _HOOK_MARK, True)
-        return True
     except Exception as e:
         # e.g. a C-implemented Popen, whose __init__ cannot be assigned.
         _warn_hook_off("could not wrap utils.Popen: %s" % e)

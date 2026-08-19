@@ -319,6 +319,71 @@ def test_arming_the_hook_twice_does_not_announce_a_child_twice(monkeypatch):
     assert len(seen) == 1, "the child was announced %d times" % len(seen)
 
 
+def test_two_threads_installing_the_hook_at_once_wrap_it_only_once(monkeypatch):
+    """Every download arms the hook and maxConcurrentDownloads defaults to 4, so
+    two jobs starting together is ordinary, not exotic. The check for the marker
+    and the write of it are two separate statements: a second installer that
+    lands between them reads an __init__ the first has ALREADY replaced, and
+    wraps the wrapper. Nothing unwinds that — for the life of the helper every
+    spawn is announced twice, the same proc lands in `children` twice, and
+    kill_children reports "killed 2 subprocess(es)" for one deno.
+
+    Forced rather than raced: a metaclass parks the first installer between its
+    two writes, which is exactly the window, so this fails every run without the
+    lock instead of once in a few hundred.
+    """
+    first_write = threading.Event()
+    second_write = threading.Event()
+    release_first = threading.Event()
+    writes = []
+
+    class _Gate(type):
+        def __setattr__(cls, name, value):
+            # Let the write land BEFORE parking: the damaging interleaving is
+            # the one where the late installer sees the new __init__ and no mark.
+            super().__setattr__(name, value)
+            if name != "__init__":
+                return                      # the marker write is not the window
+            writes.append(name)
+            if len(writes) == 1:
+                first_write.set()
+                release_first.wait(5)
+            else:
+                second_write.set()
+
+    class _GatedPopen(metaclass=_Gate):
+        def __init__(self, args=None, **kw):
+            self.args = args
+
+    monkeypatch.setattr(lib, "_yt", lambda pylib=None: _fake_yt(_saved(), _GatedPopen))
+
+    first = threading.Thread(target=lib._install_child_hook, daemon=True)
+    second = threading.Thread(target=lib._install_child_hook, daemon=True)
+    try:
+        first.start()
+        assert first_write.wait(5), "the first installer never reached the wrap"
+        second.start()
+        # Unsynchronised, the second installer runs straight through to its own
+        # __init__ write: a handful of bytecodes, nothing blocking. Holding the
+        # lock it parks instead, and this bounded wait is what proving that
+        # costs. Kept short because only the passing path ever pays it.
+        raced = second_write.wait(0.5)
+    finally:
+        release_first.set()                 # never leave the hook lock held
+        first.join(5)
+        second.join(5)
+
+    assert not raced, "the second installer wrapped an already-wrapped __init__"
+
+    seen = []
+    lib._arm_child_sink(seen.append)
+    try:
+        _GatedPopen(["deno", "run", "-"])
+    finally:
+        lib._disarm_child_sink()
+    assert len(seen) == 1, "the child was announced %d times" % len(seen)
+
+
 def test_a_hook_that_cannot_be_installed_says_so(monkeypatch):
     """Failing silently would leave the kill lever off for the life of the helper,
     with the only symptom being the very leak it exists to prevent. The missing-
