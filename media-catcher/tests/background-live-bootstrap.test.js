@@ -615,6 +615,98 @@ test("a connected helper keeps being pinged, not only at connect", async () => {
   assert.equal(pings(), before + 1, "the heartbeat must ping a connected helper");
 });
 
+// The heartbeat was send-only: no last-pong timestamp, no missed-beat counter,
+// and no timer that fires when a pong does NOT arrive. Its only failure
+// handling was a log line — it never touched nativeState, never nulled
+// nativePort and never scheduled a re-dial. A host that wedges while keeping
+// the pipe open (a hung ffmpeg subprocess, say) therefore left the pill green
+// and nativeReady true while every job posted into it was swallowed forever.
+// The host answers ping from its message loop and runs every long command on a
+// worker thread, so an unanswered beat means that loop itself is blocked.
+test("a helper that stops answering the heartbeat is torn down and re-dialled", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses().at(-1).helper.state, "ready", "the handshake leaves the pill green");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  // The pipe stays open and nothing ever comes back.
+  for (let i = 0; i < 6; i += 1) {
+    beat.fn();
+    await settle();
+  }
+
+  const last = statuses().at(-1);
+  assert.notEqual(last.helper.state, "ready", "a wedged helper must not still read ready");
+  assert.equal(last.helper.ready, false, "nothing usable is connected");
+  assert.equal(h.helperDisconnects.length, 1,
+    "the teardown must run the same cleanup a real disconnect does");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").length, 1,
+    "the teardown must hand over to the ordinary bounded re-dial");
+});
+
+// A false teardown of a working helper is worse than slow detection, so the
+// counter has to clear on every pong: an answered beat is never a missed one,
+// however many beats have gone by.
+test("a helper that keeps answering is never torn down by the heartbeat", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "expected a heartbeat interval after the handshake");
+  for (let i = 0; i < 12; i += 1) {
+    beat.fn();
+    h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+    await settle();
+  }
+
+  const statuses = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses[statuses.length - 1].helper.state, "ready",
+    "an answering helper must stay ready");
+  assert.equal(h.helperDisconnects.length, 0, "an answering helper must not be dropped");
+  assert.equal(
+    h.timers.filter((t) => t.kind === "timeout" && t.name === "nativeRedial").length, 0,
+    "an answering helper must not be re-dialled");
+});
+
+// The mirror of the same hole: the heartbeat used to be armed inside the pong
+// handler, so a port that connected and never answered the FIRST ping armed no
+// heartbeat at all and parked on "connecting" with no deadline — for the rest
+// of the session. Arming at the one site that assigns a port closes it with
+// the same mechanism rather than a second one.
+test("a port that never answers its first ping does not park on connecting", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const statuses = () => h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.equal(statuses().at(-1).helper.state, "connecting", "the connect attempt is pending");
+
+  const beat = h.timers.find((t) => t.kind === "interval" && t.ms === 30000 && t.active);
+  assert.ok(beat, "a connection must arm the heartbeat before it is ever answered");
+  for (let i = 0; i < 6; i += 1) {
+    beat.fn();
+    await settle();
+  }
+
+  const last = statuses().at(-1);
+  assert.equal(last.helper.state, "disconnected",
+    "a connection that never answers must settle instead of hanging on connecting");
+  assert.equal(last.helper.ready, false);
+});
+
 // The heartbeat sends the same `{cmd:"ping"}` the connect path does, so the
 // host answers every beat with a full pong. Connection-time handshake work was
 // keyed off pong arrival — which stopped being a per-connection event the
