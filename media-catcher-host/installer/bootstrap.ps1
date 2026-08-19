@@ -163,12 +163,14 @@ if (Test-Path $localFfmpeg) {
 # The DIRECTORY build (yt-dlp.exe + _internal\), never the onefile. The onefile
 # launcher re-extracts ~145 files to %TEMP% on every launch; under a browser-
 # descended process each extraction is rescanned and the launch blocked ~90s in
-# DLL load, which the UI showed as "Preparing" forever. It self-updates
-# (yt-dlp -U, triggered by the host) because YouTube breaks it often.
+# DLL load, which the UI showed as "Preparing" forever. yt-dlp's own README
+# lists this artifact as "no auto-update", so `yt-dlp -U` does nothing to it;
+# YouTube breaks yt-dlp often, so the host keeps it current by re-fetching this
+# same archive (mchost/downloads.py, ytdlp_update) rather than by calling -U.
 $localYtdlp = Join-Path $InstallDir "yt-dlp.exe"
 $localInternal = Join-Path $InstallDir "_internal"
 if ((Test-Path $localYtdlp) -and (Test-Path $localInternal)) {
-  Step "yt-dlp: present (directory build, self-updates)"
+  Step "yt-dlp: present (directory build; the host re-fetches it to update)"
 } elseif ($SkipYtdlp) {
   Warn "yt-dlp: skipped - YouTube downloads will be unavailable"
 } else {

@@ -4718,6 +4718,157 @@ def test_ensure_ytdlp_accepts_a_directory_build_without_refetching(tmp_path, mon
     assert d.ensure_ytdlp() == str(exe)
 
 
+# ---------------------------------------------------------------------------
+# Updating the DIRECTORY build
+#
+# yt-dlp's own shipped README lists the artifact we install, yt-dlp_win.zip, as
+# "Unpackaged Windows (Win8+) x64 executable (no auto-update)". `-U` against it
+# cannot replace anything. An install with no python.exe beside pythonw.exe gets
+# no in-process library either, so the re-fetch below is its ONLY way to keep up
+# with YouTube — and keeping up is the whole reason the update exists.
+# ---------------------------------------------------------------------------
+
+def _ytdlp_release_zip(exe_bytes=b"MZ fresh dirbuild"):
+    """The official yt-dlp_win.zip layout, in miniature."""
+    import io as _io
+    import zipfile as _zip
+
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as z:
+        z.writestr("_internal/base_library.zip", b"NEW-LIB")
+        z.writestr("yt-dlp.exe", exe_bytes)
+    return buf.getvalue()
+
+
+def _exe_only_install(d, tmp_path, monkeypatch, internal=True):
+    """An exe-only install: no in-process library, yt-dlp.exe resolved in HERE.
+    Returns the exe path. With internal=False it is a onefile instead."""
+    from mchost import ytdlp_lib
+
+    exe = tmp_path / "yt-dlp.exe"
+    exe.write_bytes(b"MZ stale build")
+    if internal:
+        (tmp_path / "_internal").mkdir()
+        (tmp_path / "_internal" / "base_library.zip").write_bytes(b"OLD-LIB")
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    monkeypatch.setattr(d, "YTDLP", str(exe), raising=False)
+    monkeypatch.setattr(d, "_YTDLP_REFETCHED", False, raising=False)
+    monkeypatch.setattr(d, "_ytdlp_version", lambda: "2026.08.19")
+    # No python.exe beside pythonw.exe means no vendored library — the install
+    # this fallback exists for.
+    monkeypatch.setattr(ytdlp_lib, "available", lambda *a, **k: False)
+    return exe
+
+
+def _record_urlopen(monkeypatch, payload):
+    import io as _io
+    import urllib.request
+
+    asked = {}
+
+    def fake_urlopen(req, timeout=None):
+        asked["url"] = getattr(req, "full_url", str(req))
+        asked["n"] = asked.get("n", 0) + 1
+        return _io.BytesIO(payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return asked
+
+
+def test_ytdlp_update_refetches_the_directory_build_it_cannot_self_update(tmp_path,
+                                                                          monkeypatch):
+    """`-U` on the directory build is a no-op that reports success, so an
+    exe-only install silently rotted as YouTube changed. Re-fetch the release."""
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch)
+    asked = _record_urlopen(monkeypatch, _ytdlp_release_zip())
+
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: ran.append(cmd))
+
+    d.ytdlp_update()
+
+    assert not ran, "the directory build has no self-updater to invoke: %r" % (ran,)
+    assert asked.get("url", "").endswith("yt-dlp_win.zip"), asked
+    assert exe.read_bytes() == b"MZ fresh dirbuild", "the exe was not replaced"
+    assert (tmp_path / "_internal" / "base_library.zip").read_bytes() == b"NEW-LIB", \
+        "_internal must move with the exe or the pair is a version mismatch"
+
+
+def test_ytdlp_update_still_self_updates_a_genuine_onefile(tmp_path, monkeypatch):
+    """The onefile DOES carry an updater. Nothing here should start downloading
+    release archives over an install that can update itself in place."""
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch, internal=False)
+
+    def boom(*a, **k):
+        raise AssertionError("a onefile updates itself; must not re-fetch")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+
+    ran = []
+
+    class _R:
+        stdout = b"yt-dlp is up to date"
+
+    def fake_run(cmd, *a, **k):
+        ran.append(cmd)
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    d.ytdlp_update()
+
+    assert ran == [[str(exe), "-U"]], ran
+
+
+def test_a_requested_ytdlp_update_ignores_the_once_per_process_fetch_guard(tmp_path,
+                                                                           monkeypatch):
+    """_YTDLP_REFETCHED stops a failing network re-downloading on every JOB. An
+    explicit update request is not a job, and refusing it would leave the user's
+    only remedy dead for the life of the helper."""
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "_YTDLP_REFETCHED", True, raising=False)
+    asked = _record_urlopen(monkeypatch, _ytdlp_release_zip())
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not run -U")))
+
+    d.ytdlp_update()
+
+    assert asked.get("n") == 1, "the guard swallowed a user-initiated update"
+    assert exe.read_bytes() == b"MZ fresh dirbuild"
+
+
+def test_an_unwritable_ytdlp_exe_leaves_the_whole_install_untouched(tmp_path,
+                                                                    monkeypatch):
+    """A RUNNING yt-dlp.exe is opened FILE_SHARE_READ|DELETE, so replacing it
+    while a download is in flight is a sharing violation. Detect that BEFORE
+    unpacking: a violation landing partway through leaves a fresh _internal
+    beside the old exe, which is a mismatched pair, not an install."""
+    import stat as _stat
+
+    import mchost.downloads as d
+
+    exe = _exe_only_install(d, tmp_path, monkeypatch)
+    asked = _record_urlopen(monkeypatch, _ytdlp_release_zip())
+    os.chmod(str(exe), _stat.S_IREAD)
+    try:
+        assert d.ytdlp_update() is None
+        assert asked.get("n") is None, "nothing should be downloaded to be discarded"
+        assert exe.read_bytes() == b"MZ stale build"
+        assert (tmp_path / "_internal" / "base_library.zip").read_bytes() == b"OLD-LIB", \
+            "_internal was overwritten beside an exe that could not be replaced"
+    finally:
+        os.chmod(str(exe), _stat.S_IWRITE | _stat.S_IREAD)
+
+
 def test_youtube_job_is_acknowledged_before_the_slow_preflight(tmp_path, monkeypatch):
     """ensure_deno() and start_pot_provider() can take minutes. The row must be
     host-acknowledged first, or it is indistinguishable from a dead helper."""

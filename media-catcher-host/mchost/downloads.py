@@ -930,7 +930,7 @@ def _pip_upgrade_pylib():
 
 def ytdlp_update():
     """Ask yt-dlp to update itself (it breaks often as YouTube changes). Best-effort."""
-    global _YTDLP_VER
+    global _YTDLP_VER, YTDLP
     # The in-process library updates via pip, not the exe's -U (there may be no
     # exe, and updating one would not touch the other). Re-run the same targeted
     # install bootstrap uses; leave the exe -U for exe-only installs.
@@ -945,6 +945,31 @@ def ytdlp_update():
         _h()._hlog("warn", "yt-dlp library update failed: %s" % e)
     if not YTDLP:
         return None
+    if _has_internal(YTDLP):
+        # The directory build has NO self-updater — yt-dlp's own shipped README
+        # lists yt-dlp_win.zip as "Unpackaged Windows (Win8+) x64 executable (no
+        # auto-update)" — so `-U` here reports something and replaces nothing.
+        # Re-fetch the release instead. This is the only update path an install
+        # with no python.exe beside pythonw.exe has (no python.exe means no
+        # vendored library), and yt-dlp rotting as YouTube changes is the whole
+        # reason an update exists.
+        #
+        # _YTDLP_REFETCHED is deliberately NOT consulted: that guard stops a
+        # failing network re-downloading on every JOB, and an explicit update
+        # request is not a job. Honouring it would kill the user's only remedy
+        # for the rest of the process's life after one bad fetch.
+        try:
+            _h()._hlog("info", "fetching the latest yt-dlp "
+                               "(the directory build cannot self-update)…")
+            YTDLP = _fetch_ytdlp_dir_build()
+            _YTDLP_VER = _ytdlp_version() or _YTDLP_VER
+            out = "yt-dlp updated (directory build%s)" % (
+                " " + _YTDLP_VER if _YTDLP_VER else "")
+            _h()._hlog("info", "yt-dlp update: %s" % out)
+            return out
+        except Exception as e:
+            _h()._hlog("warn", "yt-dlp update failed: %s" % e)
+            return None
     cf, si = _no_window()
     try:
         r = subprocess.run([YTDLP, "-U"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -974,6 +999,69 @@ def _has_internal(exe):
     return os.path.isdir(os.path.join(os.path.dirname(exe), "_internal"))
 
 
+def _ytdlp_dest_is_writable(dest):
+    """False when yt-dlp.exe could not be replaced right now.
+
+    Windows opens a RUNNING image FILE_SHARE_READ|FILE_SHARE_DELETE, so a
+    download in flight denies write access to the very file an update has to
+    overwrite. Probed BEFORE the ~20MB archive is fetched so a busy exe costs a
+    log line rather than a discarded download, and r+b so the probe itself never
+    truncates anything. A job that starts between this probe and the write still
+    meets the raw violation; the exe-first write order below is what keeps that
+    case from mixing a fresh _internal with a stale exe."""
+    if not os.path.exists(dest):
+        return True                 # fresh install: nothing to be held open
+    try:
+        with open(dest, "r+b"):
+            return True
+    except OSError:
+        return False
+
+
+def _fetch_ytdlp_dir_build():
+    """Unpack the official yt-dlp_win.zip (yt-dlp.exe + _internal/) into HERE and
+    return the exe path. Raises on any failure — each caller decides what to keep.
+
+    Shared by ensure_ytdlp (first use, and replacing a onefile) and ytdlp_update
+    (the directory build has no self-updater), so there is one archive URL, one
+    traversal check and one write order rather than two drifting copies.
+    """
+    here = _h().HERE
+    dest = os.path.join(here, "yt-dlp.exe")
+    if not _ytdlp_dest_is_writable(dest):
+        raise RuntimeError("yt-dlp.exe is in use — a download is in flight")
+    import urllib.request, zipfile, io
+    req = urllib.request.Request(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip",
+        headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        blob = r.read()
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+        members = []
+        for name in z.namelist():
+            rel = name.replace("\\", "/").lstrip("/")
+            # Refuse absolute/traversing members: this unpacks into the host
+            # directory, so a crafted archive must not reach outside it.
+            if not rel or rel.endswith("/") or ".." in rel.split("/"):
+                continue
+            members.append((name, rel))
+        # The whole archive is already in memory, so no write here can fail for
+        # want of network. Write the exe FIRST anyway: it is the one member a
+        # running yt-dlp holds open by itself, so if the writability probe above
+        # was overtaken by a job starting, the violation lands before any of
+        # _internal has been touched. Nothing else can be holding _internal open
+        # without having run this exe.
+        members.sort(key=lambda nr: nr[1].lower() != "yt-dlp.exe")
+        for name, rel in members:
+            out = os.path.join(here, *rel.split("/"))
+            os.makedirs(os.path.dirname(out) or here, exist_ok=True)
+            with z.open(name) as src, open(out, "wb") as f:
+                shutil.copyfileobj(src, f)
+    if not os.path.isfile(dest):
+        raise RuntimeError("yt-dlp.exe missing from archive")
+    return dest
+
+
 def ensure_ytdlp():
     """Return a path to yt-dlp, fetching the official release into HERE if it's missing
     or is a onefile. Lets auto-updated installs (which don't ship the binary) get
@@ -995,30 +1083,9 @@ def ensure_ytdlp():
     if _YTDLP_REFETCHED:
         return YTDLP
     _YTDLP_REFETCHED = True
-    here = _h().HERE
-    dest = os.path.join(here, "yt-dlp.exe")
     try:
-        import urllib.request, zipfile, io
         _h()._hlog("info", "fetching yt-dlp (first YouTube use)…")
-        req = urllib.request.Request(
-            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip",
-            headers={"User-Agent": "MediaCatcher-Host/%s" % _h().VERSION})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            blob = r.read()
-        with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            for name in z.namelist():
-                rel = name.replace("\\", "/").lstrip("/")
-                # Refuse absolute/traversing members: this unpacks into the host
-                # directory, so a crafted archive must not reach outside it.
-                if not rel or rel.endswith("/") or ".." in rel.split("/"):
-                    continue
-                out = os.path.join(here, *rel.split("/"))
-                os.makedirs(os.path.dirname(out) or here, exist_ok=True)
-                with z.open(name) as src, open(out, "wb") as f:
-                    shutil.copyfileobj(src, f)
-        if not os.path.isfile(dest):
-            raise RuntimeError("yt-dlp.exe missing from archive")
-        YTDLP = dest
+        YTDLP = _fetch_ytdlp_dir_build()
         _h()._hlog("info", "yt-dlp installed (directory build)")
         return YTDLP
     except Exception as e:
