@@ -1507,12 +1507,66 @@
       } catch (e) {}
     }
 
-    // Every property here is one a page rule could otherwise take back, which
-    // is why they are all set inline and all !important rather than left to a
-    // stylesheet that page CSS outranks somewhere. `deep` re-asserts the whole
-    // set rather than only the position: inline !important beats a stylesheet,
-    // but it does not survive a script that clears the style attribute, and
-    // re-writing twenty properties a few times a second costs nothing.
+    // The properties the container holds against the page, and the values it
+    // holds them at.
+    //
+    // The container is a plain <div> in the page's DOM, so a page stylesheet
+    // selects it — `div{...!important}` is enough. Inline !important is what
+    // outranks that, and it outranks it only for properties actually written:
+    // one left out is one the page keeps.
+    //
+    // WHAT IS IN THE LIST: the properties that can suppress the icon's paint,
+    // displace its box or clip it away. Measured in the installed Firefox 154
+    // against a container carrying this exact set inline !important while the
+    // page ran a `div{}` rule setting content-visibility:hidden, mask,
+    // mix-blend-mode:multiply, scale:0, rotate:90deg, translate:9999px,
+    // overflow:hidden, clip:rect(0,0,0,0), zoom:0.0001 and filter:opacity(0),
+    // all !important: every pinned value won the cascade. Without
+    // content-visibility in the set, that one rule left the container
+    // hit-testable at its own coordinates with nothing rendered inside it —
+    // an invisible button at a page-chosen position.
+    //
+    // WHAT THE LIST IS NOT: a proof that no other property can do the same.
+    // Nobody has enumerated CSS. That is why beamClick asks the browser
+    // whether the icon is being rendered rather than trusting this list to be
+    // complete; the list makes the common rules fail, the render check makes
+    // an uncommon one fail too.
+    //
+    // `transform:none` does not neutralise `scale`, `rotate` or `translate`:
+    // those are separate properties that compose with it, so they are pinned
+    // separately.
+    var BEAM_PINNED = [
+      ["margin", "0"],
+      ["padding", "0"],
+      ["border", "0"],
+      ["z-index", "2147483647"],
+      ["isolation", "isolate"],
+      ["contain", "layout style size"],
+      ["display", "block"],
+      ["float", "none"],
+      ["clip-path", "none"],
+      ["clip", "auto"],
+      ["filter", "none"],
+      ["mask", "none"],
+      ["mix-blend-mode", "normal"],
+      ["transform", "none"],
+      ["scale", "none"],
+      ["rotate", "none"],
+      ["translate", "none"],
+      ["zoom", "1"],
+      ["opacity", "1"],
+      ["visibility", "visible"],
+      ["content-visibility", "visible"],
+      ["overflow", "visible"],
+      ["pointer-events", "auto"],
+      ["max-width", "none"],
+      ["max-height", "none"],
+    ];
+
+    // `deep` re-asserts the whole set rather than only the corner: inline
+    // !important beats a stylesheet, but it does not survive a script that
+    // clears the style attribute, and re-writing the set a few times a second
+    // costs nothing.
     function beamPaint(rec, at, parent, deep) {
       var container = rec.container;
       if (parent && container.parentNode !== parent) {
@@ -1527,22 +1581,9 @@
       beamSetStyle(container, "top", at.top + "px");
       beamSetStyle(container, "width", at.size + "px");
       beamSetStyle(container, "height", at.size + "px");
-      beamSetStyle(container, "margin", "0");
-      beamSetStyle(container, "padding", "0");
-      beamSetStyle(container, "border", "0");
-      beamSetStyle(container, "z-index", "2147483647");
-      beamSetStyle(container, "isolation", "isolate");
-      beamSetStyle(container, "contain", "layout style size");
-      beamSetStyle(container, "display", "block");
-      beamSetStyle(container, "float", "none");
-      beamSetStyle(container, "clip-path", "none");
-      beamSetStyle(container, "filter", "none");
-      beamSetStyle(container, "transform", "none");
-      beamSetStyle(container, "opacity", "1");
-      beamSetStyle(container, "visibility", "visible");
-      beamSetStyle(container, "pointer-events", "auto");
-      beamSetStyle(container, "max-width", "none");
-      beamSetStyle(container, "max-height", "none");
+      for (var i = 0; i < BEAM_PINNED.length; i++) {
+        beamSetStyle(container, BEAM_PINNED[i][0], BEAM_PINNED[i][1]);
+      }
       return true;
     }
 

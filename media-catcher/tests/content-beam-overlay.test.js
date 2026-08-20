@@ -603,7 +603,7 @@ test("a video scrolled into view gets its icon from the scroll handler", async (
 // Not breaking the page
 // ---------------------------------------------------------------------------
 
-test("the container is out of flow, on top, and sealed against the page", async () => {
+test("the container is out of flow, on top, and its shadow root is closed", async () => {
   const root = makeRoot();
   root.document.body.appendChild(makeVideo(root));
   await installed(root);
@@ -622,6 +622,84 @@ test("the container is out of flow, on top, and sealed against the page", async 
   // No id and no class for a page stylesheet to select.
   assert.equal(container.getAttribute("id"), null);
   assert.equal(container.getAttribute("class"), null);
+});
+
+// The container is a plain <div> in the page's DOM, so `div{...!important}`
+// selects it. Inline !important is what outranks that, and only for the
+// properties actually written: an unwritten property is one the page keeps.
+//
+// Measured in the installed Firefox 154, against a container carrying exactly
+// this set inline !important while the page ran
+//   div{content-visibility:hidden!important; mask:...!important;
+//       mix-blend-mode:multiply!important; scale:0!important;
+//       rotate:90deg!important; translate:9999px 9999px!important;
+//       overflow:hidden!important; clip:rect(0,0,0,0)!important;
+//       zoom:0.0001!important; filter:opacity(0)!important}
+// every one of the pinned values won the cascade, and the button inside the
+// closed root reported checkVisibility() === true. Without content-visibility
+// in the set the same page rule left the container hit-testable at its own
+// coordinates with nothing rendered in it.
+//
+// This is an EXACT set: dropping a property from content.js fails this test,
+// and so does adding one without naming it here. It pins MEMBERSHIP, not
+// sufficiency — nobody has enumerated the properties that can suppress paint
+// without suppressing hit-testing, which is why beamClick asks the browser
+// whether the icon is rendered instead of relying on this list being complete.
+const BEAM_PINNED_VALUES = {
+  margin: "0",
+  padding: "0",
+  border: "0",
+  "z-index": "2147483647",
+  isolation: "isolate",
+  contain: "layout style size",
+  display: "block",
+  float: "none",
+  "clip-path": "none",
+  clip: "auto",
+  filter: "none",
+  mask: "none",
+  "mix-blend-mode": "normal",
+  transform: "none",
+  scale: "none",
+  rotate: "none",
+  translate: "none",
+  zoom: "1",
+  opacity: "1",
+  visibility: "visible",
+  "content-visibility": "visible",
+  overflow: "visible",
+  "pointer-events": "auto",
+  "max-width": "none",
+  "max-height": "none",
+};
+
+// Written per paint from the corner that was computed, so their values are
+// not constants and are checked separately below.
+const BEAM_GEOMETRY = ["position", "left", "top", "width", "height"];
+
+test("the container pins this exact set of properties, by name, inline and !important", async () => {
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root));
+  await installed(root);
+  const container = containers(root)[0];
+
+  const written = Object.keys(container.style._props).sort();
+  const expected = BEAM_GEOMETRY.concat(Object.keys(BEAM_PINNED_VALUES)).sort();
+  assert.deepEqual(written, expected,
+    "the set the container defends is the set named here, neither more nor less");
+
+  for (const name of expected) {
+    assert.equal(container.style.getPropertyPriority(name), "important",
+      name + " without !important is a property one page rule takes back");
+  }
+  for (const name of Object.keys(BEAM_PINNED_VALUES)) {
+    assert.equal(container.style.getPropertyValue(name), BEAM_PINNED_VALUES[name], name);
+  }
+  assert.equal(container.style.getPropertyValue("position"), "fixed");
+  assert.match(container.style.getPropertyValue("left"), /^-?\d+(\.\d+)?px$/);
+  assert.match(container.style.getPropertyValue("top"), /^-?\d+(\.\d+)?px$/);
+  assert.equal(container.style.getPropertyValue("width"), "28px");
+  assert.equal(container.style.getPropertyValue("height"), "28px");
 });
 
 test("clicking the icon never reaches the page's own handlers", async () => {
