@@ -147,16 +147,22 @@ def handle_record(req):
         _h().send({"type": "error", "id": req.get("id"), "error": "ffmpeg not found. Re-run the installer or put ffmpeg.exe next to the helper."})
         return
     jid = req.get("id")
-    # These two URLs are the only ones this host takes that no gated extension
-    # path vetted. Every other lane's arrived from webRequest or a content
-    # script; these are URIs lifted from the BODY of a fetched HLS manifest.
+    # These two URLs are the only ones this host takes that a browser-observed
+    # request did not supply: pget's mirrors accumulate from webRequest
+    # details.url and from content-script DOM reports, and the ytdl/cast lanes
+    # carry a page URL the browser handed over, while these are URIs lifted
+    # from the BODY of a fetched HLS manifest.
     # The live route is background.js "record-live" -> resolveVideoUrl, which
     # fetches the master playlist and returns pickVariant(...).uri — and
     # lib/hls.js resolveUrl returns an absolute URI unchanged, so the playlist
     # decides the string. A variant URI of "file://attacker.test/s/x" reaches
     # ffmpeg, which opens it as the UNC path \\attacker.test\s\x: an outbound
     # SMB connection carrying the user's NTLM credentials. That is the threat
-    # 2c3e0aa gated mirrors against, and this lane had no gate at all.
+    # 2c3e0aa gated mirrors against, and this lane had no gate on either side.
+    # background.js nativeRecord now applies its own isAbsoluteHttpUrl, so this
+    # is the host half of a pair rather than the only gate -- but it is the
+    # half that has to hold, because the host cannot tell a vetted sender from
+    # a spoofed one.
     #
     # audioUrl is checked for the same reason, not because today's producer
     # can reach it: findSiblingAudio only ever returns a same-stream-directory

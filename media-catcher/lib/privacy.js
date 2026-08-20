@@ -768,9 +768,12 @@
     /**
      * Free-text log redaction. Every absolute http(s) URL in the line is
      * replaced by its redactUrlForLog projection — scheme://host[:port]/path,
-     * with userinfo, query and fragment removed. Trailing sentence punctuation
-     * and wrappers are put back so a quoted or sentence-final URL still reads
-     * as one. Everything else in the line, including local save paths, is kept.
+     * with userinfo and fragment removed and, of the query, only the
+     * LOG_IDENTITY_PARAMS allowlist kept. Trailing sentence punctuation and
+     * wrappers are put back so a quoted or sentence-final URL still reads as
+     * one. Everything else in the line, including local save paths, survives
+     * THAT pass — but redactCredentialValues runs after it over the whole
+     * line, and does claim a credential-shaped name=value inside a save path.
      *
      * The match runs to whitespace, not to the first quote or angle bracket:
      * host lines carry yt-dlp's own spelling rather than a browser-canonicalised

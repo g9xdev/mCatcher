@@ -45,7 +45,9 @@ _log_lock = threading.Lock()
 # with userinfo and fragment dropped and, of the query, only the identity
 # parameters named below. Query strings on a media URL are where the signed
 # token lives; what survives (which CDN, which file, which video) is what the
-# line was worth reading for. Local save paths and everything else are kept.
+# line was worth reading for. Local save paths and everything else survive THE
+# PROJECTION -- the credential pass further down still claims a name=value
+# inside one, which is why that cost is pinned in the tests.
 # "Matches" is about the RULES -- same names, same cap, same charset, same
 # credential pattern -- not about byte-identical spelling. The extension parses
 # with URL (WHATWG) and this parses with urlsplit, and running both over the
@@ -65,8 +67,10 @@ _log_lock = threading.Lock()
 # a new shape is expected whenever either parser changes and is fine, while one
 # where the host redacts LESS is a bug, because this is the copy a user hands
 # over.
-# Running before the send too means the host never puts a raw URL on the wire,
-# and the extension's pass over an already-redacted line is a no-op.
+# Running before the send too means no LOG LINE leaves this host with a raw
+# URL on it -- _hlog is the only sender of {"type":"log"} -- and the
+# extension's pass over an already-redacted line is a no-op. It is not a claim
+# about every frame: getReport's guardianTail, for one, is relayed as written.
 #
 # Update history (_log_event / _HISTORY_PATH) is deliberately NOT projected:
 # its `source` is a release location, not a credentialed media URL, and the
