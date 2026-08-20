@@ -2205,6 +2205,17 @@
           var binding = jobBindings.get(jobs[i].id);
           if (binding && binding.progress) input.progress = binding.progress;
           if (binding && binding.mediaId) input.mediaId = binding.mediaId;
+          // Only a direct download surfaces its saved path to the popup so the
+          // file actions can open/reveal it. Assembled transfers also park a
+          // committed path on the binding, but it stays out of public popup
+          // surfaces (pinned by background-live-integration's no-leak checks).
+          if (
+            binding &&
+            input.mediaKind === "direct" &&
+            typeof binding.savedPath === "string"
+          ) {
+            input.savedPath = binding.savedPath;
+          }
           out.push(freezeClone(Privacy.projectPopupJob(input)));
         }
         return deepFreeze(out);
@@ -2224,6 +2235,13 @@
         var input = deepClone(getScheduler().getJob(jobId));
         var binding = jobBindings.get(jobId);
         if (binding && binding.mediaId) input.mediaId = binding.mediaId;
+        if (
+          binding &&
+          input.mediaKind === "direct" &&
+          typeof binding.savedPath === "string"
+        ) {
+          input.savedPath = binding.savedPath;
+        }
         return freezeClone(Privacy.projectPopupJob(input));
       }
 
@@ -2974,6 +2992,21 @@
             delete terminalBinding.limitAck;
           }
           var settledDirect = getScheduler().getJob(decision.jobId);
+          // A completed direct pget carries the host's saved file path, which
+          // the router already validated as a safe local path paired with a
+          // byte count (decision.file is set only on a completed/committed
+          // terminal, never on failed/cancelled). Park it on the binding the
+          // way the assembled path parks committed.file, so the direct-only
+          // popup projection can surface it as savedPath and light the file
+          // actions.
+          if (
+            terminalBinding &&
+            settledDirect &&
+            settledDirect.state === "completed" &&
+            typeof decision.file === "string"
+          ) {
+            terminalBinding.savedPath = decision.file;
+          }
           if (
             settledDirect &&
             settledDirect.mediaKind === "direct" &&

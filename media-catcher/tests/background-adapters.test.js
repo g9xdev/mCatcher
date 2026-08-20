@@ -5717,6 +5717,40 @@ test("completed native direct result releases capacity and starts a queued peer"
   assert.equal(fx.counts.downloadsDownload, 0);
 });
 
+test("a completed native direct result surfaces the host saved path on its popup job", async () => {
+  const commands = [];
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ postNative(c) { commands.push(c); } }));
+  const job = await enqueueNativeDirect(ctrl, fx, "saved-path");
+  const savedPath = "C:\\Users\\add\\Downloads\\saved path.mp4";
+  await ctrl.handleNativeMessage({
+    type: "pget-result", id: job.id, attemptToken: commands[0].attemptToken,
+    status: "completed", mode: "multi-range", partState: "committed",
+    file: savedPath, bytes: 1048576,
+  });
+  const row = ctrl.popupJobs().find((r) => r.id === job.id);
+  assert.ok(row, "a completed direct job must remain in the popup projection");
+  assert.equal(row.state, "completed");
+  assert.equal(row.savedPath, savedPath,
+    "the Windows path (backslashes and a space) must reach the popup intact");
+});
+
+test("a failed native direct result carries no saved path even if the host names one", async () => {
+  const commands = [];
+  const fx = makeEffects();
+  const ctrl = loadAdapters().createBackgroundAdapters(fx.options({ postNative(c) { commands.push(c); } }));
+  const job = await enqueueNativeDirect(ctrl, fx, "failed-path");
+  await ctrl.handleNativeMessage({
+    type: "pget-result", id: job.id, attemptToken: commands[0].attemptToken,
+    status: "failed", mode: "multi-range", failureCategory: "timeout", partState: "partial",
+    file: "C:\\Users\\add\\Downloads\\never.mp4", bytes: 4096,
+  });
+  const row = ctrl.popupJobs().find((r) => r.id === job.id);
+  assert.ok(row);
+  assert.equal(row.savedPath, undefined,
+    "a non-completed terminal must never surface a saved path");
+});
+
 test("timeout native direct result follows scheduler retry policy without Firefox", async () => {
   const commands = [];
   const fx = makeEffects();
