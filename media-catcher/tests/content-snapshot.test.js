@@ -1956,3 +1956,40 @@ test("periodic tick scan detects currentSrc change without mutation or loadstart
     "original source stays single"
   );
 });
+
+test("non-http(s) video srcs are never reported as media", async () => {
+  const api = loadContent();
+  // A page (or an ad iframe) chooses every src the content script reads. The
+  // reporter must forward only absolute http(s) URLs, so a file:// UNC
+  // selector never becomes a "direct" row the helper would later open.
+  const hostile = [
+    "file://////attacker.example/s/x.mp4",
+    "file:///C:/Users/x/secret.mp4",
+    "ftp://attacker.example/x.mp4",
+    "javascript:alert(1)",
+    "//attacker.example/s/x.mp4",
+  ];
+  for (const src of hostile) {
+    const root = makeInstallRoot({ mediaUrl: src });
+    api.install(root);
+    await flushMicrotasks();
+    const media = root._messages.filter((m) => m.type === "content-media");
+    assert.deepEqual(
+      media.map((m) => m.item && m.item.url),
+      [],
+      src + " must not be reported"
+    );
+  }
+
+  // The same page shape with an http(s) src still reports, so the filter is
+  // not simply suppressing everything.
+  const ok = makeInstallRoot({ mediaUrl: "https://cdn.example/video.mp4" });
+  api.install(ok);
+  await flushMicrotasks();
+  assert.deepEqual(
+    ok._messages
+      .filter((m) => m.type === "content-media")
+      .map((m) => m.item.url),
+    ["https://cdn.example/video.mp4"]
+  );
+});

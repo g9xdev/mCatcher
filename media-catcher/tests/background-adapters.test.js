@@ -2804,6 +2804,31 @@ test("BA04 — popup media exposes opaque IDs and no raw URL/context/header fiel
         );
       });
 
+      // Non-http(s) mediaUrl. A page controls every <video src> the content
+      // script reports, so the DOM lane needs the network lane's absolute
+      // http(s) requirement: a file:// UNC selector reaching a helper turns
+      // into an outbound SMB connection to an attacker-named host.
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ mediaUrl: "file://////attacker.example/s/x.mp4" })
+        );
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ mediaUrl: "file:///C:/Users/x/secret.mp4" })
+        );
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ mediaUrl: "ftp://attacker.example/x.mp4" })
+        );
+      });
+      await assertDomRejectedAtomic((ctrl) => {
+        ctrl.captureDomMedia(
+          validDomCapture({ mediaUrl: "//attacker.example/s/x.mp4" })
+        );
+      });
+
       // requestHeaders invalid forms
       {
         const hits = { h: 0 };

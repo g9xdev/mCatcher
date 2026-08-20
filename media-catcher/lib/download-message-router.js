@@ -772,6 +772,27 @@
     }
 
     /**
+     * A pget/pget-single url the helper will spawn a downloader on: nonblank,
+     * trim-stable, control-free, and an absolute http(s) URL. Decides
+     * accept/reject only — callers keep the exact accepted spelling.
+     */
+    function isAbsoluteHttpUrl(v) {
+      if (!isNonblankPrimitiveString(v)) return false;
+      if (v.trim() !== v || !isSafeHttpContextString(v)) return false;
+      if (!/^https?:\/\//i.test(v)) return false;
+      // URL is absent from some classic-script/test realms; the scheme test
+      // above already decided the lane, so treat a missing URL as "accepted".
+      if (typeof URL !== "function") return true;
+      var parsed;
+      try {
+        parsed = new URL(v);
+      } catch (e) {
+        return false;
+      }
+      return parsed.protocol === "http:" || parsed.protocol === "https:";
+    }
+
+    /**
      * Descriptor-safe mirrors snapshot for start payloads.
      * Absent → undefined. null → undefined (omit). Non-array present → generic TypeError.
      * Dense own-data entries only; sparse/accessor/hostile length → generic TypeError.
@@ -904,7 +925,7 @@
 
       if (kind === "pget") {
         var url = requireOwnData(input, "url");
-        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
+        if (!isAbsoluteHttpUrl(url)) throw genericTypeError();
         var maxConnections = requireOwnData(input, "maxConnections");
         if (!isPositiveInt(maxConnections)) throw genericTypeError();
         var pgetGen = requireProviderGeneration(input);
@@ -929,7 +950,7 @@
 
       if (kind === "pget-single") {
         var singleUrl = requireOwnData(input, "url");
-        if (!isNonblankPrimitiveString(singleUrl)) throw genericTypeError();
+        if (!isAbsoluteHttpUrl(singleUrl)) throw genericTypeError();
         var singleGen = requireProviderGeneration(input);
         var singleMirrors = snapshotOptionalMirrors(input);
         var singleReferer = readOptionalHttpContext(input, "referer");

@@ -1995,9 +1995,11 @@
         var requestHeaders = transport.requestHeaders;
         var futureTransport = transport.futureTransport;
 
-        var mediaUrl = requireNonblankControlFreeString(
-          readRequiredOwnString(input, "mediaUrl")
-        );
+        // Same absolute-http(s) requirement the network lane applies to
+        // details.url: the page picks every DOM src, and a non-http(s) one
+        // (file://, and especially a file: UNC selector) must never become a
+        // capture the helper is later asked to open.
+        var mediaUrl = requireAbsoluteHttpUrl(readRequiredOwnString(input, "mediaUrl"));
         var mediaOrigin = readOwnStringOrNull(input, "mediaOrigin");
         if (mediaOrigin === undefined) mediaOrigin = "";
         if (mediaOrigin != null && hasControlChars(mediaOrigin)) throw genericTypeError();

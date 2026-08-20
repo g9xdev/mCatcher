@@ -1317,6 +1317,51 @@ test("buildNativeStartPayload rejects unknown kinds and malformed inputs", () =>
   assert.equal(hits, 0);
 });
 
+test("buildNativeStartPayload pget kinds require an absolute http(s) url", () => {
+  const { buildNativeStartPayload } = loadRouter();
+  const intent = saveAsIntent();
+  // The helper spawns a downloader on this exact string. Every producer of a
+  // pget URL already validates http(s) upstream; this is the last gate before
+  // the string leaves the extension.
+  const rejected = [
+    "file://////attacker.example/s/x.mp4",
+    "file:///C:/Users/x/secret.mp4",
+    "ftp://attacker.example/x.mp4",
+    "//attacker.example/s/x.mp4",
+    "cdn.example/x.mp4",
+    "https://cdn.example/x .mp4\u0000",
+  ];
+  for (const url of rejected) {
+    for (const kind of ["pget", "pget-single"]) {
+      const input = {
+        kind,
+        jobId: "j",
+        attemptToken: "a",
+        intent,
+        url,
+        providerGeneration: 0,
+      };
+      if (kind === "pget") input.maxConnections = 1;
+      assert.throws(
+        () => buildNativeStartPayload(input),
+        TypeError,
+        kind + " must reject " + url
+      );
+    }
+  }
+
+  const ok = buildNativeStartPayload({
+    kind: "pget",
+    jobId: "j",
+    attemptToken: "a",
+    intent,
+    url: "https://cdn.example/x.mp4?sig=abc#frag",
+    maxConnections: 1,
+    providerGeneration: 0,
+  });
+  assert.deepEqual(ok.urls, ["https://cdn.example/x.mp4?sig=abc#frag"]);
+});
+
 test("buildNativeStartPayload file-open never carries media URL or tokens", () => {
   const { buildNativeStartPayload } = loadRouter();
   const intent = saveAsIntent({

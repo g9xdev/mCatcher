@@ -807,15 +807,17 @@
       return reportInflight[url];
     }
 
+    // Only absolute http(s) srcs are reportable media. An allowlist, not a
+    // blocklist: blob:/mediasource:/data: are unfetchable here, and file: /
+    // ftp: / javascript: srcs are page-chosen strings that must never travel
+    // to the background as a media URL.
+    function isReportableUrl(url) {
+      return typeof url === "string" && /^https?:\/\//i.test(url);
+    }
+
     function report(url) {
       if (!url || boundUrls.has(url)) return Promise.resolve();
-      if (
-        url.indexOf("blob:") === 0 ||
-        url.indexOf("mediasource:") === 0 ||
-        url.indexOf("data:") === 0
-      ) {
-        return Promise.resolve();
-      }
+      if (!isReportableUrl(url)) return Promise.resolve();
       var item = {
         url: url,
         kind: /\.m3u8(\?|#|$)/i.test(url) ? "hls" : "direct",
