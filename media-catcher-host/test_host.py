@@ -781,3 +781,56 @@ def test_every_long_loop_command_really_dispatches_to_a_worker():
 # "len(reason) > 20" check passes anything and would be updated reflexively the
 # first time it fired, which is worse than not having it: the reasons are there
 # for a reader, and only a reader can judge them.
+
+
+# ---------------------------------------------------------------------------
+# The two log sinks say the same thing
+#
+# The extension redacts URLs on the way into storage.local, but the on-disk
+# copy at %TEMP%\host.log used to keep the query string -- and that is the copy
+# a user hands over when they are asked for "the helper log". Redaction moved
+# to the _hlog seam so both sinks carry one projection.
+# ---------------------------------------------------------------------------
+
+def test_hlog_redacts_urls_in_both_sinks(tmp_path, monkeypatch):
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(log_path))
+
+    hlog._hlog("info", "yt-dlp: downloading "
+                       "https://user:pw@cdn.example:8443/a/b.mp4?token=SECRET#frag "
+                       "(pot=on)")
+
+    on_disk = log_path.read_text(encoding="utf-8")
+    on_wire = sent[-1]["msg"]
+    for blob in (on_disk, on_wire):
+        assert "SECRET" not in blob, blob
+        assert "user:pw" not in blob, blob
+        assert "https://cdn.example:8443/a/b.mp4" in blob, blob
+    # One projection, not two policies: the disk line carries the wire line.
+    assert on_wire in on_disk
+
+
+def test_hlog_keeps_local_paths_and_fails_closed_on_a_bad_url(tmp_path, monkeypatch):
+    """A save path is not a URL and stays whole; an unparseable URL is dropped
+    to a marker rather than passed through, because echoing it IS the leak."""
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(tmp_path / "host.log"))
+
+    local = r"saved to C:\Users\me\Videos\clip.mp4"
+    hlog._hlog("info", local)
+    assert sent[-1]["msg"] == local
+
+    hlog._hlog("error", "bad https://[invalid?token=SECRET")
+    assert sent[-1]["msg"] == "bad [redacted]"
+
+    # Idempotent: the extension redacts again over what it receives.
+    once = hlog._redact_log_text("see https://a.test/x.mp4?k=SECRET.")
+    assert once == "see https://a.test/x.mp4."
+    assert hlog._redact_log_text(once) == once

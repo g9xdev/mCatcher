@@ -7,8 +7,10 @@ constants are owned here; nothing outside this module uses them.
 """
 import json
 import os
+import re
 import threading
 import time
+import urllib.parse
 
 def _h():
     """Call-time shim lookup (review of b9043cd, Important): a module-level
@@ -29,6 +31,75 @@ _HOST_LOG = os.path.join(TMPDIR, "host.log")
 _HISTORY_PATH = os.path.join(HERE, "update-history.jsonl")
 _log_lock = threading.Lock()
 
+# ---- log redaction ------------------------------------------------------
+# Applied at the _hlog SEAM, so both sinks say the same thing. The extension
+# already redacts what it puts in storage.local (media-catcher/lib/privacy.js
+# redactLogText), but the disk copy kept the full URL, query and all, and that
+# is the copy a user hands over when they are asked for "the helper log".
+# Nothing in this host SERVES that file -- getReport does not include it and
+# the Settings console is fed by the {"type":"log"} relay -- so redacting it
+# is not closing a remote read; it is making the one file that leaves the
+# machine safe to hand over without a warning label attached.
+#
+# The projection matches the extension's: scheme://host[:port]/path, with
+# userinfo, query and fragment dropped. Query strings on a media URL are where
+# the signed token lives; what survives (which CDN, which file) is what the
+# line was worth reading for. Local save paths and everything else are kept.
+# Running before the send too means the host never puts a raw URL on the wire,
+# and the extension's pass over an already-redacted line is a no-op.
+#
+# Update history (_log_event / _HISTORY_PATH) is deliberately NOT projected:
+# its `source` is a release location, not a credentialed media URL, and the
+# panel exists to say where an update came from. Only the line it mirrors
+# through _hlog is redacted.
+_URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.I)
+_URL_TAIL_PUNCT = re.compile(r"[.,;:!?)\]}]+$")
+
+
+def _redact_url(url):
+    """scheme://host[:port]/path — userinfo, query and fragment dropped."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        if not host:
+            return "[redacted]"
+        if ":" in host:                       # IPv6 literal
+            host = "[%s]" % host
+        port = parts.port                     # raises on a malformed port
+        if port is not None:
+            host = "%s:%d" % (host, port)
+        return "%s://%s%s" % (parts.scheme.lower(), host, parts.path)
+    except Exception:
+        # Never echo the input on a parse failure — that is the leak itself.
+        return "[redacted]"
+
+
+def _redact_log_text(msg):
+    """Every absolute http(s) URL in a log line, replaced by its projection.
+
+    Trailing sentence punctuation is put back so a URL ending a sentence still
+    reads as one. Never raises: a line that cannot be projected is dropped to
+    a fixed marker rather than passed through.
+    """
+    try:
+        text = msg if isinstance(msg, str) else str(msg)
+    except Exception:
+        return "[unprintable]"
+
+    def one(m):
+        hit = m.group(0)
+        tail = _URL_TAIL_PUNCT.search(hit)
+        trailing = ""
+        if tail:
+            trailing = tail.group(0)
+            hit = hit[:len(hit) - len(trailing)]
+        return _redact_url(hit) + trailing
+
+    try:
+        return _URL_IN_TEXT.sub(one, text)
+    except Exception:
+        return "[redacted]"
+
 
 def _now_ms():
     return int(time.time() * 1000)
@@ -36,9 +107,13 @@ def _now_ms():
 
 def _hlog(level, msg, src="host"):
     """Emit one structured log line: to the extension for the live console, and to
-    a rolling on-disk file for after-the-fact inspection. Never raises."""
+    a rolling on-disk file for after-the-fact inspection. Never raises.
+
+    URLs are projected once, HERE, so the wire copy and the disk copy carry the
+    same text — see the redaction note above."""
+    msg = _redact_log_text(msg)
     try:
-        _h().send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": str(msg)})
+        _h().send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": msg})
     except Exception:
         pass
     try:
