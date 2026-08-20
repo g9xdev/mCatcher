@@ -135,6 +135,10 @@ MESSAGE_SCHEMA = {
     "pickFolder": {"requestId": ID, "reqId": ID, "dir": STR},
     "open": {"id": ID, "path": STR},
     "reveal": {"id": ID, "path": STR},
+    # Same two fields as open/reveal, and deliberately no third: the program
+    # BadApple runs is chosen by the host (tools.find_badapple), so there is
+    # no executable for a caller to name here.
+    "badapple": {"id": ID, "path": STR},
     "update": {"extDir": STR, "zipDir": STR, "profileDir": STR, "silent": BOOL},
     "watch": {"enable": BOOL, "extDir": STR, "zipDir": STR},
     "checkGithub": {"auto": BOOL, "force": BOOL, "extDir": STR, "zipDir": STR,
