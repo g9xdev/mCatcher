@@ -834,3 +834,33 @@ def test_hlog_keeps_local_paths_and_fails_closed_on_a_bad_url(tmp_path, monkeypa
     once = hlog._redact_log_text("see https://a.test/x.mp4?k=SECRET.")
     assert once == "see https://a.test/x.mp4."
     assert hlog._redact_log_text(once) == once
+
+
+def test_hlog_credential_pass_catches_what_the_url_match_cannot(tmp_path, monkeypatch):
+    """Mirrors media-catcher/lib/privacy.js, so the two sinks stay in step.
+
+    The URL match ends at whitespace, so a URL yt-dlp printed with a raw space
+    in it keeps its tail -- and the Signature after that space -- as loose
+    text. A second pass redacts credential-shaped VALUES wherever they appear,
+    so no boundary has to be decided. Being additive it can only remove more,
+    which is why the format-selector line is pinned unchanged here rather than
+    assumed.
+    """
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(tmp_path / "host.log"))
+
+    hlog._hlog("info", "yt-dlp: https://cdn.test/a b.mp4?Signature=SECRETSIG&Expires=99")
+    assert sent[-1]["msg"] == \
+        "yt-dlp: https://cdn.test/a b.mp4?Signature=[redacted]&Expires=[redacted]"
+
+    # An unencoded quote inside a query no longer ends the URL match.
+    assert "SECRETTOK" not in hlog._redact_log_text(
+        'get https://cdn.test/a.mp4?q="x&token=SECRETTOK now')
+
+    # Whole-name only, and a real diagnostic the projection preserves is kept.
+    for keep in ("monkey=notacredential", "passwordless=alsofine",
+                 "Key-Pair-Id=keepme", "-f bv*[height<=720]+ba"):
+        assert hlog._redact_log_text(keep) == keep, keep

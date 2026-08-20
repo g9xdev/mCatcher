@@ -52,8 +52,37 @@ _log_lock = threading.Lock()
 # its `source` is a release location, not a credentialed media URL, and the
 # panel exists to say where an update came from. Only the line it mirrors
 # through _hlog is redacted.
-_URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.I)
-_URL_TAIL_PUNCT = re.compile(r"[.,;:!?)\]}]+$")
+# The match runs to WHITESPACE, not to the first quote or angle bracket: host
+# lines carry yt-dlp's own spelling rather than a browser-canonicalised URL, so
+# an unencoded quote inside a query would otherwise end the match and leave the
+# credential after it standing in the line. Trailing wrappers and sentence
+# punctuation are put back afterwards so a quoted or sentence-final URL still
+# reads as one.
+_URL_IN_TEXT = re.compile(r"https?://\S+", re.I)
+_URL_TAIL_PUNCT = re.compile(r"['\">.,;:!?)\]}]+$")
+
+# Second, independent pass: the VALUE of a credential-shaped parameter name,
+# wherever it appears, in a URL or not. Whitespace being the URL boundary, a
+# URL yt-dlp printed with a raw space in it is projected only up to that space
+# and the tail carrying the Signature stays in the line as loose text; this
+# redacts that tail without any boundary having to be decided.
+#
+# A blocklist, and deliberately never the only defence -- _redact_url's
+# allowlist still decides what survives of anything that parses as a URL.
+# Being additive it can only remove more, never less, so it cannot take a
+# diagnostic the projection preserves. The name must match WHOLE: a preceding
+# name character means no match, so monkey=, passwordless= and Key-Pair-Id=
+# are untouched. Alternation order is longest-first among overlapping names
+# (signature before sig, expires before expire) because first match wins.
+#
+# Mirrors media-catcher/lib/privacy.js redactCredentialValues. The two are
+# kept in step deliberately: the point of redacting here is that the disk copy
+# and the extension's copy say the same thing.
+_LOG_CREDENTIAL_VALUE = re.compile(
+    r"(^|[^A-Za-z0-9_-])"
+    r"(x-amz-security-token|x-amz-credential|x-amz-signature|signature|"
+    r"password|expires|policy|expire|token|auth|pwd|sig|key)"
+    r"=([^&\s\"'<>]+)", re.I)
 
 
 def _redact_url(url):
@@ -96,7 +125,8 @@ def _redact_log_text(msg):
         return _redact_url(hit) + trailing
 
     try:
-        return _URL_IN_TEXT.sub(one, text)
+        projected = _URL_IN_TEXT.sub(one, text)
+        return _LOG_CREDENTIAL_VALUE.sub(r"\1\2=[redacted]", projected)
     except Exception:
         return "[redacted]"
 
