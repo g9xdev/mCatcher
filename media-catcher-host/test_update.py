@@ -3,6 +3,8 @@ Run:  python -m pytest test_update.py -q   (or directly:  py test_update.py)"""
 import json
 import os
 import struct
+import subprocess
+import threading
 import zipfile
 
 import pytest
@@ -10,6 +12,9 @@ import pytest
 from conftest import load_host
 
 mc = load_host()
+
+from mchost import tools as mc_tools        # noqa: E402
+from mchost import updates as mc_updates    # noqa: E402
 
 
 def make_ext_zip(path, version, extra=None):
@@ -175,6 +180,113 @@ def test_zip_completeness_guard(workspace, tmp_path):
     assert mc._zip_complete(partial) is False, "_zip_complete rejects a truncated zip"
     assert mc._await_zip(good, tries=2, delay=0.05) is True, \
         "_await_zip returns fast for a complete zip"
+
+
+# ---------------------------------------------------------------------------
+# The auto-install watch folder is not a folder the browser writes into
+#
+# _install_updates trusts whatever .zip it finds in the watched folder that
+# starts with "media_catcher"/"media-catcher", and the only thing between a
+# planted package and the guardian is a Yes/No shown to a user who opted into
+# auto-update and is therefore expecting one. While the fallback was
+# downloads_dir(), any page could put media-catcher-host-9.9.9.zip in front of
+# that dialog with an ordinary drive-by download.
+# ---------------------------------------------------------------------------
+
+def test_watch_folder_never_defaults_to_downloads(tmp_path, monkeypatch):
+    downloads = os.path.join(str(tmp_path), "Downloads"); os.makedirs(downloads)
+    monkeypatch.setattr(mc, "downloads_dir", lambda: downloads)
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc_tools, "HERE", str(tmp_path))
+
+    # The live path first: an un-configured host with auto-update on installs
+    # from whatever _auto_update_check hands _install_updates.
+    seen = []
+    monkeypatch.setattr(mc_updates, "_install_updates",
+                        lambda ext, zdir, **kw: seen.append(zdir))
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    mc_updates._auto_update_check()
+    assert seen and os.path.realpath(seen[0]) != os.path.realpath(downloads),         "the watcher installs packages out of the browser download folder"
+
+    staged = mc.update_staging_dir()
+    assert os.path.realpath(staged) != os.path.realpath(downloads),         "the update staging folder is the browser's own download folder"
+    assert os.path.isdir(staged), "update_staging_dir did not create the folder"
+
+    # …and every resolution path agrees, not just the helper.
+    for cfg in ({}, {"zipDir": ""}, {"zipDir": None}, {"zipDir": downloads},
+                {"zipDir": downloads.lower()}, {"zipDir": downloads + os.sep}):
+        got = mc_updates._resolve_zip_dir(cfg)
+        assert os.path.realpath(got) != os.path.realpath(downloads),             "cfg=%r resolved the watch folder to Downloads" % (cfg,)
+
+
+def _dir_link(target, link):
+    """A directory link at `link` pointing at `target`.
+
+    A junction on Windows, because it needs no elevation where os.symlink does,
+    and os.path.realpath resolves the two identically."""
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                       check=True, capture_output=True)
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def test_a_link_that_resolves_to_downloads_is_refused_too(tmp_path, monkeypatch):
+    """realpath, not normcase, is what _is_downloads_dir rests on: Downloads is
+    routinely redirected through a junction/symlink, and a link to it is another
+    spelling of the same folder. Case is already covered above."""
+    downloads = os.path.join(str(tmp_path), "Downloads"); os.makedirs(downloads)
+    link = os.path.join(str(tmp_path), "dl-link")
+    try:
+        _dir_link(downloads, link)
+    except (OSError, NotImplementedError, AttributeError,
+            subprocess.CalledProcessError) as e:
+        pytest.skip("no directory link available here: %s" % e)
+    assert os.path.realpath(link) == os.path.realpath(downloads), \
+        "the link was not made, so this would pass for the wrong reason"
+    monkeypatch.setattr(mc, "downloads_dir", lambda: downloads)
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc_tools, "HERE", str(tmp_path))
+
+    assert mc_updates._is_downloads_dir(link), \
+        "a link pointing at Downloads was not recognised as Downloads"
+    got = mc_updates._resolve_zip_dir({"zipDir": link})
+    assert os.path.realpath(got) != os.path.realpath(downloads), \
+        "packages would be staged in Downloads through a link"
+
+
+def test_explicitly_configured_watch_folder_still_wins(tmp_path, monkeypatch):
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc_tools, "HERE", str(tmp_path))
+    chosen = os.path.join(str(tmp_path), "packages"); os.makedirs(chosen)
+    assert mc_updates._resolve_zip_dir({"zipDir": chosen}) == chosen
+    assert mc_updates._resolve_zip_dir({}, req={"zipDir": chosen}) == chosen
+    # a request's choice outranks the persisted one
+    other = os.path.join(str(tmp_path), "other"); os.makedirs(other)
+    assert mc_updates._resolve_zip_dir({"zipDir": other}, req={"zipDir": chosen}) == chosen
+
+
+def test_implicit_downloads_default_is_never_persisted(tmp_path, monkeypatch):
+    """handle_update wrote its resolved zip_dir back to the config
+    unconditionally, so one press of 'Check & install update' turned the
+    implicit Downloads fallback into what looks like an explicit choice.
+    Nothing may write the browser's download folder into the config."""
+    downloads = os.path.join(str(tmp_path), "Downloads"); os.makedirs(downloads)
+    monkeypatch.setattr(mc, "downloads_dir", lambda: downloads)
+    monkeypatch.setattr(mc, "HERE", str(tmp_path))
+    monkeypatch.setattr(mc_tools, "HERE", str(tmp_path))
+    cfg_path = os.path.join(str(tmp_path), "mc_config_test.json")
+    monkeypatch.setattr(mc, "_config_path", lambda: cfg_path)
+    monkeypatch.setattr(mc_updates, "_install_updates", lambda *a, **kw: None)
+
+    done = threading.Event()
+    real = mc.save_config
+    monkeypatch.setattr(mc, "save_config", lambda cfg: (real(cfg), done.set()))
+    mc.handle_update({"cmd": "update", "extDir": "", "zipDir": ""})
+    assert done.wait(5), "handle_update never saved a config"
+    saved = mc.load_config().get("zipDir")
+    assert os.path.realpath(saved or str(tmp_path)) != os.path.realpath(downloads),         "handle_update persisted the browser download folder as the watch folder"
+
 
 
 if __name__ == "__main__":

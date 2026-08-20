@@ -28,6 +28,38 @@ def downloads_dir():
     return d if os.path.isdir(d) else os.path.expanduser("~")
 
 
+# The folder the updater watches, and the reason it is not Downloads.
+#
+# _install_updates matches candidate packages on a filename prefix and then
+# offers to hand them to the guardian. The only thing between a package and the
+# guardian is a Yes/No dialog, shown to the one user who turned auto-update on
+# and is therefore expecting one. While this folder defaulted to downloads_dir()
+# any web page could put "media-catcher-host-9.9.9.zip" in front of that dialog
+# with an ordinary drive-by download; the browser writes there unprompted, which
+# is the whole vector.
+#
+# HERE is the host's own install directory. It is the right owner because the
+# host already treats it as its private state: mc_config_*.json is written
+# there, install.ps1 drops ffmpeg.exe there, and the guardian's host apply is an
+# overlay write (McHostSafe.ApplyHostZip walks the zip's own entries) rather
+# than a wipe, so a subfolder survives a host update. Nothing but the host and
+# its installer writes into it.
+def update_staging_dir():
+    """The host-owned folder update packages are staged in, created if absent.
+
+    Returns the path whether or not the mkdir succeeded — start_watch's own
+    os.path.isdir check is what decides whether watching is possible, and
+    github_stage_release makedirs again before it writes. A read-only install
+    directory therefore degrades to "no local staging", not to a crash.
+    """
+    d = os.path.join(HERE, "updates")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
 def sanitize(name):
     """A recording's display name, made into a filename stem.
 

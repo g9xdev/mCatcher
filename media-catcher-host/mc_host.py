@@ -79,7 +79,8 @@ from mchost.nm import init_io, send, read_message   # noqa: E402,F401
 
 
 # ---- tool discovery: moved to mchost/tools.py (Task C1) ------------------
-from mchost.tools import HERE, TMPDIR, FFMPEG, find_ffmpeg, downloads_dir, sanitize   # noqa: E402,F401
+from mchost.tools import (HERE, TMPDIR, FFMPEG, find_ffmpeg, downloads_dir,   # noqa: E402,F401
+                          sanitize, update_staging_dir)
 
 
 # ---- self-update ----------------------------------------------------------
@@ -842,7 +843,8 @@ from mchost.updates import (GITHUB_REPO, GITHUB_RELEASES_URL, _GITHUB_POLL_INTER
 # Moved to mchost/updates.py (Task C2). _WATCH (the stop-event/dir registry)
 # is owned by updates and not re-exported.
 from mchost.updates import (_parse_notify, _dir_watcher, _auto_update_check,   # noqa: E402,F401
-                            start_watch, stop_watch, handle_watch)
+                            start_watch, stop_watch, handle_watch,
+                            _resolve_zip_dir)
 
 
 # ---- jobs ----
@@ -894,6 +896,7 @@ from mchost.downloads import (find_ytdlp, find_node, find_deno, _POT_PORT,   # n
 from mchost.cast.legacy import (_DLNA, _lan_ip, _ssdp_discover, _dlna_describe,   # noqa: E402,F401
                                 _dlna_soap, _dlna_soap_retry, _ensure_media_server,
                                 _ensure_media_server_locked, _dlna_media_url,
+                                _stop_media_server, _close_media_server,
                                 _dlna_discover, _hms, _from_hms, _DLNA_STATE,
                                 _dlna_status, _dlna_start, _dlna_control,
                                 _dlna_start_poller)
@@ -938,7 +941,7 @@ def main():
     try:
         cfg = load_config()
         if cfg.get("autoUpdate") and cfg.get("extDir") and os.name == "nt":
-            start_watch(cfg.get("zipDir") or downloads_dir())
+            start_watch(_resolve_zip_dir(cfg))
             start_github_poll()
     except Exception:
         pass

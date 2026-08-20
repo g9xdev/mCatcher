@@ -91,7 +91,7 @@ def _emit(msg):
 # HTTP; the control endpoint 500s while the TV switches apps (LG_TRANSITIONING),
 # so SetURI/Play retry.
 _DLNA = {"devices": {}, "ctrl": None, "rctrl": None, "poll": None,
-         "server": None, "port": 0, "media": {}}
+         "server": None, "thread": None, "port": 0, "media": {}}
 
 
 def _lan_ip(target="10.255.255.255"):
@@ -140,10 +140,72 @@ def _ssdp_discover(timeout=4):
     return locs
 
 
+_DESC_OPENER = None
+
+
+def _desc_opener():
+    """The opener every request AT a device goes through: no redirects.
+
+    The host pins below are checked on the URL we ASK for, and urlopen's default
+    opener follows a 302 to any host — so a device could answer its own SSDP
+    LOCATION (or, in _dlna_soap, the control POST) with a redirect and the
+    REQUEST ITSELF would be the one an attacker wanted made. Re-checking
+    afterwards is too late: by then it has landed. Returning None from
+    redirect_request leaves the 3xx unhandled, so it surfaces as an HTTPError —
+    _dlna_describe's except clause turns that into "no such device" and
+    _dlna_soap's into a non-200. UPnP serves the description directly at
+    LOCATION and control at controlURL; nothing in the spec asks a control
+    point to chase redirects for either.
+    """
+    global _DESC_OPENER
+    import urllib.request
+    if _DESC_OPENER is None:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        _DESC_OPENER = urllib.request.build_opener(_NoRedirect)
+    return _DESC_OPENER
+
+
+def _pin_ctrl(loc, curl):
+    """`curl` resolved against the description URL `loc`, or None if it lands
+    somewhere else.
+
+    urljoin against an ABSOLUTE url discards the base entirely, so a renderer
+    that answered <controlURL>http://127.0.0.1:8080/x</controlURL> got SOAP
+    POSTed there by _dlna_soap — SSRF into loopback services that trust local
+    callers, from a user-privileged process, triggered by anything that can
+    answer an SSDP M-SEARCH on the LAN.
+
+    SCHEME and HOST are pinned. The scheme has to be: `file:///C:/…` is an
+    absolute URL too, and urllib would happily open it.
+
+    The PORT deliberately is not. Renderers really do split the description and
+    the control endpoint across ports of one device, and once the host is pinned
+    a different port on it is still the device's own box — it buys the attacker
+    nothing it did not already have.
+    """
+    import urllib.parse
+    if not curl:
+        return None
+    url = urllib.parse.urljoin(loc, curl)
+    base, got = urllib.parse.urlparse(loc), urllib.parse.urlparse(url)
+    if got.scheme != base.scheme or got.hostname != base.hostname:
+        return None
+    return url
+
+
 def _dlna_describe(loc, expect_host=None):
     """Fetch a device description; return {name, model, avCtrl, rcCtrl} or None.
+
     expect_host pins the fetch to the device that answered the SSDP query, so a
-    hostile LAN peer can't point us at an arbitrary URL via its LOCATION header."""
+    hostile LAN peer can't point us at an arbitrary URL via its LOCATION header;
+    _desc_opener keeps a redirect from moving that fetch afterwards, and
+    _pin_ctrl holds the control endpoints the description names to the same
+    scheme and host. A device with no AVTransport left is not castable and is
+    dropped; a bad RenderingControl only costs volume control (rcCtrl is
+    already optional at every use).
+    """
     import urllib.request
     import urllib.parse
     import xml.etree.ElementTree as ET
@@ -153,7 +215,7 @@ def _dlna_describe(loc, expect_host=None):
             return None
         if expect_host and parsed.hostname != expect_host:
             return None
-        xmlsrc = urllib.request.urlopen(loc, timeout=4).read().decode("utf-8", "replace")
+        xmlsrc = _desc_opener().open(loc, timeout=4).read().decode("utf-8", "replace")
         root = ET.fromstring(xmlsrc)
         ns = {"u": "urn:schemas-upnp-org:device-1-0"}
         av = rc = None
@@ -161,9 +223,9 @@ def _dlna_describe(loc, expect_host=None):
             stype = svc.findtext("u:serviceType", default="", namespaces=ns)
             curl = svc.findtext("u:controlURL", default="", namespaces=ns)
             if "AVTransport" in stype:
-                av = urllib.parse.urljoin(loc, curl) if curl else None
+                av = _pin_ctrl(loc, curl)
             elif "RenderingControl" in stype:
-                rc = urllib.parse.urljoin(loc, curl) if curl else None
+                rc = _pin_ctrl(loc, curl)
         if not av:
             return None
         return {"name": root.findtext(".//u:friendlyName", default="TV", namespaces=ns),
@@ -174,7 +236,17 @@ def _dlna_describe(loc, expect_host=None):
 
 
 def _dlna_soap(ctrl, service, action, inner, timeout=8):
-    """One SOAP call. Returns (status, body); -1 on connection errors."""
+    """One SOAP call. Returns (status, body); -1 on connection errors.
+
+    Sent through _desc_opener for the same reason the description fetch is:
+    _pin_ctrl constrains the URL this ASKS for, and a redirect-following opener
+    would let the device move the POST itself — pass the pin with a same-host
+    <controlURL>, answer with `302 -> http://127.0.0.1:8080/...`, and the
+    re-issued request is the one the attacker wanted made, eight times over via
+    _dlna_soap_retry. Refusing the redirect surfaces as an HTTPError, which the
+    clause below already turns into (code, body): a non-200, so callers treat
+    it as a failed action rather than a reply.
+    """
     import urllib.request
     import urllib.error
     body = ('<?xml version="1.0" encoding="utf-8"?>'
@@ -186,7 +258,7 @@ def _dlna_soap(ctrl, service, action, inner, timeout=8):
         "Content-Type": 'text/xml; charset="utf-8"',
         "SOAPACTION": '"urn:schemas-upnp-org:service:%s:1#%s"' % (service, action)})
     try:
-        r = urllib.request.urlopen(req, timeout=timeout)
+        r = _desc_opener().open(req, timeout=timeout)
         return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         try:
@@ -355,15 +427,83 @@ def _ensure_media_server_locked():
     srv = Srv(("0.0.0.0", 0), MediaHandler)
     _DLNA["server"] = srv
     _DLNA["port"] = srv.server_address[1]
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    # Started under _DLNA_SRV_LOCK, which _stop_media_server also takes: a
+    # teardown can therefore never reach a server whose serve_forever thread
+    # has not been started, and srv.shutdown() always has something to wait on.
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    _DLNA["thread"] = t
+    t.start()
     _h()._hlog("info", "cast: media server on :%d" % _DLNA["port"])
     return _DLNA["port"]
 
 
+def _close_media_server(srv):
+    try:
+        srv.shutdown()          # returns once serve_forever has left its loop
+    except Exception:
+        pass
+    try:
+        srv.server_close()      # drops the listening socket
+    except Exception:
+        pass
+
+
+def _stop_media_server():
+    """Stop the media server and forget every token it was serving.
+
+    The server binds 0.0.0.0, so until this runs the last cast file is
+    downloadable by anything on the LAN from http://<lan-ip>:<port>/m/<token>.
+    Neither stop() nor shutdown() used to do either half, so the file outlived
+    the session that justified serving it -- until the next cast, or process
+    exit.
+
+    The token map is cleared FIRST and under the lock, because that is the half
+    that matters: it is what makes a token stop resolving. Closing the socket is
+    the belt.
+
+    Three lifecycle details this has to respect:
+      - shutdown() waits for serve_forever to return, and DEADLOCKS if the
+        caller IS that thread. The check below guards exactly that, but nothing
+        reaches it today and it is not what keeps handlers out: Srv is a
+        ThreadingMixIn, so a request runs on its own thread and is never the
+        one compared against. It is kept for a caller that ever does run on the
+        serving thread — a non-threading server, or a serve_forever callback.
+      - a request in flight does not hold it up: Srv is a ThreadingMixIn, so
+        serve_forever hands each request to its own thread and stays free to
+        notice the shutdown flag.
+      - server_close() does not join those threads either, because
+        daemon_threads is set. In-flight responses run on their own accepted
+        sockets and simply end.
+    """
+    with _DLNA_SRV_LOCK:
+        srv = _DLNA["server"]
+        thread = _DLNA.get("thread")
+        _DLNA["server"] = None
+        _DLNA["thread"] = None
+        _DLNA["port"] = 0
+        _DLNA["media"] = {}
+    if srv is None:
+        return
+    if thread is not None and thread is threading.current_thread():
+        threading.Thread(target=_close_media_server, args=(srv,), daemon=True).start()
+        return
+    _close_media_server(srv)
+
+
 def _dlna_media_url(source, device_ip=None):
-    """Register a local path or remote URL; return (LAN URL the TV fetches, ctype)."""
+    """Register a local path or remote URL; return (LAN URL the TV fetches, ctype).
+
+    Starting the server and claiming a token on it is ONE step under
+    _DLNA_SRV_LOCK. handle_cast runs each request on its own thread with no
+    ordering between them, so a stop lands wherever it lands; with the lock
+    taken and released by _ensure_media_server and the map rewritten outside it,
+    a start could read the map, lose the server to a concurrent stop, and write
+    that map back — putting the stopped session's carried-forward token onto the
+    next server, LAN-fetchable again. Held across both, the stop is either
+    entirely before this (so it starts a fresh server and carries nothing
+    forward) or entirely after (so it clears this too).
+    """
     import uuid
-    port = _ensure_media_server()
     token = uuid.uuid4().hex
     ctype = "video/mp4"
     low = source.lower()
@@ -375,11 +515,18 @@ def _dlna_media_url(source, device_ip=None):
         else {"path": source, "ctype": ctype}
     # A direct http:// URL could pass through, but proxying always works
     # (https, cookies, and CORS never reach the TV) — so always proxy.
-    # Keep the most recent old token alive: if this new cast fails, the previous
-    # session may still be streaming and must keep answering Range requests.
-    media = dict(list(_DLNA["media"].items())[-1:])
-    media[token] = entry
-    _DLNA["media"] = media
+    # Carry at most ONE old token forward, so a re-registration with no stop
+    # between it and the last one (a retry inside a single start) does not cut
+    # off a stream still being read. Ending a session clears the map outright --
+    # both an explicit stop and the dispatcher's stop-before-start go through
+    # _cast_stop_active -- so in the ordinary re-cast this keeps nothing.
+    with _DLNA_SRV_LOCK:
+        port = _ensure_media_server_locked()
+        media = dict(list(_DLNA["media"].items())[-1:])
+        media[token] = entry
+        _DLNA["media"] = media
+    # Outside the lock deliberately: _lan_ip probes the routing table, and the
+    # lock is also what a teardown waits on.
     # Advertise the interface that actually routes to this TV (multi-homed PCs/VPNs).
     ip = _lan_ip(device_ip) if device_ip else _lan_ip()
     return "http://%s:%d/m/%s" % (ip, port, token), ctype
@@ -635,9 +782,25 @@ def _cast_loop():
 
 
 def _cast_run(coro, timeout=40):
-    """Submit a coroutine to the cast loop and block for its result (from a worker thread)."""
+    """Submit a coroutine to the cast loop and block for its result (from a worker
+    thread), CANCELLING it if the wait runs out.
+
+    result(timeout) only stops WAITING; it left the coroutine running on the cast
+    loop. A slow connect or pair_begin therefore reported failure to the popup and
+    then finished anyway -- arriving at a device the user had already been told was
+    unreachable, and writing into a _CAST the next attempt had moved on from.
+    run_coroutine_threadsafe chains a cancel of its concurrent future onto the
+    loop's task itself, so calling it from this thread is the supported route.
+    The TimeoutError is re-raised unchanged: the caller's error reporting is
+    exactly what it was."""
     import asyncio
-    return asyncio.run_coroutine_threadsafe(coro, _cast_loop()).result(timeout)
+    import concurrent.futures
+    fut = asyncio.run_coroutine_threadsafe(coro, _cast_loop())
+    try:
+        return fut.result(timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise
 
 
 async def _cast_storage():
@@ -770,8 +933,14 @@ async def _cast_pair_begin(device_id):
     st = await _cast_storage()
     config = await _find_config(device_id)
     handler = await pyatv.pair(config, Protocol.AirPlay, _cast_loop(), storage=st)
-    await handler.begin()
+    # Stored BEFORE begin(): begin() opens a session on the device, and _cast_run
+    # cancels this coroutine once its wait runs out (an asleep Apple TV takes
+    # longer than that to answer). Storing it afterwards meant the cancel dropped
+    # the only reference to an already-open session — the aiohttp session leaked,
+    # the device held its PIN, and the retry's _cast_pair_cancel() found None and
+    # closed nothing before pyatv.pair() ran again.
     _CAST["pairing"] = handler
+    await handler.begin()
     return bool(handler.device_provides_pin)
 
 
@@ -949,7 +1118,13 @@ def _cast_stop_poller():
 def _cast_stop_active():
     """Tear down whatever is currently casting (either protocol) before a new cast
     or an explicit stop. Without this, switching between an AirPlay TV and a DLNA TV
-    orphaned the previous session and left control/stop routed at the wrong one."""
+    orphaned the previous session and left control/stop routed at the wrong one.
+
+    Order matters: the RECEIVER is told to stop before the media server goes, so
+    it is never left reading a socket that died under it. The media server is
+    shared by both protocols, so it is torn down whichever one was live --
+    including when neither was, which is how a start that failed before it
+    committed a session still gets its token cleared."""
     _cast_stop_poller()
     if _CAST.get("kind") == "airplay":
         try:
@@ -964,6 +1139,7 @@ def _cast_stop_active():
         _DLNA["ctrl"] = None
         _DLNA["rctrl"] = None
     _CAST["kind"] = None
+    _stop_media_server()
 
 
 class LegacyBackend(CastBackend):

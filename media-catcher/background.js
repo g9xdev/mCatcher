@@ -27,7 +27,9 @@ const DEFAULT_SETTINGS = {
   minDirectSizeMB: 5,           // hide direct files smaller than this (0 = off)
   saveFolder: "",               // default save folder for the helper ("" = Downloads)
   updateExtDir: "",             // the extension's source folder (for self-update)
-  updateZipDir: "",             // where update .zip packages land ("" = Downloads)
+  updateZipDir: "",             // where update .zip packages land ("" = the helper's
+                                // own updates folder; the browser's download folder
+                                // is refused, it is the drive-by plant vector)
   autoUpdate: false,            // helper watches the package folder and auto-installs
   convertCodec: "off",          // "off" | "h265" | "av1" — re-encode saved & downloaded files
   convertQuality: "visually-lossless", // "visually-lossless" | "balanced" | "true-lossless" (h265 only)
@@ -912,6 +914,15 @@ function onLegacyNativeMessage(msg) {
     if (typeof msg.pct === "number") dl.convertPct = msg.pct;
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "ytdl-progress") {
+    // The cancel is still travelling to the helper while the helper's frames
+    // travel back, so one written before it saw the cancel arrives after this
+    // row was settled. Dropping it is what makes the cancel stick: a wedge the
+    // helper cannot break — one with no live child to kill — sends no terminal
+    // frame afterwards to correct a row this put back on "downloading", and
+    // while the row reads as in flight YT_IN_FLIGHT refuses to start that URL
+    // again. ytdl-done is deliberately NOT dropped the same way: it names a
+    // file already on disk.
+    if (dl.status === "cancelled") return;
     dl.status = "downloading";
     const pct = typeof msg.pct === "number" ? Math.max(0, Math.min(100, Math.round(msg.pct)))
                                             : (dl.progress ? dl.progress.done : 0);

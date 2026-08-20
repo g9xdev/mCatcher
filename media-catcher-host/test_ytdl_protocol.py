@@ -5350,6 +5350,115 @@ def test_a_throw_between_registering_and_downloading_releases_the_job_id(tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# One output path, one writer.
+#
+# The extension settles a cancelled row locally so the user is not stuck on a
+# wedge the host cannot break. That frees the URL for a retry — but the wedged
+# worker is still parked holding the file. The legacy template is deterministic
+# (no _dedup here, and the pathname O_EXCL scheme was removed), and the retry
+# mints a fresh id, so nothing downstream would notice two yt-dlps writing one
+# path: it surfaces as WinError 32 on the .part and on the ffmpeg merge.
+# ---------------------------------------------------------------------------
+
+def _park_until(release, entered, lib_box):
+    """A lib.download that records its entry and holds until released."""
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        entered.append(argv)
+        assert release.wait(5), "the parked job was never released"
+        raise lib_box[0].Cancelled()
+    return fake_download
+
+
+def test_a_second_job_on_one_output_path_is_refused_while_the_first_holds_it(
+        tmp_path, monkeypatch):
+    """Same template, same URL, different id — the second must not start."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    url = "https://youtu.be/x"
+    outtmpl = os.path.join(str(tmp_path), "%(title).150B [%(id)s].%(ext)s")
+    entered = []
+    release = threading.Event()
+    lib_box = [None]
+    lib_box[0] = FakeYtdlLib(_park_until(release, entered, lib_box))
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib_box[0])
+
+    wedged = threading.Thread(
+        target=d._ytdl_download_via_lib, daemon=True,
+        args=("j-wedged", url, "b", outtmpl, None, False))
+    wedged.start()
+    try:
+        assert wait_for(lambda: entered, 5), "the first job never started"
+
+        d._ytdl_download_via_lib("j-retry", url, "b", outtmpl, None, False)
+
+        assert len(entered) == 1, \
+            "a second yt-dlp started on the output path the first still holds"
+        refused = [m for m in sent
+                   if m.get("id") == "j-retry" and m["type"] == "ytdl-error"]
+        assert len(refused) == 1, refused
+        # The reason has to name the real obstacle: this id is brand new, so
+        # "id already in use" would send the reader looking at the wrong thing.
+        assert refused[0]["reason"] == "busy", refused[0]
+        assert "id already in use" not in refused[0]["error"].lower(), refused[0]
+        assert d._pget_registry_get("j-retry") is None, \
+            "the refused job kept a registry entry"
+    finally:
+        release.set()
+        wedged.join(5)
+    assert not wedged.is_alive(), "the wedged worker outran its release"
+    # Once the holder is gone the path is free again: a retry now runs.
+    assert d._pget_registry_get("j-wedged") is None
+
+    entered.clear()
+    release2 = threading.Event()
+    release2.set()
+    lib_box[0] = FakeYtdlLib(_park_until(release2, entered, lib_box))
+    d._ytdl_download_via_lib("j-after", url, "b", outtmpl, None, False)
+    assert len(entered) == 1, "the path stayed claimed after its holder ended"
+
+
+def test_two_jobs_on_different_urls_share_a_folder_without_colliding(tmp_path,
+                                                                    monkeypatch):
+    """The claim is the FILE, not the folder: the legacy template is identical
+    for every job into one directory, so keying on it alone would refuse every
+    concurrent YouTube download."""
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+
+    outtmpl = os.path.join(str(tmp_path), "%(title).150B [%(id)s].%(ext)s")
+    entered = []
+    release = threading.Event()
+    lib_box = [None]
+    lib_box[0] = FakeYtdlLib(_park_until(release, entered, lib_box))
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib_box[0])
+
+    first = threading.Thread(
+        target=d._ytdl_download_via_lib, daemon=True,
+        args=("j-a", "https://youtu.be/aaa", "b", outtmpl, None, False))
+    first.start()
+    try:
+        assert wait_for(lambda: entered, 5), "the first job never started"
+        second = threading.Thread(
+            target=d._ytdl_download_via_lib, daemon=True,
+            args=("j-b", "https://youtu.be/bbb", "b", outtmpl, None, False))
+        second.start()
+        assert wait_for(lambda: len(entered) == 2, 5), \
+            "a second video into the same folder was refused: %r" % (sent,)
+    finally:
+        release.set()
+        first.join(5)
+        second.join(5)
+
+
+# ---------------------------------------------------------------------------
 # The in-process path's children: a wedged deno is the one hang no hook and no
 # log line can reach, so bounding the silence is not enough — the child has to
 # go. These pin the kill policy, and above all that it can never reach a
@@ -5549,6 +5658,61 @@ def test_the_wedged_worker_and_its_registration_end_with_the_kill(tmp_path,
     assert not t.is_alive(), "the worker thread outlived its job"
     assert d._pget_registry_get("j-freed") is None, "the registration leaked"
     assert reported, "the row was never closed"
+
+
+def test_a_cancel_frees_a_wedge_the_watchdog_can_no_longer_reach(tmp_path,
+                                                                 monkeypatch):
+    """The wedge that has no watchdog behind it.
+
+    ffmpeg merging is a per-job spawned image and --socket-timeout does not
+    cover it, so it is the realistic way lib.download never returns. By then
+    on_progress has fired, which disarms the resolve watchdog for good — that
+    disarm is correct, a transferring job must never be killed on a clock — so
+    the only thing left that can reach this worker is the user pressing Cancel.
+    Pin what that has to achieve: the child taken, the thread unwound, exactly
+    one terminal frame, and the registration handed back — a worker that has
+    ended no longer holds the output path, so the entry must not outlive it."""
+    import mchost.downloads as d
+
+    sent = []
+    killed = []
+    merging = threading.Event()
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(d, "_h", lambda: mc)
+    # Large enough that a watchdog which HAD still been armed could not fire
+    # inside this test: a pass here is the cancel's doing, not the clock's.
+    monkeypatch.setattr(d, "_YTDL_RESOLVE_STALL", 30)
+    _record_kills(d, monkeypatch, killed)
+
+    child = FakeChild("ffmpeg")
+    lib = None
+
+    def fake_download(argv, on_progress=None, on_note=None, should_cancel=None,
+                      on_child=None):
+        on_progress({"stage": "downloading", "pct": 100.0, "total": 9})
+        on_progress({"stage": "merging"})
+        on_child(child)                 # yt-dlp shells out to ffmpeg to merge
+        merging.set()
+        # The wedge: nothing in here polls, and only the child going away can
+        # end it — the same shape as Popen.run parked in communicate().
+        assert wait_for(lambda: child.killed, 5), "cancel never reached the merge"
+        raise lib.Cancelled()
+
+    lib = FakeYtdlLib(fake_download)
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: lib)
+    t = threading.Thread(target=d._ytdl_download_via_lib, daemon=True,
+                         args=("j-merge-wedge", "https://youtu.be/x", "b",
+                               str(tmp_path / "v.mp4"), None, False))
+    t.start()
+    assert merging.wait(5), "the download never reached the merge"
+    d._pget_cancel({"id": "j-merge-wedge"})
+    t.join(5)
+
+    assert killed == [child], "the wedged ffmpeg was never killed"
+    assert not t.is_alive(), "the worker thread outlived its job"
+    terminal = [m for m in sent if m["type"] in ("ytdl-error", "ytdl-done")]
+    assert [m.get("reason") for m in terminal] == ["cancelled"], terminal
+    assert d._pget_registry_get("j-merge-wedge") is None, "the registration leaked"
 
 
 def test_a_child_spawned_after_the_kill_is_taken_too(tmp_path, monkeypatch):

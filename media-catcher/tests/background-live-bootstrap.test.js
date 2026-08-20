@@ -610,6 +610,56 @@ test("a second click on a downloading YouTube URL does not start a second yt-dlp
     "a second click on the same URL must not spawn a competing yt-dlp");
 });
 
+// Cancel travels to the helper while the helper's frames travel back, so a
+// progress frame written before the cancel arrived is delivered after the row
+// was already marked cancelled. ytdl-error consults the local flag; ytdl-progress
+// did not, so that straggler put the row back on "downloading" — and the wedge it
+// was cancelled for is precisely the case where no terminal frame follows to
+// correct it. YT_IN_FLIGHT then reads the row as still owning its output path and
+// refuses every retry of that URL, which is the stuck row users could not clear.
+test("a straggling progress frame does not put a cancelled YouTube row back in flight", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const item = { url: "https://www.youtube.com/watch?v=WEDGE", kind: "youtube", name: "wedged" };
+  const ytdls = () => h.nativePosts.filter((p) => p && p.cmd === "ytdl");
+
+  await h.sandbox.downloadYouTube(item, 7, "wedged.mp4", {});
+  await settle();
+  assert.equal(ytdls().length, 1, "the download starts");
+  const id = ytdls()[0].id;
+
+  // Bytes flowed and the merge began — the last thing the helper says before
+  // ffmpeg wedges and lib.download stops returning.
+  h.nativeMessages.emit({ type: "ytdl-progress", id, pct: 99, stage: "merging" });
+  await settle();
+
+  h.sandbox.browser.runtime.onMessage.emit({ type: "cancel", id }, {}, () => {});
+  await settle();
+  const updates = h.runtimeMessages.filter(
+    (m) => m && m.type === "download-update" && m.download && m.download.id === id);
+  assert.ok(updates.length, "the row is broadcast");
+  // Broadcasts carry the live row object, so this reads its current state.
+  const row = updates[updates.length - 1].download;
+  assert.equal(row.status, "cancelled", "the cancel must settle the row");
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "pget-cancel").length, 1,
+    "the cancel must also reach the helper");
+
+  h.nativeMessages.emit({ type: "ytdl-progress", id, pct: 99, stage: "merging" });
+  await settle();
+  assert.equal(row.status, "cancelled",
+    "a frame the helper sent before it saw the cancel put the row back in flight");
+
+  await h.sandbox.downloadYouTube(item, 7, "wedged.mp4", {});
+  await settle();
+  assert.equal(ytdls().length, 2,
+    "the same URL must be startable again once the row is cancelled");
+});
+
 test("the live controller is driven by a clock", async () => {
   const h = createHarness();
   h.load();

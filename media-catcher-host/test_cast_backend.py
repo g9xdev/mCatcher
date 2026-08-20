@@ -422,5 +422,540 @@ def test_control_without_a_live_session_touches_no_transport(monkeypatch):
     assert calls == ["dlna", "airplay", "airplay-run"], calls
 
 
+# ===========================================================================
+# The DLNA control endpoint belongs to the device that answered
+#
+# _dlna_describe pins the description FETCH to the SSDP responder, then resolved
+# <controlURL> with urljoin -- and urljoin against an ABSOLUTE url discards the
+# base. A hostile MediaRenderer (or an SSDP spoofer) that answered with
+# <controlURL>http://127.0.0.1:8080/…</controlURL> therefore got attacker-chosen
+# SOAP XML POSTed to a loopback service by a user-privileged process.
+# ===========================================================================
+
+def _description(av_ctrl, rc_ctrl):
+    return ('<?xml version="1.0"?>'
+            '<root xmlns="urn:schemas-upnp-org:device-1-0"><device>'
+            "<friendlyName>Living Room</friendlyName><modelName>X9</modelName>"
+            "<serviceList>"
+            "<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1"
+            "</serviceType><controlURL>%s</controlURL></service>"
+            "<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1"
+            "</serviceType><controlURL>%s</controlURL></service>"
+            "</serviceList></device></root>" % (av_ctrl, rc_ctrl))
+
+
+class _FakeResponse:
+    status = 200
+
+    def __init__(self, body):
+        self._body = body.encode("utf-8")
+
+    def read(self, *a):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _describe_serving(monkeypatch, xml):
+    """Point the description fetch at `xml` and record every SOAP POST.
+
+    Both go through _desc_opener (the no-redirect opener), so the fake below
+    serves the description for the GET and records the URL for the POST. The
+    urlopen tripwire keeps that arrangement honest: if a request ever goes back
+    to the redirect-following default opener, it lands in `posted` tagged, and
+    the host-pin assertions below fail on it rather than passing vacuously.
+    """
+    import urllib.request
+    posted = []
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            if isinstance(req, str):
+                return _FakeResponse(xml)       # the description GET
+            posted.append(req.full_url)         # a SOAP POST
+            return _FakeResponse("")
+
+    monkeypatch.setattr(legacy_mod, "_desc_opener", lambda: _Opener())
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, *a, **kw: posted.append(
+                            "urlopen:" + (req if isinstance(req, str)
+                                          else req.full_url)) or _FakeResponse(""))
+    return posted
+
+
+DEV = "192.168.7.50"
+LOC = "http://192.168.7.50:1900/desc.xml"
+
+
+@pytest.mark.parametrize("hostile", [
+    "http://127.0.0.1:8080/evil",          # loopback service that trusts local callers
+    "http://169.254.169.254/latest/meta",  # cloud metadata
+    "https://attacker.example/collect",    # off-LAN entirely
+    "file:///C:/Windows/win.ini",          # not even http
+])
+def test_control_url_on_another_host_is_never_posted_to(monkeypatch, hostile):
+    posted = _describe_serving(monkeypatch, _description(hostile, hostile))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    # Whatever the describe decides, no endpoint it hands back may be POSTed to
+    # anywhere but the device that served the description.
+    for key in ("avCtrl", "rcCtrl"):
+        url = (d or {}).get(key)
+        if url:
+            legacy_mod._dlna_soap(url, "AVTransport", "Stop", "<InstanceID>0</InstanceID>")
+    assert all(u.startswith("http://%s:" % DEV) for u in posted),         "SOAP was POSTed off the device that served the description: %r" % (posted,)
+
+
+def test_relative_and_same_host_control_urls_still_work(monkeypatch):
+    # The pin must not cost the normal case: relative paths (what nearly every
+    # renderer emits) and an absolute URL back at the same device.
+    _describe_serving(monkeypatch, _description(
+        "/upnp/control/AVTransport1", "http://192.168.7.50:1900/upnp/control/RC1"))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    assert d, "a well-formed description was rejected"
+    assert d["avCtrl"] == "http://192.168.7.50:1900/upnp/control/AVTransport1"
+    assert d["rcCtrl"] == "http://192.168.7.50:1900/upnp/control/RC1"
+
+
+def test_a_control_url_on_another_port_of_the_same_device_is_kept(monkeypatch):
+    # Deliberate: renderers do split description and control across ports, and
+    # once the HOST is pinned a different port is still the attacker's own box.
+    _describe_serving(monkeypatch, _description(
+        "http://192.168.7.50:49152/ctrl", "http://192.168.7.50:49152/rc"))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    assert d and d["avCtrl"] == "http://192.168.7.50:49152/ctrl"
+
+
+def test_a_hostile_rendering_control_url_does_not_take_the_device_out(monkeypatch):
+    # Only the offending endpoint is dropped: AVTransport is what casting needs.
+    _describe_serving(monkeypatch, _description(
+        "/upnp/control/AVTransport1", "http://127.0.0.1:8080/evil"))
+    d = legacy_mod._dlna_describe(LOC, expect_host=DEV)
+    assert d, "a good AVTransport was thrown away with the bad RenderingControl"
+    assert d["rcCtrl"] is None, "the off-host RenderingControl survived"
+
+
+def _one_shot_server(handler_body):
+    """A real ThreadingHTTPServer on 127.0.0.1, stopped by the caller."""
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            handler_body(self)
+
+        def do_POST(self):
+            # Drain the SOAP envelope first: an unread body leaves bytes in the
+            # socket that the client sees as a broken reply rather than the
+            # status this server meant to send.
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            handler_body(self)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_a_redirect_cannot_move_the_description_fetch_off_the_device():
+    """The host pin is checked on the URL we ASK for. urlopen follows a 302 to
+    anywhere, so without a no-redirect opener a device could answer its own
+    LOCATION with `302 -> http://<internal>/` and the fetch itself is the SSRF —
+    the GET has already happened by the time anything re-checks."""
+    hits = []
+
+    def victim(h):
+        hits.append(h.path)
+        body = b"<root/>"
+        h.send_response(200)
+        h.send_header("Content-Type", "text/xml")
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    vic = _one_shot_server(victim)
+    target = "http://localhost:%d/internal" % vic.server_address[1]
+
+    def redirector(h):
+        h.send_response(302)
+        h.send_header("Location", target)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    red = _one_shot_server(redirector)
+    try:
+        loc = "http://127.0.0.1:%d/desc.xml" % red.server_address[1]
+        out = legacy_mod._dlna_describe(loc, expect_host="127.0.0.1")
+        assert out is None, "a redirected description was accepted"
+        assert hits == [], "the description fetch followed a redirect to %r" % (hits,)
+    finally:
+        for s in (red, vic):
+            s.shutdown()
+            s.server_close()
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_redirect_cannot_move_the_soap_post_off_the_device(code):
+    """_pin_ctrl pins the URL the SOAP call ASKS for, not the one it reaches.
+
+    A device passes the pin with a same-host <controlURL>, then answers the
+    POST with a redirect anywhere it likes; a redirect-following opener
+    re-issues the request there, and _dlna_soap_retry does it up to 8 times.
+    301/302/303 are the live hole: urllib rewrites a redirected POST to GET and
+    re-issues it. 307/308 already fail closed, because urllib's own
+    redirect_request raises rather than replay a body — they are here so a
+    future opener that DOES honour them (they preserve method and body, so they
+    would forward the whole envelope) fails this test instead of shipping.
+    """
+    hits = []
+
+    def victim(h):
+        hits.append(h.path)
+        h.send_response(200)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    vic = _one_shot_server(victim)
+    target = "http://localhost:%d/internal/admin" % vic.server_address[1]
+
+    def redirector(h):
+        h.send_response(code)
+        h.send_header("Location", target)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+
+    red = _one_shot_server(redirector)
+    try:
+        ctrl = "http://127.0.0.1:%d/upnp/control/AVTransport1" % red.server_address[1]
+        st, _body = legacy_mod._dlna_soap(ctrl, "AVTransport", "Stop",
+                                          "<InstanceID>0</InstanceID>")
+        assert hits == [], "the SOAP POST followed a %d to %r" % (code, hits)
+        # The refusal surfaces as the 3xx itself, which is not 200 — so
+        # _dlna_start treats it as a failure and _dlna_soap_retry keeps failing.
+        assert st == code, "expected the %d back, got %r" % (code, st)
+    finally:
+        for s in (red, vic):
+            s.shutdown()
+            s.server_close()
+
+
+
+# ===========================================================================
+# Stop means the file stops being fetchable
+#
+# The cast media server binds 0.0.0.0 and hands out /m/<token>. stop() and
+# shutdown() tore down the SESSION but never the server and never _DLNA["media"],
+# so after the user pressed Stop the last cast file stayed downloadable from
+# every host on the LAN until the next cast or process exit.
+# ===========================================================================
+
+def _live_cast(monkeypatch, tmp_path, payload=b"cast me"):
+    """A running media server with one registered token. Returns (url, srv)."""
+    import urllib.request
+    monkeypatch.setattr(legacy_mod, "_DLNA",
+                        dict(legacy_mod._DLNA, server=None, port=0, media={},
+                             ctrl=None, rctrl=None))
+    monkeypatch.setattr(mc_host, "_DLNA", legacy_mod._DLNA)
+    monkeypatch.setattr(legacy_mod, "_lan_ip", lambda *a, **kw: "127.0.0.1")
+    monkeypatch.setattr(legacy_mod, "_CAST", {"kind": None, "poll": None})
+    monkeypatch.setattr(mc_host, "_CAST", legacy_mod._CAST)
+    # shutdown() opens with pair_cancel(); there is no pyatv loop here and no
+    # pairing to cancel, so the coroutine is closed rather than submitted.
+    def _no_cast_loop(coro, timeout=None):
+        try:
+            coro.close()
+        except Exception:
+            pass
+    monkeypatch.setattr(mc_host, "_cast_run", _no_cast_loop)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(payload)
+    url, _ct = legacy_mod._dlna_media_url(str(clip))
+    assert urllib.request.urlopen(url, timeout=5).read() == payload,         "the media server did not serve the file it was handed"
+    return url, legacy_mod._DLNA["server"]
+
+
+def _unreachable(url):
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(url, timeout=3).read()
+    except (urllib.error.URLError, ConnectionError, OSError):
+        return True
+    return False
+
+
+@pytest.mark.parametrize("teardown", ["stop", "shutdown"])
+def test_the_cast_file_is_not_fetchable_after_stop(monkeypatch, tmp_path, teardown):
+    url, srv = _live_cast(monkeypatch, tmp_path)
+    backend = _legacy_backend(monkeypatch, lambda m: None)
+    getattr(backend, teardown)()
+    assert legacy_mod._DLNA["media"] == {},         "the token map still resolves the last cast: %r" % (legacy_mod._DLNA["media"],)
+    assert legacy_mod._DLNA["server"] is None, "the media server was left registered"
+    assert _unreachable(url), "the cast file is still fetchable from the LAN after %s()" % teardown
+    srv.server_close()      # no-op if the teardown already closed it
+
+
+def test_stop_does_not_block_on_a_request_in_flight(monkeypatch, tmp_path):
+    """server.shutdown() waits for serve_forever to return. ThreadingMixIn hands
+    each request to its own thread so the accept loop is never the one blocked,
+    and daemon_threads keeps server_close from joining them — this pins both, so
+    a partially-read response cannot wedge Stop."""
+    import socket
+    url, srv = _live_cast(monkeypatch, tmp_path, payload=b"x" * (4 << 20))
+    host, port = "127.0.0.1", legacy_mod._DLNA["port"]
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        path = url.split("/m/")[-1]
+        crlf = chr(13) + chr(10)
+        sock.sendall(("GET /m/%s HTTP/1.1%sHost: x%s%s"
+                      % (path, crlf, crlf, crlf)).encode())
+        assert sock.recv(64), "the server never started answering"   # headers only
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (_legacy_backend(monkeypatch, lambda m: None).stop(),
+                            done.set()), daemon=True).start()
+        assert done.wait(20), "stop() did not return with a request in flight"
+    finally:
+        # Let the handler finish writing before the socket goes, so the test
+        # does not manufacture the broken pipe it is not about.
+        try:
+            sock.settimeout(5)
+            while sock.recv(65536):
+                pass
+        except Exception:
+            pass
+        sock.close()
+        srv.server_close()
+
+
+def test_a_second_cast_gets_a_working_server_again(monkeypatch, tmp_path):
+    # The teardown must not be one-way: casting again has to rebuild the server.
+    _live_cast(monkeypatch, tmp_path)
+    _legacy_backend(monkeypatch, lambda m: None).stop()
+    import urllib.request
+    clip = tmp_path / "next.mp4"
+    clip.write_bytes(b"second")
+    url, _ct = legacy_mod._dlna_media_url(str(clip))
+    try:
+        assert urllib.request.urlopen(url, timeout=5).read() == b"second",             "the media server did not come back for the next cast"
+    finally:
+        legacy_mod._stop_media_server()
+
+
+def test_cast_run_timeout_cancels_the_coroutine(monkeypatch):
+    """_cast_run returned the TimeoutError and left the coroutine running, so a
+    slow connect/pair_begin reported failure to the popup and then completed
+    anyway — pairing a device the user had been told was unreachable."""
+    import asyncio
+    import concurrent.futures
+    monkeypatch.setattr(legacy_mod, "_CAST", {"loop": None, "thread": None})
+    state = {}
+
+    async def slow():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        state["completed"] = True
+
+    try:
+        with pytest.raises(concurrent.futures.TimeoutError):
+            legacy_mod._cast_run(slow(), timeout=0.2)
+        assert wait_for(lambda: state.get("cancelled"), timeout=5),             "the timed-out coroutine was never cancelled: %r" % (state,)
+        assert not state.get("completed")
+    finally:
+        loop = legacy_mod._CAST.get("loop")
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+
+
+# ===========================================================================
+# A cancelled pair_begin must still be closeable
+#
+# _cast_run now cancels a coroutine it stopped waiting on. pair_begin opens a
+# real session on the device before it returns, so the ONE reference to that
+# handler has to exist from the moment it does — otherwise an Apple TV that is
+# merely asleep (begin() past the 30s bound) leaks the aiohttp session, holds
+# its PIN, and the retry's pair_cancel finds None and closes nothing.
+# ===========================================================================
+
+class _PairHandler:
+    """The pyatv pairing handler, reduced to what _cast_pair_* touches."""
+
+    def __init__(self, begin):
+        self._begin = begin
+        self.closed = False
+        self.device_provides_pin = True
+
+    async def begin(self):
+        await self._begin()
+
+    async def close(self):
+        self.closed = True
+
+
+def _fake_pyatv(monkeypatch, pair):
+    """A minimal importable pyatv whose pair() is `pair`. The real one is an
+    on-demand install (ensure_pyatv), so it is not importable in the suite."""
+    const = types.ModuleType("pyatv.const")
+    const.Protocol = types.SimpleNamespace(AirPlay="airplay")
+    mod = types.ModuleType("pyatv")
+    mod.const = const
+    mod.pair = pair
+    monkeypatch.setitem(sys.modules, "pyatv", mod)
+    monkeypatch.setitem(sys.modules, "pyatv.const", const)
+
+
+def test_a_cancelled_pair_begin_leaves_the_handler_closeable(monkeypatch):
+    import asyncio
+    import concurrent.futures
+    monkeypatch.setattr(legacy_mod, "_CAST",
+                        {"loop": None, "thread": None, "pairing": None,
+                         "storage": None})
+
+    async def asleep():
+        await asyncio.sleep(30)          # an Apple TV that has to be woken
+
+    handler = _PairHandler(asleep)
+
+    async def pair(config, protocol, loop, storage=None):
+        return handler
+
+    _fake_pyatv(monkeypatch, pair)
+
+    async def storage():
+        return None
+
+    async def find_config(device_id):
+        return object()
+
+    monkeypatch.setattr(legacy_mod, "_cast_storage", storage)
+    monkeypatch.setattr(legacy_mod, "_find_config", find_config)
+
+    try:
+        with pytest.raises(concurrent.futures.TimeoutError):
+            legacy_mod._cast_run(legacy_mod._cast_pair_begin("atv-1"), timeout=0.3)
+        assert legacy_mod._CAST.get("pairing") is handler, \
+            "the cancel dropped the only reference to an already-open pairing session"
+        legacy_mod._cast_run(legacy_mod._cast_pair_cancel(), timeout=5)
+        assert handler.closed, "the retry's pair_cancel had nothing to close"
+    finally:
+        loop = legacy_mod._CAST.get("loop")
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+
+
+def test_pair_begin_still_reports_whether_the_device_shows_a_pin(monkeypatch):
+    """Storing the handler earlier must not change what begin() returns."""
+    monkeypatch.setattr(legacy_mod, "_CAST",
+                        {"loop": None, "thread": None, "pairing": None,
+                         "storage": None})
+
+    async def quick():
+        return None
+
+    handler = _PairHandler(quick)
+    handler.device_provides_pin = False
+
+    async def pair(config, protocol, loop, storage=None):
+        return handler
+
+    _fake_pyatv(monkeypatch, pair)
+
+    async def storage():
+        return None
+
+    async def find_config(device_id):
+        return object()
+
+    monkeypatch.setattr(legacy_mod, "_cast_storage", storage)
+    monkeypatch.setattr(legacy_mod, "_find_config", find_config)
+
+    try:
+        assert legacy_mod._cast_run(legacy_mod._cast_pair_begin("atv-1"),
+                                    timeout=5) is False
+        assert legacy_mod._CAST.get("pairing") is handler
+    finally:
+        loop = legacy_mod._CAST.get("loop")
+        if loop:
+            loop.call_soon_threadsafe(loop.stop)
+
+
+# ===========================================================================
+# The token map is shared state, and cast requests are not serialized
+#
+# handle_cast spawns one daemon thread per request, so a stop can land in the
+# middle of a start. _stop_media_server clears _DLNA["media"] under
+# _DLNA_SRV_LOCK; _dlna_media_url read-modify-wrote it under nothing, so the
+# start could repopulate the map the stop had just emptied — the stopped
+# session's file LAN-fetchable again — or lose the stop's own token.
+# ===========================================================================
+
+def test_a_stop_during_a_registration_does_not_resurrect_the_token_map(monkeypatch,
+                                                                       tmp_path):
+    """Park a registration at the READ half of its read-modify-write and stop
+    the server underneath it.
+
+    The map it read still holds the previous session's token (the deliberate
+    one-token carry-forward), so an unlocked write-back puts that token back on
+    the map the stop had just emptied — and the next start serves it again.
+    """
+    clip = tmp_path / "a.mp4"
+    clip.write_bytes(b"a")
+    monkeypatch.setattr(legacy_mod, "_DLNA",
+                        dict(legacy_mod._DLNA, server=None, port=0, media={},
+                             thread=None, devices={}))
+    monkeypatch.setattr(legacy_mod, "_lan_ip", lambda *a: "127.0.0.1")
+
+    reached = threading.Event()
+    release = threading.Event()
+
+    class _SlowMap(dict):
+        """Blocks exactly where _dlna_media_url reads the map it will rewrite."""
+
+        def items(self):
+            reached.set()
+            release.wait(5)
+            return dict.items(self)
+
+    try:
+        legacy_mod._dlna_media_url(str(clip))          # session 1 takes a token
+        old_token = next(iter(legacy_mod._DLNA["media"]))
+        legacy_mod._DLNA["media"] = _SlowMap(legacy_mod._DLNA["media"])
+
+        starter = threading.Thread(
+            target=legacy_mod._dlna_media_url, args=(str(clip),), daemon=True)
+        starter.start()
+        assert reached.wait(5), "the registration never reached the map"
+
+        stopper = threading.Thread(target=legacy_mod._stop_media_server, daemon=True)
+        stopper.start()
+        # Bounded, and the outcome differs by design: unlocked, the stop runs to
+        # completion here and the parked write-back lands after it; locked, the
+        # stop is still waiting and the two cannot interleave at all. Either way
+        # the assertion below is the same.
+        stopper.join(1.0)
+        release.set()
+        starter.join(5)
+        stopper.join(5)
+        assert not starter.is_alive() and not stopper.is_alive()
+
+        assert old_token not in legacy_mod._DLNA["media"], \
+            "a stopped session's token came back onto the map"
+    finally:
+        release.set()
+        legacy_mod._stop_media_server()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
