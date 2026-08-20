@@ -1147,14 +1147,18 @@
     //     the browser did not mark isTrusted, which is every event a script
     //     dispatched.
     //
-    // WHAT IT COSTS A FRAME WITH NO VIDEO: no timers of its own, no observer
-    // of its own, no per-frame loop. It rides content.js's existing
-    // MutationObserver and document listeners. Mutations arrive in storms and
-    // are throttled to one re-check per BEAM_DEEP_MS; a media event is NOT
-    // throttled, because it is the moment the answer changed and a storm of
-    // them is a page choosing to burn its own CPU. The sweep for shadow roots
-    // runs at most once per BEAM_SHADOW_MS with a hard cap on elements
-    // examined, whichever path asked for it.
+    // WHAT IT COSTS A FRAME WITH NO VIDEO: no timer of its own, no observer of
+    // its own, and no per-frame loop — the MutationObserver and the 12-second
+    // interval it re-checks from are content.js's, and the positioning loop
+    // exists only while an overlay does. It does bind capture-phase listeners
+    // of its own: the media and fullscreen events on the document, scroll and
+    // resize on the window. Those are the moments the answer can change.
+    // Mutations arrive in storms and are throttled to one re-check per
+    // BEAM_DEEP_MS, as are scroll and resize; a media event is NOT throttled,
+    // because it is the moment the answer changed and a storm of them is a
+    // page choosing to burn its own CPU. The sweep for shadow roots runs at
+    // most once per BEAM_SHADOW_MS with a hard cap on elements examined,
+    // whichever path asked for it.
     //
     // WHAT IT CANNOT SEE: a video inside a CLOSED shadow root. `.shadowRoot`
     // is null for one and nothing else in a content script's reach answers.
@@ -1559,9 +1563,6 @@
           // The free half of the predicate first. getComputedStyle is the one
           // expensive read in this loop, and on a page full of ad slots most
           // videos are already excluded by play state or size without it.
-          // The free half of the predicate first. getComputedStyle is the one
-          // expensive read in this loop, and on a page full of ad slots most
-          // videos are already excluded by play state or size without it.
           if (!isBeamableVideo(video, { rect: rect, style: null, viewport: viewport })) {
             beamDetach(video);
             continue;
@@ -1670,9 +1671,13 @@
                        "webkitfullscreenchange"];
     for (var bi = 0; bi < BEAM_EVENTS.length; bi++) onDoc(BEAM_EVENTS[bi], beamSyncNow);
 
-    // Scrolling and resizing move the corner without changing anything else.
-    // Throttled by syncBeamOverlays itself, and a no-op in a frame with no
-    // overlay up.
+    // Scrolling and resizing move the corner, and they also change WHICH
+    // videos are eligible: on screen is half the predicate. So this is not a
+    // no-op in a frame with no overlay up — syncBeamOverlays's deep pass runs
+    // on its own BEAM_DEEP_MS throttle whether or not anything is drawn, and
+    // that is how a video below the fold gets an icon when it is scrolled to.
+    // Nothing else would notice: no media event fires, and the page need not
+    // mutate. The cheap pass is the one that returns early with no overlays.
     try {
       if (typeof root.addEventListener === "function") {
         root.addEventListener("scroll", function () { syncBeamOverlays(); }, true);

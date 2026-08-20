@@ -215,7 +215,18 @@ function makeRoot(opts) {
     setTimeout(fn, ms) { timers.push({ fn, ms, kind: "timeout" }); return timers.length; },
     clearInterval() {},
     clearTimeout() {},
-    addEventListener() {},
+    // The window's own listeners, recorded rather than dropped: scroll and
+    // resize are bound here, not on the document.
+    _windowListeners: Object.create(null),
+    addEventListener(type, fn, capture) {
+      (root._windowListeners[type] = root._windowListeners[type] || [])
+        .push({ fn, capture: !!capture });
+    },
+    _fireWindow(type, event) {
+      for (const entry of (root._windowListeners[type] || []).slice()) {
+        entry.fn(event || { type });
+      }
+    },
     browser: {
       runtime: {
         sendMessage(message) {
@@ -535,6 +546,34 @@ test("no branch reaches for an accessor a content script does not have", () => {
   assert.match(contentSrc, /beamSearchRoots/, "anchored: the sweep is in this file");
   assert.equal(/openOrClosedShadowRoot/.test(codeLines(contentSrc)), false,
     "the name may be explained in a comment; it may not be reached for in code");
+});
+
+test("a video scrolled into view gets its icon from the scroll handler", async () => {
+  // The scroll handler is NOT a no-op in a frame with no overlay up. A video
+  // below the fold is ineligible because it is off screen, and scrolling is
+  // the only thing that changes that answer — no media event fires, and the
+  // page need not mutate. If the handler returned early when nothing was
+  // drawn, the icon would wait for the next mutation or the 12-second tick.
+  const root = makeRoot();
+  const video = makeVideo(root, { rect: { left: 100, top: 900, width: 640, height: 360 } });
+  root.document.body.appendChild(video);
+  await installed(root);
+  assert.equal(containers(root).length, 0, "below the fold there is nothing to draw");
+
+  video._rect = { left: 100, top: 80, width: 640, height: 360 };
+
+  // Past the discovery throttle — a scroll gesture takes longer than that
+  // anyway, and without the step this would be measuring the throttle.
+  const realNow = Date.now;
+  Date.now = () => realNow() + 1000;
+  try {
+    root._fireWindow("scroll");
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.equal(containers(root).length, 1,
+    "the scroll IS the moment it became eligible, so the scroll is what notices");
 });
 
 // ---------------------------------------------------------------------------
