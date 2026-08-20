@@ -1238,9 +1238,11 @@ test("redactLogText strips userinfo, query and fragment from every URL it finds"
       "(referer http://site.example/watch)"
   );
   // Non-URL diagnostics — including local save paths — survive unchanged.
+  // String.raw, not "D:\Vids": \V and \M are not escapes, so a plain literal
+  // would assert a backslash-free string and prove nothing about real paths.
   assert.equal(
-    P.redactLogText("saved to D:\Vids\Movie Night.mp4 (2 connections)"),
-    "saved to D:\Vids\Movie Night.mp4 (2 connections)"
+    P.redactLogText(String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`),
+    String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`
   );
   assert.equal(P.redactLogText(""), "");
   assert.equal(P.redactLogText(null), "");
