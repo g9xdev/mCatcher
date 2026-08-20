@@ -47,12 +47,24 @@ _log_lock = threading.Lock()
 # token lives; what survives (which CDN, which file, which video) is what the
 # line was worth reading for. Local save paths and everything else are kept.
 # "Matches" is about the RULES -- same names, same cap, same charset, same
-# credential pattern -- not about byte-identical spelling. The extension
-# parses with URL and this parses with urlsplit, so a bare origin gains a
-# trailing slash there and not here; and where the extension falls back to a
-# manual strip on a URL its parser rejects, this fails closed to [redacted].
-# Both differences are the host redacting MORE or the same, never less, which
-# is the direction that matters for the copy a user hands over.
+# credential pattern -- not about byte-identical spelling. The extension parses
+# with URL (WHATWG) and this parses with urlsplit, and running both over the
+# same inputs turns up divergences in at least these shapes:
+#   - a bare origin gains a trailing slash there and not here;
+#   - where the extension falls back to a manual strip on a URL its parser
+#     rejects, this fails closed to [redacted] -- a malformed port, say;
+#   - canonicalisation WHATWG does and urlsplit does not: a backslash read as
+#     a separator, dot segments removed, 0x7f.1 folded to 127.0.0.1, an IDN
+#     host punycoded, a path character percent-encoded;
+#   - an empty authority -- https:///p?v=abc, where the extension reads p as
+#     the host and this fails closed;
+#   - re.I folds more of Unicode than the extension's /i, so a name spelled
+#     with U+017F or U+212A is redacted here and not there.
+# EVERY DIFFERENCE FOUND SO FAR is the host redacting MORE or the same, never
+# less. The invariant is that DIRECTION, not the count of shapes listed here:
+# a new shape is expected whenever either parser changes and is fine, while one
+# where the host redacts LESS is a bug, because this is the copy a user hands
+# over.
 # Running before the send too means the host never puts a raw URL on the wire,
 # and the extension's pass over an already-redacted line is a no-op.
 #
