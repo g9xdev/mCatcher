@@ -1129,11 +1129,14 @@
     // by that frame's own copy — nothing here reaches across a frame boundary.
     //
     // WHAT THE PAGE CAN DO TO IT, and what stops that:
-    //   - restyle it. The container's own properties are inline !important,
-    //     and everything visible lives in a CLOSED shadow root, which page
-    //     CSS cannot select into and which is not reachable from
+    //   - restyle it. Everything visible lives in a CLOSED shadow root, which
+    //     page CSS cannot select into and which is not reachable from
     //     element.shadowRoot. No id, no class, no `part` for a page
-    //     stylesheet to hook.
+    //     stylesheet to hook. The CONTAINER is a plain <div> in the page's
+    //     DOM and `div{}` does select it, so it pins BEAM_PINNED on itself
+    //     inline !important — a named set, not a complete one. What covers a
+    //     property nobody listed is beamClick asking the browser whether the
+    //     icon is being painted before it treats a click as one.
     //   - be broken by it. The container is position:fixed with an explicit
     //     size and `contain: layout style size`, so it contributes nothing to
     //     the page's layout wherever it is parked.
@@ -1368,6 +1371,58 @@
       } catch (e3) {}
     }
 
+    // The options that make checkVisibility answer the question this lane
+    // needs. Every one of them is OFF by default, so each has to be asked for
+    // by name: without them the call answers a narrower question than "is the
+    // browser painting this".
+    var BEAM_VISIBILITY_OPTS = {
+      checkVisibilityCSS: true,
+      contentVisibilityAuto: true,
+      opacityProperty: true,
+      visibilityProperty: true,
+    };
+
+    function beamElementRendered(el) {
+      try {
+        if (!el || typeof el.checkVisibility !== "function") return false;
+        return el.checkVisibility(BEAM_VISIBILITY_OPTS) === true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    // Is the icon actually being painted, right now, where it was clicked?
+    //
+    // isTrusted answers "a human clicked". It cannot answer "the human could
+    // SEE what they clicked", and the two come apart: an element with nothing
+    // painted in it is still hit-tested at its own coordinates. Measured in
+    // the installed Firefox 154, against a container carrying the whole
+    // BEAM_PINNED set inline !important:
+    //
+    //   page rule  div{content-visibility:hidden!important}
+    //     container.checkVisibility(...) -> true    <- the box is still there
+    //     button.checkVisibility(...)    -> false   <- nothing is drawn in it
+    //     document.elementFromPoint(icon centre) -> the container
+    //
+    //   an ancestor carrying  opacity:0!important
+    //     container.checkVisibility(...) -> false
+    //     button.checkVisibility(...)    -> false
+    //     document.elementFromPoint(icon centre) -> the container
+    //
+    // So BOTH are asked, and either one saying no is a no.
+    // `content-visibility:hidden` suppresses an element's CONTENTS and not its
+    // own box, which is why the container alone answers the wrong question for
+    // the case that motivated this; the container is what carries an
+    // ancestor's problem down to the icon.
+    //
+    // ABSENT: refused. This is the only thing in the lane that can answer "the
+    // person could see what they clicked", and an answer that could not be
+    // obtained is not a yes. What keeps that from being the ordinary case is
+    // the manifest's strict_min_version, not a fallback here.
+    function beamRendered(rec) {
+      return beamElementRendered(rec.container) && beamElementRendered(rec.button);
+    }
+
     // A USER clicked, not a script.
     //
     // The container is a node in the page's DOM: page script can locate it —
@@ -1386,6 +1441,11 @@
     function beamClick(rec, e) {
       beamSwallow(e);
       if (!e || e.isTrusted !== true) return;
+      // Nothing is said about this refusal either, and here it is not a
+      // choice: the panel a message would appear in is inside the container
+      // that is not being painted. The only party who could read one is the
+      // page that hid it.
+      if (!beamRendered(rec)) return;
       if (rec.busy) return;
       rec.busy = true;
       beamLastRecord = rec;

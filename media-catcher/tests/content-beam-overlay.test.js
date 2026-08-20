@@ -118,6 +118,16 @@ function makeNode(doc, tag, opts) {
       while (cur) { if (cur === node) return true; cur = cur.parentNode; }
       return false;
     },
+    // Element.checkVisibility. In a browser this is the browser's own answer
+    // to "are you painting this right now"; here it is a flag a test sets.
+    // The options it was asked with are recorded, because every one of them
+    // is OFF by default and asking without them asks a different question.
+    _visible: true,
+    _visibilityOpts: null,
+    checkVisibility(opts) {
+      node._visibilityOpts = opts || null;
+      return node._visible !== false;
+    },
     getBoundingClientRect() {
       const r = node._rect;
       return {
@@ -856,6 +866,96 @@ test("a click the page dispatched itself beams nothing", async () => {
   container._fire("click", makeEvent("click"));
   await settle();
   assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 1);
+});
+
+// The button inside the container's closed shadow root — the thing a person
+// actually sees and presses.
+function overlayButton(container) {
+  return container._closedShadow.querySelectorAll("button")[0];
+}
+
+test("a click on an icon the browser is not painting beams nothing", async () => {
+  // isTrusted answers "a human clicked". It cannot answer "the human could
+  // see what they clicked", and the two come apart: an element with nothing
+  // painted in it is still hit-tested at its own coordinates. Measured in the
+  // installed Firefox 154, against a container carrying the whole pinned set
+  // inline !important, with the page running
+  // `div{content-visibility:hidden!important}`:
+  //   container.checkVisibility(...) -> true   (the box is there)
+  //   button.checkVisibility(...)    -> false  (nothing is drawn in it)
+  //   document.elementFromPoint(centre of the icon) -> the container
+  // So the container's own answer is not enough, and the button is asked too.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+  const button = overlayButton(container);
+  assert.ok(button, "there is a button to ask about");
+
+  button._visible = false;
+  container._fire("click", makeEvent("click"));
+  await settle();
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 0,
+    "an icon with nothing drawn in it cannot have been what a person aimed at");
+
+  // The other half of the same measurement: an ancestor carrying opacity:0
+  // makes the CONTAINER report false while the page keeps it hit-testable.
+  button._visible = true;
+  container._visible = false;
+  container._fire("click", makeEvent("click"));
+  await settle();
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 0,
+    "and neither can one the browser says it is not rendering");
+
+  // A gate, not a switch.
+  container._visible = true;
+  container._fire("click", makeEvent("click"));
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 1,
+    "a visible icon still beams");
+});
+
+test("the render check asks for the four options that are off by default", async () => {
+  // checkVisibility() with no argument answers a narrower question than this
+  // needs: contentVisibilityAuto, opacityProperty, visibilityProperty and
+  // checkVisibilityCSS all default to false, so each of the four ways a page
+  // can suppress paint has to be asked for by name.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+
+  container._fire("click", makeEvent("click"));
+  await settle();
+
+  for (const el of [container, overlayButton(container)]) {
+    assert.ok(el._visibilityOpts, "asked at all");
+    assert.equal(el._visibilityOpts.checkVisibilityCSS, true);
+    assert.equal(el._visibilityOpts.contentVisibilityAuto, true);
+    assert.equal(el._visibilityOpts.opacityProperty, true);
+    assert.equal(el._visibilityOpts.visibilityProperty, true);
+  }
+});
+
+test("an icon whose browser will not say whether it is painted is not clickable", async () => {
+  // Feature detection with the answer stated: absent REFUSES. This check is
+  // the only thing that can answer "the person could see what they clicked",
+  // and an answer that could not be obtained is not a yes. The manifest's
+  // strict_min_version is what keeps this from being the ordinary case.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+  delete container.checkVisibility;
+  delete overlayButton(container).checkVisibility;
+
+  container._fire("click", makeEvent("click"));
+  await settle();
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 0,
+    "no answer is not a yes");
 });
 
 // The overlay's message panel, on its own — _text() below would also drag in
