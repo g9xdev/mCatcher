@@ -722,17 +722,34 @@
     // in it ends at the space, and the tail carrying the Signature stays in the
     // line as loose text; no boundary has to be decided to redact that tail.
     //
-    // Being additive it can only remove more, never less, so it cannot take a
-    // diagnostic the projection preserves. A false positive costs one
-    // credential-shaped value, which is what we are willing to lose. The name
+    // It is additive, so it can only remove more than the projection does --
+    // including, sometimes, a diagnostic the projection deliberately kept. A
+    // name=value inside a path is claimed like any other: /token=1/clip.mp4
+    // and /token=2/clip.mp4 both end as /token=[redacted], because the value
+    // runs to the next &, whitespace, quote or angle bracket and a path
+    // separator is none of those. That is a price, not an accident: a token in
+    // a path segment is a real spelling (signed CDN paths put one there), so
+    // most of what looks like a false positive is what this pass is for. What
+    // it costs is pinned in the tests rather than argued away here. The name
     // must be whole: a preceding name character (monkey=, passwordless=) means
-    // no match, and the value runs to the next &, whitespace, quote or bracket.
-    // A regex literal, not a built string: the value class carries a quote and
-    // a backslash escape, which a string would swallow before RegExp saw them.
-    var LOG_CREDENTIAL_VALUE_RE = /(^|[^A-Za-z0-9_-])(x-amz-security-token|x-amz-credential|x-amz-signature|signature|password|expires|policy|expire|token|auth|pwd|sig|key)=([^&\s"'<>]+)/gi;
+    // no match. A quoted value counts as a value -- token="S" and 'token': 'S'
+    // are both credentials, and excluding the quote from the value class used
+    // to mean the whole line went through untouched. A ':' separator is
+    // claimed only when the value is quoted, so an "Expires: Thu, 01 Dec"
+    // header keeps its shape. A regex literal, not a built string: the value
+    // class carries a quote and a backslash escape, which a string would
+    // swallow before RegExp saw them.
+    var LOG_CREDENTIAL_VALUE_RE = /(^|[^A-Za-z0-9_-])(x-amz-security-token|x-amz-credential|x-amz-signature|signature|password|expires|policy|expire|token|auth|pwd|sig|key)(["']?\s*(?:=|:(?=\s*["']))\s*)("[^"]*"|'[^']*'|[^&\s"'<>]+)/gi;
 
     function redactCredentialValues(text) {
-      return text.replace(LOG_CREDENTIAL_VALUE_RE, "$1$2=[redacted]");
+      return text.replace(LOG_CREDENTIAL_VALUE_RE,
+        function (whole, lead, name, separator, value) {
+          // Keep the quotes the line was written with, so a redacted value
+          // still reads as the value of that name.
+          var first = value.charAt(0);
+          var quote = (first === '"' || first === "'") ? first : "";
+          return lead + name + separator + quote + "[redacted]" + quote;
+        });
     }
 
     /**

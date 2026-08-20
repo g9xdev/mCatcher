@@ -1298,6 +1298,19 @@ test("redactLogText redacts credential values no URL match can claim", () => {
     P.redactLogText('header "Signature=SECRET_SIGNED_QUERY_XYZ" rejected'),
     'header "Signature=[redacted]" rejected'
   );
+  // A quoted value is still a value. The value class excludes " and ' and
+  // requires one character, so token="SECRET" matched nothing at all and
+  // passed both layers untouched -- the URL projection cannot claim it either,
+  // since the line it sits on need not be a URL.
+  assert.equal(
+    P.redactLogText('resuming with token="SECRET_SIGNED_QUERY_XYZ"'),
+    'resuming with token="[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText("headers: {'token': 'SECRET_SIGNED_QUERY_XYZ'}"),
+    "headers: {'token': '[redacted]'}"
+  );
+
   // The X-Amz-* family, whose names the bare alternatives would not cover.
   assert.equal(
     P.redactLogText(
@@ -1310,9 +1323,37 @@ test("redactLogText redacts credential values no URL match can claim", () => {
     "X-Amz-Security-Token=[redacted] next"
   );
 
-  // Strictly additive: this pass can only remove more, never less. The format
-  // selector carries no credential-shaped name=value, so the line the widened
-  // URL match would have eaten must read exactly as it did before.
+  // A ':' separator is claimed only when the value is quoted, so an ordinary
+  // header dump keeps its shape instead of losing its first word.
+  assert.equal(
+    P.redactLogText("Expires: Thu, 01 Dec 1994 16:00:00 GMT"),
+    "Expires: Thu, 01 Dec 1994 16:00:00 GMT"
+  );
+
+  // What the pass costs, pinned rather than claimed. It runs over the whole
+  // line, so a credential-shaped name=value the URL projection deliberately
+  // KEPT -- one inside a path, or inside a local save path -- is redacted
+  // too, and the value runs to the next &, whitespace, quote or angle bracket
+  // rather than to the next path separator. Two distinct clips can therefore
+  // project to one line. That is the price of a pass that decides no
+  // boundary; a token in a path segment is a real spelling, so the same
+  // behaviour is also the point of it.
+  assert.equal(
+    P.redactLogText("saved https://cdn.example/token=1/clip.mp4"),
+    "saved https://cdn.example/token=[redacted]"
+  );
+  assert.equal(
+    P.redactLogText("saved https://cdn.example/token=2/clip.mp4"),
+    "saved https://cdn.example/token=[redacted]"
+  );
+  assert.equal(
+    P.redactLogText(String.raw`saved to D:\Vids\[key=abc] Movie.mp4`),
+    String.raw`saved to D:\Vids\[key=[redacted] Movie.mp4`
+  );
+
+  // Additive: it can only remove more, never less. The format selector
+  // carries no credential-shaped name=value, so the line the widened URL
+  // match would have eaten must read exactly as it did before.
   const selector =
     "yt-dlp: requested https://site.example/watch?v=abc [bv*[height<=720]+ba/b[height<=720]]";
   assert.equal(P.redactLogText(selector), selector);
