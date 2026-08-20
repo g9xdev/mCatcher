@@ -46,10 +46,13 @@ _log_lock = threading.Lock()
 # parameters named below. Query strings on a media URL are where the signed
 # token lives; what survives (which CDN, which file, which video) is what the
 # line was worth reading for. Local save paths and everything else are kept.
-# "Matches" is about the RULES -- same names, same cap, same charset -- not
-# about byte-identical spelling: the extension parses with URL and this parses
-# with urlsplit, and the two normalise differently in corners neither line
-# depends on (a bare origin gains a trailing slash there and not here).
+# "Matches" is about the RULES -- same names, same cap, same charset, same
+# credential pattern -- not about byte-identical spelling. The extension
+# parses with URL and this parses with urlsplit, so a bare origin gains a
+# trailing slash there and not here; and where the extension falls back to a
+# manual strip on a URL its parser rejects, this fails closed to [redacted].
+# Both differences are the host redacting MORE or the same, never less, which
+# is the direction that matters for the copy a user hands over.
 # Running before the send too means the host never puts a raw URL on the wire,
 # and the extension's pass over an already-redacted line is a no-op.
 #
@@ -78,9 +81,14 @@ _URL_TAIL_PUNCT = re.compile(r"['\">.,;:!?)\]}]+$")
 # .../videoplayback line and the allowlist works only for the lines the
 # extension writes itself.
 _LOG_IDENTITY_PARAMS = ("v", "id")
-# A media id is a short plain identifier. Anything longer, or carrying a
-# separator that could nest a second query, fails closed and is dropped.
-_LOG_IDENTITY_VALUE_MAX = 64
+# A media id is a short plain identifier: YouTube's v is 11 characters,
+# googlevideo's id is 16. The cap is headroom over those, and it bounds the
+# risk rather than removing it -- [A-Za-z0-9_.~-] is also the alphabet of a
+# base64url or hex token, so a provider that spells a signed link
+# id=<signature> has that value kept. At 64 a whole hex HMAC or a 256-bit
+# base64url token fitted; at 24 neither does. A separator that could nest a
+# second query fails closed at the pattern below.
+_LOG_IDENTITY_VALUE_MAX = 24
 _LOG_IDENTITY_VALUE_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 
 # Second, independent pass: the VALUE of a credential-shaped parameter name,
@@ -91,20 +99,41 @@ _LOG_IDENTITY_VALUE_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 #
 # A blocklist, and deliberately never the only defence -- _redact_url's
 # allowlist still decides what survives of anything that parses as a URL.
-# Being additive it can only remove more, never less, so it cannot take a
-# diagnostic the projection preserves. The name must match WHOLE: a preceding
-# name character means no match, so monkey=, passwordless= and Key-Pair-Id=
-# are untouched. Alternation order is longest-first among overlapping names
-# (signature before sig, expires before expire) because first match wins.
 #
-# Mirrors media-catcher/lib/privacy.js redactCredentialValues. The two are
-# kept in step deliberately: the point of redacting here is that the disk copy
-# and the extension's copy say the same thing.
+# It is additive, so it can only remove MORE than the projection does --
+# including, sometimes, a diagnostic the projection deliberately kept. A
+# name=value inside a path is claimed like any other: /token=1/clip.mp4 and
+# /token=2/clip.mp4 both end as /token=[redacted], because the value runs to
+# the next &, whitespace, quote or angle bracket and a path separator is none
+# of those. That is a price, not an accident: a token in a path segment is a
+# real spelling, so most of what looks like a false positive is what this pass
+# is for. What it costs is pinned in the tests rather than argued away here.
+#
+# The name must match WHOLE: a preceding name character means no match, so
+# monkey=, passwordless= and Key-Pair-Id= are untouched. Alternation order is
+# longest-first among overlapping names (signature before sig, expires before
+# expire) because first match wins. A quoted value counts as a value --
+# token="S" and 'token': 'S' are both credentials -- and a ':' separator is
+# claimed only when the value is quoted, so an "Expires: Thu, 01 Dec" header
+# keeps its shape.
+#
+# Mirrors media-catcher/lib/privacy.js redactCredentialValues, down to the
+# pattern. The two are kept in step deliberately: the point of redacting here
+# is that the disk copy and the extension's copy say the same thing.
 _LOG_CREDENTIAL_VALUE = re.compile(
     r"(^|[^A-Za-z0-9_-])"
     r"(x-amz-security-token|x-amz-credential|x-amz-signature|signature|"
     r"password|expires|policy|expire|token|auth|pwd|sig|key)"
-    r"=([^&\s\"'<>]+)", re.I)
+    r"([\"']?\s*(?:=|:(?=\s*[\"']))\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^&\s\"'<>]+)", re.I)
+
+
+def _redact_one_credential(m):
+    """Replace a matched credential value, keeping the quotes it was written
+    with so the line still reads as that name's value."""
+    lead, name, sep, value = m.group(1), m.group(2), m.group(3), m.group(4)
+    quote = value[0] if value[:1] in ('"', "'") else ""
+    return "%s%s%s%s[redacted]%s" % (lead, name, sep, quote, quote)
 
 
 def _identity_query(query):
@@ -177,7 +206,7 @@ def _redact_log_text(msg):
 
     try:
         projected = _URL_IN_TEXT.sub(one, text)
-        return _LOG_CREDENTIAL_VALUE.sub(r"\1\2=[redacted]", projected)
+        return _LOG_CREDENTIAL_VALUE.sub(_redact_one_credential, projected)
     except Exception:
         return "[redacted]"
 

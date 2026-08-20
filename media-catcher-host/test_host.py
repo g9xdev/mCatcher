@@ -862,8 +862,22 @@ def test_hlog_credential_pass_catches_what_the_url_match_cannot(tmp_path, monkey
 
     # Whole-name only, and a real diagnostic the projection preserves is kept.
     for keep in ("monkey=notacredential", "passwordless=alsofine",
-                 "Key-Pair-Id=keepme", "-f bv*[height<=720]+ba"):
+                 "Key-Pair-Id=keepme", "-f bv*[height<=720]+ba",
+                 # A ':' separator is claimed only for a quoted value, so a
+                 # date-valued header keeps its shape.
+                 "Expires: Thu, 01 Dec 2050 00:00:00 GMT"):
         assert hlog._redact_log_text(keep) == keep, keep
+
+    # A quoted value is a value: excluding the quote from the value class used
+    # to let the whole line through untouched. The quotes are kept so the line
+    # still reads as that name's value.
+    assert hlog._redact_log_text('token="SECRET"') == 'token="[redacted]"'
+    assert hlog._redact_log_text("'token': 'SECRET'") == "'token': '[redacted]'"
+
+    # The cost this pass accepts, pinned rather than argued: a name=value in a
+    # PATH is claimed too, so two paths that differ only there collapse.
+    assert hlog._redact_log_text("https://a.test/token=1/clip.mp4") == \
+        "https://a.test/token=[redacted]"
 
 
 def test_hlog_keeps_the_identity_parameters_the_extension_keeps(tmp_path, monkeypatch):
@@ -902,10 +916,12 @@ def test_hlog_keeps_the_identity_parameters_the_extension_keeps(tmp_path, monkey
     # Emitted in allowlist order, so one URL is always one line whatever order
     # the site wrote its query in.
     assert r("https://a.test/w?id=two&v=one") == "https://a.test/w?v=one&id=two"
-    # The value rules are privacy.js's: 64 characters, [A-Za-z0-9_.~-], and a
-    # value outside them is dropped rather than kept.
-    assert r("https://a.test/w?v=" + "a" * 64) == "https://a.test/w?v=" + "a" * 64
-    assert r("https://a.test/w?v=" + "a" * 65) == "https://a.test/w"
+    # The value rules are privacy.js's: 24 characters, [A-Za-z0-9_.~-], and a
+    # value outside them is dropped rather than kept. 24 is headroom over the
+    # ids this exists to keep (v is 11, googlevideo's id is 16) and no longer
+    # admits a whole hex HMAC or a 256-bit base64url token.
+    assert r("https://a.test/w?v=" + "a" * 24) == "https://a.test/w?v=" + "a" * 24
+    assert r("https://a.test/w?v=" + "a" * 25) == "https://a.test/w"
     # "a%0A" is the reason the charset test is a fullmatch: Python's $ matches
     # before a trailing newline and JavaScript's does not.
     for bad in ("a/b", "a%20b", "a%0A", "a%0Ab", "a?b", ""):
