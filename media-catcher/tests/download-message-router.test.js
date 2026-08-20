@@ -3076,6 +3076,29 @@ test("buildNativeStartPayload snapshots mirrors descriptor-safely before depende
   assert.deepEqual(out.urls, [primary, mirror]);
   assert.equal(Object.isFrozen(out.urls), true);
 
+  // Only absolute http(s) mirrors reach the wire. handle_pget takes a STRLIST
+  // with no URL check and hands each entry to urllib.request.urlopen, where
+  // url2pathname maps file://////attacker.test/s/x.mp4 to an SMB path.
+  const gated = buildNativeStartPayload({
+    kind: "pget",
+    jobId: "j1",
+    attemptToken: "atk",
+    intent: saveAsIntent(),
+    url: primary,
+    mirrors: [
+      mirror,
+      "file://////attacker.test/s/x.mp4",
+      "ftp://attacker.test/x.mp4",
+      "//mirror/x.mp4",
+      "javascript:alert(1)",
+      " https://padded/x.mp4 ",
+      "https://ok.example/x.mp4",
+    ],
+    maxConnections: 2,
+    providerGeneration: 1,
+  });
+  assert.deepEqual(gated.urls, [primary, mirror, "https://ok.example/x.mp4"]);
+
   // Sparse mirrors fail generically.
   const sparse = [];
   sparse.length = 1;

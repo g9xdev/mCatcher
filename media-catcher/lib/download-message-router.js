@@ -796,8 +796,12 @@
      * Descriptor-safe mirrors snapshot for start payloads.
      * Absent → undefined. null → undefined (omit). Non-array present → generic TypeError.
      * Dense own-data entries only; sparse/accessor/hostile length → generic TypeError.
-     * Own-data blank/non-string entries are omitted (closed skip contract).
-     * Returns a fresh dense array of unique nonblank strings (no primary).
+     * Entries that are not absolute http(s) URLs are omitted (closed skip
+     * contract) — the host's handle_pget takes a STRLIST with no URL check and
+     * hands each entry to urllib.request.urlopen, where url2pathname turns a
+     * file://////host/share/x URL into an SMB open. snapshotMirrorArray already
+     * gates upstream; this is the same gate at the wire boundary.
+     * Returns a fresh dense array of unique http(s) URLs (no primary).
      */
     function snapshotOptionalMirrors(input) {
       var m = readOptionalOwnValue(input, "mirrors");
@@ -817,7 +821,7 @@
         var entry = ownData(mirrors, String(i));
         if (!entry.ok) throw genericTypeError();
         var v = entry.value;
-        if (typeof v !== "string" || !isNonblankPrimitiveString(v)) continue;
+        if (!isAbsoluteHttpUrl(v)) continue;
         if (seen[v]) continue;
         seen[v] = true;
         out.push(v);
