@@ -23,6 +23,7 @@ const policyScripts = [
   "lib/download-message-router.js",
   "lib/live-media-assembler.js",
   "lib/media-size.js",
+  "lib/beam-target.js",
   "lib/background-adapters.js",
 ];
 
@@ -71,6 +72,7 @@ function createHarness() {
   const settingsLoad = deferred();
   const nativePosts = [];
   const runtimeMessages = [];
+  const tabMessages = [];
   const controllerCreates = [];
   const handledNative = [];
   const helperDisconnects = [];
@@ -160,6 +162,13 @@ function createHarness() {
       create() { return Promise.resolve(); },
       update() { return Promise.resolve(); },
       executeScript() { return Promise.resolve(); },
+      // A message aimed at ONE content script, unlike runtime.sendMessage's
+      // broadcast to extension pages — which is the only way an answer can get
+      // back to the frame whose overlay asked for it.
+      sendMessage(tabId, message, options) {
+        tabMessages.push({ tabId, message, options });
+        return Promise.resolve();
+      },
     },
     webRequest: {
       onSendHeaders: noOpEvent(),
@@ -276,6 +285,7 @@ function createHarness() {
     nativeDisconnects,
     nativePosts,
     runtimeMessages,
+    tabMessages,
     controllerCreates,
     handledNative,
     helperDisconnects,
@@ -792,6 +802,183 @@ test("a host error naming no row is logged rather than dropped", async () => {
   assert.ok(last, "the refusal reached the log console");
   assert.equal(last.line.level, "error");
   assert.match(last.line.msg, /BadApple is not installed/);
+});
+
+// ---------------------------------------------------------------------------
+// The beam lane: the overlay's click, resolved and sent.
+//
+// The popup's BadApple button names a file this host wrote. The overlay names
+// an ADDRESS a page is playing, which is a different frame (`url`, never
+// `path` — the two are mutually exclusive on the host) and a different
+// failure mode: the address frequently does not exist, because an MSE-fed
+// <video> has a blob: currentSrc. Resolution therefore happens HERE, where the
+// tab's detected media lives; the content script never sees that list.
+// ---------------------------------------------------------------------------
+
+function beamSender(tabId, frameId) {
+  return { tab: { id: tabId, url: "https://site.example/watch" }, frameId: frameId || 0 };
+}
+
+async function seedDetected(h, tabId, item) {
+  h.sandbox.browser.runtime.onMessage.emit(
+    { type: "content-media", item }, beamSender(tabId), () => {});
+  await settle();
+  await settle();
+}
+
+async function beam(h, src, sender) {
+  let answered = null;
+  h.sandbox.browser.runtime.onMessage.emit(
+    { type: "beam-video", src }, sender, (r) => { answered = r; });
+  await settle();
+  await settle();
+  return answered;
+}
+
+async function readyHarness() {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true, badapple: true });
+  await settle();
+  return h;
+}
+
+test("a beam of the element's own address reaches the helper as a url frame", async () => {
+  const h = await readyHarness();
+  const answered = await beam(h, "https://cdn.example/progressive.mp4", beamSender(7));
+
+  const posts = h.nativePosts.filter((p) => p && p.cmd === "badapple");
+  assert.equal(posts.length, 1, "one frame reaches the helper");
+  assert.deepEqual(Object.keys(posts[0]).sort(), ["cmd", "id", "url"],
+    "a url beam names no path — the host refuses a frame carrying both");
+  assert.equal(posts[0].url, "https://cdn.example/progressive.mp4");
+  assert.ok(posts[0].id, "an id, or a refusal has nothing to come back to");
+  assert.equal(answered && answered.ok, true);
+});
+
+test("a blob: element src is answered from the tab's detected media", async () => {
+  const h = await readyHarness();
+  await seedDetected(h, 7, {
+    kind: "direct", url: "https://cdn.example/feature.mp4", ts: 5, source: "network",
+  });
+
+  const answered = await beam(h, "blob:https://site.example/9f1c", beamSender(7));
+  const posts = h.nativePosts.filter((p) => p && p.cmd === "badapple");
+  assert.equal(posts.length, 1, "the fallback found something to send");
+  assert.equal(posts[0].url, "https://cdn.example/feature.mp4");
+  assert.equal(answered && answered.ok, true);
+  assert.equal(answered.source, "detected");
+});
+
+test("a blob: with nothing detected is refused with a reason, not sent", async () => {
+  const h = await readyHarness();
+  const answered = await beam(h, "blob:https://site.example/9f1c", beamSender(7));
+
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0,
+    "a blob: never crosses the port — it means nothing outside the page");
+  assert.equal(answered && answered.ok, false);
+  assert.match(String(answered.error), /blob:/,
+    "the click is answered with why, not with silence");
+});
+
+test("another tab's detected media is never beamed into this one", async () => {
+  const h = await readyHarness();
+  await seedDetected(h, 8, { kind: "hls", url: "https://cdn.example/other-tab.m3u8", ts: 5 });
+
+  const answered = await beam(h, "blob:https://site.example/9f1c", beamSender(7));
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0);
+  assert.equal(answered && answered.ok, false);
+});
+
+test("a beam from outside a tab is refused before anything is resolved", async () => {
+  const h = await readyHarness();
+  const answered = await beam(h, "https://cdn.example/a.mp4", {});
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0);
+  assert.equal(answered && answered.ok, false);
+});
+
+test("a beam with no helper answers with an error, not silence", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  const answered = await beam(h, "https://cdn.example/a.mp4", beamSender(7));
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0);
+  assert.equal(answered && answered.ok, false);
+  assert.match(String(answered.error), /helper/i);
+});
+
+test("the beam frame carries no field a caller hoped would name a program", async () => {
+  const h = await readyHarness();
+  let answered = null;
+  const payload = "C:\\Users\\x\\Downloads\\payload.exe";
+  h.sandbox.browser.runtime.onMessage.emit({
+    type: "beam-video",
+    src: "https://cdn.example/a.mp4",
+    path: payload, exe: payload, app: payload, argv: [payload],
+  }, beamSender(7), (r) => { answered = r; });
+  await settle();
+  await settle();
+
+  const posts = h.nativePosts.filter((p) => p && p.cmd === "badapple");
+  assert.equal(posts.length, 1);
+  assert.deepEqual(Object.keys(posts[0]).sort(), ["cmd", "id", "url"]);
+  assert.equal(JSON.stringify(posts[0]).toLowerCase().includes("payload.exe"), false);
+  assert.equal(answered && answered.ok, true);
+});
+
+// The defect this lane already produced once: a refusal with no id fell out of
+// the router into silence. An id is only half the fix — the answer also has to
+// reach the FRAME that asked, and runtime.sendMessage does not go to content
+// scripts.
+test("a host refusal for a beam reaches the frame that asked for it", async () => {
+  const h = await readyHarness();
+  await beam(h, "https://cdn.example/a.mp4", beamSender(7, 3));
+  const post = h.nativePosts.filter((p) => p && p.cmd === "badapple")[0];
+
+  h.nativeMessages.emit({
+    type: "error", id: post.id,
+    error: "BadApple is not installed on this computer.",
+  });
+  await settle();
+
+  const delivered = h.tabMessages.filter(
+    (m) => m.message && m.message.type === "beam-result");
+  assert.equal(delivered.length, 1, "the refusal was routed back to the overlay");
+  assert.equal(delivered[0].tabId, 7);
+  assert.equal(delivered[0].options && delivered[0].options.frameId, 3,
+    "to the subframe that asked, not the top frame");
+  assert.equal(delivered[0].message.ok, false);
+  assert.match(delivered[0].message.error, /BadApple is not installed/);
+
+  const lines = h.runtimeMessages.filter((m) => m && m.type === "log-line");
+  assert.match(String(lines[lines.length - 1].line.msg), /BadApple is not installed/,
+    "and is still on the record in the log console");
+});
+
+test("a beam a second refusal cannot name twice is forgotten", async () => {
+  const h = await readyHarness();
+  await beam(h, "https://cdn.example/a.mp4", beamSender(7));
+  const post = h.nativePosts.filter((p) => p && p.cmd === "badapple")[0];
+
+  h.nativeMessages.emit({ type: "error", id: post.id, error: "first" });
+  await settle();
+  h.nativeMessages.emit({ type: "error", id: post.id, error: "second" });
+  await settle();
+
+  const delivered = h.tabMessages.filter(
+    (m) => m.message && m.message.type === "beam-result");
+  assert.equal(delivered.length, 1, "the pending beam is claimed once and dropped");
+
+  // A beam the helper never answers must not sit in the map forever: success
+  // is SILENT on this command, so every successful beam would otherwise leak
+  // an entry.
+  const forget = h.timers.filter((t) => t.name === "forgetBeam");
+  assert.equal(forget.length, 1, "an expiry is armed when the beam is sent");
+  assert.ok(forget[0].ms > 0);
 });
 
 test("the live controller is driven by a clock", async () => {

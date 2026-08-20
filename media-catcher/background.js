@@ -200,6 +200,26 @@ let castState = { state: "idle" };
 const pendingCastDiscover = new Map();   // reqId -> resolver, settled by "cast-devices"
 let lastCastDevices = [];                // retained list — warm picker opens answer from it instantly
 
+// ---- beaming (the content-script overlay's icon) ----
+// beamId -> { tabId, frameId, timer }. `badapple` is SILENT on success, so an
+// entry is not a request awaiting a reply — it is a return address kept only
+// long enough for a refusal to use. Without one, a host refusal names an id no
+// row matches and goes to the log console, where the person who just clicked
+// an icon on a video is not looking.
+const pendingBeams = new Map();
+const BEAM_REPLY_WINDOW_MS = 20000;
+
+// Hold a return address for one beam, and stop holding it. The expiry is not a
+// timeout on the beam — the beam is already gone — it is what keeps a map of
+// return addresses from growing by one on every SUCCESSFUL click, since a
+// success sends nothing back to release the entry.
+function rememberBeam(beamId, tabId, frameId) {
+  const entry = { tabId, frameId: Number.isInteger(frameId) ? frameId : 0 };
+  entry.timer = setTimeout(function forgetBeam() { pendingBeams.delete(beamId); },
+    BEAM_REPLY_WINDOW_MS);
+  pendingBeams.set(beamId, entry);
+}
+
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
   // "connecting to the native helper…" line — must survive the async restore.
@@ -928,12 +948,31 @@ function onLegacyNativeMessage(msg) {
     if (fb) { try { api.downloads.download({ url: fb.item.url, filename: fb.finalName, saveAs: true }); } catch (e) {} }
     return;
   }
+  // A refusal of a beam. Checked BEFORE the row lookup because a beam id is
+  // not a download id and would never match one — and because the log-console
+  // fallback below, while true, is not where someone who just clicked an icon
+  // on a video is looking. Claimed once: the entry is deleted here, so a
+  // second frame carrying the same id falls through to the log like any other.
+  if (msg.type === "error" && pendingBeams.has(msg.id)) {
+    const beam = pendingBeams.get(msg.id);
+    pendingBeams.delete(msg.id);
+    if (beam.timer) clearTimeout(beam.timer);
+    const text = String(msg.error == null ? "BadApple could not play that." : msg.error);
+    pushLog({ ts: Date.now(), level: "error", src: "host", msg: text });
+    // tabs.sendMessage, not broadcast(): runtime.sendMessage from here reaches
+    // extension pages, never a content script.
+    try {
+      api.tabs.sendMessage(beam.tabId, { type: "beam-result", ok: false, error: text },
+        Number.isInteger(beam.frameId) ? { frameId: beam.frameId } : undefined);
+    } catch (e) { /* the frame is gone; the log line above still stands */ }
+    return;
+  }
   const dl = activeDownloads.get(msg.id);
-  // A host error that names no live row. `open`, `reveal` and `badapple` are
-  // sent without an id, so a refusal from any of them — a suffix outside
-  // MEDIA_EXTS, a file that has since been moved, BadApple not installed —
-  // arrives with nothing to attach to and fell off here into silence. The log
-  // console is somewhere the user can actually read it.
+  // A host error that names no live row. `open`, `reveal` and the popup's
+  // `badapple` are sent without an id, so a refusal from any of them — a
+  // suffix outside MEDIA_EXTS, a file that has since been moved, BadApple not
+  // installed — arrives with nothing to attach to and fell off here into
+  // silence. The log console is somewhere the user can actually read it.
   if (!dl && msg.type === "error") {
     pushLog({ ts: Date.now(), level: "error", src: "host",
       msg: String(msg.error == null ? "Helper error" : msg.error) });
@@ -3597,6 +3636,35 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "reveal-file") {
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "reveal", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "beam-video") {
+        // The content-script overlay's icon. It reports the element's own src
+        // and nothing else; WHICH address is beamed is decided here, because
+        // the fallback for an MSE-fed <video> is the tab's detected media and
+        // that list never leaves the background (see lib/beam-target.js for
+        // the ordering and why it is that way round).
+        if (!sender.tab || !Number.isInteger(sender.tab.id)) {
+          sendResponse({ ok: false, error: "This video is not in a tab Media Catcher can read." });
+        } else {
+          const target = self.McBeamTarget.resolveBeamTarget({
+            elementSrc: typeof msg.src === "string" ? msg.src : "",
+            items: visibleFor(sender.tab.id),
+          });
+          if (!target.ok) {
+            sendResponse({ ok: false, error: target.error });
+          } else if (!nativePort || !nativeReady) {
+            sendResponse({ ok: false, error: "Beaming needs the native helper — install or enable it first." });
+          } else {
+            // `url`, never `path`: the two are mutually exclusive on the host
+            // and a frame carrying both is refused. The id is what a refusal
+            // comes back on — an id-less error frame is a click that did
+            // nothing with no way to say so.
+            const beamId = "beam" + (++downloadCounter);
+            nativePort.postMessage({ cmd: "badapple", id: beamId, url: target.url });
+            rememberBeam(beamId, sender.tab.id, sender.frameId);
+            mclog("info", "beam: " + target.url + " → BadApple");
+            sendResponse({ ok: true, url: target.url, source: target.source });
+          }
+        }
       } else if (msg.type === "open-in-badapple") {
         // Only the file crosses the port. The helper decides which executable
         // BadApple is; naming one from here is the arbitrary-execution hole
