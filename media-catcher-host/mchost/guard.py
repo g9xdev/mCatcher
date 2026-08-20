@@ -135,10 +135,14 @@ MESSAGE_SCHEMA = {
     "pickFolder": {"requestId": ID, "reqId": ID, "dir": STR},
     "open": {"id": ID, "path": STR},
     "reveal": {"id": ID, "path": STR},
-    # Same two fields as open/reveal, and deliberately no third: the program
-    # BadApple runs is chosen by the host (tools.find_badapple), so there is
-    # no executable for a caller to name here.
-    "badapple": {"id": ID, "path": STR},
+    # Two SOURCES, mutually exclusive, and deliberately no program: the
+    # executable BadApple runs is chosen by the host (tools.find_badapple), so
+    # there is no field for a caller to name one. `path` is a saved file
+    # (refuse_open's allowlist); `url` is an address the overlay read off a
+    # playing <video> (refuse_url, the same predicate the downloader uses).
+    # Mutual exclusion is enforced in the handler, not here: this table types
+    # fields, it does not express relations between them.
+    "badapple": {"id": ID, "path": STR, "url": STR},
     "update": {"extDir": STR, "zipDir": STR, "profileDir": STR, "silent": BOOL},
     "watch": {"enable": BOOL, "extDir": STR, "zipDir": STR},
     "checkGithub": {"auto": BOOL, "force": BOOL, "extDir": STR, "zipDir": STR,

@@ -32,11 +32,15 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
       # ytdl legacy path; the ytdl structured (Save As) path still creates
       # missing components by handle on purpose -- see
       # guard.resolve_existing_dir.
-    {"cmd":"badapple","path":P}    # open a saved file in the BadApple player
-      # Same MEDIA_EXTS allowlist as "open". The message names the FILE only;
-      # the host locates BadApple itself (mchost.tools.find_badapple), so no
-      # field here can choose which program runs. Answers with an error frame
-      # when BadApple is not installed.
+    {"cmd":"badapple","path":P}    # play a saved file in the BadApple player
+    {"cmd":"badapple","url":U}     # or beam an address a page is playing
+      # Exactly ONE source per frame: "path" and "url" are mutually exclusive
+      # and a frame carrying both, or neither, is refused. A path goes through
+      # the same MEDIA_EXTS allowlist as "open"; a url goes through
+      # guard.refuse_url (http(s), a host, no padding or control characters)
+      # and is never stat'd. Neither names a PROGRAM: the host locates BadApple
+      # itself (mchost.tools.find_badapple). Answers with an error frame,
+      # carrying the request id, when BadApple is not installed.
     {"cmd":"update","extDir":D,"zipDir":D?,"profileDir":D?}  # self-update from a packaged zip
     {"cmd":"watch","enable":bool,"extDir":D?,"zipDir":D?}    # auto-install when a package appears
     {"cmd":"checkGithub","auto":bool?,"extDir":D?,"zipDir":D?}  # pull the latest GitHub release

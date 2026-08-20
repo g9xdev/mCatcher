@@ -1039,16 +1039,35 @@ def handle_reveal(req):
 
 
 def handle_badapple(req):
-    """Open a saved file in BadApple (popup "Open in BadApple" button).
+    """Play something in BadApple: a saved file, or an address off a page.
 
     Two halves, and only one of them comes from the extension.
 
-    THE FILE is caller-supplied, so it goes through the SAME guard.refuse_open
-    allowlist as `open` and `reveal`. Refusal precedes the stat for the same
-    reason it does there — a refused path is never probed for existence on the
-    caller's behalf.
+    THE SOURCE is caller-supplied and arrives as exactly one of two fields.
+    `path` is the popup's "Open in BadApple" on a file this host wrote; `url`
+    is the content-script overlay's beam of a video a page is playing. They
+    are MUTUALLY EXCLUSIVE and a frame carrying both is refused rather than
+    resolved: picking an arm would make which gate ran depend on a precedence
+    nobody wrote down, and the two gates guard different dangers.
 
-    That allowlist is deliberately NOT intersected with the narrower set of
+    A PATH goes through the SAME guard.refuse_open allowlist as `open` and
+    `reveal`. Refusal precedes the stat for the same reason it does there — a
+    refused path is never probed for existence on the caller's behalf.
+
+    A URL goes through guard.refuse_url, the predicate yt-dlp's lane already
+    uses: http(s) only, a host required, no padding and no control characters,
+    and nothing dash-leading. It is NOT stat'd — a URL is not a path, and the
+    isfile() gate below would answer "file not found" for every one of them.
+    Reusing that one predicate rather than writing a second is deliberate: two
+    URL rules are free to drift, and drift in the permissive direction is a
+    hole. Scheme, host and shape is the WHOLE of what this host checks about a
+    URL: it does not fetch it, does not resolve it, and cannot tell a stream
+    from a web page. BadApple's engine applies its own gate to whatever
+    arrives over --beam (engine._beam_refusal accepts an http(s) URL or a file
+    on its own disks and refuses the rest by name), so neither side is
+    relying on the other to have looked.
+
+    THE PATH allowlist is deliberately NOT intersected with the narrower set of
     suffixes BadApple itself accepts (.mp4 .mkv .avi .mov .webm .m4v .ts .wmv
     .flv .iso). MEDIA_EXTS is the security boundary and it is a superset here
     in every direction that matters: it admits no suffix BadApple's list would
@@ -1061,43 +1080,68 @@ def handle_badapple(req):
     for a file the helper did not write.
 
     THE PROGRAM is not caller-supplied at all. find_badapple reads a fixed
-    list compiled into the host; no field of `req` reaches the argv, and the
-    schema lists only `id` and `path` as fields this handler reads. An argv
-    list with shell=False is the same spawn discipline every other subprocess
-    here uses: nothing is parsed as a command line, so a path with a space or
-    a quote in it is one argument.
+    list compiled into the host; no field of `req` reaches argv[0], and the
+    schema lists only `id`, `path` and `url` as fields this handler reads. An
+    argv list with shell=False is the same spawn discipline every other
+    subprocess here uses: nothing is parsed as a command line, so a path with
+    a space or a quote in it is one argument.
 
-    `--beam` is BadApple's own flag for this: a second launch hands the path
+    `--beam` is BadApple's own flag for this: a second launch hands the source
     to the instance already running over its single-instance channel and
     exits, so clicking the button twice does not open a second window.
 
-    On a worker, like handle_open and handle_reveal: the isfile() is a stat on
-    a caller-supplied path, and one on a dead network share blocks for as long
-    as the SMB timeout takes. Shares no state with any other handler.
+    On a worker, like handle_open and handle_reveal: the file arm's isfile()
+    is a stat on a caller-supplied path, and one on a dead network share
+    blocks for as long as the SMB timeout takes. Shares no state with any
+    other handler.
+
+    EVERY refusal below carries req["id"]. The extension's router looks a
+    frame's id up against its live rows and drops what it cannot place, so an
+    id-less error is a click that did nothing with no way to say so.
     """
     def worker():
+        def refuse(reason):
+            _h().send({"type": "error", "id": req.get("id"), "error": reason})
+
         path = req.get("path")
-        refusal = guard.refuse_open(path)
-        if refusal:
-            _h().send({"type": "error", "id": req.get("id"), "error": refusal})
+        url = req.get("url")
+        # null reads the same as absent everywhere else on this port
+        # (guard._check_fields), so "given" is "not None" here too.
+        if path is not None and url is not None:
+            refuse("refused: name a file or an address to beam, not both")
             return
-        if not os.path.isfile(path):
-            _h().send({"type": "error", "id": req.get("id"),
-                       "error": "file not found: %s" % path})
+        if path is None and url is None:
+            refuse("refused: name a file or an address to beam — "
+                   "this frame named neither")
             return
+
+        if url is not None:
+            refusal = guard.refuse_url(url)
+            if refusal:
+                refuse(refusal)
+                return
+            target = url
+        else:
+            refusal = guard.refuse_open(path)
+            if refusal:
+                refuse(refusal)
+                return
+            if not os.path.isfile(path):
+                refuse("file not found: %s" % path)
+                return
+            target = path
+
         app = find_badapple()
         if not app:
             # Named, so the popup can tell the user what is missing rather than
             # showing a button that did nothing.
-            _h().send({"type": "error", "id": req.get("id"),
-                       "error": "BadApple is not installed on this computer."})
+            refuse("BadApple is not installed on this computer.")
             return
         cf, si = _no_window()
         try:
-            subprocess.Popen([app, "--beam", path], creationflags=cf, startupinfo=si)
+            subprocess.Popen([app, "--beam", target], creationflags=cf, startupinfo=si)
         except Exception as e:
-            _h().send({"type": "error", "id": req.get("id"),
-                       "error": "BadApple failed to start: %s" % e})
+            refuse("BadApple failed to start: %s" % e)
     threading.Thread(target=worker, daemon=True).start()
 
 

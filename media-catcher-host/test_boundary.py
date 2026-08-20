@@ -250,9 +250,10 @@ def test_refuse_open_covers_the_windows_shapes(tmp_path):
 # assertions below check position 0 specifically.
 # ---------------------------------------------------------------------------
 
-def test_badapple_is_typed_like_open_and_reveal():
-    assert guard.MESSAGE_SCHEMA["badapple"] == {"id": guard.ID, "path": guard.STR}, \
-        "badapple takes a correlation id and a file path — nothing else is read"
+def test_badapple_is_typed_like_open_and_reveal_plus_a_url():
+    assert guard.MESSAGE_SCHEMA["badapple"] == {
+        "id": guard.ID, "path": guard.STR, "url": guard.STR,
+    }, "badapple takes a correlation id and ONE source — a file path or a URL"
 
 
 def _fake_badapple(monkeypatch, tmp_path, installed=True):
@@ -381,6 +382,160 @@ def test_badapple_not_installed_answers_with_an_error(monkeypatch, tmp_path):
     assert sent[0].get("type") == "error" and sent[0].get("id") == "b4", sent
     assert "badapple" in sent[0].get("error", "").lower(), \
         "the UI can say what is missing"
+
+
+# ---------------------------------------------------------------------------
+# 2c. `badapple` — the URL arm
+#
+# The overlay beams what a page is PLAYING, and that is an address, not a file
+# this host wrote. So `badapple` grew a second, mutually exclusive source.
+#
+# The two arms are gated by different predicates because they are different
+# dangers. A path becomes a ShellExecuteW/argv target on this machine's disk,
+# so it goes through refuse_open's MEDIA_EXTS allowlist. A URL never touches
+# the disk; what it can do is choose a SCHEME, and yt-dlp's lane already
+# learned what that buys (guard.refuse_url's docstring). Reusing that one
+# predicate is the point: a second URL list here would be free to drift from
+# the one the downloader uses, and drift in the permissive direction is a hole.
+# ---------------------------------------------------------------------------
+
+def test_badapple_beams_an_http_url_and_never_stats_it(monkeypatch, tmp_path):
+    """A URL is spawned as-is. It is not a path, so the isfile() gate that
+    guards the file arm must not run on it — if it did, every URL would answer
+    "file not found" instead of reaching BadApple."""
+    app = _fake_badapple(monkeypatch, tmp_path)
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    url = "https://cdn.example/live/master.m3u8?token=SIGNED"
+    mc.handle_badapple({"id": "u1", "url": url})
+    assert wait_for(lambda: bool(ran), timeout=2.0), "BadApple was spawned for the URL"
+    assert sent == [], "a well-formed http(s) URL drew no refusal"
+    argv, kwargs = ran[0]
+    assert argv[0] == [app, "--beam", url], argv
+    assert kwargs.get("shell") is not True, "argv list, never a shell string"
+
+
+def test_badapple_url_arm_is_guard_refuse_url_and_not_a_second_list(monkeypatch, tmp_path):
+    """Pinned by substitution: the handler must ASK guard.refuse_url rather
+    than re-deciding what a URL is. Swap the predicate and the answer changes."""
+    _fake_badapple(monkeypatch, tmp_path)
+    ran, sent, asked = [], [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(guard, "refuse_url",
+                        lambda u: (asked.append(u), "refused: sentinel")[1])
+
+    mc.handle_badapple({"id": "u2", "url": "https://cdn.example/clip.mp4"})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert asked == ["https://cdn.example/clip.mp4"], asked
+    assert ran == [], "the substituted refusal stopped the spawn"
+    assert sent[0].get("error") == "refused: sentinel", sent
+
+
+def test_badapple_refuses_every_url_shape_that_is_not_http(monkeypatch, tmp_path):
+    """blob: is the one the overlay meets daily — an MSE-fed <video> has a
+    blob: currentSrc, which means nothing outside the page that minted it."""
+    _fake_badapple(monkeypatch, tmp_path)
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    refused = [
+        "blob:https://site.example/2f1c-4a",
+        "file:///C:/Windows/System32/calc.exe",
+        "ftp://host/x.mp4",
+        "javascript:alert(1)",
+        "data:video/mp4;base64,AAAA",
+        "\\\\attacker\\share\\clip.mp4",
+        "https://",                       # no host
+        " https://cdn.example/a.mp4",     # padded: what is checked is not what ships
+        "https://cdn.example/a\tb.mp4",   # control character
+        "--exec=calc.exe",                # dash-leading: an option, not an address
+    ]
+    for i, bad in enumerate(refused):
+        sent.clear()
+        mc.handle_badapple({"id": "u%d" % i, "url": bad})
+        assert wait_for(lambda: bool(sent), timeout=2.0), "answered for %r" % (bad,)
+        assert sent[0].get("type") == "error", (bad, sent)
+        assert sent[0].get("id") == "u%d" % i, \
+            "the refusal carries the request id, or the popup never sees it"
+        # Every refuse_url message names the ADDRESS. Requiring that here is
+        # what makes this test able to fail before the url arm exists: without
+        # it the frame falls into the file arm and answers "no file path
+        # given", which is a true sentence about the wrong field.
+        assert "address" in sent[0].get("error", "").lower(), (bad, sent)
+    assert ran == [], "nothing was spawned for any of them"
+
+
+def test_badapple_refuses_a_frame_naming_both_a_file_and_a_url(monkeypatch, tmp_path):
+    """Mutually exclusive, and refused rather than silently preferring one.
+    A frame carrying both is a caller that does not know what it is asking
+    for; picking an arm for it would make which gate ran depend on an
+    ordering nobody wrote down."""
+    _fake_badapple(monkeypatch, tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\0")
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "u7", "path": str(clip), "url": "https://cdn.example/a.mp4"})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "nothing was spawned"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "u7", sent
+    assert "refus" in sent[0].get("error", "").lower(), sent
+
+
+def test_badapple_refuses_a_frame_naming_neither(monkeypatch, tmp_path):
+    _fake_badapple(monkeypatch, tmp_path)
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "u8"})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "nothing was spawned"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "u8", sent
+    # Names both arms. The pre-url handler answered "no file path given",
+    # which stops being the whole truth once a URL is also a way to ask.
+    reason = sent[0].get("error", "").lower()
+    assert "file" in reason and "address" in reason, sent
+
+
+def test_badapple_url_arm_still_cannot_choose_the_program(monkeypatch, tmp_path):
+    """The same assertion the file arm carries, repeated for the new arm: a
+    second entry point into one Popen is a second chance to reach argv[0]."""
+    app = _fake_badapple(monkeypatch, tmp_path)
+    payload = str(tmp_path / "payload.exe")
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({
+        "id": "u10", "url": "https://cdn.example/a.mp4",
+        "exe": payload, "app": payload, "player": payload, "command": payload,
+        "argv": [payload], "cwd": str(tmp_path), "shell": True,
+    })
+    assert wait_for(lambda: bool(ran), timeout=2.0), "BadApple was spawned"
+    argv, kwargs = ran[0]
+    assert argv[0][0] == app, "the host chose the program, not the message"
+    assert not any("payload.exe" in str(part) for part in argv[0]), argv
+    assert kwargs.get("shell") is not True
+
+
+def test_badapple_url_arm_answers_when_badapple_is_not_installed(monkeypatch, tmp_path):
+    _fake_badapple(monkeypatch, tmp_path, installed=False)
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "u11", "url": "https://cdn.example/a.mp4"})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "nothing was spawned"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "u11", sent
+    assert "badapple" in sent[0].get("error", "").lower()
 
 
 def test_find_badapple_reads_only_host_owned_candidates(monkeypatch, tmp_path):
