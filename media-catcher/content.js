@@ -1134,9 +1134,11 @@
     // The beam overlay
     //
     // An icon in the top-right corner of a video that is PLAYING; clicking it
-    // asks the background to beam that video to BadApple. This runs in every
-    // frame content.js already runs in, so a player in a subframe is covered
-    // by that frame's own copy — nothing here reaches across a frame boundary.
+    // asks the background to beam that video to BadApple. content.js runs in
+    // every frame, but the icon is drawn only in the TOP frame and in
+    // same-origin children — see beamFrameAllowed for why, and for what a
+    // cross-origin frame could otherwise do on its own. Nothing here reaches
+    // across a frame boundary either way.
     //
     // WHAT THE PAGE CAN DO TO IT, and what stops that:
     //   - restyle it. Everything visible lives in a CLOSED shadow root, which
@@ -1190,6 +1192,39 @@
     // either. A player in a closed root therefore gets no icon, and this
     // claims nothing more.
     // =====================================================================
+
+    // Which frames may show an icon.
+    //
+    // content.js runs in every frame because DETECTION needs to: media lives
+    // in subframes, and a frame that finds a stream still reports it. The
+    // overlay does not follow it there. A 300x135-and-up ad slot clears
+    // BEAM_MIN_W/H, so a hostile third-party frame would otherwise supply the
+    // video, the address AND the click target by itself — no cross-frame
+    // injection required, no other party involved. Narrowing the icon to
+    // frames the top page vouches for removes that chain; it costs an icon on
+    // a cross-origin embedded player, which the popup still covers.
+    //
+    // Same-origin children keep it: an <iframe> of the same site IS the site.
+    // The test is the browser's own — reading `top.location` across an origin
+    // boundary throws SecurityError, and the throw IS the answer. The
+    // differing-origin arm is checked as well rather than relying on the
+    // throw, so an object that merely looks like a Location does not pass.
+    //
+    // Chosen by the owner on 2026-08-20 over "everywhere it can attach",
+    // which was picked before the ad-slot chain was known.
+    function beamFrameAllowed() {
+      try {
+        var top = root.top;
+        if (!top || top === root) return true;
+        var mine = root.location && root.location.origin;
+        var theirs = top.location && top.location.origin;
+        return typeof mine === "string" && !!mine && mine === theirs;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    var beamAllowedHere = beamFrameAllowed();
 
     var beamOverlays = new Map();     // video element -> record
     var beamRootsCache = null;
@@ -1716,6 +1751,7 @@
     }
 
     function syncBeamOverlays() {
+      if (!beamAllowedHere) return;
       if (!documentRef) return;
       var now = Date.now();
       var deep = (now - beamDeepAt) >= BEAM_DEEP_MS;

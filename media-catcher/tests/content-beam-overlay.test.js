@@ -618,6 +618,81 @@ test("an ordinary wrapper does not cost the video its icon", async () => {
   assert.equal(containers(root).length, 1);
 });
 
+// ---------------------------------------------------------------------------
+// Which frames may show an icon
+//
+// content.js runs in EVERY frame, because detection needs to — media lives in
+// subframes. The overlay does not follow it there. A 300x250 ad slot clears
+// BEAM_MIN_W/H, so a hostile third-party frame supplies the video, the address
+// and the click target by itself, with nothing to inject across a frame
+// boundary and no other party involved.
+// ---------------------------------------------------------------------------
+
+function subframe(opts) {
+  // A root whose window.top is somebody else's. Reading `top.location` across
+  // an origin boundary THROWS in a browser rather than returning a different
+  // string, so the throwing case is the one that matters; the differing-origin
+  // case is kept as a second arm because a predicate that only handles the
+  // throw would pass a same-origin-looking object that is not one.
+  const root = makeRoot();
+  const o = opts || {};
+  if (o.throws) {
+    root.top = { get location() { throw new Error("SecurityError: Blocked a frame with origin"); } };
+  } else if (o.otherOrigin) {
+    root.top = { location: { origin: "https://ads.example" } };
+  } else {
+    root.top = { location: { origin: root.location.origin } };
+  }
+  return root;
+}
+
+for (const [name, opts] of [
+  ["that cannot read its top at all", { throws: true }],
+  ["whose top is a different origin", { otherOrigin: true }],
+]) {
+  test("a subframe " + name + " gets no icon", async () => {
+    const root = subframe(opts);
+    root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/ad.mp4" }));
+    await installed(root);
+
+    assert.equal(containers(root).length, 0,
+      "a frame the top page did not vouch for supplies no beam target");
+    assert.equal(root._rafs.length, 0,
+      "and costs no per-frame loop either");
+  });
+}
+
+test("a same-origin child frame still gets an icon", async () => {
+  // An <iframe> of the same site IS the site. Withholding the icon here would
+  // take it away from ordinary players, which is the cost this narrowing is
+  // meant to avoid paying.
+  const root = subframe();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  assert.equal(containers(root).length, 1);
+});
+
+test("a top frame is not mistaken for a subframe of itself", async () => {
+  // makeRoot sets root.top === root, which is what a browser reports for the
+  // top frame. The positive control for the three above.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  assert.equal(containers(root).length, 1);
+});
+
+test("a subframe still detects media even though it shows no icon", async () => {
+  // The narrowing is the OVERLAY's, not the content script's. Detection is why
+  // all_frames is on, and a frame that may not draw an icon must still report
+  // what it is playing, or the popup loses media it used to find.
+  const root = subframe({ throws: true });
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/ad.mp4" }));
+  await installed(root);
+  assert.equal(containers(root).length, 0);
+  assert.ok(root._messages.length > 0,
+    "the frame still talks to the background about what it found");
+});
+
 test("a video inside an open shadow root is reached", async () => {
   const root = makeRoot();
   const host = root.document.createElement("media-player");

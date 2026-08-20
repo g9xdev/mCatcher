@@ -78,6 +78,62 @@
   // newlines before it reports a scheme, so a string that parses clean is not
   // the string that would travel.
   // ------------------------------------------------------------------------
+  // Does this hostname name THIS machine, or the network it sits on?
+  //
+  // The host spawns a player that fetches the address outside the browser,
+  // where no origin policy applies, so a page picking the address can reach
+  // what the page itself cannot: a service on loopback, a router admin page,
+  // a cloud metadata endpoint. All three were measured accepted before this.
+  //
+  // HONEST LIMIT — this refuses ADDRESSES, not destinations. A NAME that
+  // resolves into one of these ranges is not caught: a content script cannot
+  // resolve names, and resolving them in the host would be a different check
+  // at a different moment from the one that connects. What it removes is the
+  // class that needs no DNS at all, which is the class a page can use on its
+  // own. It is not a claim that a beam can only reach the public internet.
+  //
+  // Unreadable is refused, not allowed: a hostname this cannot parse is a
+  // hostname this cannot vouch for.
+  function beamHostIsInternal(hostname) {
+    if (typeof hostname !== "string" || !hostname) return true;
+    var h = hostname.toLowerCase();
+
+    // RFC 6761 reserves `localhost` and everything under it to the loopback
+    // interface, so unlike other names it is decidable without resolving.
+    if (h === "localhost" || h.slice(-10) === ".localhost") return true;
+
+    if (h.charAt(0) === "[" || h.indexOf(":") >= 0) {
+      var v6 = h.replace(/^\[/, "").replace(/\]$/, "");
+      if (v6 === "::1" || v6 === "::") return true;
+      if (/^fe[89ab]/.test(v6)) return true;          // fe80::/10 link-local
+      if (/^f[cd]/.test(v6)) return true;             // fc00::/7 unique local
+      if (v6.indexOf("::ffff:") === 0) {
+        // IPv4-mapped. URL() rewrites ::ffff:127.0.0.1 as ::ffff:7f00:1, so
+        // both spellings have to be read or the normalised one walks through.
+        var rest = v6.slice(7);
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(rest)) return beamHostIsInternal(rest);
+        var hex = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        if (hex) {
+          var hi = parseInt(hex[1], 16), lo = parseInt(hex[2], 16);
+          return beamHostIsInternal([hi >> 8, hi & 255, lo >> 8, lo & 255].join("."));
+        }
+        return true;
+      }
+      return false;
+    }
+
+    var q = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!q) return false;                              // an ordinary name
+    var a = Number(q[1]), b = Number(q[2]);
+    if (a === 127) return true;                        // loopback
+    if (a === 0) return true;                          // "this network"
+    if (a === 10) return true;                         // RFC1918
+    if (a === 192 && b === 168) return true;           // RFC1918
+    if (a === 172 && b >= 16 && b <= 31) return true;  // RFC1918
+    if (a === 169 && b === 254) return true;           // link-local + metadata
+    return false;
+  }
+
   function beamableUrl(value) {
     if (typeof value !== "string" || !value) return "";
     if (value !== value.trim()) return "";
@@ -90,6 +146,7 @@
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
     if (!parsed.host) return "";
+    if (beamHostIsInternal(parsed.hostname)) return "";
     return value;
   }
 

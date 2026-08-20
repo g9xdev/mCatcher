@@ -500,6 +500,90 @@ def test_badapple_url_arm_is_guard_refuse_url_and_not_a_second_list(monkeypatch,
     assert sent[0].get("error") == "refused: sentinel", sent
 
 
+# ---------------------------------------------------------------------------
+# The beam arm's SECOND gate: where a beam may point.
+#
+# refuse_url answers "is this a URL yt-dlp may be handed". It does not answer
+# "should this host fetch it", and for the beam arm those differ: the overlay's
+# address comes from a PAGE, and the fetch happens outside the browser where no
+# origin policy applies. Loopback services, router admin pages and the cloud
+# metadata endpoint were all measured accepted before this gate.
+#
+# Deliberately NOT in refuse_url, which the yt-dlp download lane shares. That
+# lane is reached from the popup by a person who picked the address; the beam
+# arm is reached by a page. Widening refuse_url would change a lane nobody
+# asked to change -- the scoping is pinned by its own test below.
+#
+# HONEST LIMIT: addresses, not destinations. A NAME resolving into one of these
+# ranges is not caught, because resolving it here would be a different check at
+# a different time from the one that connects.
+# ---------------------------------------------------------------------------
+
+BEAM_INSIDE_THIS_MACHINE = [
+    'http://127.0.0.1:8080/admin',
+    'http://localhost:8080/x.mp4',
+    'http://sub.localhost/x.mp4',
+    'http://0.0.0.0/x.mp4',
+    'http://10.0.0.5/x.mp4',
+    'http://172.16.4.4/x.mp4',
+    'http://172.31.255.255/x.mp4',
+    'http://192.168.1.1/setup.mp4',
+    'http://169.254.169.254/latest/meta-data/',
+    'https://169.254.169.254/latest/meta-data/',
+    'http://[::1]:8080/x.mp4',
+    'http://[fe80::1]/x.mp4',
+    'http://[fc00::1]/x.mp4',
+]
+
+
+def test_badapple_url_arm_refuses_an_address_inside_this_machine(monkeypatch, tmp_path):
+    _fake_badapple(monkeypatch, tmp_path)
+    for i, url in enumerate(BEAM_INSIDE_THIS_MACHINE):
+        ran, sent = [], []
+        monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+        monkeypatch.setattr(mc, "send", sent.append)
+        rid = "n%d" % i
+        mc.handle_badapple({"id": rid, "url": url})
+        assert wait_for(lambda: bool(sent), timeout=2.0), url
+        assert ran == [], "nothing was spawned for %s" % url
+        assert sent[0].get("type") == "error", (url, sent)
+        assert sent[0].get("id") == rid, (url, sent)
+
+
+def test_badapple_url_arm_still_beams_an_ordinary_public_address(monkeypatch, tmp_path):
+    """The positive control. A gate that refused everything would satisfy every
+    assertion above while shipping a feature that does nothing."""
+    app = _fake_badapple(monkeypatch, tmp_path)
+    for i, url in enumerate([
+        "https://cdn.example/a.mp4",
+        "http://cdn.example:8080/a.mp4",
+        "https://172.32.0.1/a.mp4",       # just outside 172.16/12
+        "https://11.0.0.1/a.mp4",         # just outside 10/8
+        "https://192.169.0.1/a.mp4",      # just outside 192.168/16
+        "https://169.253.0.1/a.mp4",      # just outside 169.254/16
+    ]):
+        ran, sent = [], []
+        monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+        monkeypatch.setattr(mc, "send", sent.append)
+        mc.handle_badapple({"id": "p%d" % i, "url": url})
+        assert wait_for(lambda: bool(ran), timeout=2.0), url
+        assert sent == [], (url, sent)
+        assert ran[0][0][0] == [app, "--beam", url], ran
+
+
+def test_the_download_lane_is_deliberately_left_alone():
+    """The scoping decision, recorded as behaviour.
+
+    The owner chose (2026-08-20) to gate the BEAM arm only. yt-dlp's lane
+    already accepts these addresses and is reached from the popup by a person
+    who picked one -- a self-hosted server on the LAN is a legitimate download
+    target. If someone later widens refuse_url, this test is what tells them
+    they changed a second lane, rather than a bug report six months on.
+    """
+    for url in BEAM_INSIDE_THIS_MACHINE:
+        assert guard.refuse_url(url) is None,             "refuse_url still admits %s; the beam gate is a separate one" % url
+
+
 def test_badapple_refuses_every_url_shape_that_is_not_http(monkeypatch, tmp_path):
     """blob: is the one the overlay meets daily — an MSE-fed <video> has a
     blob: currentSrc, which means nothing outside the page that minted it."""

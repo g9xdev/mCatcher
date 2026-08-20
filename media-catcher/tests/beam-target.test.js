@@ -245,3 +245,78 @@ test("junk in never throws and never selects", () => {
   assert.equal(out.ok, true);
   assert.equal(out.url, "https://ok.example/a.m3u8");
 });
+
+// ---------------------------------------------------------------------------
+// Where a beam may point
+//
+// The host spawns a player that FETCHES the address, outside the browser,
+// where no origin policy applies. A page choosing that address can therefore
+// reach things the page itself cannot: a router admin page, a service bound to
+// loopback, a cloud metadata endpoint.
+//
+// Scoped to the BEAM arm on purpose. The yt-dlp download lane already accepts
+// these addresses and is deliberately left alone -- it is reached from the
+// popup by a person who typed or picked it, not from a page's own <video>.
+//
+// HONEST LIMIT: this refuses ADDRESSES, not destinations. A hostname that
+// resolves into one of these ranges (localtest.me, a DNS record an attacker
+// controls) is not caught, because a content script cannot resolve names and
+// resolving them host-side would be a different check at a different time from
+// the one that connects. What it removes is the whole class that needs no DNS
+// at all, which is the class a page can use directly.
+// ---------------------------------------------------------------------------
+
+const INSIDE_THIS_MACHINE = [
+  "http://127.0.0.1:8080/admin",
+  "http://127.9.9.9/x.mp4",
+  "http://localhost:8080/x.mp4",
+  "http://LocalHost/x.mp4",
+  "http://sub.localhost/x.mp4",
+  "http://0.0.0.0/x.mp4",
+  "http://10.0.0.5/x.mp4",
+  "http://172.16.4.4/x.mp4",
+  "http://172.31.255.255/x.mp4",
+  "http://192.168.1.1/setup.mp4",
+  "http://169.254.169.254/latest/meta-data/",
+  "https://169.254.169.254/latest/meta-data/",
+  "http://[::1]:8080/x.mp4",
+  "http://[fe80::1]/x.mp4",
+  "http://[fc00::1]/x.mp4",
+  "http://[::ffff:127.0.0.1]/x.mp4",
+];
+
+for (const url of INSIDE_THIS_MACHINE) {
+  test("a beam may not point at " + url, () => {
+    const { beamableUrl } = load();
+    assert.equal(beamableUrl(url), "", url);
+  });
+}
+
+test("an ordinary public address is still beamable", () => {
+  // The positive control. A refusal list that refused everything would pass
+  // every assertion above and ship a feature that does nothing.
+  const { beamableUrl } = load();
+  for (const url of [
+    "https://cdn.example/a.mp4",
+    "http://cdn.example:8080/a.mp4",
+    "https://172.32.0.1/a.mp4",        // just outside 172.16/12
+    "https://11.0.0.1/a.mp4",          // just outside 10/8
+    "https://192.169.0.1/a.mp4",       // just outside 192.168/16
+    "https://169.253.0.1/a.mp4",       // just outside 169.254/16
+  ]) {
+    assert.equal(beamableUrl(url), url, url);
+  }
+});
+
+test("a refused address never reaches the caller as a target", () => {
+  // beamableUrl is the predicate; this is the behaviour that depends on it.
+  const { resolveBeamTarget } = load();
+  const out = resolveBeamTarget({
+    elementSrc: "http://169.254.169.254/latest/meta-data/",
+    items: [],
+  });
+  assert.equal(out.ok, false);
+  assert.equal(typeof out.error, "string");
+  assert.ok(out.error.length > 0, "a refusal names itself");
+});
+

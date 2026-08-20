@@ -1116,7 +1116,10 @@ def handle_badapple(req):
             return
 
         if url is not None:
-            refusal = guard.refuse_url(url)
+            # refuse_beam_url, not refuse_url: it asks refuse_url first and
+            # then adds the where-may-a-beam-point gate. The download lane
+            # keeps refuse_url alone, on purpose.
+            refusal = guard.refuse_beam_url(url)
             if refusal:
                 refuse(refusal)
                 return

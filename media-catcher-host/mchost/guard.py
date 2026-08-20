@@ -30,6 +30,7 @@ No mchost sibling is imported here: guard sits under everything else so any
 module can use it without an import-order hazard.
 """
 import hashlib
+import ipaddress
 import os
 import re
 import urllib.parse
@@ -509,6 +510,69 @@ def _has_control_char(s):
     are judged by the same character class, and widening it later widens both.
     """
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in s)
+
+
+def _beam_host_is_internal(host):
+    """True when `host` names this machine or the network it sits on.
+
+    Unreadable is treated as internal: a host this cannot parse is one it
+    cannot vouch for, and the caller is about to hand it to a fetcher.
+    """
+    if not isinstance(host, str) or not host.strip():
+        return True
+    h = host.strip().lower().strip("[]")
+    # RFC 6761 reserves `localhost` and everything under it to the loopback
+    # interface, so unlike other names it is decidable without resolving.
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False        # an ordinary name -- see the honest limit below
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local
+                or ip.is_unspecified or ip.is_reserved)
+
+
+def refuse_beam_url(url):
+    """None when `url` may be BEAMED, else a user-facing reason.
+
+    A SECOND gate on top of refuse_url, not a replacement for it: a shape
+    yt-dlp would refuse is still refused here, and refuse_url is asked first.
+
+    Why the beam arm needs one when the download lane does not. refuse_url
+    answers "is this a URL yt-dlp may be handed". It does not answer "should
+    this host fetch it", and for a beam those come apart: the address arrives
+    from a PAGE, via the overlay, and the fetch then happens OUTSIDE the
+    browser where no origin policy applies. Measured accepted before this
+    existed: http://127.0.0.1:8080/admin, http://192.168.1.1/setup.mp4 and
+    http://169.254.169.254/latest/meta-data/.
+
+    Deliberately NOT folded into refuse_url, which the yt-dlp lane shares.
+    That lane is reached from the popup by a person who picked the address --
+    a media server on the LAN is a legitimate download target -- and widening
+    it would change a lane nobody asked to change. Chosen by the owner on
+    2026-08-20; test_the_download_lane_is_deliberately_left_alone pins it.
+
+    HONEST LIMIT: this refuses ADDRESSES, not destinations. A NAME that
+    resolves into one of these ranges is not caught. Resolving it here would
+    be a different lookup at a different moment from the one that connects, so
+    it would answer a question about a name this host resolved rather than
+    about the socket the player opens. What this removes is the class that
+    needs no DNS at all -- which is the class a page can use by itself.
+    """
+    refusal = refuse_url(url)
+    if refusal:
+        return refusal
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        return "refused: that address could not be read as a URL"
+    if _beam_host_is_internal(host):
+        return ("refused: a beam cannot point at this machine or the network "
+                "it is on")
+    return None
 
 
 def refuse_url(url):
