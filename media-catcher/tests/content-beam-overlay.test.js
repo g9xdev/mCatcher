@@ -615,6 +615,66 @@ test("clicking the icon never reaches the page's own handlers", async () => {
   assert.ok(event._seen.prevent >= 1, "the page's default for that spot is not run");
 });
 
+test("everything a click is made of is taken off the page's hands", async () => {
+  // Stopping only `click` would still let a player that acts on mousedown —
+  // many do — pause the video underneath while its icon is being pressed.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root));
+  await installed(root);
+  const container = containers(root)[0];
+
+  for (const type of ["mousedown", "mouseup", "pointerdown", "pointerup",
+                      "touchstart", "touchend", "dblclick", "contextmenu"]) {
+    const event = makeEvent(type);
+    container._fire(type, event);
+    assert.ok(event._seen.stop >= 1, type + " reached the page");
+    assert.ok(event._seen.stopImmediate >= 1,
+      type + " reached a page listener bound before ours");
+    assert.ok(event._seen.prevent >= 1, type + " ran the page's default for that spot");
+  }
+});
+
+test("a page that wipes the style attribute gets the whole set back", async () => {
+  // Inline !important outranks a page stylesheet. It does not survive a
+  // script assigning style="" or replacing the attribute, and nothing has
+  // moved, so the cheap pass has no reason to look. The deep pass re-asserts
+  // every property rather than only the corner it just computed.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root));
+  await installed(root);
+  const container = containers(root)[0];
+  assert.equal(container.style.getPropertyValue("position"), "fixed");
+
+  container.style = makeStyle();          // the page cleared it
+
+  const realNow = Date.now;
+  Date.now = () => realNow() + 1000;      // past the discovery throttle
+  try {
+    root._pumpFrames(2);
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.equal(container.style.getPropertyValue("position"), "fixed",
+    "not just the corner — the properties that keep it out of the page's way");
+  assert.equal(container.style.getPropertyPriority("position"), "important");
+  assert.equal(container.style.getPropertyValue("z-index"), "2147483647");
+  assert.equal(container.style.getPropertyValue("contain"), "layout style size");
+});
+
+test("the button all:unset stripped still shows keyboard focus", () => {
+  // `all:unset` takes the browser's focus ring with it, and the button stays
+  // reachable by keyboard. This is a conditional, not a copy of the rule: a
+  // sheet that stops resetting the button does not need to put a ring back,
+  // and one that keeps resetting it does.
+  const sheet = contentSrc.match(/var BEAM_CSS = \[([\s\S]*?)\]\.join\(""\);/);
+  assert.ok(sheet, "anchored: the overlay's stylesheet is still built here");
+  if (/all\s*:\s*(unset|initial|revert)/.test(sheet[1])) {
+    assert.match(sheet[1], /:focus-visible\{[^}]*outline\s*:/,
+      "the reset removed the ring, so the sheet has to draw one");
+  }
+});
+
 // ---------------------------------------------------------------------------
 // The click, and only the click
 // ---------------------------------------------------------------------------
@@ -772,6 +832,25 @@ test("the overlay follows the video into a fullscreened player", async () => {
   root._pumpFrames(2);
   assert.equal(container.parentNode, player,
     "a fixed box outside the fullscreen element is painted under it");
+});
+
+test("an overlay for a video outside the fullscreen element is taken down", async () => {
+  const root = makeRoot();
+  const other = root.document.createElement("div");
+  const video = makeVideo(root);
+  root.document.body.appendChild(other);
+  root.document.body.appendChild(video);
+  await installed(root);
+  assert.equal(containers(root).length, 1);
+
+  // Someone else's element went fullscreen. The top layer is above every
+  // z-index, so a container left parked on <body> is painted UNDER it: an
+  // icon nobody can see or click, floating over someone else's content.
+  root.document.fullscreenElement = other;
+  root.document._fire("fullscreenchange", { target: other });
+  root._pumpFrames(2);
+  assert.equal(containers(root).length, 0,
+    "nowhere honest to put it, so it is taken down");
 });
 
 test("a <video> that is itself the fullscreen element hides the icon rather than lying", async () => {
