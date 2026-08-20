@@ -240,7 +240,8 @@ function makeRoot(opts) {
     },
     getComputedStyle(el) {
       root._styleReads += 1;
-      return (el && el._computed) || { display: "block", visibility: "visible", opacity: "1" };
+      return (el && el._computed) ||
+        { display: "block", visibility: "visible", opacity: "1", contentVisibility: "visible" };
     },
     requestAnimationFrame(fn) { rafs.push(fn); return rafs.length; },
     cancelAnimationFrame() {},
@@ -335,7 +336,8 @@ function containers(root) {
 // ---------------------------------------------------------------------------
 
 const VIEWPORT = { width: 1280, height: 720 };
-const VISIBLE = { display: "block", visibility: "visible", opacity: "1" };
+const VISIBLE = { display: "block", visibility: "visible", opacity: "1",
+                  contentVisibility: "visible" };
 
 function env(over) {
   return Object.assign({
@@ -380,14 +382,19 @@ test("pixels and thumbnails are too small to matter", () => {
   assert.equal(isBeamableVideo(playing(), tiny(640, 8)), false, "one dimension is enough to fail");
 });
 
-test("a hidden video gets no icon however it was hidden", () => {
+test("each of the four style fields can take the icon away on its own", () => {
+  // Four fields, not "however it was hidden" — this is a predicate over the
+  // measurements it is handed, and a way of hiding a box that does not reach
+  // one of these fields is not one it can see. Getting the ANCESTORS into
+  // these four is beamStyle's job and is tested against the DOM below.
   const { isBeamableVideo } = load();
   for (const style of [
-    { display: "none", visibility: "visible", opacity: "1" },
-    { display: "block", visibility: "hidden", opacity: "1" },
-    { display: "block", visibility: "collapse", opacity: "1" },
-    { display: "block", visibility: "visible", opacity: "0" },
-    { display: "block", visibility: "visible", opacity: "0.02" },
+    { display: "none", visibility: "visible", opacity: "1", contentVisibility: "visible" },
+    { display: "block", visibility: "hidden", opacity: "1", contentVisibility: "visible" },
+    { display: "block", visibility: "collapse", opacity: "1", contentVisibility: "visible" },
+    { display: "block", visibility: "visible", opacity: "0", contentVisibility: "visible" },
+    { display: "block", visibility: "visible", opacity: "0.02", contentVisibility: "visible" },
+    { display: "block", visibility: "visible", opacity: "1", contentVisibility: "hidden" },
   ]) {
     assert.equal(isBeamableVideo(playing(), env({ style })), false, JSON.stringify(style));
   }
@@ -507,24 +514,38 @@ test("an ad-sized and a hidden video are passed over while a real one is not", a
 });
 
 test("a page full of ad slots is not measured with getComputedStyle", async () => {
-  const root = makeRoot();
-  for (let i = 0; i < 20; i += 1) {
-    root.document.body.appendChild(makeVideo(root, {
-      rect: { left: 0, top: 0, width: 300, height: 100 },   // under the floor
-    }));
-  }
-  root.document.body.appendChild(makeVideo(root, {
-    rect: { left: 0, top: 0, width: 800, height: 450 },
-  }));
-  await installed(root);
-
-  assert.equal(containers(root).length, 1);
   // getComputedStyle forces style resolution and is the one expensive read in
-  // the discovery loop. Only the candidate that already passed play state and
-  // size is worth paying it for.
-  assert.ok(root._styleReads <= 2,
-    "twenty ad slots must not cost twenty style resolutions (saw " +
-      root._styleReads + ")");
+  // the discovery loop. Only a video that already passed play state and size
+  // is worth paying it for.
+  //
+  // beamStyle composes over the ancestor chain, so the bill is that ONE
+  // candidate's chain however many ad slots share the page with it. Measuring
+  // the same page twice — with the ad slots and without — pins that property
+  // directly, rather than pinning a total that every change in nesting depth
+  // would have to renegotiate.
+  async function readsFor(adSlots) {
+    const root = makeRoot();
+    for (let i = 0; i < adSlots; i += 1) {
+      root.document.body.appendChild(makeVideo(root, {
+        rect: { left: 0, top: 0, width: 300, height: 100 },   // under the floor
+      }));
+    }
+    root.document.body.appendChild(makeVideo(root, {
+      rect: { left: 0, top: 0, width: 800, height: 450 },
+    }));
+    await installed(root);
+    assert.equal(containers(root).length, 1, "one icon, on the one candidate");
+    return root._styleReads;
+  }
+
+  const alone = await readsFor(0);
+  const crowded = await readsFor(20);
+  assert.equal(crowded, alone,
+    "twenty ad slots must not cost one style resolution between them (saw " +
+      crowded + " with them, " + alone + " without)");
+  assert.equal(alone, 3,
+    "the whole bill is the candidate's own chain: <video>, <body>, <html> (saw " +
+      alone + ")");
 });
 
 test("a frame with no video costs no animation frames and no elements", async () => {
@@ -538,6 +559,63 @@ test("a frame with no video costs no animation frames and no elements", async ()
   assert.equal(containers(root).length, 0);
   assert.equal(root._rafs.length, 0,
     "nothing to position means no per-frame loop to run");
+});
+
+// An ancestor that hides the video hides the video. Measured in the installed
+// Firefox 154: with `opacity:0!important` on a parent, the <video>'s OWN
+// computed opacity is still "1"; with `display:none!important` on a parent its
+// own computed display is still "inline"; with
+// `content-visibility:hidden!important` on a parent its own computed
+// content-visibility is still "visible". Reading getComputedStyle on the
+// element alone therefore says "visible" for a video nobody can see — and the
+// icon would be the only thing on that part of the page that IS painted.
+for (const [name, computed] of [
+  ["opacity:0", { display: "block", visibility: "visible", opacity: "0", contentVisibility: "visible" }],
+  ["display:none", { display: "none", visibility: "visible", opacity: "1", contentVisibility: "visible" }],
+  ["content-visibility:hidden",
+   { display: "block", visibility: "visible", opacity: "1", contentVisibility: "hidden" }],
+]) {
+  test("a video whose ANCESTOR carries " + name + " gets no icon", async () => {
+    const root = makeRoot();
+    const wrapper = root.document.createElement("div");
+    wrapper._computed = computed;
+    const video = makeVideo(root);
+    wrapper.appendChild(video);
+    root.document.body.appendChild(wrapper);
+    await installed(root);
+    assert.equal(containers(root).length, 0,
+      "an icon standing over an invisible video is the whole attack");
+  });
+}
+
+test("an ancestor's opacity multiplies down rather than being taken alone", async () => {
+  // Two ancestors at 0.3 each: neither is under the floor, the product is.
+  // Opacity is not inherited, so this is the composition the browser does and
+  // a single read of one node cannot see.
+  const root = makeRoot();
+  const outer = root.document.createElement("div");
+  outer._computed = { display: "block", visibility: "visible", opacity: "0.3",
+                      contentVisibility: "visible" };
+  const inner = root.document.createElement("div");
+  inner._computed = { display: "block", visibility: "visible", opacity: "0.3",
+                      contentVisibility: "visible" };
+  outer.appendChild(inner);
+  inner.appendChild(makeVideo(root));
+  root.document.body.appendChild(outer);
+  await installed(root);
+  assert.equal(containers(root).length, 0, "0.3 * 0.3 is under the floor");
+});
+
+test("an ordinary wrapper does not cost the video its icon", async () => {
+  // The positive control for the three above: nesting alone is not hiding.
+  const root = makeRoot();
+  const outer = root.document.createElement("div");
+  const inner = root.document.createElement("div");
+  outer.appendChild(inner);
+  inner.appendChild(makeVideo(root));
+  root.document.body.appendChild(outer);
+  await installed(root);
+  assert.equal(containers(root).length, 1);
 });
 
 test("a video inside an open shadow root is reached", async () => {

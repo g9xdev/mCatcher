@@ -430,10 +430,15 @@
   // True when this element is worth putting an icon on RIGHT NOW.
   //
   // `env` is {rect, style, viewport}: rect from getBoundingClientRect, style
-  // the three computed properties that can hide a laid-out box, viewport the
+  // the four computed properties that can hide a laid-out box, viewport the
   // window's inner size. A null style means "could not measure", which is read
   // as visible — refusing to draw because a measurement failed would silently
   // disable the feature rather than report anything.
+  //
+  // The style it is handed is COMPOSED over the ancestor chain by beamStyle,
+  // not read off the <video> alone. This predicate only decides; it cannot see
+  // where a value came from, and a way of hiding a box that does not reach one
+  // of these four fields is not one it can see.
   function isBeamableVideo(video, env) {
     if (!video || typeof video !== "object") return false;
     if (!env || typeof env !== "object") return false;
@@ -469,6 +474,11 @@
       try {
         if (style.display === "none") return false;
         if (style.visibility === "hidden" || style.visibility === "collapse") return false;
+        // content-visibility:hidden suppresses an element's CONTENTS while
+        // leaving its box laid out and hit-testable — the exact shape of the
+        // invisible-click-target case, and the reason this is a fourth field
+        // rather than something the other three already cover.
+        if (style.contentVisibility === "hidden") return false;
         var opacity = parseFloat(style.opacity);
         if (!isNaN(opacity) && opacity < BEAM_MIN_OPACITY) return false;
       } catch (e2) {
@@ -1319,17 +1329,75 @@
       }
     }
 
-    function beamStyle(video) {
+    function beamComputed(el) {
       try {
         var gcs = root.getComputedStyle ||
           (typeof getComputedStyle === "function" ? getComputedStyle : null);
         if (typeof gcs !== "function") return null;
-        var cs = gcs.call(root, video);
-        if (!cs) return null;
-        return { display: cs.display, visibility: cs.visibility, opacity: cs.opacity };
+        return gcs.call(root, el) || null;
       } catch (e) {
+        // A ShadowRoot and a Document are both reachable by walking up and
+        // neither is an Element, so getComputedStyle throws on them. That is
+        // the loop's normal way of running off the end of a chain, not a
+        // failure to measure the video.
         return null;
       }
+    }
+
+    // The four properties that can hide a laid-out box, COMPOSED over the
+    // ancestor chain rather than read off the <video>.
+    //
+    // Three of the four are not inherited, so the video's own computed value
+    // says nothing about an ancestor carrying them. Measured in the installed
+    // Firefox 154: under a parent with `opacity:0!important` the <video> still
+    // reports its own opacity as "1"; under `display:none!important` it still
+    // reports "inline"; under `content-visibility:hidden!important` it still
+    // reports "visible". An icon placed on that reading would be the only
+    // thing painted over that part of the page — which is the whole attack.
+    //
+    // `visibility` is deliberately NOT walked: it IS inherited, so the
+    // browser has already carried an ancestor's `hidden` down to the video's
+    // own computed value. Walking it as well would also refuse the legitimate
+    // case, since a descendant that re-declares `visibility:visible` inside a
+    // hidden parent is painted.
+    //
+    // Opacity multiplies rather than taking the smallest: two ancestors at 0.3
+    // are each above the floor and their product is not, and the product is
+    // what the compositor draws.
+    //
+    // Cost: one getComputedStyle per ancestor, paid only on the deep pass —
+    // the per-frame path reuses the record's stored style and never calls
+    // this. An ancestor that cannot be measured is skipped rather than
+    // treated as hiding, on the same reasoning as a null style overall.
+    function beamStyle(video) {
+      var own = beamComputed(video);
+      if (!own) return null;
+
+      var display = own.display;
+      var visibility = own.visibility;
+      var contentVisibility = "visible";
+      var opacity = 1;
+
+      var node = video;
+      while (node) {
+        var cs = node === video ? own : beamComputed(node);
+        if (cs) {
+          if (cs.display === "none") display = "none";
+          if (cs.contentVisibility === "hidden") contentVisibility = "hidden";
+          var o = parseFloat(cs.opacity);
+          if (!isNaN(o)) opacity *= o;
+        }
+        // A ShadowRoot has a null parentNode and reaches its host through
+        // `host`, so an ancestor hiding a shadow-hosted player is still seen.
+        try {
+          node = node.parentNode || node.host || null;
+        } catch (e) {
+          node = null;
+        }
+      }
+
+      return { display: display, visibility: visibility,
+               opacity: String(opacity), contentVisibility: contentVisibility };
     }
 
     // Everything a click is made of, taken off the page's hands. Stopping only
