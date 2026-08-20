@@ -3493,8 +3493,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         sendResponse({ ok: true });
       } else if (msg.type === "content-thumb") {
-        // From content script: a JPEG frame of the playing video.
-        if (sender.tab && typeof msg.dataUrl === "string" &&
+        // From the top frame's content script: a JPEG frame of the playing
+        // video. tabThumbs holds one picture per tab and decorate() attaches it
+        // to every row of that tab, so a subframe must not be able to set it.
+        if (sender.tab && senderFrameKey(sender) === 0 &&
+            typeof msg.dataUrl === "string" &&
             msg.dataUrl.startsWith("data:image/jpeg") && msg.dataUrl.length < 200000) {
           tabThumbs.set(sender.tab.id, msg.dataUrl);
           if (mediaByTab.has(sender.tab.id)) broadcast({ type: "media-updated", tabId: sender.tab.id });

@@ -848,3 +848,43 @@ test("a network claim is reused by a DOM report from any frame", async () => {
   assert.equal(h.captureDomMedia.length, 0, "the network lane owns the file for every frame");
   assert.equal(h.captureNetwork.length, 1);
 });
+
+test("content-thumb is accepted only from the top frame", async () => {
+  const h = createHarness();
+  await settle();
+  const tabId = 7;
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+
+  await h.send({
+    type: "content-media",
+    item: { url: "https://cdn.example/movie.mp4", kind: "direct" },
+    referrerUrl: topFrame.url,
+    frameOrigin: "https://site.example",
+    snapshot: Object.assign({}, pageSnapshot(), { frameId: 0, documentId: "doc-top" }),
+  }, topFrame);
+
+  // One thumbnail is attached to every row of the tab, so a subframe that can
+  // set it picks the picture the user sees for the top page's media.
+  const adThumb = "data:image/jpeg;base64,QUQ=";
+  await h.send({ type: "content-thumb", dataUrl: adThumb }, adFrame);
+  let result = await h.send({ type: "get-media", tabId });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].thumb, null, "a subframe must not set the tab thumbnail");
+
+  const topThumb = "data:image/jpeg;base64,VE9Q";
+  await h.send({ type: "content-thumb", dataUrl: topThumb }, topFrame);
+  result = await h.send({ type: "get-media", tabId });
+  assert.equal(result.items[0].thumb, topThumb);
+
+  // A later subframe thumb must not overwrite the top frame's.
+  await h.send({ type: "content-thumb", dataUrl: adThumb }, adFrame);
+  result = await h.send({ type: "get-media", tabId });
+  assert.equal(result.items[0].thumb, topThumb);
+});

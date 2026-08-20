@@ -933,6 +933,9 @@
     }
 
     function sendThumb() {
+      // One thumbnail is stored per tab and attached to every row of that tab,
+      // so only the top frame may set it — the same gate sendPageInfo uses.
+      if (!isTopFrame()) return;
       var dataUrl = captureThumb();
       if (!dataUrl || dataUrl.length > THUMB_MAX || dataUrl === lastThumbSent) return;
       lastThumbSent = dataUrl;
