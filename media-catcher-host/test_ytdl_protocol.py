@@ -4098,6 +4098,15 @@ def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
         "path_exists": None,
         "payload": None,
     }
+    # The probe below runs AFTER the frame is appended to `sent`, and
+    # _wait_terminal polls `sent` -- so the main thread could return and reach
+    # _assert_pin_fail_e2e while the worker was still between the two, reading
+    # `race` at its initializers and failing all three of its assertions at
+    # once. wait_for(_PGET.get(jid) is None) supplied no synchronisation: the
+    # ytdl terminal path unregisters BEFORE it sends. Gate on the probe rather
+    # than moving it above the append, which would trade this for the dropped
+    # terminal frame the comment in capturing_send names.
+    probed = threading.Event()
     close_calls = []
     real_close = d._ytdl_close_handle
     real_dup = d._ytdl_duplicate_readonly_pin
@@ -4137,6 +4146,7 @@ def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
                 race["path_exists"] = bool(path) and os.path.isfile(path)
             except OSError:
                 race["path_exists"] = False
+            probed.set()
 
     monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", dup_fail)
     monkeypatch.setattr(d, "_ytdl_close_handle", track_close)
@@ -4159,6 +4169,7 @@ def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
         "url": "https://example.test/v", "name": "%s.mp4" % case, "dir": str(dest),
     })
     term = _wait_terminal(sent, jid)
+    assert probed.wait(5), "terminal frame landed but the race probe never ran"
     assert wait_for(lambda: d._PGET.get(jid) is None, timeout=5)
 
     # Restore real helpers for post-terminal rename probe and teardown.
@@ -5845,3 +5856,136 @@ def test_a_cancel_does_not_wait_to_see_whether_the_child_died(tmp_path, monkeypa
     t.join(5)
     assert not t.is_alive()
     assert elapsed < 2, "cancel sat on the message loop for %.1fs" % elapsed
+
+
+# ---------------------------------------------------------------------------
+# The yt-dlp URL positional is an http(s) address, or nothing runs
+# ---------------------------------------------------------------------------
+
+class _NoLib:
+    """ytdlp_lib stand-in for an install without the vendored library."""
+
+    @staticmethod
+    def available():
+        return False
+
+
+def test_non_http_url_never_reaches_ytdlp(tmp_path, monkeypatch):
+    """file:, ftp:, javascript: and bare paths are refused before argv.
+
+    This covers flag injection too, and that is the sharper half: the url is
+    appended LAST and yt-dlp parses with optparse, which reads a dash-leading
+    trailing argument as an option, not a positional -- being the only
+    caller-controlled token in argv is the injection position, not protection.
+    The scheme half is the generic extractor reaching somewhere the browser
+    never went, ftp:// being the plain case. Both yt-dlp entry points are
+    covered because the in-process one parses the SAME argv the exe would
+    have been given.
+    """
+    import mchost.downloads as d
+
+    sent = []
+    spawned = []
+    lib_argv = []
+    via_lib = []
+
+    def fake_popen(*a, **k):
+        spawned.append(list(a[0]) if a else [])
+        return LiveProc(lines=[], returncode=1)
+
+    class _Lib:
+        @staticmethod
+        def available():
+            return True
+
+        @staticmethod
+        def extract_info(argv, *a, **k):
+            lib_argv.append(list(argv))
+            raise RuntimeError("the probe should not have been reached")
+
+    _patch_ytdl_base(monkeypatch, d, mc, sent, popen=fake_popen)
+    monkeypatch.setattr(d, "find_ytdlp", lambda: "yt-dlp-fake")
+    monkeypatch.setattr(mc, "downloads_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(mc, "load_config", lambda: {})
+    monkeypatch.setattr(d, "_ytdl_download_via_lib",
+                        lambda jid, url, *a, **k: via_lib.append(url))
+
+    def reached():
+        return bool(spawned or lib_argv or via_lib)
+
+    def reset():
+        for box in (sent, spawned, lib_argv, via_lib):
+            box.clear()
+
+    bad = [
+        "file:///C:/Windows/win.ini",
+        "ftp://attacker.test/x",
+        "javascript:alert(1)",
+        "data:text/plain,x",
+        r"C:\Windows\win.ini",
+        r"\\attacker.test\share\x",
+        "//attacker.test/x",
+        "http://",                      # a scheme with no host
+        "not a url",
+        " https://ok.test/v",           # padded: what is checked must be what ships
+        "ht\ttp://ok.test/v",           # urlsplit drops the tab; yt-dlp does not
+        "https://ok.test/\x00v",
+    ]
+
+    for lib_on in (False, True):
+        monkeypatch.setattr(d, "_ytdlp_lib", lambda on=lib_on: _Lib if on else _NoLib)
+        for i, url in enumerate(bad):
+            tag = "%d-%d" % (int(lib_on), i)
+
+            reset()
+            d.handle_ytdl({"cmd": "ytdl", "id": "s" + tag, "attemptToken": "atk",
+                           "url": url, "name": "ok.mp4", "dir": str(tmp_path)})
+            wait_for(lambda: reached() or any(m.get("type") == "ytdl-error"
+                                              for m in sent), timeout=1.0)
+            assert not reached(), "structured %r reached yt-dlp" % (url,)
+            errs = [m for m in sent if m.get("type") == "ytdl-error"]
+            assert len(errs) == 1, "structured %r: %r" % (url, sent)
+            assert errs[0].get("attemptToken") == "atk"
+            assert errs[0].get("id") == "s" + tag
+            assert d._PGET.get("s" + tag) is None
+
+            reset()
+            d.handle_ytdl({"cmd": "ytdl", "id": "l" + tag, "url": url,
+                           "dir": str(tmp_path)})
+            wait_for(lambda: reached() or any(m.get("type") == "ytdl-error"
+                                              for m in sent), timeout=1.0)
+            assert not reached(), "legacy %r reached yt-dlp" % (url,)
+            errs = [m for m in sent if m.get("type") == "ytdl-error"]
+            assert len(errs) == 1, "legacy %r: %r" % (url, sent)
+            assert d._PGET.get("l" + tag) is None
+
+            reset()
+            d.handle_ytmeta({"cmd": "ytmeta", "reqId": "m" + tag, "url": url})
+            wait_for(lambda: reached() or any(m.get("type") == "ytmeta"
+                                              for m in sent), timeout=1.0)
+            assert not reached(), "ytmeta %r reached yt-dlp" % (url,)
+            metas = [m for m in sent if m.get("type") == "ytmeta"]
+            assert len(metas) == 1, "ytmeta %r: %r" % (url, sent)
+            assert metas[0].get("ok") is False
+
+    # The other half of the claim: an ordinary https URL still runs, on both
+    # entry points. A refusal that swallowed everything would pass the loop.
+    reset()
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: _NoLib)
+    d.handle_ytdl({"cmd": "ytdl", "id": "good-exe", "url": "https://ok.test/v",
+                   "dir": str(tmp_path)})
+    assert wait_for(lambda: bool(spawned), timeout=3.0), "https never spawned"
+    assert spawned[0][-1] == "https://ok.test/v"
+    # Let the worker reach its terminal frame before the patches come off:
+    # a send landing after teardown would go at the real messaging channel.
+    assert wait_for(lambda: any(m.get("type") in ("ytdl-error", "ytdl-done")
+                                for m in sent), timeout=5.0)
+
+    reset()
+    monkeypatch.setattr(d, "_ytdlp_lib", lambda: _Lib)
+    d.handle_ytmeta({"cmd": "ytmeta", "reqId": "good-lib",
+                     "url": "https://ok.test/v"})
+    assert wait_for(lambda: bool(lib_argv), timeout=3.0), "https never probed"
+    assert lib_argv[0][-1] == "https://ok.test/v"
+    assert wait_for(lambda: any(m.get("type") == "ytmeta" for m in sent),
+                    timeout=5.0)

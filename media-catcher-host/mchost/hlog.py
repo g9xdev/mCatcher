@@ -7,8 +7,10 @@ constants are owned here; nothing outside this module uses them.
 """
 import json
 import os
+import re
 import threading
 import time
+import urllib.parse
 
 def _h():
     """Call-time shim lookup (review of b9043cd, Important): a module-level
@@ -29,6 +31,207 @@ _HOST_LOG = os.path.join(TMPDIR, "host.log")
 _HISTORY_PATH = os.path.join(HERE, "update-history.jsonl")
 _log_lock = threading.Lock()
 
+# ---- log redaction ------------------------------------------------------
+# Applied at the _hlog SEAM, so both sinks say the same thing. The extension
+# already redacts what it puts in storage.local (media-catcher/lib/privacy.js
+# redactLogText), but the disk copy kept the full URL, query and all, and that
+# is the copy a user hands over when they are asked for "the helper log".
+# Nothing in this host SERVES that file -- getReport does not include it and
+# the Settings console is fed by the {"type":"log"} relay -- so redacting it
+# is not closing a remote read; it is making the one file that leaves the
+# machine safe to hand over without a warning label attached.
+#
+# The projection is the extension's redactUrlForLog: scheme://host[:port]/path,
+# with userinfo and fragment dropped and, of the query, only the identity
+# parameters named below. Query strings on a media URL are where the signed
+# token lives; what survives (which CDN, which file, which video) is what the
+# line was worth reading for. Local save paths and everything else survive THE
+# PROJECTION -- the credential pass further down still claims a name=value
+# inside one, which is why that cost is pinned in the tests.
+# "Matches" is about the RULES -- same names, same cap, same charset, same
+# credential pattern -- not about byte-identical spelling. The extension parses
+# with URL (WHATWG) and this parses with urlsplit, and running both over the
+# same inputs turns up divergences in at least these shapes:
+#   - a bare origin gains a trailing slash there and not here;
+#   - where the extension falls back to a manual strip on a URL its parser
+#     rejects, this fails closed to [redacted] -- a malformed port, say;
+#   - canonicalisation WHATWG does and urlsplit does not: a backslash read as
+#     a separator, dot segments removed, 0x7f.1 folded to 127.0.0.1, an IDN
+#     host punycoded, a path character percent-encoded;
+#   - an empty authority -- https:///p?v=abc, where the extension reads p as
+#     the host and this fails closed;
+#   - re.I folds more of Unicode than the extension's /i, so a name spelled
+#     with U+017F or U+212A is redacted here and not there.
+# EVERY DIFFERENCE FOUND SO FAR is the host redacting MORE or the same, never
+# less. The invariant is that DIRECTION, not the count of shapes listed here:
+# a new shape is expected whenever either parser changes and is fine, while one
+# where the host redacts LESS is a bug, because this is the copy a user hands
+# over.
+# Running before the send too means no LOG LINE leaves this host with a raw
+# URL on it -- _hlog is the only sender of {"type":"log"} -- and the
+# extension's pass over an already-redacted line is a no-op. It is not a claim
+# about every frame: getReport's guardianTail, for one, is relayed as written.
+#
+# Update history (_log_event / _HISTORY_PATH) is deliberately NOT projected:
+# its `source` is a release location, not a credentialed media URL, and the
+# panel exists to say where an update came from. Only the line it mirrors
+# through _hlog is redacted.
+# The match runs to WHITESPACE, not to the first quote or angle bracket: host
+# lines carry yt-dlp's own spelling rather than a browser-canonicalised URL, so
+# an unencoded quote inside a query would otherwise end the match and leave the
+# credential after it standing in the line. Trailing wrappers and sentence
+# punctuation are put back afterwards so a quoted or sentence-final URL still
+# reads as one.
+_URL_IN_TEXT = re.compile(r"https?://\S+", re.I)
+_URL_TAIL_PUNCT = re.compile(r"['\">.,;:!?)\]}]+$")
+
+# The query parameters that say WHICH media a line is about. A closed
+# allowlist, mirroring media-catcher/lib/privacy.js LOG_IDENTITY_PARAMS:
+# Signature, token, sig, key and expire are not in it and cannot be added by a
+# site, and a name nobody has vetted is dropped rather than kept.
+#
+# Keeping them has to happen HERE as well as there. Redaction runs before the
+# send, so the extension's redactLogText only ever sees an already-projected
+# host line and cannot restore what this dropped: without the allowlist on
+# this side, two googlevideo 403s for two different files both arrive as one
+# .../videoplayback line and the allowlist works only for the lines the
+# extension writes itself.
+_LOG_IDENTITY_PARAMS = ("v", "id")
+# A media id is a short plain identifier: YouTube's v is 11 characters,
+# googlevideo's id is 16. The cap is headroom over those, and it bounds the
+# risk rather than removing it -- [A-Za-z0-9_.~-] is also the alphabet of a
+# base64url or hex token, so a provider that spells a signed link
+# id=<signature> has that value kept. At 64 a whole hex HMAC or a 256-bit
+# base64url token fitted; at 24 neither does. A separator that could nest a
+# second query fails closed at the pattern below.
+_LOG_IDENTITY_VALUE_MAX = 24
+_LOG_IDENTITY_VALUE_RE = re.compile(r"[A-Za-z0-9_.~-]+")
+
+# Second, independent pass: the VALUE of a credential-shaped parameter name,
+# wherever it appears, in a URL or not. Whitespace being the URL boundary, a
+# URL yt-dlp printed with a raw space in it is projected only up to that space
+# and the tail carrying the Signature stays in the line as loose text; this
+# redacts that tail without any boundary having to be decided.
+#
+# A blocklist, and deliberately never the only defence -- _redact_url's
+# allowlist still decides what survives of anything that parses as a URL.
+#
+# It is additive, so it can only remove MORE than the projection does --
+# including, sometimes, a diagnostic the projection deliberately kept. A
+# name=value inside a path is claimed like any other: /token=1/clip.mp4 and
+# /token=2/clip.mp4 both end as /token=[redacted], because the value runs to
+# the next &, whitespace, quote or angle bracket and a path separator is none
+# of those. That is a price, not an accident: a token in a path segment is a
+# real spelling, so most of what looks like a false positive is what this pass
+# is for. What it costs is pinned in the tests rather than argued away here.
+#
+# The name must match WHOLE: a preceding name character means no match, so
+# monkey=, passwordless= and Key-Pair-Id= are untouched. Alternation order is
+# longest-first among overlapping names (signature before sig, expires before
+# expire) because first match wins. A quoted value counts as a value --
+# token="S" and 'token': 'S' are both credentials -- and a ':' separator is
+# claimed only when the value is quoted, so an "Expires: Thu, 01 Dec" header
+# keeps its shape. The CLOSING quote is optional because THIS host manufactures
+# the line that needs it: downloads.py logs str(e)[:500] and a joined stderr
+# tail cut at 2000, and the cut lands before _hlog redacts, so a yt-dlp header
+# dump arrives as {"token": "SECRET with the closing quote gone. Requiring it
+# sent that line to host.log untouched. The unclosed alternative is reached
+# only when no closing quote follows at all, so it takes the rest of the line
+# -- over-redacting a truncated diagnostic, the direction this pass accepts.
+#
+# Mirrors media-catcher/lib/privacy.js redactCredentialValues, down to the
+# pattern. The two are kept in step deliberately: the point of redacting here
+# is that the disk copy and the extension's copy say the same thing.
+_LOG_CREDENTIAL_VALUE = re.compile(
+    r"(^|[^A-Za-z0-9_-])"
+    r"(x-amz-security-token|x-amz-credential|x-amz-signature|signature|"
+    r"password|expires|policy|expire|token|auth|pwd|sig|key)"
+    r"([\"']?\s*(?:=|:(?=\s*[\"']))\s*)"
+    r"(\"[^\"]*\"?|'[^']*'?|[^&\s\"'<>]+)", re.I)
+
+
+def _redact_one_credential(m):
+    """Replace a matched credential value, keeping the quotes it was written
+    with so the line still reads as that name's value."""
+    lead, name, sep, value = m.group(1), m.group(2), m.group(3), m.group(4)
+    quote = value[0] if value[:1] in ('"', "'") else ""
+    return "%s%s%s%s[redacted]%s" % (lead, name, sep, quote, quote)
+
+
+def _identity_query(query):
+    """The allowlisted part of `query`, as "?v=…[&id=…]" or "".
+
+    Emitted in _LOG_IDENTITY_PARAMS order, not the site's, so one URL always
+    projects to one line whatever order its query was written in. First value
+    per name, matching URLSearchParams.get. fullmatch, not a $-anchored match:
+    Python's $ also matches before a trailing newline and JavaScript's does
+    not, so "?v=abc%0A" would otherwise survive here and be dropped there.
+    """
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    except Exception:
+        return ""
+    first = {}
+    for name, value in pairs:
+        first.setdefault(name, value)
+    kept = ""
+    for name in _LOG_IDENTITY_PARAMS:
+        value = first.get(name)
+        if not value or len(value) > _LOG_IDENTITY_VALUE_MAX:
+            continue
+        if not _LOG_IDENTITY_VALUE_RE.fullmatch(value):
+            continue
+        kept += ("&" if kept else "?") + name + "=" + value
+    return kept
+
+
+def _redact_url(url):
+    """scheme://host[:port]/path[?v=…[&id=…]] — userinfo and fragment dropped,
+    and of the query only the identity parameters."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        if not host:
+            return "[redacted]"
+        if ":" in host:                       # IPv6 literal
+            host = "[%s]" % host
+        port = parts.port                     # raises on a malformed port
+        if port is not None:
+            host = "%s:%d" % (host, port)
+        return "%s://%s%s%s" % (parts.scheme.lower(), host, parts.path,
+                                _identity_query(parts.query))
+    except Exception:
+        # Never echo the input on a parse failure — that is the leak itself.
+        return "[redacted]"
+
+
+def _redact_log_text(msg):
+    """Every absolute http(s) URL in a log line, replaced by its projection.
+
+    Trailing sentence punctuation is put back so a URL ending a sentence still
+    reads as one. Never raises: a line that cannot be projected is dropped to
+    a fixed marker rather than passed through.
+    """
+    try:
+        text = msg if isinstance(msg, str) else str(msg)
+    except Exception:
+        return "[unprintable]"
+
+    def one(m):
+        hit = m.group(0)
+        tail = _URL_TAIL_PUNCT.search(hit)
+        trailing = ""
+        if tail:
+            trailing = tail.group(0)
+            hit = hit[:len(hit) - len(trailing)]
+        return _redact_url(hit) + trailing
+
+    try:
+        projected = _URL_IN_TEXT.sub(one, text)
+        return _LOG_CREDENTIAL_VALUE.sub(_redact_one_credential, projected)
+    except Exception:
+        return "[redacted]"
+
 
 def _now_ms():
     return int(time.time() * 1000)
@@ -36,9 +239,13 @@ def _now_ms():
 
 def _hlog(level, msg, src="host"):
     """Emit one structured log line: to the extension for the live console, and to
-    a rolling on-disk file for after-the-fact inspection. Never raises."""
+    a rolling on-disk file for after-the-fact inspection. Never raises.
+
+    URLs are projected once, HERE, so the wire copy and the disk copy carry the
+    same text — see the redaction note above."""
+    msg = _redact_log_text(msg)
     try:
-        _h().send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": str(msg)})
+        _h().send({"type": "log", "ts": _now_ms(), "level": level, "src": src, "msg": msg})
     except Exception:
         pass
     try:

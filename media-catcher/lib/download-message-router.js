@@ -772,11 +772,36 @@
     }
 
     /**
+     * A pget/pget-single url the helper will spawn a downloader on: nonblank,
+     * trim-stable, control-free, and an absolute http(s) URL. Decides
+     * accept/reject only — callers keep the exact accepted spelling.
+     */
+    function isAbsoluteHttpUrl(v) {
+      if (!isNonblankPrimitiveString(v)) return false;
+      if (v.trim() !== v || !isSafeHttpContextString(v)) return false;
+      if (!/^https?:\/\//i.test(v)) return false;
+      // URL is absent from some classic-script/test realms; the scheme test
+      // above already decided the lane, so treat a missing URL as "accepted".
+      if (typeof URL !== "function") return true;
+      var parsed;
+      try {
+        parsed = new URL(v);
+      } catch (e) {
+        return false;
+      }
+      return parsed.protocol === "http:" || parsed.protocol === "https:";
+    }
+
+    /**
      * Descriptor-safe mirrors snapshot for start payloads.
      * Absent → undefined. null → undefined (omit). Non-array present → generic TypeError.
      * Dense own-data entries only; sparse/accessor/hostile length → generic TypeError.
-     * Own-data blank/non-string entries are omitted (closed skip contract).
-     * Returns a fresh dense array of unique nonblank strings (no primary).
+     * Entries that are not absolute http(s) URLs are omitted (closed skip
+     * contract) — the host's handle_pget takes a STRLIST with no URL check and
+     * hands each entry to urllib.request.urlopen, where url2pathname turns a
+     * file://////host/share/x URL into an SMB open. snapshotMirrorArray already
+     * gates upstream; this is the same gate at the wire boundary.
+     * Returns a fresh dense array of unique http(s) URLs (no primary).
      */
     function snapshotOptionalMirrors(input) {
       var m = readOptionalOwnValue(input, "mirrors");
@@ -796,7 +821,7 @@
         var entry = ownData(mirrors, String(i));
         if (!entry.ok) throw genericTypeError();
         var v = entry.value;
-        if (typeof v !== "string" || !isNonblankPrimitiveString(v)) continue;
+        if (!isAbsoluteHttpUrl(v)) continue;
         if (seen[v]) continue;
         seen[v] = true;
         out.push(v);
@@ -904,7 +929,7 @@
 
       if (kind === "pget") {
         var url = requireOwnData(input, "url");
-        if (!isNonblankPrimitiveString(url)) throw genericTypeError();
+        if (!isAbsoluteHttpUrl(url)) throw genericTypeError();
         var maxConnections = requireOwnData(input, "maxConnections");
         if (!isPositiveInt(maxConnections)) throw genericTypeError();
         var pgetGen = requireProviderGeneration(input);
@@ -929,7 +954,7 @@
 
       if (kind === "pget-single") {
         var singleUrl = requireOwnData(input, "url");
-        if (!isNonblankPrimitiveString(singleUrl)) throw genericTypeError();
+        if (!isAbsoluteHttpUrl(singleUrl)) throw genericTypeError();
         var singleGen = requireProviderGeneration(input);
         var singleMirrors = snapshotOptionalMirrors(input);
         var singleReferer = readOptionalHttpContext(input, "referer");

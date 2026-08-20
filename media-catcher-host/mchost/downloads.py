@@ -147,6 +147,62 @@ def handle_record(req):
         _h().send({"type": "error", "id": req.get("id"), "error": "ffmpeg not found. Re-run the installer or put ffmpeg.exe next to the helper."})
         return
     jid = req.get("id")
+    # These two URLs are the only ones this host takes that a browser-observed
+    # request did not supply: pget's mirrors accumulate from webRequest
+    # details.url and from content-script DOM reports, and the ytdl/cast lanes
+    # carry a page URL the browser handed over, while these are URIs lifted
+    # from the BODY of a fetched HLS manifest.
+    # The live route is background.js "record-live" -> resolveVideoUrl, which
+    # fetches the master playlist and returns pickVariant(...).uri — and
+    # lib/hls.js resolveUrl returns an absolute URI unchanged, so the playlist
+    # decides the string. A variant URI of "file://attacker.test/s/x" reaches
+    # ffmpeg, which opens it as the UNC path \\attacker.test\s\x: an outbound
+    # SMB connection carrying the user's NTLM credentials. That is the threat
+    # 2c3e0aa gated mirrors against, and this lane had no gate on either side.
+    # background.js nativeRecord now applies its own isAbsoluteHttpUrl, so this
+    # is the host half of a pair rather than the only gate -- but it is the
+    # half that has to hold, because the host cannot tell a vetted sender from
+    # a spoofed one.
+    #
+    # audioUrl is checked for the same reason, not because today's producer
+    # can reach it: findSiblingAudio only ever returns a same-stream-directory
+    # or token-swapped sibling of a URL that already passed, so it is pinned
+    # by construction rather than by test. The point is that the lane has a
+    # boundary. It stays optional, so only a present one is checked; videoUrl
+    # the schema already requires.
+    #
+    # The gate buys more than the one argv it inspects. ffmpeg derives a
+    # child's protocol whitelist from its PARENT's, so holding the top-level
+    # -i to http(s) holds every URI in the MANIFEST BODY there too -- and the
+    # manifest body is the actual attack surface, since this lane's URLs come
+    # out of one. Measured against the bundled ffmpeg.exe (8.1.2-essentials,
+    # gyan.dev) rather than assumed: serving an attacker-controlled master ->
+    # media playlist over HTTP from 127.0.0.1 whose segment URI was
+    # file:///<path>, ffmpeg refused to open the segment with
+    #   [file @ ...] Protocol 'file' not on whitelist
+    #   'http,https,tls,rtp,tcp,udp,crypto,httpproxy,data'!
+    # A future ffmpeg could widen that default list, so this is a second layer
+    # under refuse_url, not a reason to relax it.
+    for field in ("videoUrl", "audioUrl"):
+        value = req.get(field)
+        if field == "audioUrl" and not value:
+            continue
+        err = guard.refuse_url(value)
+        if err:
+            _h()._hlog("error", "record: %s (%s)" % (err, field))
+            _h().send({"type": "error", "id": jid,
+                       "error": "That isn't a stream this helper can record."})
+            return
+    # ffmpeg_cmd joins these into ONE -headers value with a literal \r\n
+    # between them, so a control character in either is a header the page
+    # wrote appended to every request ffmpeg makes for this stream.
+    for field in ("referer", "userAgent"):
+        err = guard.refuse_http_context(req.get(field))
+        if err:
+            _h()._hlog("error", "record: %s (%s)" % (err, field))
+            _h().send({"type": "error", "id": jid,
+                       "error": "That isn't a stream this helper can record."})
+            return
     # The id is the extension's correlation token, not a path component. It used
     # to be interpolated straight in here, so "../.." walked out of TMPDIR: an
     # arbitrary .mp4 create-or-overwrite anywhere the user can write, and
@@ -280,10 +336,25 @@ def handle_snapshot(req):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _dedup(dest):
+def _dedup(dest, taken=None):
+    """The first "<name> (n)<ext>" nobody else has.
+
+    `taken` is a second, caller-supplied answer to "is this one spoken for" —
+    os.path.exists only knows about files that are already THERE, and neither a
+    download nor a recording creates its final path until the very end.
+
+    Omitted, this is the plain existence check — which no shipped caller wants
+    on its own. Both of them (_claim_free_dest, for pget and for recording
+    saves) pass `taken`, because an existence check alone let two writers
+    resolve one path and silently overwrite each other. The default is kept for
+    the check in isolation, not because any caller relies on it.
+
+    Stats only; takes no lock. _claim_free_dest calls it with _PGET_LOCK
+    RELEASED and re-checks the winner afterwards — see there for why.
+    """
     root, ext = os.path.splitext(dest)
     n = 1
-    while os.path.exists(dest):
+    while os.path.exists(dest) or (taken is not None and taken(dest)):
         dest = "%s (%d)%s" % (root, n, ext)
         n += 1
     return dest
@@ -809,8 +880,23 @@ def handle_save(req):
         d = req.get("dir") or _h().downloads_dir()
         if not os.path.isdir(d):
             d = _h().downloads_dir()
-        dest = _dedup(os.path.join(d, _h().sanitize(req.get("base") or job.base) + ".mp4"))
-        _finalize_move(job, jid, dest, req)
+        want = os.path.join(d, _h().sanitize(req.get("base") or job.base) + ".mp4")
+        # Claimed, not merely deduped, and for the same reason a pget claims:
+        # neither writer creates its path until the last moment (shutil.move
+        # here, os.replace there), so os.path.exists cannot see the other one
+        # coming. A user who records a stream and starts a direct download from
+        # the same page has both derive the page title into the same folder;
+        # unclaimed, both resolved one string and both wrote it, and the row
+        # that landed first went green over a file that no longer held its
+        # recording. The claim is held across _finalize_move, so the reverse
+        # order is covered too: a pget resolving while shutil.move is still
+        # copying sees the path taken and lands on "clip (1).mp4".
+        owner = {"kind": "recording", "id": jid}
+        dest = _claim_free_dest(want, owner)
+        try:
+            _finalize_move(job, jid, dest, req)
+        finally:
+            _release_free_dest(dest, owner)
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -1481,6 +1567,15 @@ def handle_ytmeta(req):
     def worker():
         reqid = req.get("reqId")
         url = req.get("url") or ""
+        url_err = guard.refuse_url(url)
+        if url_err:
+            # The probe reads whatever it is pointed at and hands the result
+            # back to the popup, so the scheme matters here for the same
+            # reason it matters on the download path.
+            _h()._hlog("error", "yt-dlp -J: %s" % url_err, "ytdlp")
+            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False,
+                       "error": "That isn't a link this helper can read."})
+            return
         deno = DENO or find_deno()
         lib = _ytdlp_lib()
         if lib.available():
@@ -3185,8 +3280,14 @@ def _handle_ytdl_structured(req):
     if not _ytdl_exact_nonblank_str(token):
         return
 
+    # guard.refuse_url does two jobs the exact-str tests above cannot: those
+    # say the url is a nonblank built-in str and nothing more. It has to be a
+    # URL because _ytdl_build_cmd appends it LAST and yt-dlp's optparse reads a
+    # dash-leading trailing argument as an OPTION, and because yt-dlp's generic
+    # extractor will reach a non-http scheme the browser never went to.
     if not _ytdl_exact_nonblank_str(jid) or not _ytdl_exact_nonblank_str(url) \
-            or not _ytdl_exact_nonblank_str(name):
+            or not _ytdl_exact_nonblank_str(name) \
+            or guard.refuse_url(url):
         _h().send({
             "type": "ytdl-error",
             "id": jid if _ytdl_exact_nonblank_str(jid) else None,
@@ -4036,6 +4137,15 @@ def _handle_ytdl_legacy(req):
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
+        url_err = guard.refuse_url(url)
+        if url_err:
+            # Refused BEFORE the acknowledgement below, because there is
+            # nothing to prepare: no runtime to fetch, no provider to start.
+            # The row goes straight to its one terminal frame.
+            _h()._hlog("error", "yt-dlp: %s" % url_err, "ytdlp")
+            _terminal({"type": "ytdl-error", "id": jid, "reason": "permanent",
+                       "error": "That isn't a link this helper can download."})
+            return
         # Acknowledge before the preflight: ensure_deno() can download a JS runtime
         # and start_pot_provider() waits on a socket bind, and until one of these
         # frames lands the row is indistinguishable from a dead helper.
@@ -4229,14 +4339,37 @@ def _handle_ytdl_legacy(req):
 # stitched into a sibling .part path and committed with os.replace. Terminal
 # outcomes are structured pget-result messages (never browser handoff).
 _PGET = {}  # id -> operation dict (stop Event, cancel flag, optional yt-dlp proc)
-# Second index over the same entries: output-path claim -> the op holding it,
-# for ops that set a "dest" (see _ytdl_dest_key). Registering by id alone is
-# not enough on the legacy yt-dlp path, where a retry mints a FRESH id and the
-# output template is deterministic, so two writers can reach one file. Both
-# maps are written under _PGET_LOCK inside _pget_register/_pget_unregister and
-# nowhere else, so an entry is never in one and not the other.
+# Second index, keyed by output-path claim -> whoever holds it. Registering by
+# id alone is not enough on the legacy yt-dlp path, where a retry mints a FRESH
+# id and the output template is deterministic, so two writers can reach one
+# file; nor on pget, where two jobs with different ids can derive the same
+# filename and _dedup cannot tell them apart because neither has created the
+# file yet. Recordings sit in the same window: handle_save resolves a name and
+# does not create it until shutil.move, and it derives that name from the same
+# page title a pget started from the same page does.
+#
+# TWO KEY SPACES, which cannot collide because a tuple never equals a str:
+#   (normcase(outtmpl), url)  - legacy yt-dlp (_ytdl_dest_key), claimed at
+#                               registration, because yt-dlp does not produce a
+#                               concrete path until it has opened the file.
+#   normcase(final_path)      - pget (_pget_claim_dest) and recording saves
+#                               (handle_save), claimed later, when the worker
+#                               resolves its concrete path.
+# NOT every value here is a _PGET op: a recording claim has no id in _PGET, and
+# its value is a plain marker released by _release_free_dest. Everything that
+# reads this map tests membership or identity, never op fields, so the two
+# kinds of holder never have to be told apart.
+#
+# Written under _PGET_LOCK inside _pget_register / _claim_free_dest /
+# _release_free_dest / _pget_unregister and nowhere else; pget claims are
+# released with their id by _pget_drop_locked, recording claims by
+# _release_free_dest.
 _PGET_DEST = {}
-_PGET_LOCK = threading.Lock()  # short CAS only: register / lookup / unregister
+# Held only for register / lookup / claim-CAS / unregister — dict work and
+# nothing else. Never a filesystem walk (_claim_free_dest stats outside it) and
+# never network I/O, because _pget_cancel takes it on the message loop and
+# every queued command waits behind that.
+_PGET_LOCK = threading.Lock()
 _PGET_MAX_CONN = 6
 _PGET_CR_PROBE = re.compile(r"^bytes 0-0/(\d+)$")
 _PGET_CR_SEG = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
@@ -4941,6 +5074,9 @@ def _pget_register(jid, op):
     caller that reported "id already in use" for a freshly minted id would send
     whoever reads it after the wrong thing. Looking it up afterwards instead
     would be a second, unlocked read.
+
+    Only ops that already KNOW their path claim it here. pget does not: it
+    resolves one inside its worker, and claims it then (_pget_claim_dest).
     """
     dest = op.get("dest") if isinstance(op, dict) else None
     with _PGET_LOCK:
@@ -4955,6 +5091,109 @@ def _pget_register(jid, op):
         if dest is not None:
             _PGET_DEST[dest] = op
         return True
+
+
+def _claim_free_dest(dest, owner, commit=None):
+    """Resolve `dest` to a path nobody holds, and claim it for `owner`.
+
+    pget's final path and a recording save resolve here, because
+    os.path.exists alone cannot answer the question. A pget's final path is
+    not created until os.replace at the very end of the job, and a recording's
+    not until shutil.move, so two writers resolving in that window agree on
+    one string -- one .part, one set of segment files, one replace target --
+    and the second silently overwrites the first. _PGET_DEST is the other half
+    of the answer: a path a live writer already claimed is taken exactly as an
+    existing file is, and the second lands on "clip (1).mp4".
+
+    NOT every writer that picks its own name, and each one that skips this is
+    deliberate. Legacy yt-dlp claims in a key space of its own -- the
+    (normcase(outtmpl), url) tuple _ytdl_dest_key builds, claimed at
+    registration because yt-dlp produces no concrete path until it opens the
+    file -- and `taken` below is a string membership test, so the two spaces
+    cannot protect each other and are not meant to. The structured yt-dlp path
+    needs no claim at all: _ytdl_commit_with_candidates is a bounded
+    no-replace rename that retries on OBJECT_NAME_COLLISION, so the filesystem
+    settles the name and a loser takes the next candidate. handle_snapshot
+    does not claim either -- its "<base> (partial).mp4" is a checkpoint of one
+    recording, and the next checkpoint is meant to overwrite the last.
+
+    Deduping rather than refusing is the difference from the legacy yt-dlp
+    claim in _pget_register, and it is because the two answer different
+    questions. There, the claim IS the identity of the job (same video, same
+    folder, same template) so a second one is a duplicate and is turned away.
+    Here two writers that merely derived one name are two different things the
+    user asked for, and they can both have what they asked for under two names.
+
+    THE WALK RUNS WITH _PGET_LOCK RELEASED. _dedup costs one os.path.exists
+    per existing "<name> (n)<ext>" sibling -- as many as the folder happens to
+    hold, not a fixed few -- and on a save folder that is an SMB share each one
+    is a network round trip. _PGET_LOCK is the same lock _pget_cancel takes on
+    the message loop (_pget_registry_get), so a walk held inside it stalls
+    every command queued behind that cancel. Instead the walk reads a snapshot
+    of the claims, and the lock is taken only to re-check the candidate and
+    record it. A loser goes round again; the winner's key is in the next
+    snapshot, so the retry moves past the name it lost rather than picking it
+    twice. Contention is between the handful of writers live at once, so the
+    repeated walk is not a practical cost.
+
+    The existence half is racy either way and always was: nothing stops another
+    PROCESS creating the file after the stat. The lock buys atomicity only for
+    what this host can actually make atomic, which is the registry.
+
+    `commit`, when given, is called with the winning normcase key while the
+    lock is held and returns False to abandon the claim (this helper then
+    returns None) -- that is where a caller re-checks whatever made the claim
+    worth taking, and stores its own back-reference in the same critical
+    section so no unregister can run between the two.
+    """
+    while True:
+        with _PGET_LOCK:
+            held = frozenset(_PGET_DEST)
+        path = _dedup(dest, taken=lambda p: os.path.normcase(p) in held)
+        key = os.path.normcase(path)
+        with _PGET_LOCK:
+            if key in _PGET_DEST:
+                continue                 # lost the race — resolve again
+            if commit is not None and not commit(key):
+                return None
+            _PGET_DEST[key] = owner
+            return path
+
+
+def _release_free_dest(path, owner):
+    """Drop a claim _claim_free_dest took for a writer with no registry entry.
+
+    pget ops are released by _pget_drop_locked along with their id. A recording
+    has no id in _PGET, so its claim is released here instead, and only when it
+    is still the one this owner took.
+    """
+    if path is None:
+        return
+    with _PGET_LOCK:
+        key = os.path.normcase(path)
+        if _PGET_DEST.get(key) is owner:
+            del _PGET_DEST[key]
+
+
+def _pget_claim_dest(jid, op, dest):
+    """Resolve `dest` to a path no live writer holds, and claim it for `op`.
+
+    The dedup-and-claim protocol itself is _claim_free_dest; this is the pget
+    binding of it. Returns the claimed path, or None when this op is no longer
+    the registered owner of `jid`: a job already finished has nothing left to
+    claim, and claiming would leave an entry no unregister will ever drop.
+
+    op["dest"] is set in the same critical section as the claim, because that
+    back-reference is how _pget_drop_locked finds the claim again — set after
+    the lock, an unregister landing in between would leak the entry.
+    """
+    def commit(key):
+        if _PGET.get(jid) is not op:
+            return False
+        op["dest"] = key
+        return True
+
+    return _claim_free_dest(dest, op, commit=commit)
 
 
 def _pget_kill_off_loop(proc, kill_children):
@@ -5329,13 +5568,30 @@ def handle_pget(req):
                 # No makedirs: resolve_existing_dir already required the
                 # destination to exist, so nothing on THIS path builds a
                 # tree (the structured ytdl lease still does, by design).
-                final_path = _dedup(os.path.join(out_dir, name))
+                # Claimed, not merely deduped: the path is not created until
+                # os.replace, so a concurrent job would otherwise resolve the
+                # same one (_pget_claim_dest).
+                final_path = _pget_claim_dest(jid, op, os.path.join(out_dir, name))
                 op["final_path"] = final_path
             except Exception:
                 if op.get("cancel_requested") or stop.is_set():
                     finish("cancelled", "cancelled", "empty")
                 else:
                     finish("failed", "local_io", "empty")
+                return
+
+            if final_path is None:
+                # DEFENSIVE, and unreachable as this ships. _pget_claim_dest
+                # returns None only when the registry no longer points at this
+                # op, and nothing takes it away underneath a worker that has
+                # not finished: _pget_cancel sets flags and never unregisters,
+                # _pget_register refuses a second op on a live id, and the only
+                # unregister on this path is finish()'s -- which every caller
+                # returns from immediately. Kept because "claimed a path that
+                # no unregister will ever release" is the failure it prevents,
+                # and the guard costs one comparison. finish() is idempotent,
+                # so if the route ever opens the terminal is still exactly one.
+                finish("cancelled", "cancelled", "empty")
                 return
 
             if op.get("cancel_requested") or stop.is_set():
@@ -5631,7 +5887,8 @@ def handle_pget_single(req):
                 # No makedirs: resolve_existing_dir already required the
                 # destination to exist, so nothing on THIS path builds a
                 # tree (the structured ytdl lease still does, by design).
-                final_path = _dedup(os.path.join(out_dir, name))
+                # Claimed, not merely deduped: same window as handle_pget's.
+                final_path = _pget_claim_dest(jid, op, os.path.join(out_dir, name))
                 op["final_path"] = final_path
                 op["n"] = n
             except Exception:
@@ -5639,6 +5896,12 @@ def handle_pget_single(req):
                     finish("cancelled", "cancelled", "empty")
                 else:
                     finish("failed", "local_io", "empty")
+                return
+
+            if final_path is None:
+                # Defensive and unreachable today, exactly as on handle_pget's
+                # path: nothing unregisters a live op behind its own worker.
+                finish("cancelled", "cancelled", "empty")
                 return
 
             if op.get("cancel_requested") or stop.is_set():

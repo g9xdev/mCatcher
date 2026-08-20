@@ -642,6 +642,45 @@
       return s;
     }
 
+    // Query parameters that say which media a line is about. Closed allowlist:
+    // Signature, token, sig, key and expire are not in it and cannot be added
+    // by a site, and a parameter nobody has vetted is dropped rather than kept.
+    // Without this the whole query went, so every video logged as .../watch and
+    // two different googlevideo failures collapsed to one .../videoplayback line.
+    var LOG_IDENTITY_PARAMS = ["v", "id"];
+    // A media id is a short plain identifier: YouTube's v is 11 characters,
+    // googlevideo's id is 16. The cap is headroom over those, and it bounds
+    // the risk rather than removing it — [A-Za-z0-9_.~-] is also the alphabet
+    // of a base64url or hex token, so a provider that spells a signed link
+    // id=<signature> has that value kept. At 64 a whole hex HMAC or a 256-bit
+    // base64url token fitted; at 24 neither does. A separator that could nest
+    // a second query fails closed at the pattern below.
+    var LOG_IDENTITY_VALUE_MAX = 24;
+    var LOG_IDENTITY_VALUE_RE = /^[A-Za-z0-9_.~-]+$/;
+
+    // The allowlisted part of a parsed URL's query, as "?v=…[&id=…]" or "".
+    // Emitted in LOG_IDENTITY_PARAMS order so the same URL always projects to
+    // the same line whatever order the site wrote its query in.
+    function identityQuery(u) {
+      var params = u && u.searchParams;
+      if (!params || typeof params.get !== "function") return "";
+      var kept = "";
+      for (var i = 0; i < LOG_IDENTITY_PARAMS.length; i++) {
+        var name = LOG_IDENTITY_PARAMS[i];
+        var value;
+        try {
+          value = params.get(name);
+        } catch (e) {
+          return "";
+        }
+        if (typeof value !== "string" || value.length === 0) continue;
+        if (value.length > LOG_IDENTITY_VALUE_MAX) continue;
+        if (!LOG_IDENTITY_VALUE_RE.test(value)) continue;
+        kept += (kept ? "&" : "?") + name + "=" + value;
+      }
+      return kept;
+    }
+
     function redactUrlForLog(url) {
       // Primitive strings only — never coerce objects/arrays via String().
       if (typeof url !== "string" || url.length === 0) return "[redacted]";
@@ -653,14 +692,19 @@
             var u = new URL(url);
             u.username = "";
             u.password = "";
+            var identity = identityQuery(u);
             u.search = "";
             u.hash = "";
-            // href after clearing userinfo/query/hash is scheme://host[:port]/path
-            return u.href;
+            // href after clearing userinfo/query/hash is scheme://host[:port]/path.
+            // identity is re-appended already checked against the value pattern,
+            // so nothing but [A-Za-z0-9_.~-] follows the "?".
+            return u.href + identity;
           }
         } catch (e) {
           // fall through to manual strip
         }
+        // No URL parser to read the query with, so the manual paths below keep
+        // no identity parameter at all — they drop the query outright.
         return manualRedactAbsoluteHttp(url);
       }
 
@@ -673,6 +717,83 @@
       var pathOnly = url.split("#")[0].split("?")[0];
       if (!pathOnly) return "[redacted]";
       return pathOnly;
+    }
+
+    // Credential-shaped parameter names, redacted by value wherever they appear
+    // in a line — inside a URL or not. Deliberately a blocklist, and just as
+    // deliberately never the only defence: redactUrlForLog's allowlist decides
+    // what survives of anything that parses as a URL, and this is the layer
+    // behind it for text no URL match can claim. A URL printed with a raw space
+    // in it ends at the space, and the tail carrying the Signature stays in the
+    // line as loose text; no boundary has to be decided to redact that tail.
+    //
+    // It is additive, so it can only remove more than the projection does —
+    // including, sometimes, a diagnostic the projection deliberately kept. A
+    // name=value inside a path is claimed like any other: /token=1/clip.mp4
+    // and /token=2/clip.mp4 both end as /token=[redacted], because the value
+    // runs to the next &, whitespace, quote or angle bracket and a path
+    // separator is none of those. That is a price, not an accident: a token in
+    // a path segment is a real spelling (signed CDN paths put one there), so
+    // most of what looks like a false positive is what this pass is for. What
+    // it costs is pinned in the tests rather than argued away here. The name
+    // must be whole: a preceding name character (monkey=, passwordless=) means
+    // no match. A quoted value counts as a value — token="S" and 'token': 'S'
+    // are both credentials, and excluding the quote from the value class used
+    // to mean the whole line went through untouched. The CLOSING quote is
+    // optional for the same reason: the host logs str(e)[:500] and a joined
+    // stderr tail cut at 2000, and the cut lands before either layer redacts,
+    // so a header dump arrives as {"token": "SECRET with the closing quote
+    // gone. Requiring it sent that line through both layers untouched. Falling
+    // back to the unclosed alternative only happens when no closing quote
+    // follows at all, so it takes the rest of the line — over-redacting a
+    // truncated diagnostic, which is the direction this pass already accepts.
+    // A ':' separator is
+    // claimed only when the value is quoted, so an "Expires: Thu, 01 Dec"
+    // header keeps its shape. A regex literal, not a built string: the value
+    // class carries a quote and a backslash escape, which a string would
+    // swallow before RegExp saw them.
+    var LOG_CREDENTIAL_VALUE_RE = /(^|[^A-Za-z0-9_-])(x-amz-security-token|x-amz-credential|x-amz-signature|signature|password|expires|policy|expire|token|auth|pwd|sig|key)(["']?\s*(?:=|:(?=\s*["']))\s*)("[^"]*"?|'[^']*'?|[^&\s"'<>]+)/gi;
+
+    function redactCredentialValues(text) {
+      return text.replace(LOG_CREDENTIAL_VALUE_RE,
+        function (whole, lead, name, separator, value) {
+          // Keep the quotes the line was written with, so a redacted value
+          // still reads as the value of that name.
+          var first = value.charAt(0);
+          var quote = (first === '"' || first === "'") ? first : "";
+          return lead + name + separator + quote + "[redacted]" + quote;
+        });
+    }
+
+    /**
+     * Free-text log redaction. Every absolute http(s) URL in the line is
+     * replaced by its redactUrlForLog projection — scheme://host[:port]/path,
+     * with userinfo and fragment removed and, of the query, only the
+     * LOG_IDENTITY_PARAMS allowlist kept. Trailing sentence punctuation and
+     * wrappers are put back so a quoted or sentence-final URL still reads as
+     * one. Everything else in the line, including local save paths, survives
+     * THAT pass — but redactCredentialValues runs after it over the whole
+     * line, and does claim a credential-shaped name=value inside a save path.
+     *
+     * The match runs to whitespace, not to the first quote or angle bracket:
+     * host lines carry yt-dlp's own spelling rather than a browser-canonicalised
+     * URL, so an unencoded quote inside the query would otherwise end the match
+     * and leave the credential after it standing in the line. Whitespace is
+     * still the boundary, so a URL printed with a raw space in it is projected
+     * only up to that space — which is what the second pass below is for.
+     */
+    function redactLogText(text) {
+      if (typeof text !== "string" || text.length === 0) return "";
+      var projected = text.replace(/https?:\/\/\S+/gi, function (match) {
+        var trailing = "";
+        var punct = match.match(/['">.,;:!?)\]}]+$/);
+        if (punct) {
+          trailing = punct[0];
+          match = match.slice(0, match.length - trailing.length);
+        }
+        return redactUrlForLog(match) + trailing;
+      });
+      return redactCredentialValues(projected);
     }
 
     function assertNoSentinels(blob, sentinels) {
@@ -758,6 +879,7 @@
       projectSafeHistory: projectSafeHistory,
       projectPopupJob: projectPopupJob,
       redactUrlForLog: redactUrlForLog,
+      redactLogText: redactLogText,
       assertNoSentinels: assertNoSentinels,
       clearEphemeralOnTerminal: clearEphemeralOnTerminal,
     };

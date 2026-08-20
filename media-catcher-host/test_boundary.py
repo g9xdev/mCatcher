@@ -591,3 +591,213 @@ def test_no_untyped_container_kind_can_be_declared():
         guard._assert_kinds_declared({"save": {"convert": "dict"}})
     with pytest.raises(ValueError):
         guard._assert_kinds_declared({"save": {"convert": {"quality": "dict"}}})
+
+
+def test_refuse_url_covers_the_scheme_shapes():
+    r = guard.refuse_url
+    for ok in ("http://a.test/x", "https://a.test/x", "HTTPS://A.TEST/x",
+               "https://a.test:8443/v?q=1#f", "https://user:pw@a.test/x"):
+        assert r(ok) is None, ok
+    for bad in ("file:///C:/Windows/win.ini", "ftp://a.test/x",
+                "javascript:alert(1)", "data:text/plain,x", "ws://a.test/x",
+                r"C:\Windows\win.ini", r"\\a.test\share\x", "//a.test/x",
+                "http://", "http:/a", "not a url", "", "   ", None, 5, b"x",
+                " https://a.test/x", "https://a.test/x ",
+                "ht\ttp://a.test/x", "https://a.test/\x00x",
+                "https://a.test/x\n--exec"):
+        assert r(bad) is not None, repr(bad)
+
+
+def test_cast_url_is_not_a_yt_dlp_url():
+    """The two "url" fields mean different things, and the schema is per-cmd.
+
+    cast's "url" is a media SOURCE: mchost/cast/legacy.py serves anything that
+    is not ^https?:// as a file on disk, which is how casting a finished
+    recording works. A kind on ytdl's url would not have reached this one --
+    MESSAGE_SCHEMA is keyed by command, so the two entries are independent, and
+    the comment above refuse_url no longer claims otherwise. What actually
+    keeps refuse_url out of the schema is the shape of the refusal; see
+    test_a_schema_refusal_cannot_carry_an_attempt_token.
+    """
+    from mchost.cast import legacy
+
+    assert guard.MESSAGE_SCHEMA["cast"]["url"] == guard.STR
+    # Per-command, so the fields are not one declaration shared by name.
+    assert guard.MESSAGE_SCHEMA["cast"] is not guard.MESSAGE_SCHEMA["ytdl"]
+    assert guard.validate_message(
+        {"cmd": "cast", "sub": "start", "id": "d1",
+         "url": r"C:\Users\me\Videos\clip.mp4"}) is None
+    entry = legacy._dlna_media_url(r"C:\Users\me\Videos\clip.mp4", None)
+    assert isinstance(entry, tuple)
+
+
+def test_refuse_url_covers_argv_injection_not_only_scheme():
+    """The url is the LAST argv entry, which is where an option is read from.
+
+    yt-dlp parses with optparse, and optparse reads a dash-leading trailing
+    argument as an option, not as a positional. Being the only
+    caller-controlled token in argv is therefore not protection. This asserts
+    the parser behaviour that makes it matter, so the reason written above
+    refuse_url cannot quietly stop being true.
+    """
+    import optparse
+
+    p = optparse.OptionParser()
+    p.add_option("-f", dest="fmt")
+    p.add_option("-o", dest="out")
+    opts, args = p.parse_args(["-f", "b", "-o", "t", "-o://evil"])
+    assert opts.out == "://evil", opts.out
+    assert args == [], args        # consumed as an option; no positional at all
+
+    # ...which is why every dash-leading shape is refused before argv.
+    for bad in ("--exec=calc.exe", "-o://evil", "--paths=C:/x",
+                "--enable-file-urls", "-", "--"):
+        assert guard.refuse_url(bad) is not None, bad
+
+
+def test_a_schema_refusal_cannot_carry_an_attempt_token():
+    """The true reason refuse_url is a handler call, not a schema kind.
+
+    A schema refusal IS correlated -- mc_host echoes guard.message_id on it --
+    but message_id only ever returns an id, never the attemptToken, and the
+    frame is a {"type":"error"}, not the ytdl-error a structured row waits for.
+    """
+    msg = {"cmd": "ytdl", "id": "j1", "attemptToken": "atk-1", "url": 5}
+    assert guard.validate_message(msg) is not None
+    assert guard.message_id(msg) == "j1"
+    assert guard.message_id({"cmd": "ytdl", "attemptToken": "atk-1"}) is None
+
+
+# ---------------------------------------------------------------------------
+# 6. The record lane's URLs are attacker text too
+#
+# Every other URL this host takes arrived from webRequest or a gated content
+# script. record's did not: it is a URI lifted from the BODY of a fetched HLS
+# manifest. The live route is background.js "record-live" -> resolveVideoUrl,
+# which fetches the master playlist and returns pickVariant(...).uri, and
+# media-catcher/lib/hls.js resolveUrl returns an absolute URI unchanged, so
+# the playlist decides the string. ffmpeg opens "file://attacker.test/s/x" as
+# the UNC path \\attacker.test\s\x -- an outbound SMB connection carrying the
+# user's NTLM credentials -- which is the threat 2c3e0aa gated mirrors
+# against. audioUrl is gated for the same reason rather than because a shipped
+# producer reaches it: findSiblingAudio only returns a same-stream-directory
+# or token-swapped sibling of a URL that already passed, so it is pinned by
+# construction rather than by test. The point is that the lane has a boundary.
+#
+# The headers are the same lane's second half: ffmpeg_cmd interpolates referer
+# and userAgent into one -headers value separated by a literal \r\n, so a
+# control character in either appends headers of the page's choosing to every
+# request ffmpeg makes for that stream.
+# ---------------------------------------------------------------------------
+
+def _record_argv(monkeypatch, req):
+    """handle_record end to end: (ffmpeg argv or None if none was built, frames).
+
+    Popen raises so nothing is launched, which also settles job.finished on the
+    worker — the argv is captured at the real spawn point, not from ffmpeg_cmd.
+    """
+    import mchost.downloads as d
+
+    calls, sent = [], []
+    monkeypatch.setattr(mc, "FFMPEG", "ffmpeg")
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+
+    def fake_popen(cmd, **kw):
+        calls.append(list(cmd))
+        raise OSError("test: ffmpeg is not really launched")
+
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+    try:
+        mc.handle_record(req)
+        job = d.JOBS.get(req.get("id"))
+        if job is not None:
+            assert job.finished.wait(5), "run_job never finished"
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop(req.get("id"), None)
+    return (calls[0] if calls else None), sent
+
+
+def _record_error(sent, jid):
+    errs = [m for m in sent if m.get("type") == "error" and m.get("id") == jid]
+    assert errs, sent
+    return errs[-1]
+
+
+def test_record_refuses_a_non_http_audio_url(monkeypatch):
+    """The reviewer's scenario: the audio URI of a master playlist is a UNC."""
+    jid = "recUncAudio"
+    argv, sent = _record_argv(monkeypatch, {
+        "id": jid, "base": "clip",
+        "videoUrl": "https://cdn.test/v.m3u8",
+        "audioUrl": "file://attacker.test/s/x",
+    })
+    assert argv is None, argv
+    _record_error(sent, jid)
+
+
+def test_record_refuses_a_non_http_video_url(monkeypatch):
+    """The local-read half of the same shape, and the required field."""
+    for bad in ("file:///C:/Users/me/.ssh/id_rsa", "ftp://attacker.test/x",
+                "//attacker.test/s/x", " https://cdn.test/v.m3u8",
+                "https://cdn.test/v\r\n.m3u8", ""):
+        jid = "recBadVideo"
+        argv, sent = _record_argv(monkeypatch, {
+            "id": jid, "base": "clip", "videoUrl": bad,
+        })
+        assert argv is None, (bad, argv)
+        _record_error(sent, jid)
+
+
+def test_record_refuses_control_characters_in_referer_and_user_agent(monkeypatch):
+    """ffmpeg's -headers value is CRLF-separated, so a CRLF here adds headers."""
+    for field in ("referer", "userAgent"):
+        jid = "recHdr_" + field
+        argv, sent = _record_argv(monkeypatch, {
+            "id": jid, "base": "clip",
+            "videoUrl": "https://cdn.test/v.m3u8",
+            field: "http://page/\r\nX-Injected: 1",
+        })
+        assert argv is None, (field, argv)
+        _record_error(sent, jid)
+
+
+def test_record_still_records_an_ordinary_stream(monkeypatch):
+    """The gate is a gate, not a wall: the shipped shape still reaches ffmpeg."""
+    jid = "recOk"
+    argv, sent = _record_argv(monkeypatch, {
+        "id": jid, "base": "clip",
+        "videoUrl": "https://cdn.test/v.m3u8",
+        "audioUrl": "https://cdn.test/a.m3u8",
+        "referer": "https://page.test/watch", "userAgent": "UA/1.0",
+    })
+    assert argv is not None
+    assert argv.count("-i") == 2, argv
+    assert "https://cdn.test/a.m3u8" in argv, argv
+
+
+def test_record_keeps_a_referer_that_merely_spells_a_header_inside_its_own(
+        monkeypatch):
+    """Legal but adjacent: an injection's text without the CRLF that makes one.
+
+    ffmpeg_cmd joins Referer and User-Agent into ONE -headers value with a
+    literal CRLF between them, so the property worth pinning is that this
+    referer rides INSIDE the Referer line instead of becoming a third header,
+    and that the gate refuses on the control character rather than on the text.
+    The refusal half is test_record_refuses_control_characters_in_referer_and_
+    user_agent, which asserts argv is None; this is the other half.
+    """
+    jid = "recAdjacentHeaderText"
+    argv, sent = _record_argv(monkeypatch, {
+        "id": jid, "base": "clip",
+        "videoUrl": "https://cdn.test/v.m3u8",
+        "referer": "https://page.test/watch?q=X-Injected:%201",
+        "userAgent": "UA/1.0",
+    })
+    assert argv is not None, sent
+    headers = argv[argv.index("-headers") + 1]
+    lines = [ln for ln in headers.split("\r\n") if ln]
+    assert lines == ["Referer: https://page.test/watch?q=X-Injected:%201",
+                     "User-Agent: UA/1.0"], lines
+    assert all(not ln.startswith("X-Injected") for ln in lines), lines

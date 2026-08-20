@@ -14,6 +14,7 @@ const PUBLIC_KEYS = [
   "projectSafeHistory",
   "projectPopupJob",
   "redactUrlForLog",
+  "redactLogText",
   "assertNoSentinels",
   "clearEphemeralOnTerminal",
 ];
@@ -97,7 +98,7 @@ test("assertNoSentinels fails when signed query leaks", () => {
 
 // --- Exact public surface + dual export ---
 
-test("exports exactly the six public keys", () => {
+test("exports exactly the seven public keys", () => {
   assert.deepEqual(Object.keys(P).sort(), PUBLIC_KEYS.slice().sort());
   for (const k of PUBLIC_KEYS) {
     assert.equal(typeof P[k], "function", k);
@@ -1219,4 +1220,260 @@ test("projectPopupJob omits URL-like string ids and network URLs in all string f
       }
     }
   }
+});
+
+test("redactLogText strips userinfo, query and fragment from every URL it finds", () => {
+  assert.equal(
+    P.redactLogText(
+      "yt-dlp: requested https://site.example/watch?v=abc&token=SECRET [bv*+ba]"
+    ),
+    "yt-dlp: requested https://site.example/watch?v=abc [bv*+ba]"
+  );
+  assert.equal(
+    P.redactLogText(
+      "ERROR: unable to download https://cdn.example/a/b.mp4?Signature=SECRET#t=10 " +
+        "(referer http://user:pw@site.example/watch?p=SECRET)"
+    ),
+    "ERROR: unable to download https://cdn.example/a/b.mp4 " +
+      "(referer http://site.example/watch)"
+  );
+  // Non-URL diagnostics — including local save paths — survive unchanged.
+  // String.raw, not "D:\Vids": \V and \M are not escapes, so a plain literal
+  // would assert a backslash-free string and prove nothing about real paths.
+  assert.equal(
+    P.redactLogText(String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`),
+    String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`
+  );
+  assert.equal(P.redactLogText(""), "");
+  assert.equal(P.redactLogText(null), "");
+  assert.equal(P.redactLogText({ toString() { return "https://x/?t=S"; } }), "");
+});
+
+test("redactLogText matches a URL to whitespace so an in-query quote leaves no tail", () => {
+  // Host lines are yt-dlp's own spelling, not a browser-canonicalised URL, so
+  // an unencoded quote or angle bracket can sit inside the query. Ending the
+  // match there projected only the head and left the credential in the line.
+  assert.equal(
+    P.redactLogText("https://a.ex/x?title=it's&sig=SECRET_SIGNED_QUERY_XYZ"),
+    "https://a.ex/x"
+  );
+  assert.equal(
+    P.redactLogText('https://a.ex/x?q=a"b&sig=SECRET_SIGNED_QUERY_XYZ'),
+    "https://a.ex/x"
+  );
+  assert.equal(
+    P.redactLogText("https://a.ex/x?a=1<2&sig=SECRET_SIGNED_QUERY_XYZ"),
+    "https://a.ex/x"
+  );
+  // A URL wrapped in quotes or angle brackets still reads as one afterwards.
+  assert.equal(
+    P.redactLogText('saw "https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ" once'),
+    'saw "https://a.ex/x" once'
+  );
+  assert.equal(
+    P.redactLogText("<https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ>"),
+    "<https://a.ex/x>"
+  );
+  assert.equal(
+    P.redactLogText("ERROR: https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ, retrying."),
+    "ERROR: https://a.ex/x, retrying."
+  );
+});
+
+test("redactLogText redacts credential values no URL match can claim", () => {
+  // A second, independent pass over the whole line. It makes no boundary
+  // decision, so a URL printed with a raw space in it — the match ends at the
+  // space — cannot leave its signature behind in the line as loose text.
+  const spaced = P.redactLogText("u=https://a.ex/x?a=b c&sig=SECRET_SIGNED_QUERY_XYZ");
+  assert.equal(spaced.includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(spaced, "u=https://a.ex/x c&sig=[redacted]");
+
+  // After a space, on a line with no URL on it at all.
+  assert.equal(
+    P.redactLogText("resuming with token=SECRET_SIGNED_QUERY_XYZ expires=99"),
+    "resuming with token=[redacted] expires=[redacted]"
+  );
+  // Inside quotes.
+  assert.equal(
+    P.redactLogText('header "Signature=SECRET_SIGNED_QUERY_XYZ" rejected'),
+    'header "Signature=[redacted]" rejected'
+  );
+  // A quoted value is still a value. The value class excludes " and ' and
+  // requires one character, so token="SECRET" matched nothing at all and
+  // passed both layers untouched — the URL projection cannot claim it either,
+  // since the line it sits on need not be a URL.
+  assert.equal(
+    P.redactLogText('resuming with token="SECRET_SIGNED_QUERY_XYZ"'),
+    'resuming with token="[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText("headers: {'token': 'SECRET_SIGNED_QUERY_XYZ'}"),
+    "headers: {'token': '[redacted]'}"
+  );
+
+  // The X-Amz-* family, whose names the bare alternatives would not cover.
+  assert.equal(
+    P.redactLogText(
+      "X-Amz-Signature=SECRET_SIGNED_QUERY_XYZ&X-Amz-Credential=SECRET_SIGNED_QUERY_XYZ"
+    ),
+    "X-Amz-Signature=[redacted]&X-Amz-Credential=[redacted]"
+  );
+  assert.equal(
+    P.redactLogText("X-Amz-Security-Token=SECRET_SIGNED_QUERY_XYZ next"),
+    "X-Amz-Security-Token=[redacted] next"
+  );
+
+  // A ':' separator is claimed only when the value is quoted, so an ordinary
+  // header dump keeps its shape instead of losing its first word.
+  assert.equal(
+    P.redactLogText("Expires: Thu, 01 Dec 1994 16:00:00 GMT"),
+    "Expires: Thu, 01 Dec 1994 16:00:00 GMT"
+  );
+
+  // What the pass costs, pinned rather than claimed. It runs over the whole
+  // line, so a credential-shaped name=value the URL projection deliberately
+  // KEPT — one inside a path, or inside a local save path — is redacted
+  // too, and the value runs to the next &, whitespace, quote or angle bracket
+  // rather than to the next path separator. Two distinct clips can therefore
+  // project to one line. That is the price of a pass that decides no
+  // boundary; a token in a path segment is a real spelling, so the same
+  // behaviour is also the point of it.
+  assert.equal(
+    P.redactLogText("saved https://cdn.example/token=1/clip.mp4"),
+    "saved https://cdn.example/token=[redacted]"
+  );
+  assert.equal(
+    P.redactLogText("saved https://cdn.example/token=2/clip.mp4"),
+    "saved https://cdn.example/token=[redacted]"
+  );
+  assert.equal(
+    P.redactLogText(String.raw`saved to D:\Vids\[key=abc] Movie.mp4`),
+    String.raw`saved to D:\Vids\[key=[redacted] Movie.mp4`
+  );
+
+  // Additive: it can only remove more, never less. The format selector
+  // carries no credential-shaped name=value, so the line the widened URL
+  // match would have eaten must read exactly as it did before.
+  const selector =
+    "yt-dlp: requested https://site.example/watch?v=abc [bv*[height<=720]+ba/b[height<=720]]";
+  assert.equal(P.redactLogText(selector), selector);
+  // String.raw here too: in a plain literal \V and \M are not escapes, so both
+  // sides would be the same backslash-free string and the case would prove
+  // nothing about the path it names.
+  assert.equal(
+    P.redactLogText(String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`),
+    String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`
+  );
+
+  // A longer name that merely ends in a listed one is not a credential.
+  assert.equal(P.redactLogText("monkey=banana"), "monkey=banana");
+  assert.equal(P.redactLogText("passwordless=fine"), "passwordless=fine");
+  assert.equal(P.redactLogText("Key-Pair-Id=APKAEXAMPLE"), "Key-Pair-Id=APKAEXAMPLE");
+});
+
+test("redactLogText redacts a value whose closing quote was truncated away", () => {
+  // Not a corner case: the host manufactures exactly this line. Its
+  // mchost/downloads.py logs str(e)[:500] and the joined stderr tail cut at
+  // 2000, and the cut happens BEFORE either layer redacts — so a yt-dlp
+  // failure carrying a request-header dump arrives with the opening quote
+  // present and the closing one gone. While both quoted alternatives required
+  // a closing quote, and the unquoted alternative excluded the opening one,
+  // such a value matched nothing and the raw token passed both layers.
+  const cut = 'yt-dlp failed: HTTPError 403 for headers {"token": "SECRET_SIGNED_QUERY_XYZ';
+  assert.equal(P.redactLogText(cut).includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(
+    P.redactLogText(cut),
+    'yt-dlp failed: HTTPError 403 for headers {"token": "[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText("ERROR: unable to download, {'sig': 'SECRET_SIGNED_QUERY_XYZ"),
+    "ERROR: unable to download, {'sig': '[redacted]'"
+  );
+  assert.equal(
+    P.redactLogText('ERROR: {"signature": "SECRET_SIGNED_QUERY_XYZ'),
+    'ERROR: {"signature": "[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText('ffmpeg: token="SECRET_SIGNED_QUERY_XYZ'),
+    'ffmpeg: token="[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText('X-Amz-Security-Token: "SECRET_SIGNED_QUERY_XYZ'),
+    'X-Amz-Security-Token: "[redacted]"'
+  );
+
+  // Making the closing quote optional must not widen a value that closes.
+  // These are lines the pass already got right, pinned byte-identical.
+  assert.equal(
+    P.redactLogText('token="a" and sig="b"'),
+    'token="[redacted]" and sig="[redacted]"'
+  );
+  for (const keep of [
+    "monkey=banana",
+    "Key-Pair-Id=",
+    "-f bv*[height<=720]+ba",
+    "Expires: Thu, 01 Dec 1994 16:00:00 GMT",
+  ]) {
+    assert.equal(P.redactLogText(keep), keep, keep);
+  }
+});
+
+test("redactUrlForLog keeps the allowlisted identity parameter and nothing else", () => {
+  // Dropping the whole query collapsed every video to .../watch and every
+  // googlevideo failure to .../videoplayback, so two distinct failures read as
+  // one line. v and id name which media the line is about; everything else,
+  // allowlist-style, is dropped. The two names are not proof against a
+  // credential — nothing stops a provider spelling a signed link id=<sig>,
+  // and the pattern's alphabet is also base64url's — so the value is capped
+  // at a length a real media id has, which bounds what can ride out.
+  assert.equal(
+    P.redactLogText("yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),
+    "yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  );
+  const a = P.redactLogText(
+    "403 https://r1.gv.example/videoplayback?expire=1&id=aaa11&sig=SECRET_SIGNED_QUERY_XYZ"
+  );
+  const b = P.redactLogText(
+    "403 https://r1.gv.example/videoplayback?expire=2&id=bbb22&sig=SECRET_SIGNED_QUERY_XYZ"
+  );
+  assert.notEqual(a, b, "two distinct failures must not collapse to one line");
+  assert.equal(a, "403 https://r1.gv.example/videoplayback?id=aaa11");
+  assert.equal(a.includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(a.includes("expire"), false);
+
+  // Credential-shaped names never survive, whatever else is present.
+  assert.equal(
+    P.redactUrlForLog(
+      "https://a.ex/p?Signature=SECRET_SIGNED_QUERY_XYZ&token=S&key=S&sig=S&expire=9"
+    ),
+    "https://a.ex/p"
+  );
+  // Both allowlisted names survive together, in a fixed order.
+  assert.equal(
+    P.redactUrlForLog("https://a.ex/p?id=B2&hmac=SECRET_SIGNED_QUERY_XYZ&v=A1"),
+    "https://a.ex/p?v=A1&id=B2"
+  );
+  assert.equal(P.redactUrlForLog("https://a.ex/p?id=ok_1.2~3-4"), "https://a.ex/p?id=ok_1.2~3-4");
+  // Values fail closed: over-long, or anything but a plain identifier, is
+  // dropped, so a nested query can never ride back in through the allowlist.
+  assert.equal(
+    P.redactUrlForLog("https://a.ex/p?v=" + "x".repeat(24)),
+    "https://a.ex/p?v=" + "x".repeat(24)
+  );
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=" + "x".repeat(25)), "https://a.ex/p");
+  // A 64-character hex HMAC and a base64url token are exactly what the value
+  // pattern allows, so the cap is the only thing that drops them.
+  assert.equal(P.redactUrlForLog("https://a.ex/p?id=" + "a1b2c3d4".repeat(8)), "https://a.ex/p");
+  assert.equal(
+    P.redactUrlForLog("https://a.ex/p?id=eyJhbGciOiJIUzI1NiJ9.eyJ1IjoxfQ.SECRET_SIGNED_QUERY"),
+    "https://a.ex/p"
+  );
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=a%2Fb%3Ftoken%3DS"), "https://a.ex/p");
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=a b"), "https://a.ex/p");
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v="), "https://a.ex/p");
+  // Userinfo and fragment stay gone when an identity parameter is kept.
+  assert.equal(
+    P.redactUrlForLog("https://u:SECRET_SIGNED_QUERY_XYZ@a.ex/p?v=A1#SECRET_SIGNED_QUERY_XYZ"),
+    "https://a.ex/p?v=A1"
+  );
 });

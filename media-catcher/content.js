@@ -1,13 +1,16 @@
 /*
  * content.js — reports <video>/<source> srcs, the page/stream title, a
  * thumbnail frame, and a bounded document-scoped page-snapshot for filename
- * ranking. Blob/MediaSource srcs can't be downloaded from the DOM (they're
- * assembled in memory), but those streams are caught separately via the
- * network listener, so we simply skip them here.
+ * ranking. Only absolute http(s) srcs are reported: blob:/MediaSource srcs
+ * can't be downloaded from the DOM (they're assembled in memory) and are
+ * caught separately via the network listener, and every other scheme is a
+ * page-chosen string with no business reaching the background as media.
  *
- * Thumbnails: drawn from the playing <video> onto a canvas. MSE-fed players
- * (blob: src — most streaming sites) don't taint the canvas; a cross-origin
- * file src does, in which case toDataURL throws and we skip quietly.
+ * Thumbnails: drawn from the playing <video> onto a canvas, top frame only —
+ * the background keeps one per tab and shows it on every row of that tab.
+ * MSE-fed players (blob: src — most streaming sites) don't taint the canvas;
+ * a cross-origin file src does, in which case toDataURL throws and we skip
+ * quietly.
  *
  * Pure snapshot helpers are CommonJS-exportable for Node tests. In the browser
  * content-script path the factory self-installs; it does not publish a
@@ -807,15 +810,17 @@
       return reportInflight[url];
     }
 
+    // Only absolute http(s) srcs are reportable media. An allowlist, not a
+    // blocklist: blob:/mediasource:/data: are unfetchable here, and file: /
+    // ftp: / javascript: srcs are page-chosen strings that must never travel
+    // to the background as a media URL.
+    function isReportableUrl(url) {
+      return typeof url === "string" && /^https?:\/\//i.test(url);
+    }
+
     function report(url) {
       if (!url || boundUrls.has(url)) return Promise.resolve();
-      if (
-        url.indexOf("blob:") === 0 ||
-        url.indexOf("mediasource:") === 0 ||
-        url.indexOf("data:") === 0
-      ) {
-        return Promise.resolve();
-      }
+      if (!isReportableUrl(url)) return Promise.resolve();
       var item = {
         url: url,
         kind: /\.m3u8(\?|#|$)/i.test(url) ? "hls" : "direct",
@@ -931,6 +936,9 @@
     }
 
     function sendThumb() {
+      // One thumbnail is stored per tab and attached to every row of that tab,
+      // so only the top frame may set it — the same gate sendPageInfo uses.
+      if (!isTopFrame()) return;
       var dataUrl = captureThumb();
       if (!dataUrl || dataUrl.length > THUMB_MAX || dataUrl === lastThumbSent) return;
       lastThumbSent = dataUrl;

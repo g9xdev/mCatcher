@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { mediaCatcherRoot } = require("./harness/load-lib.js");
+const McPrivacy = require(path.join(mediaCatcherRoot, "lib", "privacy.js"));
 
 function event() {
   const listeners = [];
@@ -34,8 +35,9 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function createHarness() {
+function createHarness(storageSeed) {
   const runtimeMessages = event();
+  const requestHeaders = event();
   const headersReceived = event();
   const captureNetwork = [];
   const acceptPageSnapshot = [];
@@ -92,7 +94,15 @@ function createHarness() {
   const noopEvent = () => event();
   const nativePort = { onMessage: noopEvent(), onDisconnect: noopEvent(), postMessage() {} };
   const browser = {
-    storage: { local: { get() { return Promise.resolve({ pd4done: true, dq1done: true }); }, set() { return Promise.resolve(); } } },
+    storage: { local: {
+      get() {
+        return Promise.resolve(Object.assign(
+          { pd4done: true, dq1done: true },
+          storageSeed ? clone(storageSeed) : null
+        ));
+      },
+      set() { return Promise.resolve(); },
+    } },
     runtime: {
       id: "media-catcher@test",
       lastError: null,
@@ -108,7 +118,7 @@ function createHarness() {
       onActivated: noopEvent(), onRemoved: noopEvent(), onUpdated: noopEvent(), query() { return Promise.resolve([]); },
       create() { return Promise.resolve(); }, update() { return Promise.resolve(); }, executeScript() { return Promise.resolve(); },
     },
-    webRequest: { onSendHeaders: noopEvent(), onHeadersReceived: headersReceived, onBeforeSendHeaders: noopEvent() },
+    webRequest: { onSendHeaders: requestHeaders, onHeadersReceived: headersReceived, onBeforeSendHeaders: noopEvent() },
     browserAction: { onClicked: noopEvent(), setBadgeText() {}, setBadgeBackgroundColor() {} },
     contextMenus: { onClicked: noopEvent(), removeAll(cb) { if (cb) cb(); }, create() {} },
     notifications: { onClicked: noopEvent(), onClosed: noopEvent(), create() {}, clear() {} },
@@ -193,8 +203,9 @@ function createHarness() {
   }
 
   return {
-    send, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
+    send, requestHeaders, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
     registerVariants, broadcasts, popupRows, controllerJobs, textBodies, dashParsed,
+    nativePort,
     holdDirectProbe(url) {
       let release;
       let markStarted;
@@ -640,6 +651,134 @@ test("DOM-first direct media receives late exact network size without a second r
   assert.equal(h.captureDomMedia.length, 1);
 });
 
+test("a later frame's DOM claim never repoints the owner of an already-owned source", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaUrl = "https://cdn.example/movie.mp4?token=SIGNED_SENTINEL";
+  const tabId = 7;
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const report = (sender, origin) => ({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: sender.url,
+    frameOrigin: origin,
+    snapshot: Object.assign({}, pageSnapshot(), {
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      pageUrl: sender.url,
+    }),
+  });
+
+  // The honest top frame reports and claims the file first.
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  await h.send(report(topFrame, "https://site.example"), topFrame);
+  // A second later an ad iframe sets the same src. Its frameId has no claim on
+  // the source, so it still mints its own detection — that part is by design.
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+  await h.send(report(adFrame, "https://ads.example"), adFrame);
+  assert.equal(h.captureDomMedia.length, 2, "the ad frame still gets its own detection");
+
+  h.headersReceived.emit({
+    tabId,
+    frameId: 0,
+    documentId: "doc-top",
+    documentUrl: "https://site.example/watch",
+    originUrl: "https://site.example/watch",
+    url: mediaUrl,
+    statusCode: 206,
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-262143/1395864371" },
+      { name: "Content-Length", value: "262144" },
+    ],
+  });
+  await eventually(() => h.broadcasts.some((m) => m.type === "media-updated"), "size update");
+
+  // Enrichment follows ownership, so the exact Content-Range total must land on
+  // the first claimant. Before this was pinned the ad's later claim repointed
+  // the owner map and took the exact total, leaving the honest row estimating.
+  const response = await h.send({ type: "get-media", tabId });
+  const sized = response.items.filter((row) => row.sizeBytes !== undefined);
+  assert.deepEqual(sized.map((row) => row.id), ["media:opaque:1"]);
+  assert.equal(sized[0].sizeConfidence, "exact");
+  assert.equal(JSON.stringify(response).includes("SIGNED_SENTINEL"), false);
+});
+
+function remountHarness() {
+  const tabId = 7;
+  const mediaUrl = "https://cdn.example/movie.mp4?token=SIGNED_SENTINEL";
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const report = (sender, origin) => ({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: sender.url,
+    frameOrigin: origin,
+    snapshot: Object.assign({}, pageSnapshot(), {
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      pageUrl: sender.url,
+    }),
+  });
+  return { tabId, mediaUrl, frameSender, report };
+}
+
+test("an SPA remounting its player iframe lists the clip once, not twice", async () => {
+  const h = createHarness();
+  await settle();
+  const { tabId, frameSender, report } = remountHarness();
+
+  // A remount is a new BrowsingContext: new frameId, empty boundUrls, so the
+  // player reports the file it already reported and mints a second detection.
+  const firstMount = frameSender(2, "doc-mount-1", "https://site.example/player");
+  await h.send(report(firstMount, "https://site.example"), firstMount);
+  const secondMount = frameSender(5, "doc-mount-2", "https://site.example/player");
+  await h.send(report(secondMount, "https://site.example"), secondMount);
+  assert.equal(h.captureDomMedia.length, 2, "each mount still mints its own detection");
+
+  const response = await h.send({ type: "get-media", tabId });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.deepEqual(
+    direct.map((row) => row.id),
+    ["media:opaque:1"],
+    "two rows with nothing to tell them apart are one clip"
+  );
+});
+
+test("a frame proposing its own name for the page's file keeps its own row", async () => {
+  const h = createHarness();
+  await settle();
+  const { tabId, frameSender, report } = remountHarness();
+  // The fold must not become the suppression per-frame claim scoping prevents:
+  // an ad iframe naming the honest page's file differently stays visible.
+  h.popupRows.set(tabId, [
+    { id: "media:opaque:1", proposedFilename: "Movie Night.mp4", kind: "direct", variants: [] },
+    { id: "media:opaque:2", proposedFilename: "Free-iPhone.mp4", kind: "direct", variants: [] },
+  ]);
+
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  await h.send(report(topFrame, "https://site.example"), topFrame);
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+  await h.send(report(adFrame, "https://ads.example"), adFrame);
+
+  const response = await h.send({ type: "get-media", tabId });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.deepEqual(direct.map((row) => row.id), ["media:opaque:1", "media:opaque:2"]);
+  assert.deepEqual(
+    direct.map((row) => row.proposedFilename),
+    ["Movie Night.mp4", "Free-iPhone.mp4"]
+  );
+});
+
 test("network-first direct media keeps one row and publishes the probe Content-Range total", async () => {
   const h = createHarness();
   await settle();
@@ -774,4 +913,325 @@ test("clear then URL reuse never inherits the previous row's size", async () => 
   const direct = response.items.filter((row) => row.kind === "direct");
   assert.equal(direct.length, 1);
   assert.equal(direct[0].sizeBytes, undefined, "a reused URL must not inherit a stale size");
+});
+
+test("a subframe DOM claim never suppresses another frame's report of the same file", async () => {
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const tabId = 7;
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const domReport = (sender, name, origin) => ({
+    type: "content-media",
+    item: { url: mediaUrl, kind: "direct", name, source: "dom" },
+    referrerUrl: sender.url,
+    frameOrigin: origin,
+    snapshot: Object.assign({}, pageSnapshot(), {
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      pageUrl: sender.url,
+      candidates: [{ kind: "visible-filename", value: name }],
+    }),
+  });
+
+  const h = createHarness();
+  await settle();
+
+  // content_scripts runs in all_frames, so a third-party ad iframe can report
+  // the honest page's media URL first and claim the row's name.
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+  await h.send(domReport(adFrame, "Free-iPhone.mp4", "https://ads.example"), adFrame);
+  assert.equal(h.captureDomMedia.length, 1);
+
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  await h.send(domReport(topFrame, "Movie Night.mp4", "https://site.example"), topFrame);
+  assert.equal(
+    h.captureDomMedia.length,
+    2,
+    "the honest frame must get its own detection, named from its own snapshot"
+  );
+  assert.equal(h.captureDomMedia[1].frameOrigin, "https://site.example");
+  assert.equal(h.captureDomMedia[1].snapshot.frameId, 0);
+
+  // A frame that repeats its own report still gets exactly one detection.
+  await h.send(domReport(topFrame, "Movie Night.mp4", "https://site.example"), topFrame);
+  await h.send(domReport(adFrame, "Free-iPhone.mp4", "https://ads.example"), adFrame);
+  assert.equal(h.captureDomMedia.length, 2, "same-frame repeats stay deduplicated");
+});
+
+test("a network claim is reused by a DOM report from any frame", async () => {
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const h = createHarness();
+  await settle();
+  emitNetwork(h, 7, mediaUrl, "video/mp4", "doc-7");
+  await eventually(() => h.captureNetwork.length === 1, "network direct promotion");
+
+  for (const frameId of [0, 2, 9]) {
+    const sender = {
+      tab: { id: 7, url: "https://site.example/watch" },
+      frameId,
+      documentId: "doc-" + frameId,
+      url: "https://frame.example/player",
+    };
+    await h.send({
+      type: "content-media",
+      item: { url: mediaUrl, kind: "direct", name: "movie.mp4", source: "dom" },
+      referrerUrl: sender.url,
+      frameOrigin: "https://frame.example",
+      snapshot: Object.assign({}, pageSnapshot(), { frameId }),
+    }, sender);
+  }
+  assert.equal(h.captureDomMedia.length, 0, "the network lane owns the file for every frame");
+  assert.equal(h.captureNetwork.length, 1);
+});
+
+test("content-thumb is accepted only from the top frame", async () => {
+  const h = createHarness();
+  await settle();
+  const tabId = 7;
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+
+  await h.send({
+    type: "content-media",
+    item: { url: "https://cdn.example/movie.mp4", kind: "direct" },
+    referrerUrl: topFrame.url,
+    frameOrigin: "https://site.example",
+    snapshot: Object.assign({}, pageSnapshot(), { frameId: 0, documentId: "doc-top" }),
+  }, topFrame);
+
+  // One thumbnail is attached to every row of the tab, so a subframe that can
+  // set it picks the picture the user sees for the top page's media.
+  const adThumb = "data:image/jpeg;base64,QUQ=";
+  await h.send({ type: "content-thumb", dataUrl: adThumb }, adFrame);
+  let result = await h.send({ type: "get-media", tabId });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].thumb, null, "a subframe must not set the tab thumbnail");
+
+  const topThumb = "data:image/jpeg;base64,VE9Q";
+  await h.send({ type: "content-thumb", dataUrl: topThumb }, topFrame);
+  result = await h.send({ type: "get-media", tabId });
+  assert.equal(result.items[0].thumb, topThumb);
+
+  // A later subframe thumb must not overwrite the top frame's.
+  await h.send({ type: "content-thumb", dataUrl: adThumb }, adFrame);
+  result = await h.send({ type: "get-media", tabId });
+  assert.equal(result.items[0].thumb, topThumb);
+});
+
+test("the diagnostics ring never keeps a URL's userinfo, query or fragment", async () => {
+  const h = createHarness();
+  await settle();
+  // Every producer — mclog for extension lines, the host/guardian "log" relay
+  // for helper output — funnels through pushLog, which is what persists the
+  // ring to storage.local and streams it to the Settings console.
+  //
+  // First, the line shape the shipped host actually emits: it redacts at its
+  // own seam, so what arrives here has already lost its signed query and
+  // keeps only the identity parameter. This is the case the extension's
+  // allowlist decides — without it the second pass would take ?v=abc back off
+  // every real host line, and a test that feeds the ring a raw signed query
+  // exercises a shape no host produces.
+  const asHostEmits =
+    "yt-dlp: ERROR https://site.example/watch?v=abc -> https://cdn.example/a/b.mp4";
+  h.nativePort.onMessage.emit({ type: "log", level: "warn", src: "host", msg: asHostEmits });
+  await settle();
+  let lines = h.broadcasts.filter((m) => m.type === "log-line");
+  assert.equal(lines.length >= 1, true);
+  assert.equal(lines[lines.length - 1].line.msg, asHostEmits);
+
+  // Second, a line no host redacted. The helper updates independently of the
+  // extension, so an older installed host still emits its query whole, and
+  // extension-side mclog lines are never redacted at their source.
+  h.nativePort.onMessage.emit({
+    type: "log",
+    level: "warn",
+    src: "host",
+    msg: "yt-dlp: ERROR https://site.example/watch?v=abc&token=SECRET_TOKEN " +
+      "-> https://cdn.example/a/b.mp4?Signature=SECRET_SIG#t=10",
+  });
+  await settle();
+
+  lines = h.broadcasts.filter((m) => m.type === "log-line");
+  assert.equal(lines.length >= 2, true);
+  const line = lines[lines.length - 1];
+  assert.equal(line.line.src, "host");
+  assert.equal(line.line.level, "warn");
+  // ?v=abc survives: it says which video the line is about, and it is short
+  // enough and plain enough for the identity allowlist to keep. The signed
+  // query around it does not.
+  assert.equal(line.line.msg, asHostEmits);
+  assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_TOKEN"), false);
+  assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_SIG"), false);
+});
+
+test("an update event's detail is redacted before it is persisted or copied", async () => {
+  const h = createHarness();
+  await settle();
+  // get-update-report asks the helper for a fresh report; answer it inline so
+  // the handler resolves and the copied payload can be inspected whole.
+  h.nativePort.postMessage = (message) => {
+    if (message && message.cmd === "getReport") {
+      h.nativePort.onMessage.emit({ type: "report", reqId: message.reqId, ok: true });
+    }
+  };
+
+  // Every updates.py detail is a literal English string today. Nothing catches
+  // the first one that is not, because recordEvent skipped the projection
+  // pushLog applies while _persistDiag writes mcEvents beside mcLogs.
+  h.nativePort.onMessage.emit({
+    type: "update-event",
+    event: {
+      ts: 1,
+      kind: "update-failed",
+      detail: "download failed: https://cdn.example/mc.zip?Signature=SECRET_EVENT_SIG#f",
+    },
+  });
+  await settle();
+
+  const report = await h.send({ type: "get-update-report" });
+  assert.equal(
+    report.events[report.events.length - 1].detail,
+    "download failed: https://cdn.example/mc.zip"
+  );
+  McPrivacy.assertNoSentinels(JSON.stringify(report), ["SECRET_EVENT_SIG"]);
+  McPrivacy.assertNoSentinels(JSON.stringify(h.broadcasts), ["SECRET_EVENT_SIG"]);
+});
+
+test("events restored from storage are redacted before they can be read back", async () => {
+  const h = createHarness({
+    mcEvents: [{
+      ts: 1,
+      kind: "update-failed",
+      detail: "download failed: https://cdn.example/mc.zip?Signature=SECRET_EVENT_SIG",
+    }],
+  });
+  await settle();
+  h.nativePort.postMessage = (message) => {
+    if (message && message.cmd === "getReport") {
+      h.nativePort.onMessage.emit({ type: "report", reqId: message.reqId, ok: true });
+    }
+  };
+  const report = await h.send({ type: "get-update-report" });
+  assert.equal(report.events[0].detail, "download failed: https://cdn.example/mc.zip");
+  McPrivacy.assertNoSentinels(JSON.stringify(report), ["SECRET_EVENT_SIG"]);
+});
+
+test("a ring restored from storage is redacted before it can be read back", async () => {
+  const h = createHarness({
+    mcLogs: [{
+      ts: 1,
+      level: "info",
+      src: "ext",
+      msg: "yt-dlp: requested https://site.example/watch?v=abc&token=SECRET_TOKEN",
+    }],
+  });
+  await settle();
+  const logs = await h.send({ type: "get-logs" });
+  // Restored lines precede the lines this session pushed during startup.
+  assert.equal(
+    logs.logs[0].msg,
+    "yt-dlp: requested https://site.example/watch?v=abc"
+  );
+  assert.equal(JSON.stringify(logs).includes("SECRET_TOKEN"), false);
+});
+
+// A ready helper is what routes a recording to ffmpeg instead of the in-browser
+// recorder, and a captured record command is what the host would act on.
+async function readyHelper(h) {
+  h.nativePort.onMessage.emit({ type: "pong", ffmpeg: true });
+  const posts = [];
+  h.nativePort.postMessage = (message) => { posts.push(clone(message)); };
+  await settle();
+  return posts;
+}
+
+function liveMaster(variantUri) {
+  return [
+    "#EXTM3U",
+    "#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1280x720",
+    variantUri,
+    "",
+  ].join("\n");
+}
+
+test("the record lane refuses a stream URL the helper must not open", async () => {
+  const h = createHarness();
+  await settle();
+  const posts = await readyHelper(h);
+
+  // This lane's URL comes from the body of a fetched manifest, not from
+  // webRequest or a gated content script, and an absolute URI in a playlist
+  // resolves to itself. ffmpeg opens file://host/share as a UNC path, so the
+  // recording would be an outbound SMB handshake carrying the user's
+  // credentials to whoever served the playlist.
+  const master = "https://site.example/live/master.m3u8";
+  h.textBodies.set(master, liveMaster("file://attacker.test/s/x"));
+
+  assert.deepEqual(await h.send({
+    type: "record-live",
+    item: { kind: "hls", url: master, name: "master.m3u8" },
+    tabId: 7,
+    filename: "Live",
+  }), { ok: true });
+
+  // Refusing silently would leave a row that never records and never says why,
+  // so the refusal has to be the visible failure of that row.
+  await eventually(
+    () => h.broadcasts.some((m) => m.type === "download-update" && m.download.status === "error"),
+    "the refused recording never surfaced as a failed row"
+  );
+  const updates = h.broadcasts.filter((m) => m.type === "download-update");
+  const failed = updates[updates.length - 1];
+  assert.equal(failed.download.status, "error");
+  assert.equal(typeof failed.download.error, "string");
+  assert.equal(failed.download.error.length > 0, true);
+  assert.equal(posts.some((m) => m && m.cmd === "record"), false, "nothing reached the helper");
+  assert.equal(JSON.stringify(posts).includes("attacker.test"), false);
+});
+
+test("the record lane sends no page header the host would have to sanitise", async () => {
+  const h = createHarness();
+  await settle();
+  const posts = await readyHelper(h);
+
+  // Page context is captured from the tab's own requests and handed to ffmpeg
+  // as -headers, where a control character is a header-injection primitive.
+  // The host gates it too; a value that would fail there should never be sent.
+  h.requestHeaders.emit({
+    tabId: 7,
+    requestHeaders: [
+      { name: "Referer", value: "https://site.example/watch\r\nX-Injected: SECRET_HEADER" },
+      { name: "User-Agent", value: "Detection Browser" },
+    ],
+  });
+
+  const master = "https://site.example/live/master.m3u8";
+  h.textBodies.set(master, liveMaster("https://site.example/live/hi.m3u8"));
+  assert.deepEqual(await h.send({
+    type: "record-live",
+    item: { kind: "hls", url: master, name: "master.m3u8" },
+    tabId: 7,
+    filename: "Live",
+  }), { ok: true });
+
+  await eventually(
+    () => posts.some((m) => m && m.cmd === "record"),
+    "the http(s) recording never reached the helper"
+  );
+  const record = posts.find((m) => m.cmd === "record");
+  assert.equal(record.videoUrl, "https://site.example/live/hi.m3u8");
+  assert.equal(record.audioUrl, null);
+  assert.equal(record.referer, "", "an unsendable Referer is dropped, not passed on");
+  assert.equal(record.userAgent, "Detection Browser");
+  assert.equal(JSON.stringify(posts).includes("SECRET_HEADER"), false);
 });

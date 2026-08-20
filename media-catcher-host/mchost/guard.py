@@ -32,6 +32,7 @@ module can use it without an import-order hazard.
 import hashlib
 import os
 import re
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Field kinds
@@ -469,6 +470,105 @@ def refuse_open(path):
     if not _ext_ok(real):
         return ("refused: %s resolves to something this helper cannot open"
                 % os.path.basename(path))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# What may be handed to yt-dlp as a URL
+#
+# NOT a schema kind, and the reason is the SHAPE OF THE REFUSAL, not the reach
+# of a kind. MESSAGE_SCHEMA is keyed per command, so a URL kind on "ytdl"'s
+# url would never have touched "cast"'s (different entry, same field name);
+# cast does need to keep serving a local file for a recording off disk, but
+# that was never what a kind here would have broken.
+#
+# What a kind cannot do is answer in the right protocol. A schema refusal is a
+# {"type":"error"} frame — correlated (mc_host.py echoes guard.message_id), but
+# carrying an id, NOT the attemptToken. The structured ytdl path owes its
+# caller a terminal ytdl-error with that token on it, and a row waiting for one
+# does not settle on an error frame it cannot match to its attempt. So the
+# predicate lives here, once, and each handler answers in its own protocol's
+# shape -- the same division refuse_basename and refuse_open already use.
+# ---------------------------------------------------------------------------
+
+_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def _has_control_char(s):
+    """True when `s` holds a C0 control or DEL.
+
+    One predicate for both callers below so an address and a request header
+    are judged by the same character class, and widening it later widens both.
+    """
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in s)
+
+
+def refuse_url(url):
+    """None when `url` may be handed to yt-dlp, else a user-facing reason.
+
+    This guards TWO things, and the argv one is the sharper of them.
+
+    ARGV INJECTION. _ytdl_build_cmd appends the url LAST, and yt-dlp parses
+    with optparse, which reads a dash-leading trailing argument as an option
+    rather than a positional: parse_args(["-f","b","-o","t","-o://evil"])
+    returns out="://evil" and NO positional at all. Being the only
+    caller-controlled token in argv is therefore not protection -- it is
+    exactly the position an option is read from. A url of "--exec=calc.exe"
+    was consumable as yt-dlp's --exec. Requiring a scheme is what stops it: a
+    leading "-" can never parse as one, so every such shape is refused here.
+
+    SCHEME. yt-dlp's positional argument is also not merely a fetch target:
+    given a scheme its networking stack supports, the generic extractor
+    reaches somewhere the browser never went -- "ftp://host/x" is the plain
+    case. ("file:///C:/..." additionally needs yt-dlp's --enable-file-urls,
+    which this host never passes; it is refused here regardless, and the point
+    does not rest on it.)
+
+    Padding and control characters are refused rather than trimmed so that
+    what is CHECKED is what ships: urllib.parse.urlsplit strips leading
+    whitespace and deletes tab/newline before it reads the scheme, so
+    "ht<tab>tp://h" parses as http here while the argv yt-dlp gets still has
+    the tab in it. Refusing keeps the two readings from ever differing.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return "refused: no address given"
+    if url != url.strip():
+        return "refused: that address is padded with whitespace"
+    if _has_control_char(url):
+        return "refused: that address contains a control character"
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return "refused: that address could not be read as a URL"
+    if parts.scheme.lower() not in _URL_SCHEMES:
+        return "refused: only http and https addresses can be downloaded"
+    if not parts.netloc:
+        return "refused: that address names no host"
+    return None
+
+
+def refuse_http_context(value):
+    """None when `value` may be interpolated into a request, else a reason.
+
+    A Referer or User-Agent the caller supplies is not just a string that ends
+    up in a request — where it is joined to its neighbours by a literal CRLF
+    (downloads.ffmpeg_cmd builds ffmpeg's one -headers value that way), a
+    control character in it appends headers of the caller's choosing to every
+    request that follows. Absent is not a refusal: both fields are optional
+    and the handler simply omits the header.
+
+    The extension's router applies its own isSafeHttpContextString to the pget
+    lane's copies of these fields; this is the host-side check, and it refuses
+    the same C0 and DEL that refuse_url does. (The router additionally refuses
+    C1; those are not a header separator, and the host's one character class
+    is the point of _has_control_char.)
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        return "refused: that header value is not text"
+    if _has_control_char(value):
+        return "refused: that header value contains a control character"
     return None
 
 

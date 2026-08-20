@@ -781,3 +781,191 @@ def test_every_long_loop_command_really_dispatches_to_a_worker():
 # "len(reason) > 20" check passes anything and would be updated reflexively the
 # first time it fired, which is worse than not having it: the reasons are there
 # for a reader, and only a reader can judge them.
+
+
+# ---------------------------------------------------------------------------
+# The two log sinks say the same thing
+#
+# The extension redacts URLs on the way into storage.local, but the on-disk
+# copy at %TEMP%\host.log used to keep the query string -- and that is the copy
+# a user hands over when they are asked for "the helper log". Redaction moved
+# to the _hlog seam so both sinks carry one projection.
+# ---------------------------------------------------------------------------
+
+def test_hlog_redacts_urls_in_both_sinks(tmp_path, monkeypatch):
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(log_path))
+
+    hlog._hlog("info", "yt-dlp: downloading "
+                       "https://user:pw@cdn.example:8443/a/b.mp4?token=SECRET#frag "
+                       "(pot=on)")
+
+    on_disk = log_path.read_text(encoding="utf-8")
+    on_wire = sent[-1]["msg"]
+    for blob in (on_disk, on_wire):
+        assert "SECRET" not in blob, blob
+        assert "user:pw" not in blob, blob
+        assert "https://cdn.example:8443/a/b.mp4" in blob, blob
+    # One projection, not two policies: the disk line carries the wire line.
+    assert on_wire in on_disk
+
+
+def test_hlog_keeps_local_paths_and_fails_closed_on_a_bad_url(tmp_path, monkeypatch):
+    """A save path is not a URL and stays whole; an unparseable URL is dropped
+    to a marker rather than passed through, because echoing it IS the leak."""
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(tmp_path / "host.log"))
+
+    local = r"saved to C:\Users\me\Videos\clip.mp4"
+    hlog._hlog("info", local)
+    assert sent[-1]["msg"] == local
+
+    hlog._hlog("error", "bad https://[invalid?token=SECRET")
+    assert sent[-1]["msg"] == "bad [redacted]"
+
+    # Idempotent: the extension redacts again over what it receives.
+    once = hlog._redact_log_text("see https://a.test/x.mp4?k=SECRET.")
+    assert once == "see https://a.test/x.mp4."
+    assert hlog._redact_log_text(once) == once
+
+
+def test_hlog_credential_pass_catches_what_the_url_match_cannot(tmp_path, monkeypatch):
+    """Mirrors media-catcher/lib/privacy.js, so the two sinks stay in step.
+
+    The URL match ends at whitespace, so a URL yt-dlp printed with a raw space
+    in it keeps its tail -- and the Signature after that space -- as loose
+    text. A second pass redacts credential-shaped VALUES wherever they appear,
+    so no boundary has to be decided. Being additive it can only remove more,
+    which is why the format-selector line is pinned unchanged here rather than
+    assumed.
+    """
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(tmp_path / "host.log"))
+
+    hlog._hlog("info", "yt-dlp: https://cdn.test/a b.mp4?Signature=SECRETSIG&Expires=99")
+    assert sent[-1]["msg"] == \
+        "yt-dlp: https://cdn.test/a b.mp4?Signature=[redacted]&Expires=[redacted]"
+
+    # An unencoded quote inside a query no longer ends the URL match.
+    assert "SECRETTOK" not in hlog._redact_log_text(
+        'get https://cdn.test/a.mp4?q="x&token=SECRETTOK now')
+
+    # Whole-name only, and a real diagnostic the projection preserves is kept.
+    for keep in ("monkey=notacredential", "passwordless=alsofine",
+                 "Key-Pair-Id=keepme", "-f bv*[height<=720]+ba",
+                 # A ':' separator is claimed only for a quoted value, so a
+                 # date-valued header keeps its shape.
+                 "Expires: Thu, 01 Dec 2050 00:00:00 GMT"):
+        assert hlog._redact_log_text(keep) == keep, keep
+
+    # A quoted value is a value: excluding the quote from the value class used
+    # to let the whole line through untouched. The quotes are kept so the line
+    # still reads as that name's value.
+    assert hlog._redact_log_text('token="SECRET"') == 'token="[redacted]"'
+    assert hlog._redact_log_text("'token': 'SECRET'") == "'token': '[redacted]'"
+
+    # The cost this pass accepts, pinned rather than argued: a name=value in a
+    # PATH is claimed too, so two paths that differ only there collapse.
+    assert hlog._redact_log_text("https://a.test/token=1/clip.mp4") == \
+        "https://a.test/token=[redacted]"
+
+
+def test_hlog_redacts_a_value_whose_closing_quote_was_truncated_away(tmp_path,
+                                                                    monkeypatch):
+    """This host manufactures the truncated line itself, so it is not a corner.
+
+    mchost/downloads.py logs str(e)[:500] and ("\n".join(errbuf[-12:]))[:2000],
+    and the cut happens BEFORE _hlog redacts. A yt-dlp failure carrying a
+    request-header dump therefore arrives here cut mid-value: the opening quote
+    present and the closing one gone. While both quoted alternatives required a
+    closing quote -- and the unquoted alternative excluded the opening one --
+    such a value matched nothing at all, and the raw token went into host.log,
+    the one file a user is asked to hand over.
+    """
+    from mchost import hlog
+
+    r = hlog._redact_log_text
+    cut = 'yt-dlp failed: HTTPError 403 for headers {"token": "SECRETVALUE'
+    assert "SECRETVALUE" not in r(cut), r(cut)
+    assert r(cut) == (
+        'yt-dlp failed: HTTPError 403 for headers {"token": "[redacted]"')
+
+    for line, want in (
+        ("ERROR: unable to download, {'sig': 'SECRETSIG",
+         "ERROR: unable to download, {'sig': '[redacted]'"),
+        ('ERROR: {"signature": "SECRETSIG',
+         'ERROR: {"signature": "[redacted]"'),
+        ('ffmpeg: token="SECRETTOK', 'ffmpeg: token="[redacted]"'),
+        ('X-Amz-Security-Token: "SECRETAWS',
+         'X-Amz-Security-Token: "[redacted]"'),
+    ):
+        assert r(line) == want, (line, r(line))
+
+    # Making the closing quote optional must not widen a value that closes.
+    # These are lines the pass already got right, pinned byte-identical.
+    assert r('token="a" and sig="b"') == 'token="[redacted]" and sig="[redacted]"'
+    for keep in ("monkey=banana", "Key-Pair-Id=", "-f bv*[height<=720]+ba",
+                 "Expires: Thu, 01 Dec 2050 00:00:00 GMT"):
+        assert r(keep) == keep, keep
+
+
+def test_hlog_keeps_the_identity_parameters_the_extension_keeps(tmp_path, monkeypatch):
+    """The allowlist from media-catcher/lib/privacy.js, applied on this side too.
+
+    Redaction runs at this seam, BEFORE the send, so a line the host writes
+    reaches the extension already projected and redactLogText cannot put back
+    an identity parameter this dropped. Two googlevideo failures for two
+    different files are the example the allowlist exists for; if they collapse
+    to one line here they are one line in the ring, the console and the copied
+    report, and the feature works only for lines the extension writes itself.
+    """
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(log_path))
+
+    for fid in ("aaa111", "bbb222"):
+        hlog._hlog("error",
+                   "yt-dlp: HTTP 403 for https://r1---sn-x.googlevideo.com"
+                   "/videoplayback?id=%s&itag=137&signature=SECRET%s" % (fid, fid))
+
+    lines = [m["msg"] for m in sent]
+    assert lines[0] != lines[1], lines
+    assert lines[0].endswith("/videoplayback?id=aaa111"), lines[0]
+    assert lines[1].endswith("/videoplayback?id=bbb222"), lines[1]
+    for blob in lines + [log_path.read_text(encoding="utf-8")]:
+        assert "SECRET" not in blob, blob
+        assert "itag" not in blob, blob
+
+    r = hlog._redact_log_text
+    # Closed allowlist: nothing else survives, whatever it is called.
+    assert r("https://a.test/watch?v=abc&token=SECRET") == "https://a.test/watch?v=abc"
+    # Emitted in allowlist order, so one URL is always one line whatever order
+    # the site wrote its query in.
+    assert r("https://a.test/w?id=two&v=one") == "https://a.test/w?v=one&id=two"
+    # The value rules are privacy.js's: 24 characters, [A-Za-z0-9_.~-], and a
+    # value outside them is dropped rather than kept. 24 is headroom over the
+    # ids this exists to keep (v is 11, googlevideo's id is 16) and no longer
+    # admits a whole hex HMAC or a 256-bit base64url token.
+    assert r("https://a.test/w?v=" + "a" * 24) == "https://a.test/w?v=" + "a" * 24
+    assert r("https://a.test/w?v=" + "a" * 25) == "https://a.test/w"
+    # "a%0A" is the reason the charset test is a fullmatch: Python's $ matches
+    # before a trailing newline and JavaScript's does not.
+    for bad in ("a/b", "a%20b", "a%0A", "a%0Ab", "a?b", ""):
+        assert r("https://a.test/w?v=" + bad) == "https://a.test/w", bad
+    # Still idempotent: the extension redacts again over what it receives.
+    once = r("see https://a.test/watch?v=abc&sig=SECRET.")
+    assert once == "see https://a.test/watch?v=abc."
+    assert r(once) == once

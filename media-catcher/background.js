@@ -203,8 +203,12 @@ let lastCastDevices = [];                // retained list — warm picker opens 
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
   // "connecting to the native helper…" line — must survive the async restore.
-  if (r && Array.isArray(r.mcLogs)) logRing = r.mcLogs.concat(logRing).slice(-LOG_CAP);
-  if (r && Array.isArray(r.mcEvents)) updateEvents = r.mcEvents.concat(updateEvents).slice(-EVENT_CAP);
+  if (r && Array.isArray(r.mcLogs)) {
+    logRing = r.mcLogs.map(redactLogLine).concat(logRing).slice(-LOG_CAP);
+  }
+  if (r && Array.isArray(r.mcEvents)) {
+    updateEvents = r.mcEvents.map(redactEventDetail).concat(updateEvents).slice(-EVENT_CAP);
+  }
   _persistDiag();
 }).catch(() => {});
 
@@ -216,7 +220,32 @@ function _persistDiag() {
   }, 800);
 }
 
+// Redact before the ring, not at copy time: _persistDiag writes the ring to
+// storage.local, so whatever is kept here is readable by anything that can read
+// extension storage, not only by whoever clicks Copy in Settings. Origin + path
+// is what diagnoses a failure; a signed URL's query is what identifies the user.
+// Applied to restored lines too, so a ring written by an older build is
+// redacted on the next start rather than waiting to roll over.
+function redactLogLine(line) {
+  if (line && typeof line === "object") line.msg = self.McPrivacy.redactLogText(line.msg);
+  return line;
+}
+
+// Update events ride the same persisted write and the same Copy button: they go
+// to storage.local beside mcLogs and come back out of get-update-report. Their
+// free-text field gets the projection msg gets, for the same reason. Every
+// detail updates.py emits today is a literal English string; this is what
+// catches the first one that carries a signed URL. Non-string details project
+// to "" rather than passing through, and an event without a detail keeps none.
+function redactEventDetail(ev) {
+  if (ev && typeof ev === "object" && Object.prototype.hasOwnProperty.call(ev, "detail")) {
+    ev.detail = self.McPrivacy.redactLogText(ev.detail);
+  }
+  return ev;
+}
+
 function pushLog(line) {
+  redactLogLine(line);
   logRing.push(line);
   if (logRing.length > LOG_CAP) logRing = logRing.slice(-LOG_CAP);
   broadcast({ type: "log-line", line });
@@ -232,6 +261,7 @@ function mclog(level, msg) {
 
 function recordEvent(ev) {
   if (!ev) return;
+  redactEventDetail(ev);
   updateEvents.push(ev);
   if (updateEvents.length > EVENT_CAP) updateEvents = updateEvents.slice(-EVENT_CAP);
   broadcast({ type: "update-event", event: ev });
@@ -259,11 +289,24 @@ const liveNetworkEvidence = new WeakMap();
 const liveControllerTabs = new Set();
 const liveControllerMediaIds = new Map();
 const livePromotedKeys = new Map();
+// tabId -> canonical direct source key -> the set of claimants for that
+// source. A DOM claimant is the reporting frame's frameId; NETWORK_CLAIM
+// stands for the network lane, which is not frame-attributable.
 const liveDirectSourceKeys = new Map();
+// The network lane's claimant. content_scripts runs in all_frames, so a DOM
+// claim is only ever reused by the frame that made it — otherwise an ad iframe
+// that reports the top page's media URL first would name the row the user then
+// sees for the honest video.
+const NETWORK_CLAIM = null;
 // tabId -> canonical direct source key -> the opaque media ID that owns it.
 // Late evidence for an owned source enriches that row instead of minting a
 // second one. Session-only; cleared with the rest of a tab's ownership.
 const liveDirectMediaOwners = new Map();
+// tabId -> opaque media ID -> the canonical direct source key that DOM-lane row
+// was minted for. Read only by the render pass, to recognise a remounted frame's
+// repeat of one file. Network rows are absent by design: they carry mirrors, and
+// a shared mirror does not make two rows the same clip.
+const liveDirectRowSources = new Map();
 // opaque media ID -> frozen { sizeBytes, sizeConfidence }. Never holds URLs,
 // headers, or any other transport evidence.
 const liveSizeMetadata = new Map();
@@ -967,15 +1010,57 @@ function onLegacyNativeMessage(msg) {
   }
 }
 
+// Reject C0, DEL and C1 controls in a value that becomes an HTTP header. Same
+// rule as the message router's isSafeHttpContextString; this lane never enters
+// the router, whose export surface is deliberately three functions wide.
+function isSafeHttpContextString(v) {
+  return typeof v === "string" && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+}
+
+// A URL the helper may open. Mirrors the router's isAbsoluteHttpUrl, which
+// gates the pget lanes: nonblank, trim-stable, control-free, absolute http(s)
+// by both scheme text and parse.
+function isAbsoluteHttpUrl(v) {
+  if (typeof v !== "string" || v.trim().length === 0) return false;
+  if (v.trim() !== v || !isSafeHttpContextString(v)) return false;
+  if (!/^https?:\/\//i.test(v)) return false;
+  try {
+    const parsed = new URL(v);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (e) {
+    return false;
+  }
+}
+
+// The record lane is a raw postMessage — it never passes through the message
+// router, so the router's URL gate never sees it. It needs one of its own more
+// than the other lanes do: its URLs come from the body of a fetched manifest
+// rather than from webRequest or a gated content script, and an absolute URI
+// in a playlist resolves to itself, so a page can name any scheme it likes.
+// ffmpeg opens file://host/share as a UNC path, which is an outbound SMB
+// handshake carrying the user's NTLM credentials.
+//
+// Refusal throws: recordLiveHls's catch turns that into a failed row with a
+// reason on it, which is what the user needs to see. Silently recording
+// nothing, or dropping just the audio track, would leave the row waiting for
+// a stream that is never coming.
 function nativeRecord(dl, tabId, videoUrl, audioUrl) {
   const hdr = resolveHeaders(tabId);
+  const video = mediaKey(videoUrl);              // drop stale _HLS_msn, keep session
+  const audio = audioUrl ? mediaKey(audioUrl) : null;
+  if (!isAbsoluteHttpUrl(video) || (audio !== null && !isAbsoluteHttpUrl(audio))) {
+    throw new Error("Refused to record: the stream URL is not http(s).");
+  }
   nativePort.postMessage({
     cmd: "record",
     id: dl.id,
-    videoUrl: mediaKey(videoUrl),                 // drop stale _HLS_msn, keep session
-    audioUrl: audioUrl ? mediaKey(audioUrl) : null,
-    referer: hdr.referer || "",
-    userAgent: hdr.userAgent || "",
+    videoUrl: video,
+    audioUrl: audio,
+    // Page context becomes an ffmpeg -headers argument. The host gates control
+    // characters too; a value that would fail there is dropped rather than
+    // sent, and losing a Referer only costs the recording its page context.
+    referer: isSafeHttpContextString(hdr.referer) ? hdr.referer : "",
+    userAgent: isSafeHttpContextString(hdr.userAgent) ? hdr.userAgent : "",
     base: sanitizeFilename(dl.name || "recording"),
   });
 }
@@ -1226,6 +1311,21 @@ function hasLiveDirectSource(tabId, url) {
   return !!keys && keys.has(directSourceKey(url));
 }
 
+// The frameId a content-script message is attributed to. Absent/hostile frame
+// ids collapse to the top frame rather than minting an unbounded claimant.
+function senderFrameKey(sender) {
+  return Number.isInteger(sender && sender.frameId) ? sender.frameId : 0;
+}
+
+// True when this frame may reuse an existing claim on the source: its own
+// earlier DOM claim, or any network claim.
+function domSourceAlreadyClaimed(tabId, url, frameKey) {
+  const keys = liveDirectSourceKeys.get(tabId);
+  const claimants = keys && keys.get(directSourceKey(url));
+  if (!claimants) return false;
+  return claimants.has(NETWORK_CLAIM) || claimants.has(frameKey);
+}
+
 // The opaque media ID that already owns this exact direct source, if any.
 function getLiveDirectOwner(tabId, url) {
   const bySource = liveDirectMediaOwners.get(tabId);
@@ -1271,12 +1371,23 @@ function forgetLiveSizesForTab(tabId) {
   const ids = liveControllerMediaIds.get(tabId);
   if (ids) for (const id of ids) liveSizeMetadata.delete(id);
   liveDirectMediaOwners.delete(tabId);
+  liveDirectRowSources.delete(tabId);
+}
+
+// Remember which canonical direct source a DOM-lane row was minted for, so the
+// render pass can recognise a remounted frame's repeat of one file.
+function rememberLiveDirectRowSource(tabId, mediaId, url) {
+  if (typeof mediaId !== "string" || !mediaId) return;
+  const sources = liveDirectRowSources.get(tabId) || new Map();
+  sources.set(mediaId, directSourceKey(url));
+  liveDirectRowSources.set(tabId, sources);
 }
 
 // Network and DOM are independent evidence producers for the same direct file.
-// Claim their shared tab-scoped identity at ingress so the controller receives
-// one source, while different directGroupKey values remain separate media.
-function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
+// Claim their shared identity at ingress so the controller receives one source,
+// while different directGroupKey values remain separate media. `claimant` says
+// who claimed: a reporting frame's frameId, or NETWORK_CLAIM.
+function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey, claimant) {
   liveControllerTabs.add(tabId);
   const ids = liveControllerMediaIds.get(tabId) || new Set();
   ids.add(mediaId);
@@ -1287,12 +1398,20 @@ function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
     livePromotedKeys.set(tabId, keys);
   }
   if (Array.isArray(directUrls) && directUrls.length) {
-    const sources = liveDirectSourceKeys.get(tabId) || new Set();
+    const sources = liveDirectSourceKeys.get(tabId) || new Map();
     const owners = liveDirectMediaOwners.get(tabId) || new Map();
     for (const url of directUrls) {
       const sourceKey = directSourceKey(url);
-      sources.add(sourceKey);
-      owners.set(sourceKey, mediaId);
+      const claimants = sources.get(sourceKey) || new Set();
+      claimants.add(claimant === undefined ? NETWORK_CLAIM : claimant);
+      sources.set(sourceKey, claimants);
+      // First claimant keeps ownership. liveDirectSourceKeys is scoped per
+      // frame, so a later frame reporting the same src still mints its own
+      // detection — but enrichment follows this map, and letting that later
+      // claim repoint it handed the exact Content-Range total to whoever
+      // reported last (an ad iframe echoing the page's src) and left the
+      // honest row on a bitrate estimate.
+      if (!owners.has(sourceKey)) owners.set(sourceKey, mediaId);
     }
     liveDirectSourceKeys.set(tabId, sources);
     liveDirectMediaOwners.set(tabId, owners);
@@ -1455,7 +1574,8 @@ async function promoteLiveNetworkItem(tabId, key, item, variants, probeSizeMetad
     key,
     mediaId,
     item.kind === "direct" ? (item.mirrors || [item.url]) : null,
-    true
+    true,
+    NETWORK_CLAIM
   );
   // Trusted probe/header totals first; a bitrate estimate only fills the gap
   // when nothing exact is known for this row.
@@ -2783,11 +2903,49 @@ function liveRowsForTab(tabId) {
   try {
     const rows = liveController.popupMedia(tabId);
     const ids = liveControllerMediaIds.get(tabId);
-    return Array.isArray(rows) && ids ? rows.filter((row) => row && ids.has(row.id)) : [];
+    if (!Array.isArray(rows) || !ids) return [];
+    return foldRemountedDirectRows(tabId, rows.filter((row) => row && ids.has(row.id)));
   } catch (e) {
     dlog("live popupMedia failed", e && e.message);
     return [];
   }
+}
+
+// An SPA that remounts its player iframe gives the new frame a new frameId and
+// an empty boundUrls set, so it reports the file the old mount already reported
+// and mints a second detection with nothing to tell the two rows apart.
+//
+// Folded here rather than by keying the claim on frame origin: an origin-scoped
+// claim would let any frame sharing the page's origin take the single row and
+// leave the other frame with none, which is the suppression per-frame claim
+// scoping exists to prevent — and a frame's origin reaches us through the
+// content script, where its frameId comes from the browser. So a row folds only
+// when it names the same canonical source AND is indistinguishable in what the
+// popup shows. A frame proposing its own name for the page's file still gets
+// its own row. Of a folded pair the owning row is kept: enrichment lands there.
+function foldRemountedDirectRows(tabId, rows) {
+  const sources = liveDirectRowSources.get(tabId);
+  if (!sources || rows.length < 2) return rows;
+  const owners = liveDirectMediaOwners.get(tabId);
+  const firstAt = new Map();
+  const out = [];
+  for (const row of rows) {
+    const sourceKey = sources.get(row.id);
+    if (typeof sourceKey !== "string") { out.push(row); continue; }
+    const identity = [
+      sourceKey,
+      typeof row.kind === "string" ? row.kind : "",
+      typeof row.proposedFilename === "string" ? row.proposedFilename : "",
+    ].join("\n");
+    const at = firstAt.get(identity);
+    if (at === undefined) {
+      firstAt.set(identity, out.length);
+      out.push(row);
+    } else if (owners && owners.get(sourceKey) === row.id) {
+      out[at] = row;
+    }
+  }
+  return out;
 }
 
 function decorateLiveRow(row, tabId) {
@@ -3429,7 +3587,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (item && item.kind === "direct" && msg.snapshot && liveController) {
             const mediaUrl = item.url;
             const key = directGroupKey(mediaUrl);
-            if (!hasLiveDirectSource(sender.tab.id, mediaUrl)) {
+            const frameKey = senderFrameKey(sender);
+            if (!domSourceAlreadyClaimed(sender.tab.id, mediaUrl, frameKey)) {
               let mediaOrigin = "";
               try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
               const mediaId = liveController.captureDomMedia({
@@ -3445,7 +3604,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               // DOM owns only this exact canonical media URL. The broader
               // directGroupKey is a network mirror policy and must not collapse
               // distinct query-addressed DOM media.
-              claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false);
+              claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false, frameKey);
+              rememberLiveDirectRowSource(sender.tab.id, mediaId, mediaUrl);
             }
           } else {
             item.name = item.name || shortName(item.url);
@@ -3465,8 +3625,11 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         sendResponse({ ok: true });
       } else if (msg.type === "content-thumb") {
-        // From content script: a JPEG frame of the playing video.
-        if (sender.tab && typeof msg.dataUrl === "string" &&
+        // From the top frame's content script: a JPEG frame of the playing
+        // video. tabThumbs holds one picture per tab and decorate() attaches it
+        // to every row of that tab, so a subframe must not be able to set it.
+        if (sender.tab && senderFrameKey(sender) === 0 &&
+            typeof msg.dataUrl === "string" &&
             msg.dataUrl.startsWith("data:image/jpeg") && msg.dataUrl.length < 200000) {
           tabThumbs.set(sender.tab.id, msg.dataUrl);
           if (mediaByTab.has(sender.tab.id)) broadcast({ type: "media-updated", tabId: sender.tab.id });

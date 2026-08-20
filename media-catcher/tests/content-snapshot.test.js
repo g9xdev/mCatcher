@@ -1956,3 +1956,96 @@ test("periodic tick scan detects currentSrc change without mutation or loadstart
     "original source stays single"
   );
 });
+
+test("non-http(s) video srcs are never reported as media", async () => {
+  const api = loadContent();
+  // A page (or an ad iframe) chooses every src the content script reads. The
+  // reporter must forward only absolute http(s) URLs, so a file:// UNC
+  // selector never becomes a "direct" row the helper would later open.
+  const hostile = [
+    "file://////attacker.example/s/x.mp4",
+    "file:///C:/Users/x/secret.mp4",
+    "ftp://attacker.example/x.mp4",
+    "javascript:alert(1)",
+    "//attacker.example/s/x.mp4",
+  ];
+  for (const src of hostile) {
+    const root = makeInstallRoot({ mediaUrl: src });
+    api.install(root);
+    await flushMicrotasks();
+    const media = root._messages.filter((m) => m.type === "content-media");
+    assert.deepEqual(
+      media.map((m) => m.item && m.item.url),
+      [],
+      src + " must not be reported"
+    );
+  }
+
+  // The same page shape with an http(s) src still reports, so the filter is
+  // not simply suppressing everything.
+  const ok = makeInstallRoot({ mediaUrl: "https://cdn.example/video.mp4" });
+  api.install(ok);
+  await flushMicrotasks();
+  assert.deepEqual(
+    ok._messages
+      .filter((m) => m.type === "content-media")
+      .map((m) => m.item.url),
+    ["https://cdn.example/video.mp4"]
+  );
+});
+
+test("only the top frame captures a thumbnail", async () => {
+  const api = loadContent();
+  const fakeDataUrl = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAg";
+  const makeFrame = (topFrame) => {
+    const root = makeInstallRoot({
+      href: "https://ads.example/unit",
+      mediaUrl: "https://cdn.example/ad.mp4",
+      topLevelPageUrl: "https://site.example/watch",
+    });
+    if (!topFrame) root.top = {};
+    const video = root.document.querySelectorAll("video")[0];
+    video.readyState = 2;
+    video.videoWidth = 320;
+    video.videoHeight = 180;
+    video.ended = false;
+    root.document.createElement = function (tag) {
+      if (String(tag).toLowerCase() === "canvas") {
+        return {
+          width: 0,
+          height: 0,
+          getContext() { return { drawImage() {} }; },
+          toDataURL() { return fakeDataUrl; },
+        };
+      }
+      return el(tag, {});
+    };
+    return root;
+  };
+
+  // The background attaches one thumbnail to every media row of the tab, so a
+  // subframe that emits one picks the picture shown for the top page's media.
+  const sub = makeFrame(false);
+  api.install(sub);
+  await flushMicrotasks();
+  const subInterval = sub._timers.find((t) => t.type === "interval");
+  await subInterval.fn();
+  await flushMicrotasks();
+  assert.deepEqual(
+    sub._messages.filter((m) => m.type === "content-thumb"),
+    [],
+    "a subframe must not emit content-thumb"
+  );
+
+  const top = makeFrame(true);
+  api.install(top);
+  await flushMicrotasks();
+  const topInterval = top._timers.find((t) => t.type === "interval");
+  await topInterval.fn();
+  await flushMicrotasks();
+  assert.equal(
+    top._messages.filter((m) => m.type === "content-thumb").length,
+    1,
+    "the top frame still emits its thumbnail"
+  );
+});

@@ -1317,6 +1317,51 @@ test("buildNativeStartPayload rejects unknown kinds and malformed inputs", () =>
   assert.equal(hits, 0);
 });
 
+test("buildNativeStartPayload pget kinds require an absolute http(s) url", () => {
+  const { buildNativeStartPayload } = loadRouter();
+  const intent = saveAsIntent();
+  // The helper spawns a downloader on this exact string. Every producer of a
+  // pget URL already validates http(s) upstream; this is the last gate before
+  // the string leaves the extension.
+  const rejected = [
+    "file://////attacker.example/s/x.mp4",
+    "file:///C:/Users/x/secret.mp4",
+    "ftp://attacker.example/x.mp4",
+    "//attacker.example/s/x.mp4",
+    "cdn.example/x.mp4",
+    "https://cdn.example/x .mp4\u0000",
+  ];
+  for (const url of rejected) {
+    for (const kind of ["pget", "pget-single"]) {
+      const input = {
+        kind,
+        jobId: "j",
+        attemptToken: "a",
+        intent,
+        url,
+        providerGeneration: 0,
+      };
+      if (kind === "pget") input.maxConnections = 1;
+      assert.throws(
+        () => buildNativeStartPayload(input),
+        TypeError,
+        kind + " must reject " + url
+      );
+    }
+  }
+
+  const ok = buildNativeStartPayload({
+    kind: "pget",
+    jobId: "j",
+    attemptToken: "a",
+    intent,
+    url: "https://cdn.example/x.mp4?sig=abc#frag",
+    maxConnections: 1,
+    providerGeneration: 0,
+  });
+  assert.deepEqual(ok.urls, ["https://cdn.example/x.mp4?sig=abc#frag"]);
+});
+
 test("buildNativeStartPayload file-open never carries media URL or tokens", () => {
   const { buildNativeStartPayload } = loadRouter();
   const intent = saveAsIntent({
@@ -3030,6 +3075,29 @@ test("buildNativeStartPayload snapshots mirrors descriptor-safely before depende
   });
   assert.deepEqual(out.urls, [primary, mirror]);
   assert.equal(Object.isFrozen(out.urls), true);
+
+  // Only absolute http(s) mirrors reach the wire. handle_pget takes a STRLIST
+  // with no URL check and hands each entry to urllib.request.urlopen, where
+  // url2pathname maps file://////attacker.test/s/x.mp4 to an SMB path.
+  const gated = buildNativeStartPayload({
+    kind: "pget",
+    jobId: "j1",
+    attemptToken: "atk",
+    intent: saveAsIntent(),
+    url: primary,
+    mirrors: [
+      mirror,
+      "file://////attacker.test/s/x.mp4",
+      "ftp://attacker.test/x.mp4",
+      "//mirror/x.mp4",
+      "javascript:alert(1)",
+      " https://padded/x.mp4 ",
+      "https://ok.example/x.mp4",
+    ],
+    maxConnections: 2,
+    providerGeneration: 1,
+  });
+  assert.deepEqual(gated.urls, [primary, mirror, "https://ok.example/x.mp4"]);
 
   // Sparse mirrors fail generically.
   const sparse = [];

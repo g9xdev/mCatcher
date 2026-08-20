@@ -4011,3 +4011,188 @@ def test_multi_range_cancel_is_prompt_while_a_segment_is_stalled(tmp_path, monke
     finally:
         hold.set()
         shutdown_server(httpd)
+
+
+def test_two_jobs_deriving_one_name_do_not_share_final_path(tmp_path, monkeypatch):
+    """Two concurrent pgets that derive the same filename get two paths.
+
+    _dedup only skips names that already EXIST on disk, and a pget's final
+    path is not created until os.replace at the very end. Two workers
+    resolving in that window therefore agree on one string -- one .part, one
+    set of segment files and one os.replace target -- so the second job
+    overwrites the first job's file and the user silently loses a download.
+    """
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    httpd, _state = run_server("range", hold=hold)
+    paths = {}
+
+    def results():
+        return [m for m in sent if m.get("type") == "pget-result"]
+
+    try:
+        url = server_url(httpd)
+        for jid in ("dupA", "dupB"):
+            mc.handle_pget({
+                "id": jid,
+                "attemptToken": "atk-" + jid,
+                "urls": [url],
+                "name": "clip.mp4",
+                "dir": str(tmp_path),
+                "maxConnections": 2,
+                "referer": "",
+                "userAgent": "t",
+            })
+
+        def resolved(jid):
+            return (d._PGET.get(jid) or {}).get("final_path")
+
+        assert wait_for(lambda: resolved("dupA") and resolved("dupB"),
+                        timeout=5.0), "both jobs never reached a final path"
+        paths["a"] = resolved("dupA")
+        paths["b"] = resolved("dupB")
+    finally:
+        hold.set()
+        wait_for(lambda: len(results()) == 2, timeout=15.0)
+        shutdown_server(httpd)
+
+    assert paths["a"] != paths["b"], "both jobs resolved %r" % (paths["a"],)
+
+    res = {m["id"]: m for m in results()}
+    assert set(res) == {"dupA", "dupB"}
+    for jid in ("dupA", "dupB"):
+        assert res[jid]["status"] == "completed", res[jid]
+        assert res[jid]["partState"] == "committed"
+    assert sorted(leftovers(tmp_path)) == ["clip (1).mp4", "clip.mp4"]
+    for name in ("clip.mp4", "clip (1).mp4"):
+        assert (tmp_path / name).read_bytes() == DEFAULT_PAYLOAD
+
+
+def test_a_recording_and_a_pget_never_resolve_one_output_path(tmp_path, monkeypatch):
+    """A recording save and a live pget that derive one name get two paths.
+
+    No adversary needed: the user records a stream and starts a direct
+    download from the same page. Both default to the save folder and both
+    derive the page title, so both want "clip.mp4". The pget claims that path
+    in _pget_claim_dest but does not CREATE it until os.replace, so a
+    handle_save that only asks os.path.exists sees nothing and picks the same
+    string -- and then _finalize_move's shutil.move and the pget's os.replace
+    both write it. Two green rows, one file: whichever landed last wins, and
+    the pget's pget-result reports a byte count read back off the recording.
+    """
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    httpd, _state = run_server("range", hold=hold)
+    rec_payload = b"RECORDING-" * 40
+
+    def results():
+        return [m for m in sent if m.get("type") == "pget-result"]
+
+    def saved():
+        return [m for m in sent if m.get("type") == "saved"]
+
+    try:
+        mc.handle_pget({
+            "id": "pget-clip",
+            "attemptToken": "atk-pget-clip",
+            "urls": [server_url(httpd)],
+            "name": "clip.mp4",
+            "dir": str(tmp_path),
+            "maxConnections": 2,
+            "referer": "",
+            "userAgent": "t",
+        })
+        assert wait_for(lambda: (d._PGET.get("pget-clip") or {}).get("final_path"),
+                        timeout=5.0), "the pget never claimed a final path"
+        pget_path = d._PGET["pget-clip"]["final_path"]
+        assert os.path.basename(pget_path) == "clip.mp4"
+        assert not os.path.exists(pget_path), \
+            "precondition: the claimed path is not created until os.replace"
+
+        # Now the recording finishes and auto-saves into the same folder under
+        # the same derived base.
+        temp = tmp_path / "rec.tmp"
+        temp.write_bytes(rec_payload)
+        job = d.Job("rec-clip", str(temp))
+        job.base = "clip"
+        job.finished.set()
+        with d.JOBS_LOCK:
+            d.JOBS["rec-clip"] = job
+        mc.handle_save({"id": "rec-clip", "dir": str(tmp_path), "base": "clip"})
+
+        assert wait_for(lambda: saved(), timeout=10.0), "the recording never saved"
+        rec_path = saved()[-1]["file"]
+    finally:
+        hold.set()
+        wait_for(lambda: len(results()) == 1, timeout=15.0)
+        shutdown_server(httpd)
+        with d.JOBS_LOCK:
+            d.JOBS.pop("rec-clip", None)
+
+    assert os.path.normcase(rec_path) != os.path.normcase(pget_path), \
+        "recording and pget both resolved %r" % (rec_path,)
+
+    res = results()[-1]
+    assert res["status"] == "completed", res
+    assert res["partState"] == "committed"
+    assert sorted(leftovers(tmp_path)) == ["clip (1).mp4", "clip.mp4"]
+    # Neither writer overwrote the other, and the pget's reported byte count is
+    # its OWN file, not whatever the recording left at that path.
+    assert open(rec_path, "rb").read() == rec_payload
+    assert open(pget_path, "rb").read() == DEFAULT_PAYLOAD
+    assert res["bytes"] == len(DEFAULT_PAYLOAD), res
+
+
+def test_claim_dest_does_not_stat_under_the_registry_lock(tmp_path, monkeypatch):
+    """_pget_claim_dest resolves its candidate with _PGET_LOCK released.
+
+    The dedup walk is one stat per existing "clip (n).mp4" sibling, not a fixed
+    handful, and on an SMB save folder each one is a round trip. _PGET_LOCK is
+    the lock _pget_cancel takes on the read loop (_pget_registry_get), so a walk
+    held inside it stalls every queued command behind the cancel.
+    """
+    import mchost.downloads as d
+
+    op = {"id": "slow-claim", "stop": threading.Event()}
+    assert d._pget_register("slow-claim", op)
+    in_walk = threading.Event()
+    release = threading.Event()
+    real_exists = os.path.exists
+    root = os.path.normcase(str(tmp_path))
+
+    def slow_exists(p):
+        # Only OUR candidate stats block; everything else is untouched.
+        if isinstance(p, str) and os.path.normcase(p).startswith(root) \
+                and "clip" in os.path.basename(p):
+            in_walk.set()
+            release.wait(10)
+        return real_exists(p)
+
+    monkeypatch.setattr(d.os.path, "exists", slow_exists)
+    claimed = []
+    worker = threading.Thread(
+        target=lambda: claimed.append(
+            d._pget_claim_dest("slow-claim", op, os.path.join(str(tmp_path), "clip.mp4"))),
+        daemon=True)
+    worker.start()
+    try:
+        assert in_walk.wait(5), "the dedup walk never started"
+        got = d._PGET_LOCK.acquire(timeout=1.0)
+        if got:
+            d._PGET_LOCK.release()
+        assert got, \
+            "_PGET_LOCK was held across the dedup stat walk; a cancel on the " \
+            "read loop would have waited for it"
+        release.set()
+        worker.join(10)
+        assert claimed and os.path.basename(claimed[0]) == "clip.mp4"
+        assert d._PGET_DEST.get(os.path.normcase(claimed[0])) is op,             "the resolved path was not actually claimed"
+    finally:
+        release.set()
+        d._pget_unregister("slow-claim", op)
