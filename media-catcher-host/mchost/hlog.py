@@ -115,7 +115,13 @@ _LOG_IDENTITY_VALUE_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 # expire) because first match wins. A quoted value counts as a value --
 # token="S" and 'token': 'S' are both credentials -- and a ':' separator is
 # claimed only when the value is quoted, so an "Expires: Thu, 01 Dec" header
-# keeps its shape.
+# keeps its shape. The CLOSING quote is optional because THIS host manufactures
+# the line that needs it: downloads.py logs str(e)[:500] and a joined stderr
+# tail cut at 2000, and the cut lands before _hlog redacts, so a yt-dlp header
+# dump arrives as {"token": "SECRET with the closing quote gone. Requiring it
+# sent that line to host.log untouched. The unclosed alternative is reached
+# only when no closing quote follows at all, so it takes the rest of the line
+# -- over-redacting a truncated diagnostic, the direction this pass accepts.
 #
 # Mirrors media-catcher/lib/privacy.js redactCredentialValues, down to the
 # pattern. The two are kept in step deliberately: the point of redacting here
@@ -125,7 +131,7 @@ _LOG_CREDENTIAL_VALUE = re.compile(
     r"(x-amz-security-token|x-amz-credential|x-amz-signature|signature|"
     r"password|expires|policy|expire|token|auth|pwd|sig|key)"
     r"([\"']?\s*(?:=|:(?=\s*[\"']))\s*)"
-    r"(\"[^\"]*\"|'[^']*'|[^&\s\"'<>]+)", re.I)
+    r"(\"[^\"]*\"?|'[^']*'?|[^&\s\"'<>]+)", re.I)
 
 
 def _redact_one_credential(m):

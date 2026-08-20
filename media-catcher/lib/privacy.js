@@ -739,12 +739,20 @@
     // must be whole: a preceding name character (monkey=, passwordless=) means
     // no match. A quoted value counts as a value — token="S" and 'token': 'S'
     // are both credentials, and excluding the quote from the value class used
-    // to mean the whole line went through untouched. A ':' separator is
+    // to mean the whole line went through untouched. The CLOSING quote is
+    // optional for the same reason: the host logs str(e)[:500] and a joined
+    // stderr tail cut at 2000, and the cut lands before either layer redacts,
+    // so a header dump arrives as {"token": "SECRET with the closing quote
+    // gone. Requiring it sent that line through both layers untouched. Falling
+    // back to the unclosed alternative only happens when no closing quote
+    // follows at all, so it takes the rest of the line — over-redacting a
+    // truncated diagnostic, which is the direction this pass already accepts.
+    // A ':' separator is
     // claimed only when the value is quoted, so an "Expires: Thu, 01 Dec"
     // header keeps its shape. A regex literal, not a built string: the value
     // class carries a quote and a backslash escape, which a string would
     // swallow before RegExp saw them.
-    var LOG_CREDENTIAL_VALUE_RE = /(^|[^A-Za-z0-9_-])(x-amz-security-token|x-amz-credential|x-amz-signature|signature|password|expires|policy|expire|token|auth|pwd|sig|key)(["']?\s*(?:=|:(?=\s*["']))\s*)("[^"]*"|'[^']*'|[^&\s"'<>]+)/gi;
+    var LOG_CREDENTIAL_VALUE_RE = /(^|[^A-Za-z0-9_-])(x-amz-security-token|x-amz-credential|x-amz-signature|signature|password|expires|policy|expire|token|auth|pwd|sig|key)(["']?\s*(?:=|:(?=\s*["']))\s*)("[^"]*"?|'[^']*'?|[^&\s"'<>]+)/gi;
 
     function redactCredentialValues(text) {
       return text.replace(LOG_CREDENTIAL_VALUE_RE,

@@ -1371,6 +1371,53 @@ test("redactLogText redacts credential values no URL match can claim", () => {
   assert.equal(P.redactLogText("Key-Pair-Id=APKAEXAMPLE"), "Key-Pair-Id=APKAEXAMPLE");
 });
 
+test("redactLogText redacts a value whose closing quote was truncated away", () => {
+  // Not a corner case: the host manufactures exactly this line. Its
+  // mchost/downloads.py logs str(e)[:500] and the joined stderr tail cut at
+  // 2000, and the cut happens BEFORE either layer redacts — so a yt-dlp
+  // failure carrying a request-header dump arrives with the opening quote
+  // present and the closing one gone. While both quoted alternatives required
+  // a closing quote, and the unquoted alternative excluded the opening one,
+  // such a value matched nothing and the raw token passed both layers.
+  const cut = 'yt-dlp failed: HTTPError 403 for headers {"token": "SECRET_SIGNED_QUERY_XYZ';
+  assert.equal(P.redactLogText(cut).includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(
+    P.redactLogText(cut),
+    'yt-dlp failed: HTTPError 403 for headers {"token": "[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText("ERROR: unable to download, {'sig': 'SECRET_SIGNED_QUERY_XYZ"),
+    "ERROR: unable to download, {'sig': '[redacted]'"
+  );
+  assert.equal(
+    P.redactLogText('ERROR: {"signature": "SECRET_SIGNED_QUERY_XYZ'),
+    'ERROR: {"signature": "[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText('ffmpeg: token="SECRET_SIGNED_QUERY_XYZ'),
+    'ffmpeg: token="[redacted]"'
+  );
+  assert.equal(
+    P.redactLogText('X-Amz-Security-Token: "SECRET_SIGNED_QUERY_XYZ'),
+    'X-Amz-Security-Token: "[redacted]"'
+  );
+
+  // Making the closing quote optional must not widen a value that closes.
+  // These are lines the pass already got right, pinned byte-identical.
+  assert.equal(
+    P.redactLogText('token="a" and sig="b"'),
+    'token="[redacted]" and sig="[redacted]"'
+  );
+  for (const keep of [
+    "monkey=banana",
+    "Key-Pair-Id=",
+    "-f bv*[height<=720]+ba",
+    "Expires: Thu, 01 Dec 1994 16:00:00 GMT",
+  ]) {
+    assert.equal(P.redactLogText(keep), keep, keep);
+  }
+});
+
 test("redactUrlForLog keeps the allowlisted identity parameter and nothing else", () => {
   // Dropping the whole query collapsed every video to .../watch and every
   // googlevideo failure to .../videoplayback, so two distinct failures read as

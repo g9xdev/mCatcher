@@ -880,6 +880,45 @@ def test_hlog_credential_pass_catches_what_the_url_match_cannot(tmp_path, monkey
         "https://a.test/token=[redacted]"
 
 
+def test_hlog_redacts_a_value_whose_closing_quote_was_truncated_away(tmp_path,
+                                                                    monkeypatch):
+    """This host manufactures the truncated line itself, so it is not a corner.
+
+    mchost/downloads.py logs str(e)[:500] and ("\n".join(errbuf[-12:]))[:2000],
+    and the cut happens BEFORE _hlog redacts. A yt-dlp failure carrying a
+    request-header dump therefore arrives here cut mid-value: the opening quote
+    present and the closing one gone. While both quoted alternatives required a
+    closing quote -- and the unquoted alternative excluded the opening one --
+    such a value matched nothing at all, and the raw token went into host.log,
+    the one file a user is asked to hand over.
+    """
+    from mchost import hlog
+
+    r = hlog._redact_log_text
+    cut = 'yt-dlp failed: HTTPError 403 for headers {"token": "SECRETVALUE'
+    assert "SECRETVALUE" not in r(cut), r(cut)
+    assert r(cut) == (
+        'yt-dlp failed: HTTPError 403 for headers {"token": "[redacted]"')
+
+    for line, want in (
+        ("ERROR: unable to download, {'sig': 'SECRETSIG",
+         "ERROR: unable to download, {'sig': '[redacted]'"),
+        ('ERROR: {"signature": "SECRETSIG',
+         'ERROR: {"signature": "[redacted]"'),
+        ('ffmpeg: token="SECRETTOK', 'ffmpeg: token="[redacted]"'),
+        ('X-Amz-Security-Token: "SECRETAWS',
+         'X-Amz-Security-Token: "[redacted]"'),
+    ):
+        assert r(line) == want, (line, r(line))
+
+    # Making the closing quote optional must not widen a value that closes.
+    # These are lines the pass already got right, pinned byte-identical.
+    assert r('token="a" and sig="b"') == 'token="[redacted]" and sig="[redacted]"'
+    for keep in ("monkey=banana", "Key-Pair-Id=", "-f bv*[height<=720]+ba",
+                 "Expires: Thu, 01 Dec 2050 00:00:00 GMT"):
+        assert r(keep) == keep, keep
+
+
 def test_hlog_keeps_the_identity_parameters_the_extension_keeps(tmp_path, monkeypatch):
     """The allowlist from media-catcher/lib/privacy.js, applied on this side too.
 
