@@ -390,6 +390,122 @@
     return deepFreeze(list);
   }
 
+  // -------------------------------------------------------------------------
+  // The beam overlay — geometry and eligibility
+  //
+  // Both of these are pure functions over MEASUREMENTS, not over the DOM, so
+  // the rules can be pinned without a browser and the DOM half below stays a
+  // thin layer that only measures and paints.
+  //
+  // BEAM_MIN_W/H is the honest part of this file's ad story. It removes
+  // zero-size elements, tracking pixels and hover-preview thumbnails, which is
+  // real: those are everywhere and an icon on each would make the feature
+  // worse than absent. It does NOT identify ads — a 640x360 pre-roll and a
+  // 640x360 feature are the same measurements, and nothing here can tell them
+  // apart. 240x135 is the smallest 16:9 rendition anyone actually streams.
+  // -------------------------------------------------------------------------
+
+  var BEAM_ICON = 28;              // px — the icon box, and the tap target
+  var BEAM_MARGIN = 10;            // px — inset from the corner it sits in
+  var BEAM_MIN_W = 240;
+  var BEAM_MIN_H = 135;
+  var BEAM_MIN_OPACITY = 0.1;
+
+  function finiteNum(record, key) {
+    try {
+      var v = record[key];
+      return typeof v === "number" && isFinite(v) ? v : NaN;
+    } catch (e) {
+      return NaN;
+    }
+  }
+
+  function beamViewportSize(viewport, key) {
+    var v = viewport ? finiteNum(viewport, key) : NaN;
+    // An unreadable viewport must not be read as "everything is off screen":
+    // treated as unbounded, the size and hidden rules still apply.
+    return isNaN(v) || v <= 0 ? Infinity : v;
+  }
+
+  // True when this element is worth putting an icon on RIGHT NOW.
+  //
+  // `env` is {rect, style, viewport}: rect from getBoundingClientRect, style
+  // the three computed properties that can hide a laid-out box, viewport the
+  // window's inner size. A null style means "could not measure", which is read
+  // as visible — refusing to draw because a measurement failed would silently
+  // disable the feature rather than report anything.
+  function isBeamableVideo(video, env) {
+    if (!video || typeof video !== "object") return false;
+    if (!env || typeof env !== "object") return false;
+
+    try {
+      if (video.paused !== false) return false;
+      if (video.ended) return false;
+      // HAVE_CURRENT_DATA: metadata alone is not playing yet.
+      if (!(finiteNum(video, "readyState") >= 2)) return false;
+      // No picture, no corner to put an icon in — this is how an audio-only
+      // <video> and a not-yet-decoded element are excluded.
+      if (!(finiteNum(video, "videoWidth") > 0)) return false;
+      if (!(finiteNum(video, "videoHeight") > 0)) return false;
+    } catch (e) {
+      return false;
+    }
+
+    var rect = env.rect;
+    if (!rect || typeof rect !== "object") return false;
+    var left = finiteNum(rect, "left");
+    var top = finiteNum(rect, "top");
+    var width = finiteNum(rect, "width");
+    var height = finiteNum(rect, "height");
+    if (isNaN(left) || isNaN(top) || isNaN(width) || isNaN(height)) return false;
+    if (width < BEAM_MIN_W || height < BEAM_MIN_H) return false;
+
+    var vw = beamViewportSize(env.viewport, "width");
+    var vh = beamViewportSize(env.viewport, "height");
+    if (left + width <= 0 || top + height <= 0 || left >= vw || top >= vh) return false;
+
+    var style = env.style;
+    if (style && typeof style === "object") {
+      try {
+        if (style.display === "none") return false;
+        if (style.visibility === "hidden" || style.visibility === "collapse") return false;
+        var opacity = parseFloat(style.opacity);
+        if (!isNaN(opacity) && opacity < BEAM_MIN_OPACITY) return false;
+      } catch (e2) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Where the icon goes: the top-right corner of the part of the video that is
+  // actually on screen, so a half-scrolled player still shows a reachable icon
+  // instead of one parked above the viewport. Null when the visible sliver has
+  // no room for it — an icon floating next to a video is worse than none.
+  function beamIconRect(rect, viewport) {
+    if (!rect || typeof rect !== "object") return null;
+    var left = finiteNum(rect, "left");
+    var top = finiteNum(rect, "top");
+    var width = finiteNum(rect, "width");
+    var height = finiteNum(rect, "height");
+    if (isNaN(left) || isNaN(top) || !(width > 0) || !(height > 0)) return null;
+
+    var vw = beamViewportSize(viewport, "width");
+    var vh = beamViewportSize(viewport, "height");
+    var visLeft = Math.max(left, 0);
+    var visTop = Math.max(top, 0);
+    var visRight = Math.min(left + width, vw);
+    var visBottom = Math.min(top + height, vh);
+    var need = BEAM_ICON + BEAM_MARGIN;
+    if (visRight - visLeft < need || visBottom - visTop < need) return null;
+
+    return {
+      left: visRight - BEAM_ICON - BEAM_MARGIN,
+      top: visTop + BEAM_MARGIN,
+      size: BEAM_ICON,
+    };
+  }
+
   // Monotonic counter so pure time fallbacks differ across immediate calls.
   var nonceSeq = 0;
 
@@ -1004,12 +1120,459 @@
         .then(function () {}, function () {});
     }
 
+    // =====================================================================
+    // The beam overlay
+    //
+    // An icon in the top-right corner of a video that is PLAYING; clicking it
+    // asks the background to beam that video to BadApple. This runs in every
+    // frame content.js already runs in, so a player in a subframe is covered
+    // by that frame's own copy — nothing here reaches across a frame boundary.
+    //
+    // WHAT THE PAGE CAN DO TO IT, and what stops that:
+    //   - restyle it. The container's own properties are inline !important,
+    //     and everything visible lives in a CLOSED shadow root, which page
+    //     CSS cannot select into and which is not reachable from
+    //     element.shadowRoot. No id, no class, no `part` for a page
+    //     stylesheet to hook.
+    //   - be broken by it. The container is position:fixed with an explicit
+    //     size and `contain: layout style size`, so it contributes nothing to
+    //     the page's layout wherever it is parked.
+    //   - swallow the click, or see it. Pointer events are stopped on the
+    //     container in the CAPTURE phase, so the page's bubble-phase handlers
+    //     never run. (A page listener capturing on document still sees the
+    //     event first; it sees a click on an anonymous div, not on the
+    //     player.)
+    //
+    // WHAT IT COSTS A FRAME WITH NO VIDEO: no timers of its own, no observer
+    // of its own, no per-frame loop. It re-checks on the media events and DOM
+    // mutations content.js already listens for, at most once per
+    // BEAM_DEEP_MS, and sweeps for shadow roots at most once per
+    // BEAM_SHADOW_MS with a hard cap on elements examined.
+    //
+    // WHAT IT CANNOT SEE: a video inside a CLOSED shadow root. There is no
+    // API that reaches one, so those get no icon and this makes no claim to
+    // cover them.
+    // =====================================================================
+
+    var beamOverlays = new Map();     // video element -> record
+    var beamRootsCache = null;
+    var beamShadowAt = 0;
+    var beamDeepAt = 0;
+    var beamFrameQueued = false;
+    var beamLastRecord = null;
+
+    var BEAM_DEEP_MS = 250;           // discovery + computed-style re-check
+    var BEAM_SHADOW_MS = 2000;        // open-shadow-root sweep
+    var BEAM_SHADOW_CAP = 2000;       // elements examined per sweep, total
+    var BEAM_MESSAGE_MS = 7000;
+    var BEAM_MESSAGE_MAX = 300;
+
+    var BEAM_CSS = [
+      ":host{all:initial}",
+      "button{all:unset;box-sizing:border-box;display:block;position:relative;",
+      "width:100%;height:100%;cursor:pointer;border-radius:7px;",
+      "background:rgba(16,16,20,.66);border:1px solid rgba(255,255,255,.34);",
+      "backdrop-filter:blur(2px)}",
+      "button:hover{background:rgba(16,16,20,.9)}",
+      // The AirPlay mark: a screen with a triangle pointing up into it.
+      "span[data-p=s]{position:absolute;left:21%;top:23%;width:58%;height:36%;",
+      "border:2px solid #fff;border-radius:2px}",
+      "span[data-p=t]{position:absolute;left:50%;top:60%;margin-left:-7px;",
+      "width:0;height:0;border-left:7px solid transparent;",
+      "border-right:7px solid transparent;border-bottom:9px solid #fff}",
+      "div[data-p=m]{display:none;position:absolute;right:0;top:calc(100% + 6px);",
+      "width:264px;max-width:60vw;padding:8px 10px;border-radius:8px;",
+      "background:rgba(16,16,20,.95);color:#f1f1f4;text-align:left;",
+      "font:400 12px/1.35 system-ui,-apple-system,'Segoe UI',sans-serif;",
+      "box-shadow:0 4px 18px rgba(0,0,0,.5);pointer-events:none}",
+      "div[data-p=m][data-on='1']{display:block}",
+      "div[data-p=m][data-tone=bad]{border:1px solid rgba(255,122,122,.5)}",
+    ].join("");
+
+    function beamViewport() {
+      var w = NaN, h = NaN;
+      try { w = finiteNum(root, "innerWidth"); h = finiteNum(root, "innerHeight"); } catch (e) {}
+      if (isNaN(w) || w <= 0) {
+        try { w = finiteNum(documentRef.documentElement, "clientWidth"); } catch (e2) { w = NaN; }
+      }
+      if (isNaN(h) || h <= 0) {
+        try { h = finiteNum(documentRef.documentElement, "clientHeight"); } catch (e3) { h = NaN; }
+      }
+      return { width: w, height: h };
+    }
+
+    function beamFullscreenElement() {
+      try {
+        return documentRef.fullscreenElement || documentRef.mozFullScreenElement ||
+          documentRef.webkitFullscreenElement || null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Where a container may live so that it is actually painted.
+    //
+    // Nothing outside the fullscreen element is visible while one is set — the
+    // top layer is above every z-index — so an overlay for a video that is not
+    // inside it has nowhere honest to go and is taken down instead of left
+    // floating over someone else's fullscreen content. A <video> that is
+    // ITSELF the fullscreen element is the same answer for a different reason:
+    // no element can be rendered inside a <video>.
+    function beamParentFor(video, fullscreenEl) {
+      var fallback = null;
+      try { fallback = documentRef.body || documentRef.documentElement || null; } catch (e) {}
+      if (!fullscreenEl) return fallback;
+      if (fullscreenEl === video) return null;
+      try {
+        if (typeof fullscreenEl.contains === "function" && fullscreenEl.contains(video)) {
+          return fullscreenEl;
+        }
+      } catch (e2) {}
+      return null;
+    }
+
+    // Every root a <video> could be queried from: the document, plus the OPEN
+    // shadow roots reachable from it. Closed roots are not reachable and that
+    // includes this overlay's own containers, which is why the sweep never
+    // finds them. Capped and cached: an uncapped walk of a large page on every
+    // mutation is exactly the cost this lane is not allowed to have.
+    function beamSearchRoots(now) {
+      if (beamRootsCache && (now - beamShadowAt) < BEAM_SHADOW_MS) return beamRootsCache;
+      beamShadowAt = now;
+      var roots = [documentRef];
+      var queue = [documentRef];
+      var budget = BEAM_SHADOW_CAP;
+      while (queue.length && budget > 0) {
+        var current = queue.shift();
+        var all = qsa(current, "*");
+        for (var i = 0; i < all.length && budget > 0; i++) {
+          budget -= 1;
+          var shadow = null;
+          try { shadow = all[i].shadowRoot; } catch (e) { shadow = null; }
+          if (shadow) { roots.push(shadow); queue.push(shadow); }
+        }
+      }
+      beamRootsCache = roots;
+      return roots;
+    }
+
+    function beamVideos(now) {
+      var roots = beamSearchRoots(now);
+      var out = [];
+      for (var i = 0; i < roots.length; i++) {
+        var found = qsa(roots[i], "video");
+        for (var j = 0; j < found.length; j++) out.push(found[j]);
+      }
+      return out;
+    }
+
+    // Node.isConnected, read defensively: an engine without it answers
+    // undefined, which is read as "still there" and left to the deep pass.
+    function beamDisconnected(video) {
+      try {
+        return video.isConnected === false;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function beamRect(video) {
+      try {
+        if (typeof video.getBoundingClientRect !== "function") return null;
+        var r = video.getBoundingClientRect();
+        if (!r) return null;
+        return { left: r.left, top: r.top, width: r.width, height: r.height };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function beamStyle(video) {
+      try {
+        var gcs = root.getComputedStyle ||
+          (typeof getComputedStyle === "function" ? getComputedStyle : null);
+        if (typeof gcs !== "function") return null;
+        var cs = gcs.call(root, video);
+        if (!cs) return null;
+        return { display: cs.display, visibility: cs.visibility, opacity: cs.opacity };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function beamSwallow(e) {
+      try { if (e && typeof e.stopPropagation === "function") e.stopPropagation(); } catch (e1) {}
+      try {
+        if (e && typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+      } catch (e2) {}
+      try { if (e && typeof e.preventDefault === "function") e.preventDefault(); } catch (e3) {}
+    }
+
+    function beamMessage(rec, text, bad) {
+      if (!rec || !rec.msg) return;
+      try {
+        // textContent, never innerHTML: the string can be a host refusal, and
+        // a refusal is not markup.
+        rec.msg.textContent = String(text == null ? "" : text).slice(0, BEAM_MESSAGE_MAX);
+        rec.msg.setAttribute("data-on", "1");
+        rec.msg.setAttribute("data-tone", bad ? "bad" : "ok");
+      } catch (e) {
+        return;
+      }
+      rec.messageSeq = (rec.messageSeq || 0) + 1;
+      var seq = rec.messageSeq;
+      var st = root.setTimeout || setTimeout;
+      try {
+        st(function () {
+          if (rec.messageSeq !== seq || !rec.msg) return;
+          try {
+            rec.msg.removeAttribute("data-on");
+            rec.msg.textContent = "";
+          } catch (e2) {}
+        }, BEAM_MESSAGE_MS);
+      } catch (e3) {}
+    }
+
+    function beamClick(rec, e) {
+      beamSwallow(e);
+      if (rec.busy) return;
+      rec.busy = true;
+      beamLastRecord = rec;
+
+      // The element's own src, reported as-is. Whether a blob: can be beamed
+      // is not this frame's decision — the background owns the precedence and
+      // the fallback, because the tab's detected media never comes here.
+      var src = "";
+      try {
+        var current = rec.video.currentSrc;
+        if (typeof current === "string" && current) src = current;
+        else {
+          var plain = rec.video.src;
+          if (typeof plain === "string") src = plain;
+        }
+      } catch (eSrc) {
+        src = "";
+      }
+
+      var sent;
+      try {
+        sent = api.runtime.sendMessage({ type: "beam-video", src: src });
+      } catch (eSend) {
+        sent = null;
+      }
+      Promise.resolve(sent).then(function (resp) {
+        rec.busy = false;
+        if (resp && resp.ok === true) {
+          beamMessage(rec, "Sent to BadApple.", false);
+          return;
+        }
+        var why = resp && typeof resp.error === "string" && resp.error
+          ? resp.error : "Media Catcher could not beam this video.";
+        beamMessage(rec, why, true);
+      }, function () {
+        rec.busy = false;
+        beamMessage(rec, "Media Catcher's background page did not answer.", true);
+      });
+    }
+
+    // Build one overlay. Returns null when the browser will not give us a
+    // closed shadow root — an unshadowed div in someone's page is a style leak
+    // in both directions, so the feature declines rather than degrades.
+    function beamAttach(video) {
+      var container, shadow;
+      try {
+        container = documentRef.createElement("div");
+        if (!container || typeof container.attachShadow !== "function") return null;
+        shadow = container.attachShadow({ mode: "closed" });
+        if (!shadow) return null;
+      } catch (e) {
+        return null;
+      }
+      try {
+        var sheet = documentRef.createElement("style");
+        sheet.textContent = BEAM_CSS;
+        shadow.appendChild(sheet);
+
+        var button = documentRef.createElement("button");
+        button.setAttribute("type", "button");
+        button.setAttribute("aria-label", "Beam this video to BadApple");
+        button.setAttribute("title", "Beam this video to BadApple");
+        var screenPart = documentRef.createElement("span");
+        screenPart.setAttribute("data-p", "s");
+        var trianglePart = documentRef.createElement("span");
+        trianglePart.setAttribute("data-p", "t");
+        button.appendChild(screenPart);
+        button.appendChild(trianglePart);
+        shadow.appendChild(button);
+
+        var msg = documentRef.createElement("div");
+        msg.setAttribute("data-p", "m");
+        shadow.appendChild(msg);
+
+        var rec = {
+          video: video, container: container, shadow: shadow,
+          button: button, msg: msg, parent: null, busy: false, messageSeq: 0,
+          left: NaN, top: NaN,
+        };
+        if (typeof container.addEventListener === "function") {
+          container.addEventListener("click", function (e) { beamClick(rec, e); }, true);
+          for (var i = 0; i < BEAM_SWALLOWED.length; i++) {
+            container.addEventListener(BEAM_SWALLOWED[i], beamSwallow, true);
+          }
+        }
+        beamOverlays.set(video, rec);
+        return rec;
+      } catch (e2) {
+        try { if (typeof container.remove === "function") container.remove(); } catch (e3) {}
+        return null;
+      }
+    }
+
+    var BEAM_SWALLOWED = ["mousedown", "mouseup", "pointerdown", "pointerup",
+                          "touchstart", "touchend", "dblclick", "contextmenu"];
+
+    function beamDetach(video) {
+      var rec = beamOverlays.get(video);
+      if (!rec) return;
+      beamOverlays["delete"](video);
+      if (beamLastRecord === rec) beamLastRecord = null;
+      try {
+        if (rec.container && typeof rec.container.remove === "function") rec.container.remove();
+      } catch (e) {}
+    }
+
+    function beamSetStyle(el, name, value) {
+      try {
+        if (el && el.style && typeof el.style.setProperty === "function") {
+          el.style.setProperty(name, value, "important");
+        }
+      } catch (e) {}
+    }
+
+    // Every property here is one a page rule could otherwise take back, which
+    // is why they are all set inline and all !important rather than left to a
+    // stylesheet that page CSS outranks somewhere.
+    function beamPaint(rec, at, parent) {
+      var container = rec.container;
+      if (parent && container.parentNode !== parent) {
+        try { parent.appendChild(container); rec.parent = parent; } catch (e) { return false; }
+      }
+      if (rec.left === at.left && rec.top === at.top && rec.painted) return true;
+      rec.left = at.left;
+      rec.top = at.top;
+      rec.painted = true;
+      beamSetStyle(container, "position", "fixed");
+      beamSetStyle(container, "left", at.left + "px");
+      beamSetStyle(container, "top", at.top + "px");
+      beamSetStyle(container, "width", at.size + "px");
+      beamSetStyle(container, "height", at.size + "px");
+      beamSetStyle(container, "margin", "0");
+      beamSetStyle(container, "padding", "0");
+      beamSetStyle(container, "border", "0");
+      beamSetStyle(container, "z-index", "2147483647");
+      beamSetStyle(container, "isolation", "isolate");
+      beamSetStyle(container, "contain", "layout style size");
+      beamSetStyle(container, "display", "block");
+      beamSetStyle(container, "float", "none");
+      beamSetStyle(container, "clip-path", "none");
+      beamSetStyle(container, "filter", "none");
+      beamSetStyle(container, "transform", "none");
+      beamSetStyle(container, "opacity", "1");
+      beamSetStyle(container, "visibility", "visible");
+      beamSetStyle(container, "pointer-events", "auto");
+      beamSetStyle(container, "max-width", "none");
+      beamSetStyle(container, "max-height", "none");
+      return true;
+    }
+
+    function syncBeamOverlays() {
+      if (!documentRef) return;
+      var now = Date.now();
+      var deep = (now - beamDeepAt) >= BEAM_DEEP_MS;
+      if (!deep && beamOverlays.size === 0) return;
+      var viewport = beamViewport();
+      var fullscreenEl = beamFullscreenElement();
+
+      if (deep) {
+        beamDeepAt = now;
+        var videos = beamVideos(now);
+        var seen = new Set(videos);
+        var stale = [];
+        beamOverlays.forEach(function (rec, video) {
+          if (!seen.has(video)) stale.push(video);
+        });
+        for (var s = 0; s < stale.length; s++) beamDetach(stale[s]);
+
+        for (var i = 0; i < videos.length; i++) {
+          var video = videos[i];
+          var rect = beamRect(video);
+          var style = beamStyle(video);
+          var at = null;
+          var parent = null;
+          if (isBeamableVideo(video, { rect: rect, style: style, viewport: viewport })) {
+            at = beamIconRect(rect, viewport);
+            parent = beamParentFor(video, fullscreenEl);
+          }
+          if (!at || !parent) { beamDetach(video); continue; }
+          var rec = beamOverlays.get(video) || beamAttach(video);
+          if (!rec) continue;
+          rec.style = style;
+          if (!beamPaint(rec, at, parent)) beamDetach(video);
+        }
+      } else {
+        var drop = [];
+        beamOverlays.forEach(function (rec, video) {
+          // A removed <video> still answers getBoundingClientRect, so the
+          // cheap pass has to ask the one question that is both cheap and
+          // decisive — otherwise an icon outlives its video for up to
+          // BEAM_DEEP_MS, floating over whatever took its place.
+          if (beamDisconnected(video)) { drop.push(video); return; }
+          var rect = beamRect(video);
+          var at = isBeamableVideo(video, { rect: rect, style: rec.style, viewport: viewport })
+            ? beamIconRect(rect, viewport) : null;
+          var parent = at ? beamParentFor(video, fullscreenEl) : null;
+          if (!at || !parent || !beamPaint(rec, at, parent)) drop.push(video);
+        });
+        for (var d = 0; d < drop.length; d++) beamDetach(drop[d]);
+      }
+
+      if (beamOverlays.size) requestBeamFrame();
+    }
+
+    // A per-frame loop exists only while there is something to keep in place.
+    // The moment the last overlay goes, so does the loop.
+    function requestBeamFrame() {
+      if (beamFrameQueued) return;
+      beamFrameQueued = true;
+      function run() {
+        beamFrameQueued = false;
+        syncBeamOverlays();
+      }
+      try {
+        if (typeof root.requestAnimationFrame === "function") {
+          root.requestAnimationFrame(run);
+          return;
+        }
+      } catch (e) {}
+      var st = root.setTimeout || setTimeout;
+      try { st(run, BEAM_DEEP_MS); } catch (e2) { beamFrameQueued = false; }
+    }
+
+    // Media events and fullscreen changes are the moments the answer actually
+    // changed, so they re-check immediately rather than waiting out the
+    // throttle. Mutations do not: those arrive in storms.
+    function beamSyncNow() {
+      beamDeepAt = 0;
+      syncBeamOverlays();
+    }
+
     var MO = root.MutationObserver ||
       (typeof MutationObserver !== "undefined" ? MutationObserver : null);
     if (MO && documentRef && documentRef.documentElement) {
       try {
         var obs = new MO(function () {
           refreshThenScan();
+          syncBeamOverlays();
         });
         obs.observe(documentRef.documentElement, { childList: true, subtree: true });
       } catch (eObs) {}
@@ -1041,10 +1604,34 @@
       }
     });
 
+    // Media events do not bubble, so these are capture-phase on the document —
+    // the same reason the two above are. They do not reach into a shadow root
+    // (a media event is not composed); a player in one is picked up by the
+    // sweep instead.
+    var BEAM_EVENTS = ["play", "playing", "pause", "ended", "emptied", "loadeddata",
+                       "seeked", "abort", "fullscreenchange", "mozfullscreenchange",
+                       "webkitfullscreenchange"];
+    for (var bi = 0; bi < BEAM_EVENTS.length; bi++) onDoc(BEAM_EVENTS[bi], beamSyncNow);
+
+    // Scrolling and resizing move the corner without changing anything else.
+    // Throttled by syncBeamOverlays itself, and a no-op in a frame with no
+    // overlay up.
+    try {
+      if (typeof root.addEventListener === "function") {
+        root.addEventListener("scroll", function () { syncBeamOverlays(); }, true);
+        root.addEventListener("resize", function () { syncBeamOverlays(); }, true);
+      }
+    } catch (eScroll) {}
+
     var si = root.setInterval || setInterval;
     si(function () {
+      syncBeamOverlays();
       return tick();
     }, 12000);
+
+    // One pass now, so a video already playing when this frame loaded gets its
+    // icon without waiting for the page to do something.
+    beamSyncNow();
 
     try {
       if (api.runtime.onMessage && typeof api.runtime.onMessage.addListener === "function") {
@@ -1055,6 +1642,16 @@
             } catch (e) {
               try { sendResponse({ title: "" }); } catch (e2) {}
             }
+            return;
+          }
+          // The helper refused a beam. `badapple` answers nothing on success,
+          // so this only ever arrives for a failure, and it arrives late —
+          // after the click has already been answered ok. Shown on the overlay
+          // that asked, which is the only one that could have.
+          if (msg && msg.type === "beam-result" && msg.ok === false) {
+            beamMessage(beamLastRecord,
+              typeof msg.error === "string" && msg.error
+                ? msg.error : "BadApple could not play that.", true);
           }
         });
       }
@@ -1065,6 +1662,8 @@
     collectFilenameCandidates: collectFilenameCandidates,
     buildPageSnapshot: buildPageSnapshot,
     createDocumentNonce: createDocumentNonce,
+    isBeamableVideo: isBeamableVideo,
+    beamIconRect: beamIconRect,
     install: install,
   });
 });

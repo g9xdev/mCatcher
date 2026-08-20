@@ -250,9 +250,11 @@ test("CommonJS export surface is frozen with exact public keys", () => {
   const api = loadContent();
   assert.ok(Object.isFrozen(api));
   assert.deepEqual(Object.keys(api).sort(), [
+    "beamIconRect",
     "buildPageSnapshot",
     "collectFilenameCandidates",
     "createDocumentNonce",
+    "isBeamableVideo",
     "install",
   ].sort());
   for (const k of Object.keys(api)) {
