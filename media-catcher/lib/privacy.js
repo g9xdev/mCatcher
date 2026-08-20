@@ -679,14 +679,21 @@
      * Free-text log redaction. Every absolute http(s) URL in the line is
      * replaced by its redactUrlForLog projection — scheme://host[:port]/path,
      * with userinfo, query and fragment removed. Trailing sentence punctuation
-     * is put back so a URL at the end of a sentence still reads as one.
-     * Everything else in the line, including local save paths, is kept.
+     * and wrappers are put back so a quoted or sentence-final URL still reads
+     * as one. Everything else in the line, including local save paths, is kept.
+     *
+     * The match runs to whitespace, not to the first quote or angle bracket:
+     * host lines carry yt-dlp's own spelling rather than a browser-canonicalised
+     * URL, so an unencoded quote inside the query would otherwise end the match
+     * and leave the credential after it standing in the line. Whitespace is
+     * still the boundary, so a URL printed with a raw space in it is projected
+     * only up to that space.
      */
     function redactLogText(text) {
       if (typeof text !== "string" || text.length === 0) return "";
-      return text.replace(/https?:\/\/[^\s"'<>]+/gi, function (match) {
+      return text.replace(/https?:\/\/\S+/gi, function (match) {
         var trailing = "";
-        var punct = match.match(/[.,;:!?)\]}]+$/);
+        var punct = match.match(/['">.,;:!?)\]}]+$/);
         if (punct) {
           trailing = punct[0];
           match = match.slice(0, match.length - trailing.length);

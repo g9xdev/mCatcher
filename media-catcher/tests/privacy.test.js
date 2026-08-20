@@ -1248,3 +1248,34 @@ test("redactLogText strips userinfo, query and fragment from every URL it finds"
   assert.equal(P.redactLogText(null), "");
   assert.equal(P.redactLogText({ toString() { return "https://x/?t=S"; } }), "");
 });
+
+test("redactLogText matches a URL to whitespace so an in-query quote leaves no tail", () => {
+  // Host lines are yt-dlp's own spelling, not a browser-canonicalised URL, so
+  // an unencoded quote or angle bracket can sit inside the query. Ending the
+  // match there projected only the head and left the credential in the line.
+  assert.equal(
+    P.redactLogText("https://a.ex/x?title=it's&sig=SECRET_SIGNED_QUERY_XYZ"),
+    "https://a.ex/x"
+  );
+  assert.equal(
+    P.redactLogText('https://a.ex/x?q=a"b&sig=SECRET_SIGNED_QUERY_XYZ'),
+    "https://a.ex/x"
+  );
+  assert.equal(
+    P.redactLogText("https://a.ex/x?a=1<2&sig=SECRET_SIGNED_QUERY_XYZ"),
+    "https://a.ex/x"
+  );
+  // A URL wrapped in quotes or angle brackets still reads as one afterwards.
+  assert.equal(
+    P.redactLogText('saw "https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ" once'),
+    'saw "https://a.ex/x" once'
+  );
+  assert.equal(
+    P.redactLogText("<https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ>"),
+    "<https://a.ex/x>"
+  );
+  assert.equal(
+    P.redactLogText("ERROR: https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ, retrying."),
+    "ERROR: https://a.ex/x, retrying."
+  );
+});
