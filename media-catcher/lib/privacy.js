@@ -648,9 +648,14 @@
     // Without this the whole query went, so every video logged as .../watch and
     // two different googlevideo failures collapsed to one .../videoplayback line.
     var LOG_IDENTITY_PARAMS = ["v", "id"];
-    // A media id is a short plain identifier. Anything longer, or carrying a
-    // separator that could nest a second query, fails closed and is dropped.
-    var LOG_IDENTITY_VALUE_MAX = 64;
+    // A media id is a short plain identifier: YouTube's v is 11 characters,
+    // googlevideo's id is 16. The cap is headroom over those, and it bounds
+    // the risk rather than removing it -- [A-Za-z0-9_.~-] is also the alphabet
+    // of a base64url or hex token, so a provider that spells a signed link
+    // id=<signature> has that value kept. At 64 a whole hex HMAC or a 256-bit
+    // base64url token fitted; at 24 neither does. A separator that could nest
+    // a second query fails closed at the pattern below.
+    var LOG_IDENTITY_VALUE_MAX = 24;
     var LOG_IDENTITY_VALUE_RE = /^[A-Za-z0-9_.~-]+$/;
 
     // The allowlisted part of a parsed URL's query, as "?v=…[&id=…]" or "".

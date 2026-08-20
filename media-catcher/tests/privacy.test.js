@@ -1371,8 +1371,11 @@ test("redactLogText redacts credential values no URL match can claim", () => {
 test("redactUrlForLog keeps the allowlisted identity parameter and nothing else", () => {
   // Dropping the whole query collapsed every video to .../watch and every
   // googlevideo failure to .../videoplayback, so two distinct failures read as
-  // one line. v and id name which media the line is about and cannot carry a
-  // credential; everything else, allowlist-style, is dropped.
+  // one line. v and id name which media the line is about; everything else,
+  // allowlist-style, is dropped. The two names are not proof against a
+  // credential -- nothing stops a provider spelling a signed link id=<sig>,
+  // and the pattern's alphabet is also base64url's -- so the value is capped
+  // at a length a real media id has, which bounds what can ride out.
   assert.equal(
     P.redactLogText("yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),
     "yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -1403,7 +1406,18 @@ test("redactUrlForLog keeps the allowlisted identity parameter and nothing else"
   assert.equal(P.redactUrlForLog("https://a.ex/p?id=ok_1.2~3-4"), "https://a.ex/p?id=ok_1.2~3-4");
   // Values fail closed: over-long, or anything but a plain identifier, is
   // dropped, so a nested query can never ride back in through the allowlist.
-  assert.equal(P.redactUrlForLog("https://a.ex/p?v=" + "x".repeat(65)), "https://a.ex/p");
+  assert.equal(
+    P.redactUrlForLog("https://a.ex/p?v=" + "x".repeat(24)),
+    "https://a.ex/p?v=" + "x".repeat(24)
+  );
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=" + "x".repeat(25)), "https://a.ex/p");
+  // A 64-character hex HMAC and a base64url token are exactly what the value
+  // pattern allows, so the cap is the only thing that drops them.
+  assert.equal(P.redactUrlForLog("https://a.ex/p?id=" + "a1b2c3d4".repeat(8)), "https://a.ex/p");
+  assert.equal(
+    P.redactUrlForLog("https://a.ex/p?id=eyJhbGciOiJIUzI1NiJ9.eyJ1IjoxfQ.SECRET_SIGNED_QUERY"),
+    "https://a.ex/p"
+  );
   assert.equal(P.redactUrlForLog("https://a.ex/p?v=a%2Fb%3Ftoken%3DS"), "https://a.ex/p");
   assert.equal(P.redactUrlForLog("https://a.ex/p?v=a b"), "https://a.ex/p");
   assert.equal(P.redactUrlForLog("https://a.ex/p?v="), "https://a.ex/p");
