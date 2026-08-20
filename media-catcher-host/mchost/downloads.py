@@ -5072,7 +5072,7 @@ def _pget_register(jid, op):
 def _claim_free_dest(dest, owner, commit=None):
     """Resolve `dest` to a path nobody holds, and claim it for `owner`.
 
-    Every writer that picks its own output name goes through here, because
+    pget's final path and a recording save resolve here, because
     os.path.exists alone cannot answer the question. A pget's final path is
     not created until os.replace at the very end of the job, and a recording's
     not until shutil.move, so two writers resolving in that window agree on
@@ -5080,6 +5080,18 @@ def _claim_free_dest(dest, owner, commit=None):
     and the second silently overwrites the first. _PGET_DEST is the other half
     of the answer: a path a live writer already claimed is taken exactly as an
     existing file is, and the second lands on "clip (1).mp4".
+
+    NOT every writer that picks its own name, and each one that skips this is
+    deliberate. Legacy yt-dlp claims in a key space of its own -- the
+    (normcase(outtmpl), url) tuple _ytdl_dest_key builds, claimed at
+    registration because yt-dlp produces no concrete path until it opens the
+    file -- and `taken` below is a string membership test, so the two spaces
+    cannot protect each other and are not meant to. The structured yt-dlp path
+    needs no claim at all: _ytdl_commit_with_candidates is a bounded
+    no-replace rename that retries on OBJECT_NAME_COLLISION, so the filesystem
+    settles the name and a loser takes the next candidate. handle_snapshot
+    does not claim either -- its "<base> (partial).mp4" is a checkpoint of one
+    recording, and the next checkpoint is meant to overwrite the last.
 
     Deduping rather than refusing is the difference from the legacy yt-dlp
     claim in _pget_register, and it is because the two answer different
