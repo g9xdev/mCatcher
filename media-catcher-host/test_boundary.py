@@ -253,7 +253,10 @@ def test_refuse_open_covers_the_windows_shapes(tmp_path):
 def test_badapple_is_typed_like_open_and_reveal_plus_a_url():
     assert guard.MESSAGE_SCHEMA["badapple"] == {
         "id": guard.ID, "path": guard.STR, "url": guard.STR,
-    }, "badapple takes a correlation id and ONE source — a file path or a URL"
+        "headers": {"Cookie": guard.STR, "Referer": guard.STR,
+                    "User-Agent": guard.STR},
+    }, ("badapple takes a correlation id, ONE source — a file path or a URL — "
+        "and, only alongside a URL, the sign-in that source needs")
 
 
 def _fake_badapple(monkeypatch, tmp_path, installed=True):

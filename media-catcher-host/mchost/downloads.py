@@ -35,6 +35,10 @@ from ctypes import wintypes
 # functions — and it imports no mchost sibling, so there is no import-order or
 # stale-copy hazard to route around.
 from mchost import guard
+# BadApple's IPC pipe — the only route a beam's sign-in may take, because argv
+# is readable by every process running as this user. Imported as a MODULE so
+# the call site stays an attribute lookup: the suite substitutes send_beam.
+from mchost import badapple_ipc
 # Where BadApple is installed — a host-owned lookup, imported here so
 # handle_badapple never has a path of its own to fall back on.
 from mchost.tools import find_badapple
@@ -1043,7 +1047,8 @@ def handle_badapple(req):
 
     Two halves, and only one of them comes from the extension.
 
-    THE SOURCE is caller-supplied and arrives as exactly one of two fields.
+    THE SOURCE is caller-supplied and arrives as exactly one of two fields
+    (a third, optional field carries the sign-in — see THE SIGN-IN below).
     `path` is the popup's "Open in BadApple" on a file this host wrote; `url`
     is the content-script overlay's beam of a video a page is playing. They
     are MUTUALLY EXCLUSIVE and a frame carrying both is refused rather than
@@ -1079,12 +1084,30 @@ def handle_badapple(req):
     never produces one, so admitting it would widen the shell-facing allowlist
     for a file the helper did not write.
 
+    THE SIGN-IN is the third field, and the only optional one. A login-gated
+    stream answers 403 to anyone who asks without the credential the browser
+    had, so `headers` carries Cookie, Referer and/or User-Agent —
+    guard.normalize_beam_headers refuses every other name BY NAME, mirroring
+    both of BadApple's own gates, and refuses a value with a control character
+    in it. ABSENT IS NOT THE SAME AS EMPTY on the far side: their engine
+    branches on the field's presence and every beam predating this feature
+    sends nothing, so {} is normalised back to "no credential" here rather than
+    forwarded as an empty object.
+
+    WHERE the sign-in travels is not a detail. Win32_Process.CommandLine is
+    readable by every process running as this user, so a credential must never
+    be an argument — their contract says "argv accepts `--beam <target>` and
+    nothing else" for exactly that reason. A beam carrying one therefore goes
+    down BadApple's single-instance IPC pipe instead (mchost/badapple_ipc.py),
+    and a beam carrying none still goes on argv exactly as it always did. Two
+    routes, chosen by presence, so the credential-free path did not change.
+
     THE PROGRAM is not caller-supplied at all. find_badapple reads a fixed
     list compiled into the host; no field of `req` reaches argv[0], and the
-    schema lists only `id`, `path` and `url` as fields this handler reads. An
-    argv list with shell=False is the same spawn discipline every other
-    subprocess here uses: nothing is parsed as a command line, so a path with
-    a space or a quote in it is one argument.
+    schema lists only `id`, `path`, `url` and `headers` as fields this handler
+    reads. An argv list with shell=False is the same spawn discipline every
+    other subprocess here uses: nothing is parsed as a command line, so a path
+    with a space or a quote in it is one argument.
 
     `--beam` is BadApple's own flag for this: a second launch hands the source
     to the instance already running over its single-instance channel and
@@ -1134,12 +1157,52 @@ def handle_badapple(req):
                 return
             target = path
 
+        # THE SIGN-IN, if there is one. Vetted before find_badapple so that a
+        # frame naming a header BadApple would refuse is answered the same way
+        # whether or not the app happens to be installed.
+        headers, refusal = guard.normalize_beam_headers(req.get("headers"))
+        if refusal:
+            refuse(refusal)
+            return
+        if headers and url is None:
+            # Mirrors the engine, which refuses the same shape rather than
+            # dropping the credential: there is no origin to send it to, and
+            # accepting it would teach the caller that BadApple took a
+            # credential it in fact discarded.
+            refuse("refused: sign-in details can only ride an http/https link — "
+                   "this beam names a local file")
+            return
+
         app = find_badapple()
         if not app:
             # Named, so the popup can tell the user what is missing rather than
             # showing a button that did nothing.
             refuse("BadApple is not installed on this computer.")
             return
+
+        # TWO ROUTES, and which one is taken is decided by whether there is a
+        # credential -- never by convenience.
+        #
+        # No credential: argv, exactly as before. Their contract permits it in
+        # so many words ("argv accepts `--beam <target>` and nothing else"),
+        # every beam predating this feature took it, and it is one process
+        # start rather than a connect-or-launch dance.
+        #
+        # A credential: the pipe, because Win32_Process.CommandLine is readable
+        # by every process running as this user. See mchost/badapple_ipc.py.
+        if headers:
+            try:
+                badapple_ipc.send_beam(app, target,
+                                       badapple_ipc.encode_headers(headers))
+            except Exception as e:
+                # BeamPipeError's messages are fixed sentences carrying neither
+                # the token nor the target. Anything else that reaches here is
+                # answered generically for the same reason -- an OSError's text
+                # is not worth the chance that it quotes the line.
+                refuse(str(e) if isinstance(e, badapple_ipc.BeamPipeError)
+                       else "BadApple would not accept the beam.")
+            return
+
         cf, si = _no_window()
         try:
             subprocess.Popen([app, "--beam", target], creationflags=cf, startupinfo=si)

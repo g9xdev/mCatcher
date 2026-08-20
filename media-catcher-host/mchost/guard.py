@@ -143,7 +143,16 @@ MESSAGE_SCHEMA = {
     # playing <video> (refuse_url, the same predicate the downloader uses).
     # Mutual exclusion is enforced in the handler, not here: this table types
     # fields, it does not express relations between them.
-    "badapple": {"id": ID, "path": STR, "url": STR},
+    #
+    # `headers` is the SIGN-IN a login-gated stream needs, and it is spelled in
+    # BadApple's names rather than this port's usual camelCase (the pget lane's
+    # `referer`/`userAgent`) because it is forwarded to them verbatim: one
+    # spelling means no translation table to drift. Listing the three types
+    # their values; it does NOT enforce the allowlist, because unlisted keys
+    # are ignored here by design -- normalize_beam_headers is what refuses a
+    # fourth name, in the handler, beside the mutual-exclusion check.
+    "badapple": {"id": ID, "path": STR, "url": STR,
+                 "headers": {"Cookie": STR, "Referer": STR, "User-Agent": STR}},
     "update": {"extDir": STR, "zipDir": STR, "profileDir": STR, "silent": BOOL},
     "watch": {"enable": BOOL, "extDir": STR, "zipDir": STR},
     "checkGithub": {"auto": BOOL, "force": BOOL, "extDir": STR, "zipDir": STR,
@@ -642,6 +651,75 @@ def refuse_http_context(value):
     if _has_control_char(value):
         return "refused: that header value contains a control character"
     return None
+
+
+# ---------------------------------------------------------------------------
+# What may ride a BEAM as a sign-in
+#
+# A login-gated stream answers 403 to anyone who asks without the sign-in the
+# browser had, so a beam of one has to carry a credential. BadApple takes three
+# names and refuses every other BY NAME on both of its own sides (engine:
+# serving.normalize_beam_headers; shell: BeamHeaders.Allowed). This is the
+# host's copy of that rule.
+#
+# WHY A THIRD COPY IS NOT A DRIFT HAZARD THE WAY A SECOND URL RULE WOULD BE.
+# refuse_url's docstring, and handle_badapple's, both record the same principle:
+# two rules guarding one danger are free to drift, and drift in the PERMISSIVE
+# direction is a hole. That is a statement about direction, not about count.
+# This copy is allowed to refuse MORE than BadApple does and must never refuse
+# less -- and it does refuse more, in one measured place: the value check below
+# is _has_control_char (every C0 and DEL, the class refuse_url already uses)
+# where BadApple refuses only CR, LF and NUL. A tab in a Cookie is something no
+# browser produced; refusing it costs a beam that would probably have worked,
+# while accepting a name BadApple bounces costs a user a credential they were
+# told was sent and a 403 that reads as a broken stream.
+# ---------------------------------------------------------------------------
+
+# Exactly BadApple's set, in exactly BadApple's casing. Their engine keys its
+# map on these spellings, so settling the casing is this side's job.
+BEAM_HEADERS = ("Cookie", "Referer", "User-Agent")
+
+_BEAM_CANONICAL = {h.lower(): h for h in BEAM_HEADERS}
+
+
+def normalize_beam_headers(headers):
+    """(canonical, None) when `headers` may ride a beam, else (None, reason).
+
+    Returns the vetted value rather than only a verdict, which is the one place
+    this file departs from its refuse_* shape. The reason is the drift the
+    section above is about: canonicalising a name and judging it are the SAME
+    walk over the same table, and splitting them into a gate plus a separate
+    re-speller is how the two come to disagree. One walk, one answer.
+
+    Absent and empty both answer ({}, None). "ABSENT means this beam has no
+    credential, and it must not be spelled as an empty object" -- so an empty
+    object is not an error to report, it is a beam with nothing to carry, and
+    the caller is what must turn {} back into the absent spelling.
+
+    NO REASON RETURNED HERE EVER QUOTES A VALUE. A refusal travels back to the
+    extension, into its log ring and onto a panel drawn over the page; naming
+    the header is what makes it actionable, and quoting the value would put the
+    credential somewhere it was never going to go.
+    """
+    if headers is None or headers == {}:
+        return {}, None
+    if not isinstance(headers, dict):
+        return None, "refused: sign-in details must be an object of header names"
+    out = {}
+    for name, value in headers.items():
+        key = _BEAM_CANONICAL.get(str(name).strip().lower())
+        if key is None:
+            # By NAME. Dropping it silently would send a beam that looks
+            # signed-in and is not.
+            return None, ("refused: %s is not a header BadApple will send — "
+                          "only %s are." % (name, ", ".join(BEAM_HEADERS)))
+        if not isinstance(value, str):
+            return None, ("refused: the %s value must be text" % key)
+        if _has_control_char(value):
+            return None, ("refused: the %s value contains a control character"
+                          % key)
+        out[key] = value
+    return out, None
 
 
 # ---------------------------------------------------------------------------
