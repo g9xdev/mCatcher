@@ -147,6 +147,38 @@ def handle_record(req):
         _h().send({"type": "error", "id": req.get("id"), "error": "ffmpeg not found. Re-run the installer or put ffmpeg.exe next to the helper."})
         return
     jid = req.get("id")
+    # These two URLs are the only ones this host takes that no gated extension
+    # path vetted. Every other lane's arrived from webRequest or a content
+    # script; these are URIs lifted from the BODY of a fetched HLS manifest,
+    # and media-catcher/lib/hls.js resolveUrl returns an absolute URI
+    # unchanged, so the playlist decides the string. recordLiveHls skips its
+    # findSiblingAudio probe when audioUrl is already set — which is exactly
+    # what an #EXT-X-MEDIA:TYPE=AUDIO line does — so a URI of
+    # "file://attacker.test/s/x" reaches ffmpeg, which opens it as the UNC
+    # path \\attacker.test\s\x: an outbound SMB connection carrying the user's
+    # NTLM credentials. That is the threat 2c3e0aa gated mirrors against, and
+    # this lane had no gate at all. audioUrl is optional, so only a present
+    # one is checked; videoUrl the schema already requires.
+    for field in ("videoUrl", "audioUrl"):
+        value = req.get(field)
+        if field == "audioUrl" and not value:
+            continue
+        err = guard.refuse_url(value)
+        if err:
+            _h()._hlog("error", "record: %s (%s)" % (err, field))
+            _h().send({"type": "error", "id": jid,
+                       "error": "That isn't a stream this helper can record."})
+            return
+    # ffmpeg_cmd joins these into ONE -headers value with a literal \r\n
+    # between them, so a control character in either is a header the page
+    # wrote appended to every request ffmpeg makes for this stream.
+    for field in ("referer", "userAgent"):
+        err = guard.refuse_http_context(req.get(field))
+        if err:
+            _h()._hlog("error", "record: %s (%s)" % (err, field))
+            _h().send({"type": "error", "id": jid,
+                       "error": "That isn't a stream this helper can record."})
+            return
     # The id is the extension's correlation token, not a path component. It used
     # to be interpolated straight in here, so "../.." walked out of TMPDIR: an
     # arbitrary .mp4 create-or-overwrite anywhere the user can write, and

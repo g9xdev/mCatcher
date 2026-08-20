@@ -666,3 +666,110 @@ def test_a_schema_refusal_cannot_carry_an_attempt_token():
     assert guard.validate_message(msg) is not None
     assert guard.message_id(msg) == "j1"
     assert guard.message_id({"cmd": "ytdl", "attemptToken": "atk-1"}) is None
+
+
+# ---------------------------------------------------------------------------
+# 6. The record lane's URLs are attacker text too
+#
+# Every other URL this host takes arrived from webRequest or a gated content
+# script. record's did not: it is a URI lifted from the BODY of a fetched HLS
+# manifest, and media-catcher/lib/hls.js resolveUrl returns an absolute URI
+# unchanged, so the playlist decides the string. recordLiveHls skips its
+# findSiblingAudio probe when audioUrl is already set, which is exactly the
+# case an #EXT-X-MEDIA:TYPE=AUDIO line creates, so nothing upstream looks at
+# it. ffmpeg opens "file://attacker.test/s/x" as the UNC path
+# \attacker.test\s\x -- an outbound SMB connection carrying the user's NTLM
+# credentials -- which is the threat 2c3e0aa gated mirrors against.
+#
+# The headers are the same lane's second half: ffmpeg_cmd interpolates referer
+# and userAgent into one -headers value separated by a literal \r\n, so a
+# control character in either appends headers of the page's choosing to every
+# request ffmpeg makes for that stream.
+# ---------------------------------------------------------------------------
+
+def _record_argv(monkeypatch, req):
+    """handle_record end to end: (ffmpeg argv or None if none was built, frames).
+
+    Popen raises so nothing is launched, which also settles job.finished on the
+    worker — the argv is captured at the real spawn point, not from ffmpeg_cmd.
+    """
+    import mchost.downloads as d
+
+    calls, sent = [], []
+    monkeypatch.setattr(mc, "FFMPEG", "ffmpeg")
+    monkeypatch.setattr(mc, "send", lambda m: sent.append(dict(m)))
+    monkeypatch.setattr(mc, "_hlog", lambda *a, **k: None)
+
+    def fake_popen(cmd, **kw):
+        calls.append(list(cmd))
+        raise OSError("test: ffmpeg is not really launched")
+
+    monkeypatch.setattr(d.subprocess, "Popen", fake_popen)
+    try:
+        mc.handle_record(req)
+        job = d.JOBS.get(req.get("id"))
+        if job is not None:
+            assert job.finished.wait(5), "run_job never finished"
+    finally:
+        with d.JOBS_LOCK:
+            d.JOBS.pop(req.get("id"), None)
+    return (calls[0] if calls else None), sent
+
+
+def _record_error(sent, jid):
+    errs = [m for m in sent if m.get("type") == "error" and m.get("id") == jid]
+    assert errs, sent
+    return errs[-1]
+
+
+def test_record_refuses_a_non_http_audio_url(monkeypatch):
+    """The reviewer's scenario: the audio URI of a master playlist is a UNC."""
+    jid = "recUncAudio"
+    argv, sent = _record_argv(monkeypatch, {
+        "id": jid, "base": "clip",
+        "videoUrl": "https://cdn.test/v.m3u8",
+        "audioUrl": "file://attacker.test/s/x",
+    })
+    assert argv is None, argv
+    _record_error(sent, jid)
+
+
+def test_record_refuses_a_non_http_video_url(monkeypatch):
+    """The local-read half of the same shape, and the required field."""
+    for bad in ("file:///C:/Users/me/.ssh/id_rsa", "ftp://attacker.test/x",
+                "//attacker.test/s/x", " https://cdn.test/v.m3u8",
+                "https://cdn.test/v\r\n.m3u8", ""):
+        jid = "recBadVideo"
+        argv, sent = _record_argv(monkeypatch, {
+            "id": jid, "base": "clip", "videoUrl": bad,
+        })
+        assert argv is None, (bad, argv)
+        _record_error(sent, jid)
+
+
+def test_record_refuses_control_characters_in_referer_and_user_agent(monkeypatch):
+    """ffmpeg's -headers value is CRLF-separated, so a CRLF here adds headers."""
+    for field in ("referer", "userAgent"):
+        jid = "recHdr_" + field
+        argv, sent = _record_argv(monkeypatch, {
+            "id": jid, "base": "clip",
+            "videoUrl": "https://cdn.test/v.m3u8",
+            field: "http://page/\r\nX-Injected: 1",
+        })
+        assert argv is None, (field, argv)
+        _record_error(sent, jid)
+
+
+def test_record_still_records_an_ordinary_stream(monkeypatch):
+    """The gate is a gate, not a wall: the shipped shape still reaches ffmpeg."""
+    jid = "recOk"
+    argv, sent = _record_argv(monkeypatch, {
+        "id": jid, "base": "clip",
+        "videoUrl": "https://cdn.test/v.m3u8",
+        "audioUrl": "https://cdn.test/a.m3u8",
+        "referer": "https://page.test/watch", "userAgent": "UA/1.0",
+    })
+    assert argv is not None
+    assert argv.count("-i") == 2, argv
+    assert "https://cdn.test/a.m3u8" in argv, argv
+    assert any("X-Injected" not in str(s) for s in argv)

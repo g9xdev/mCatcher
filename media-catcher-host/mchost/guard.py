@@ -494,6 +494,15 @@ def refuse_open(path):
 _URL_SCHEMES = frozenset({"http", "https"})
 
 
+def _has_control_char(s):
+    """True when `s` holds a C0 control or DEL.
+
+    One predicate for both callers below so an address and a request header
+    are judged by the same character class, and widening it later widens both.
+    """
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in s)
+
+
 def refuse_url(url):
     """None when `url` may be handed to yt-dlp, else a user-facing reason.
 
@@ -525,9 +534,8 @@ def refuse_url(url):
         return "refused: no address given"
     if url != url.strip():
         return "refused: that address is padded with whitespace"
-    for ch in url:
-        if ord(ch) < 32 or ord(ch) == 127:
-            return "refused: that address contains a control character"
+    if _has_control_char(url):
+        return "refused: that address contains a control character"
     try:
         parts = urllib.parse.urlsplit(url)
     except Exception:
@@ -536,6 +544,31 @@ def refuse_url(url):
         return "refused: only http and https addresses can be downloaded"
     if not parts.netloc:
         return "refused: that address names no host"
+    return None
+
+
+def refuse_http_context(value):
+    """None when `value` may be interpolated into a request, else a reason.
+
+    A Referer or User-Agent the caller supplies is not just a string that ends
+    up in a request — where it is joined to its neighbours by a literal CRLF
+    (downloads.ffmpeg_cmd builds ffmpeg's one -headers value that way), a
+    control character in it appends headers of the caller's choosing to every
+    request that follows. Absent is not a refusal: both fields are optional
+    and the handler simply omits the header.
+
+    The extension's router applies its own isSafeHttpContextString to the pget
+    lane's copies of these fields; this is the host-side check, and it refuses
+    the same C0 and DEL that refuse_url does. (The router additionally refuses
+    C1; those are not a header separator, and the host's one character class
+    is the point of _has_control_char.)
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        return "refused: that header value is not text"
+    if _has_control_char(value):
+        return "refused: that header value contains a control character"
     return None
 
 
