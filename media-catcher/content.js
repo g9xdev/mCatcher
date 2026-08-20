@@ -1142,6 +1142,10 @@
     //     never run. (A page listener capturing on document still sees the
     //     event first; it sees a click on an anonymous div, not on the
     //     player.)
+    //   - CLICK IT ITSELF. The container is a node in the page's DOM, so page
+    //     script can find it and dispatch on it. beamClick drops any event
+    //     the browser did not mark isTrusted, which is every event a script
+    //     dispatched.
     //
     // WHAT IT COSTS A FRAME WITH NO VIDEO: no timers of its own, no observer
     // of its own, no per-frame loop. It rides content.js's existing
@@ -1372,8 +1376,24 @@
       } catch (e3) {}
     }
 
+    // A USER clicked, not a script.
+    //
+    // The container is a node in the page's DOM: page script can locate it —
+    // the icon's rect is deterministic, so elementFromPoint finds it — and
+    // call .click() on it. Everything downstream of this function runs with
+    // nobody in it: the background resolves an address, the native port
+    // carries it, and the helper spawns BadApple. This is the last frame in
+    // which "a user did this" is still a question that can be answered, so it
+    // is answered here. isTrusted is the browser's own flag and is false on
+    // every event dispatched from script; anything that is not exactly true
+    // — including an object carrying no flag at all — is not a user.
+    //
+    // The overlay says nothing about a refused click. There is no one to tell:
+    // a page that dispatched the event is not a person, and a person who did
+    // click gets past this line.
     function beamClick(rec, e) {
       beamSwallow(e);
+      if (!e || e.isTrusted !== true) return;
       if (rec.busy) return;
       rec.busy = true;
       beamLastRecord = rec;

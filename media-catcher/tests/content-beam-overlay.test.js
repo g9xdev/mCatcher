@@ -145,10 +145,17 @@ function makeNode(doc, tag, opts) {
   return node;
 }
 
-function makeEvent(type) {
+// A browser stamps every Event with isTrusted, and it is TRUE only for one the
+// browser itself generated from an input device. The default here is therefore
+// true — that is what the tests above are describing when they say "clicked" —
+// and a test that wants the other kind has to ask for it. Leaving it unset
+// would make every one of them a test of a synthetic click by accident.
+function makeEvent(type, opts) {
+  opts = opts || {};
   const seen = { stop: 0, stopImmediate: 0, prevent: 0 };
   return {
     type,
+    isTrusted: "isTrusted" in opts ? opts.isTrusted : true,
     _seen: seen,
     stopPropagation() { seen.stop += 1; },
     stopImmediatePropagation() { seen.stopImmediate += 1; },
@@ -589,7 +596,7 @@ test("clicking the icon never reaches the page's own handlers", async () => {
 // The click, and only the click
 // ---------------------------------------------------------------------------
 
-test("nothing about the video leaves the page until the icon is clicked", async () => {
+test("nothing about the video leaves the page until a person clicks the icon", async () => {
   const root = makeRoot();
   root.document.body.appendChild(makeVideo(root, { currentSrc: "blob:https://site.example/9f1c" }));
   await installed(root);
@@ -609,6 +616,37 @@ test("nothing about the video leaves the page until the icon is clicked", async 
     "the frame names the element's src and nothing else");
   assert.equal(beams[0].src, "blob:https://site.example/9f1c",
     "sent as-is: whether a blob: can be beamed is not this frame's decision");
+});
+
+test("a click the page dispatched itself beams nothing", async () => {
+  // The container is a node in the PAGE's DOM. Page script can find it —
+  // elementFromPoint over the icon's rect is deterministic — and call
+  // .click() on it. Everything downstream of this listener (resolve the
+  // address, cross the native port, spawn BadApple) then runs with no user in
+  // it, and this listener is the last place the difference between a user and
+  // a script is still visible.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+
+  container._fire("click", makeEvent("click", { isTrusted: false }));
+  await settle();
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 0,
+    "a click dispatched from script launches no process");
+
+  // An event carrying no flag at all is not a user either.
+  container._fire("click", makeEvent("click", { isTrusted: undefined }));
+  await settle();
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 0,
+    "and neither is an event that never carried the flag");
+
+  // A gate, not a switch: the real click still goes through.
+  container._fire("click", makeEvent("click"));
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 1);
 });
 
 test("a refusal is put in front of the person who clicked", async () => {
