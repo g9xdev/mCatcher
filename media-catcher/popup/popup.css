@@ -801,6 +801,11 @@ input:focus-visible {
 
 /* Footer */
 .foot {
+  /* A flex child of body, sized by its own content and never squeezed. Stated
+     here rather than left to depend on .main staying correctly bounded: the
+     footer holding its place is the property, and it should not be something
+     the pane above it can take away. */
+  flex: none;
   padding: 11px 14px 10px;
   border-top: 1px solid var(--stroke);
   background: rgba(0, 0, 0, 0.1);
@@ -937,12 +942,27 @@ html.cast .bar-sep { display: inline-block; }
 .pane-right { display: none; }
 .pane-title { display: none; }
 
+/* The window is the bound. body is min-height:100% with an AUTO height, so
+   `flex: 1` on .main below had nothing to divide — the panes grew, body grew
+   with them, and everything after .main went past the bottom of an
+   overflow:hidden body. Scoped to rail mode: the classic popup still derives
+   its height from its content, which is what a browser-action popup does. */
+html.rail, html.rail body { height: 100%; }
+
 html.rail .main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 240px;
+  /* The row is the height .main was given, not the height its content wants.
+     A default `auto` row sizes to the taller pane, so both panes overflowed
+     the grid however well bounded .main itself was. */
+  grid-template-rows: minmax(0, 1fr);
   flex: 1;
   min-height: 0;                 /* fills the window rather than a fixed height */
 }
+/* Grid items default to min-height:auto, which is content-based and would undo
+   the row above. Each pane's own scroll box is what absorbs the overflow. */
+html.rail .pane-left,
+html.rail .pane-right { min-height: 0; }
 html.rail .pane-left { display: flex; flex-direction: column; }
 html.rail .pane-right {
   display: flex;
@@ -951,6 +971,12 @@ html.rail .pane-right {
   background: rgba(0, 0, 0, 0.10);
 }
 html.rail .list { max-height: none; flex: 1; min-height: 0; padding-top: 10px; }
+/* The right pane's scroll box needs the same treatment .list has above.
+   overflow-y on .rail-scroll does nothing on its own: a flex child will not
+   shrink below its content without min-height:0, so the rail grew to fit every
+   queue card, stretched .pane-right and the grid row with it, and pushed .foot
+   out of an overflow:hidden body. */
+html.rail .rail-scroll { flex: 1; min-height: 0; }
 
 html.rail .main,
 html.rail .pane-left,
