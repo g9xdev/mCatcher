@@ -164,6 +164,19 @@ def handle_record(req):
     # by construction rather than by test. The point is that the lane has a
     # boundary. It stays optional, so only a present one is checked; videoUrl
     # the schema already requires.
+    #
+    # The gate buys more than the one argv it inspects. ffmpeg derives a
+    # child's protocol whitelist from its PARENT's, so holding the top-level
+    # -i to http(s) holds every URI in the MANIFEST BODY there too -- and the
+    # manifest body is the actual attack surface, since this lane's URLs come
+    # out of one. Measured against the bundled ffmpeg.exe (8.1.2-essentials,
+    # gyan.dev) rather than assumed: serving an attacker-controlled master ->
+    # media playlist over HTTP from 127.0.0.1 whose segment URI was
+    # file:///<path>, ffmpeg refused to open the segment with
+    #   [file @ ...] Protocol 'file' not on whitelist
+    #   'http,https,tls,rtp,tcp,udp,crypto,httpproxy,data'!
+    # A future ffmpeg could widen that default list, so this is a second layer
+    # under refuse_url, not a reason to relax it.
     for field in ("videoUrl", "audioUrl"):
         value = req.get(field)
         if field == "audioUrl" and not value:
