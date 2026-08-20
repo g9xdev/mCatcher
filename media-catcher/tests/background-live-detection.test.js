@@ -649,6 +649,64 @@ test("DOM-first direct media receives late exact network size without a second r
   assert.equal(h.captureDomMedia.length, 1);
 });
 
+test("a later frame's DOM claim never repoints the owner of an already-owned source", async () => {
+  const h = createHarness();
+  await settle();
+  const mediaUrl = "https://cdn.example/movie.mp4?token=SIGNED_SENTINEL";
+  const tabId = 7;
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const report = (sender, origin) => ({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: sender.url,
+    frameOrigin: origin,
+    snapshot: Object.assign({}, pageSnapshot(), {
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      pageUrl: sender.url,
+    }),
+  });
+
+  // The honest top frame reports and claims the file first.
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  await h.send(report(topFrame, "https://site.example"), topFrame);
+  // A second later an ad iframe sets the same src. Its frameId has no claim on
+  // the source, so it still mints its own detection — that part is by design.
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+  await h.send(report(adFrame, "https://ads.example"), adFrame);
+  assert.equal(h.captureDomMedia.length, 2, "the ad frame still gets its own detection");
+
+  h.headersReceived.emit({
+    tabId,
+    frameId: 0,
+    documentId: "doc-top",
+    documentUrl: "https://site.example/watch",
+    originUrl: "https://site.example/watch",
+    url: mediaUrl,
+    statusCode: 206,
+    responseHeaders: [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-262143/1395864371" },
+      { name: "Content-Length", value: "262144" },
+    ],
+  });
+  await eventually(() => h.broadcasts.some((m) => m.type === "media-updated"), "size update");
+
+  // Enrichment follows ownership, so the exact Content-Range total must land on
+  // the first claimant. Before this was pinned the ad's later claim repointed
+  // the owner map and took the exact total, leaving the honest row estimating.
+  const response = await h.send({ type: "get-media", tabId });
+  const sized = response.items.filter((row) => row.sizeBytes !== undefined);
+  assert.deepEqual(sized.map((row) => row.id), ["media:opaque:1"]);
+  assert.equal(sized[0].sizeConfidence, "exact");
+  assert.equal(JSON.stringify(response).includes("SIGNED_SENTINEL"), false);
+});
+
 test("network-first direct media keeps one row and publishes the probe Content-Range total", async () => {
   const h = createHarness();
   await settle();

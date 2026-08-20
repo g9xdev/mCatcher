@@ -1332,7 +1332,13 @@ function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey, claim
       const claimants = sources.get(sourceKey) || new Set();
       claimants.add(claimant === undefined ? NETWORK_CLAIM : claimant);
       sources.set(sourceKey, claimants);
-      owners.set(sourceKey, mediaId);
+      // First claimant keeps ownership. liveDirectSourceKeys is scoped per
+      // frame, so a later frame reporting the same src still mints its own
+      // detection — but enrichment follows this map, and letting that later
+      // claim repoint it handed the exact Content-Range total to whoever
+      // reported last (an ad iframe echoing the page's src) and left the
+      // honest row on a bitrate estimate.
+      if (!owners.has(sourceKey)) owners.set(sourceKey, mediaId);
     }
     liveDirectSourceKeys.set(tabId, sources);
     liveDirectMediaOwners.set(tabId, owners);
