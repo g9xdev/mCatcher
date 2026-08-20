@@ -315,7 +315,16 @@ def send_beam(app, target, token, timeout=LAUNCH_TIMEOUT_S):
         deadline = time.monotonic() + timeout
         while handle is None:
             if time.monotonic() >= deadline:
-                raise BeamPipeError("BadApple did not start in time.")
+                # Naming BOTH causes, because they are indistinguishable from
+                # here and the second one is the likelier. There is no version
+                # handshake on this channel: an older BadApple hosts a pipe
+                # under a different name, so it looks exactly like one that
+                # never came up. Saying only "did not start" would send someone
+                # to look at a process that is running perfectly well.
+                raise BeamPipeError(
+                    "BadApple did not answer on its beam channel. If it is "
+                    "already running, this version may be too old to receive "
+                    "a sign-in — update BadApple and try again.")
             time.sleep(_POLL_S)
             handle = _open_pipe(name)
     try:

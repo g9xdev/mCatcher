@@ -430,6 +430,49 @@ def test_a_pipe_that_is_not_up_yet_is_waited_for_after_a_bare_launch(monkeypatch
         '--beam "https://cdn.example.test/a.m3u8" --headers %s' % token)
 
 
+def test_a_pipe_that_never_comes_up_says_what_is_actually_wrong(monkeypatch):
+    """The channel carries no version handshake, so an OLDER BadApple — which
+    hosts its pipe under a different name — is indistinguishable from one that
+    never started. Both causes are named, because "did not start" alone sends
+    someone to look at a process that is running perfectly well.
+
+    This is not a hypothetical: the BadApple installed while this was written
+    hosts `badapple-single-<session>` and knows no --headers at all.
+    """
+    name = "\\\\.\\pipe\\mc-beam-absent-%d-%s" % (os.getpid(), uuid.uuid4().hex)
+    monkeypatch.setattr(badapple_ipc, "pipe_name", lambda: name)
+    monkeypatch.setattr(badapple_ipc, "_launch_bare", lambda app: None)
+
+    token = badapple_ipc.encode_headers({"Cookie": SECRET})
+    with pytest.raises(badapple_ipc.BeamPipeError) as caught:
+        badapple_ipc.send_beam("C:\\nope\\BadApple.App.exe",
+                               "https://cdn.example.test/a.m3u8", token,
+                               timeout=0.3)
+    text = str(caught.value)
+    assert "too old" in text, text
+    # A failure message is the one thing here guaranteed to be shown to a
+    # person and written to a log ring, so it carries neither half.
+    assert SECRET not in text and token not in text, text
+
+
+def test_a_beam_that_cannot_be_delivered_answers_the_click(monkeypatch, tmp_path):
+    """A pipe failure is a refusal carrying req['id'], not a silent drop: the
+    extension looks a frame's id up against its live rows, so an id-less error
+    is a click that did nothing with no way to say so."""
+    _fake_badapple(monkeypatch, tmp_path)
+    ran, beamed, sent = _capture(monkeypatch)
+    monkeypatch.setattr(badapple_ipc, "send_beam",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            badapple_ipc.BeamPipeError("BadApple did not answer.")))
+
+    mc.handle_badapple({"id": "c8", "url": "https://cdn.example.test/a.m3u8",
+                        "headers": {"Cookie": SECRET}})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "a failed pipe never falls back to argv with the credential"
+    assert sent[0].get("id") == "c8"
+    assert SECRET not in json.dumps(sent[0]), sent
+
+
 def test_the_schema_types_the_three_names_it_will_forward():
     """Unlisted keys are ignored by the table rather than refused (it types
     fields, it does not express relations), so the ALLOWLIST is enforced in the
