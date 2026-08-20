@@ -675,6 +675,26 @@
       return pathOnly;
     }
 
+    /**
+     * Free-text log redaction. Every absolute http(s) URL in the line is
+     * replaced by its redactUrlForLog projection — scheme://host[:port]/path,
+     * with userinfo, query and fragment removed. Trailing sentence punctuation
+     * is put back so a URL at the end of a sentence still reads as one.
+     * Everything else in the line, including local save paths, is kept.
+     */
+    function redactLogText(text) {
+      if (typeof text !== "string" || text.length === 0) return "";
+      return text.replace(/https?:\/\/[^\s"'<>]+/gi, function (match) {
+        var trailing = "";
+        var punct = match.match(/[.,;:!?)\]}]+$/);
+        if (punct) {
+          trailing = punct[0];
+          match = match.slice(0, match.length - trailing.length);
+        }
+        return redactUrlForLog(match) + trailing;
+      });
+    }
+
     function assertNoSentinels(blob, sentinels) {
       if (typeof blob !== "string") {
         throw new TypeError("blob must be a primitive string");
@@ -758,6 +778,7 @@
       projectSafeHistory: projectSafeHistory,
       projectPopupJob: projectPopupJob,
       redactUrlForLog: redactUrlForLog,
+      redactLogText: redactLogText,
       assertNoSentinels: assertNoSentinels,
       clearEphemeralOnTerminal: clearEphemeralOnTerminal,
     };

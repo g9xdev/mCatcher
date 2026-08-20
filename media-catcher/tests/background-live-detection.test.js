@@ -34,7 +34,7 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function createHarness() {
+function createHarness(storageSeed) {
   const runtimeMessages = event();
   const headersReceived = event();
   const captureNetwork = [];
@@ -92,7 +92,15 @@ function createHarness() {
   const noopEvent = () => event();
   const nativePort = { onMessage: noopEvent(), onDisconnect: noopEvent(), postMessage() {} };
   const browser = {
-    storage: { local: { get() { return Promise.resolve({ pd4done: true, dq1done: true }); }, set() { return Promise.resolve(); } } },
+    storage: { local: {
+      get() {
+        return Promise.resolve(Object.assign(
+          { pd4done: true, dq1done: true },
+          storageSeed ? clone(storageSeed) : null
+        ));
+      },
+      set() { return Promise.resolve(); },
+    } },
     runtime: {
       id: "media-catcher@test",
       lastError: null,
@@ -195,6 +203,7 @@ function createHarness() {
   return {
     send, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
     registerVariants, broadcasts, popupRows, controllerJobs, textBodies, dashParsed,
+    nativePort,
     holdDirectProbe(url) {
       let release;
       let markStarted;
@@ -887,4 +896,51 @@ test("content-thumb is accepted only from the top frame", async () => {
   await h.send({ type: "content-thumb", dataUrl: adThumb }, adFrame);
   result = await h.send({ type: "get-media", tabId });
   assert.equal(result.items[0].thumb, topThumb);
+});
+
+test("the diagnostics ring never keeps a URL's userinfo, query or fragment", async () => {
+  const h = createHarness();
+  await settle();
+  // Every producer — mclog for extension lines, the host/guardian "log" relay
+  // for helper output — funnels through pushLog, which is what persists the
+  // ring to storage.local and streams it to the Settings console.
+  h.nativePort.onMessage.emit({
+    type: "log",
+    level: "warn",
+    src: "host",
+    msg: "yt-dlp: ERROR https://site.example/watch?v=abc&token=SECRET_TOKEN " +
+      "-> https://cdn.example/a/b.mp4?Signature=SECRET_SIG#t=10",
+  });
+  await settle();
+
+  const lines = h.broadcasts.filter((m) => m.type === "log-line");
+  assert.equal(lines.length >= 1, true);
+  const line = lines[lines.length - 1];
+  assert.equal(line.line.src, "host");
+  assert.equal(line.line.level, "warn");
+  assert.equal(
+    line.line.msg,
+    "yt-dlp: ERROR https://site.example/watch -> https://cdn.example/a/b.mp4"
+  );
+  assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_TOKEN"), false);
+  assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_SIG"), false);
+});
+
+test("a ring restored from storage is redacted before it can be read back", async () => {
+  const h = createHarness({
+    mcLogs: [{
+      ts: 1,
+      level: "info",
+      src: "ext",
+      msg: "yt-dlp: requested https://site.example/watch?v=abc&token=SECRET_TOKEN",
+    }],
+  });
+  await settle();
+  const logs = await h.send({ type: "get-logs" });
+  // Restored lines precede the lines this session pushed during startup.
+  assert.equal(
+    logs.logs[0].msg,
+    "yt-dlp: requested https://site.example/watch"
+  );
+  assert.equal(JSON.stringify(logs).includes("SECRET_TOKEN"), false);
 });

@@ -14,6 +14,7 @@ const PUBLIC_KEYS = [
   "projectSafeHistory",
   "projectPopupJob",
   "redactUrlForLog",
+  "redactLogText",
   "assertNoSentinels",
   "clearEphemeralOnTerminal",
 ];
@@ -97,7 +98,7 @@ test("assertNoSentinels fails when signed query leaks", () => {
 
 // --- Exact public surface + dual export ---
 
-test("exports exactly the six public keys", () => {
+test("exports exactly the seven public keys", () => {
   assert.deepEqual(Object.keys(P).sort(), PUBLIC_KEYS.slice().sort());
   for (const k of PUBLIC_KEYS) {
     assert.equal(typeof P[k], "function", k);
@@ -1219,4 +1220,29 @@ test("projectPopupJob omits URL-like string ids and network URLs in all string f
       }
     }
   }
+});
+
+test("redactLogText strips userinfo, query and fragment from every URL it finds", () => {
+  assert.equal(
+    P.redactLogText(
+      "yt-dlp: requested https://site.example/watch?v=abc&token=SECRET [bv*+ba]"
+    ),
+    "yt-dlp: requested https://site.example/watch [bv*+ba]"
+  );
+  assert.equal(
+    P.redactLogText(
+      "ERROR: unable to download https://cdn.example/a/b.mp4?Signature=SECRET#t=10 " +
+        "(referer http://user:pw@site.example/watch?p=SECRET)"
+    ),
+    "ERROR: unable to download https://cdn.example/a/b.mp4 " +
+      "(referer http://site.example/watch)"
+  );
+  // Non-URL diagnostics — including local save paths — survive unchanged.
+  assert.equal(
+    P.redactLogText("saved to D:\Vids\Movie Night.mp4 (2 connections)"),
+    "saved to D:\Vids\Movie Night.mp4 (2 connections)"
+  );
+  assert.equal(P.redactLogText(""), "");
+  assert.equal(P.redactLogText(null), "");
+  assert.equal(P.redactLogText({ toString() { return "https://x/?t=S"; } }), "");
 });

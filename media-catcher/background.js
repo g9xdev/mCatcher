@@ -203,7 +203,9 @@ let lastCastDevices = [];                // retained list — warm picker opens 
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
   // "connecting to the native helper…" line — must survive the async restore.
-  if (r && Array.isArray(r.mcLogs)) logRing = r.mcLogs.concat(logRing).slice(-LOG_CAP);
+  if (r && Array.isArray(r.mcLogs)) {
+    logRing = r.mcLogs.map(redactLogLine).concat(logRing).slice(-LOG_CAP);
+  }
   if (r && Array.isArray(r.mcEvents)) updateEvents = r.mcEvents.concat(updateEvents).slice(-EVENT_CAP);
   _persistDiag();
 }).catch(() => {});
@@ -216,7 +218,19 @@ function _persistDiag() {
   }, 800);
 }
 
+// Redact before the ring, not at copy time: _persistDiag writes the ring to
+// storage.local, so whatever is kept here is readable by anything that can read
+// extension storage, not only by whoever clicks Copy in Settings. Origin + path
+// is what diagnoses a failure; a signed URL's query is what identifies the user.
+// Applied to restored lines too, so a ring written by an older build is
+// redacted on the next start rather than waiting to roll over.
+function redactLogLine(line) {
+  if (line && typeof line === "object") line.msg = self.McPrivacy.redactLogText(line.msg);
+  return line;
+}
+
 function pushLog(line) {
+  redactLogLine(line);
   logRing.push(line);
   if (logRing.length > LOG_CAP) logRing = logRing.slice(-LOG_CAP);
   broadcast({ type: "log-line", line });
