@@ -4098,6 +4098,15 @@ def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
         "path_exists": None,
         "payload": None,
     }
+    # The probe below runs AFTER the frame is appended to `sent`, and
+    # _wait_terminal polls `sent` -- so the main thread could return and reach
+    # _assert_pin_fail_e2e while the worker was still between the two, reading
+    # `race` at its initializers and failing all three of its assertions at
+    # once. wait_for(_PGET.get(jid) is None) supplied no synchronisation: the
+    # ytdl terminal path unregisters BEFORE it sends. Gate on the probe rather
+    # than moving it above the append, which would trade this for the dropped
+    # terminal frame the comment in capturing_send names.
+    probed = threading.Event()
     close_calls = []
     real_close = d._ytdl_close_handle
     real_dup = d._ytdl_duplicate_readonly_pin
@@ -4137,6 +4146,7 @@ def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
                 race["path_exists"] = bool(path) and os.path.isfile(path)
             except OSError:
                 race["path_exists"] = False
+            probed.set()
 
     monkeypatch.setattr(d, "_ytdl_duplicate_readonly_pin", dup_fail)
     monkeypatch.setattr(d, "_ytdl_close_handle", track_close)
@@ -4159,6 +4169,7 @@ def _run_commit_with_pin_failure(tmp_path, monkeypatch, case, jid):
         "url": "https://example.test/v", "name": "%s.mp4" % case, "dir": str(dest),
     })
     term = _wait_terminal(sent, jid)
+    assert probed.wait(5), "terminal frame landed but the race probe never ran"
     assert wait_for(lambda: d._PGET.get(jid) is None, timeout=5)
 
     # Restore real helpers for post-terminal rename probe and teardown.
