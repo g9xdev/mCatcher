@@ -1357,9 +1357,12 @@ test("redactLogText redacts credential values no URL match can claim", () => {
   const selector =
     "yt-dlp: requested https://site.example/watch?v=abc [bv*[height<=720]+ba/b[height<=720]]";
   assert.equal(P.redactLogText(selector), selector);
+  // String.raw here too: in a plain literal \V and \M are not escapes, so both
+  // sides would be the same backslash-free string and the case would prove
+  // nothing about the path it names.
   assert.equal(
-    P.redactLogText("saved to D:\Vids\Movie Night.mp4 (2 connections)"),
-    "saved to D:\Vids\Movie Night.mp4 (2 connections)"
+    P.redactLogText(String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`),
+    String.raw`saved to D:\Vids\Movie Night.mp4 (2 connections)`
   );
 
   // A longer name that merely ends in a listed one is not a credential.
