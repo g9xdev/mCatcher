@@ -195,6 +195,11 @@ test("assembled HLS streams through a four-chunk window and completes only on co
     file: "D:\\Chosen\\movie.m4v", bytes: bytes.length,
   }), true);
   assert.equal(h.ctrl.popupJobs()[0].state, "completed");
+  // An assembled transfer parks its committed path on the binding, but that
+  // path is deliberately kept out of public popup surfaces (see the no-leak
+  // assertions in background-live-integration): savedPath stays absent here,
+  // unlike a direct download, whose saved path does surface for file actions.
+  assert.equal(h.ctrl.popupJobs()[0].savedPath, undefined);
   assert.equal(h.effects.firefox, 0);
   const publicJson = JSON.stringify(h.ctrl.popupJobs());
   assert.equal(publicJson.includes("cdn-12"), false);
