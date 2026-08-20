@@ -1422,7 +1422,17 @@
       Promise.resolve(sent).then(function (resp) {
         rec.busy = false;
         if (resp && resp.ok === true) {
-          beamMessage(rec, "Sent to BadApple.", false);
+          // WHICH address went is not always this element's. When its own src
+          // was unusable the background answers from a stream detected on the
+          // TAB, and nothing in that list records which <video> consumed which
+          // row — a page with a feature and an ad break contributes several,
+          // and lib/beam-target.js says so rather than pretending otherwise.
+          // The only person who can tell a wrong pick from a right one is the
+          // one watching, so a fallback is named as one.
+          beamMessage(rec, resp.source === "detected"
+            ? "Sent to BadApple — a stream detected on this tab, not this " +
+              "video's own source. If the wrong thing plays, that is why."
+            : "Sent to BadApple.", false);
           return;
         }
         var why = resp && typeof resp.error === "string" && resp.error

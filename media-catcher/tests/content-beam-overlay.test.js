@@ -649,6 +649,53 @@ test("a click the page dispatched itself beams nothing", async () => {
   assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 1);
 });
 
+// The overlay's message panel, on its own — _text() below would also drag in
+// the whole stylesheet.
+function overlayMessage(container) {
+  const panel = container._closedShadow.querySelectorAll("div")
+    .filter((n) => n.getAttribute("data-p") === "m")[0];
+  return panel ? panel.textContent : "";
+}
+
+test("a beam answered from the tab's detected media says so", async () => {
+  // The background falls back to a stream detected on this TAB when the
+  // element's own src is unusable, and that list does not record which
+  // <video> consumed which row. On a page with a feature and an ad break it
+  // can be the wrong one. Only the person watching can tell, so the message
+  // has to give them the chance.
+  const root = makeRoot({
+    onBeam: () => ({ ok: true, url: "https://cdn.example/master.m3u8", source: "detected" }),
+  });
+  root.document.body.appendChild(makeVideo(root));
+  await installed(root);
+  const container = containers(root)[0];
+
+  container._fire("click", makeEvent("click"));
+  await settle();
+  await settle();
+
+  assert.match(overlayMessage(container), /detected on this tab/,
+    "a guess is reported as a guess");
+});
+
+test("a beam of the video's own address does not hedge", async () => {
+  const root = makeRoot({
+    onBeam: () => ({ ok: true, url: "https://cdn.example/a.mp4", source: "element" }),
+  });
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+
+  container._fire("click", makeEvent("click"));
+  await settle();
+  await settle();
+
+  const text = overlayMessage(container);
+  assert.match(text, /Sent to BadApple/);
+  assert.equal(/detected on this tab/.test(text), false,
+    "this element named the address; there is nothing to warn about");
+});
+
 test("a refusal is put in front of the person who clicked", async () => {
   const root = makeRoot({
     onBeam: () => ({ ok: false, error: "This player builds the video in the page (a blob: source)." }),
