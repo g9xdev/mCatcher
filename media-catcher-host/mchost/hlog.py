@@ -41,10 +41,15 @@ _log_lock = threading.Lock()
 # is not closing a remote read; it is making the one file that leaves the
 # machine safe to hand over without a warning label attached.
 #
-# The projection matches the extension's: scheme://host[:port]/path, with
-# userinfo, query and fragment dropped. Query strings on a media URL are where
-# the signed token lives; what survives (which CDN, which file) is what the
+# The projection is the extension's redactUrlForLog: scheme://host[:port]/path,
+# with userinfo and fragment dropped and, of the query, only the identity
+# parameters named below. Query strings on a media URL are where the signed
+# token lives; what survives (which CDN, which file, which video) is what the
 # line was worth reading for. Local save paths and everything else are kept.
+# "Matches" is about the RULES -- same names, same cap, same charset -- not
+# about byte-identical spelling: the extension parses with URL and this parses
+# with urlsplit, and the two normalise differently in corners neither line
+# depends on (a bare origin gains a trailing slash there and not here).
 # Running before the send too means the host never puts a raw URL on the wire,
 # and the extension's pass over an already-redacted line is a no-op.
 #
@@ -60,6 +65,23 @@ _log_lock = threading.Lock()
 # reads as one.
 _URL_IN_TEXT = re.compile(r"https?://\S+", re.I)
 _URL_TAIL_PUNCT = re.compile(r"['\">.,;:!?)\]}]+$")
+
+# The query parameters that say WHICH media a line is about. A closed
+# allowlist, mirroring media-catcher/lib/privacy.js LOG_IDENTITY_PARAMS:
+# Signature, token, sig, key and expire are not in it and cannot be added by a
+# site, and a name nobody has vetted is dropped rather than kept.
+#
+# Keeping them has to happen HERE as well as there. Redaction runs before the
+# send, so the extension's redactLogText only ever sees an already-projected
+# host line and cannot restore what this dropped: without the allowlist on
+# this side, two googlevideo 403s for two different files both arrive as one
+# .../videoplayback line and the allowlist works only for the lines the
+# extension writes itself.
+_LOG_IDENTITY_PARAMS = ("v", "id")
+# A media id is a short plain identifier. Anything longer, or carrying a
+# separator that could nest a second query, fails closed and is dropped.
+_LOG_IDENTITY_VALUE_MAX = 64
+_LOG_IDENTITY_VALUE_RE = re.compile(r"[A-Za-z0-9_.~-]+")
 
 # Second, independent pass: the VALUE of a credential-shaped parameter name,
 # wherever it appears, in a URL or not. Whitespace being the URL boundary, a
@@ -85,8 +107,36 @@ _LOG_CREDENTIAL_VALUE = re.compile(
     r"=([^&\s\"'<>]+)", re.I)
 
 
+def _identity_query(query):
+    """The allowlisted part of `query`, as "?v=…[&id=…]" or "".
+
+    Emitted in _LOG_IDENTITY_PARAMS order, not the site's, so one URL always
+    projects to one line whatever order its query was written in. First value
+    per name, matching URLSearchParams.get. fullmatch, not a $-anchored match:
+    Python's $ also matches before a trailing newline and JavaScript's does
+    not, so "?v=abc%0A" would otherwise survive here and be dropped there.
+    """
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    except Exception:
+        return ""
+    first = {}
+    for name, value in pairs:
+        first.setdefault(name, value)
+    kept = ""
+    for name in _LOG_IDENTITY_PARAMS:
+        value = first.get(name)
+        if not value or len(value) > _LOG_IDENTITY_VALUE_MAX:
+            continue
+        if not _LOG_IDENTITY_VALUE_RE.fullmatch(value):
+            continue
+        kept += ("&" if kept else "?") + name + "=" + value
+    return kept
+
+
 def _redact_url(url):
-    """scheme://host[:port]/path — userinfo, query and fragment dropped."""
+    """scheme://host[:port]/path[?v=…[&id=…]] — userinfo and fragment dropped,
+    and of the query only the identity parameters."""
     try:
         parts = urllib.parse.urlsplit(url)
         host = parts.hostname or ""
@@ -97,7 +147,8 @@ def _redact_url(url):
         port = parts.port                     # raises on a malformed port
         if port is not None:
             host = "%s:%d" % (host, port)
-        return "%s://%s%s" % (parts.scheme.lower(), host, parts.path)
+        return "%s://%s%s%s" % (parts.scheme.lower(), host, parts.path,
+                                _identity_query(parts.query))
     except Exception:
         # Never echo the input on a parse failure — that is the leak itself.
         return "[redacted]"

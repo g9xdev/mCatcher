@@ -864,3 +864,53 @@ def test_hlog_credential_pass_catches_what_the_url_match_cannot(tmp_path, monkey
     for keep in ("monkey=notacredential", "passwordless=alsofine",
                  "Key-Pair-Id=keepme", "-f bv*[height<=720]+ba"):
         assert hlog._redact_log_text(keep) == keep, keep
+
+
+def test_hlog_keeps_the_identity_parameters_the_extension_keeps(tmp_path, monkeypatch):
+    """The allowlist from media-catcher/lib/privacy.js, applied on this side too.
+
+    Redaction runs at this seam, BEFORE the send, so a line the host writes
+    reaches the extension already projected and redactLogText cannot put back
+    an identity parameter this dropped. Two googlevideo failures for two
+    different files are the example the allowlist exists for; if they collapse
+    to one line here they are one line in the ring, the console and the copied
+    report, and the feature works only for lines the extension writes itself.
+    """
+    from mchost import hlog
+
+    sent = []
+    monkeypatch.setattr(mc_host, "send", lambda m: sent.append(dict(m)))
+    log_path = tmp_path / "host.log"
+    monkeypatch.setattr(hlog, "_HOST_LOG", str(log_path))
+
+    for fid in ("aaa111", "bbb222"):
+        hlog._hlog("error",
+                   "yt-dlp: HTTP 403 for https://r1---sn-x.googlevideo.com"
+                   "/videoplayback?id=%s&itag=137&signature=SECRET%s" % (fid, fid))
+
+    lines = [m["msg"] for m in sent]
+    assert lines[0] != lines[1], lines
+    assert lines[0].endswith("/videoplayback?id=aaa111"), lines[0]
+    assert lines[1].endswith("/videoplayback?id=bbb222"), lines[1]
+    for blob in lines + [log_path.read_text(encoding="utf-8")]:
+        assert "SECRET" not in blob, blob
+        assert "itag" not in blob, blob
+
+    r = hlog._redact_log_text
+    # Closed allowlist: nothing else survives, whatever it is called.
+    assert r("https://a.test/watch?v=abc&token=SECRET") == "https://a.test/watch?v=abc"
+    # Emitted in allowlist order, so one URL is always one line whatever order
+    # the site wrote its query in.
+    assert r("https://a.test/w?id=two&v=one") == "https://a.test/w?v=one&id=two"
+    # The value rules are privacy.js's: 64 characters, [A-Za-z0-9_.~-], and a
+    # value outside them is dropped rather than kept.
+    assert r("https://a.test/w?v=" + "a" * 64) == "https://a.test/w?v=" + "a" * 64
+    assert r("https://a.test/w?v=" + "a" * 65) == "https://a.test/w"
+    # "a%0A" is the reason the charset test is a fullmatch: Python's $ matches
+    # before a trailing newline and JavaScript's does not.
+    for bad in ("a/b", "a%20b", "a%0A", "a%0Ab", "a?b", ""):
+        assert r("https://a.test/w?v=" + bad) == "https://a.test/w", bad
+    # Still idempotent: the extension redacts again over what it receives.
+    once = r("see https://a.test/watch?v=abc&sig=SECRET.")
+    assert once == "see https://a.test/watch?v=abc."
+    assert r(once) == once
