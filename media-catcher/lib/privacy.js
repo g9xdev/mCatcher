@@ -714,6 +714,27 @@
       return pathOnly;
     }
 
+    // Credential-shaped parameter names, redacted by value wherever they appear
+    // in a line — inside a URL or not. Deliberately a blocklist, and just as
+    // deliberately never the only defence: redactUrlForLog's allowlist decides
+    // what survives of anything that parses as a URL, and this is the layer
+    // behind it for text no URL match can claim. A URL printed with a raw space
+    // in it ends at the space, and the tail carrying the Signature stays in the
+    // line as loose text; no boundary has to be decided to redact that tail.
+    //
+    // Being additive it can only remove more, never less, so it cannot take a
+    // diagnostic the projection preserves. A false positive costs one
+    // credential-shaped value, which is what we are willing to lose. The name
+    // must be whole: a preceding name character (monkey=, passwordless=) means
+    // no match, and the value runs to the next &, whitespace, quote or bracket.
+    // A regex literal, not a built string: the value class carries a quote and
+    // a backslash escape, which a string would swallow before RegExp saw them.
+    var LOG_CREDENTIAL_VALUE_RE = /(^|[^A-Za-z0-9_-])(x-amz-security-token|x-amz-credential|x-amz-signature|signature|password|expires|policy|expire|token|auth|pwd|sig|key)=([^&\s"'<>]+)/gi;
+
+    function redactCredentialValues(text) {
+      return text.replace(LOG_CREDENTIAL_VALUE_RE, "$1$2=[redacted]");
+    }
+
     /**
      * Free-text log redaction. Every absolute http(s) URL in the line is
      * replaced by its redactUrlForLog projection — scheme://host[:port]/path,
@@ -726,11 +747,11 @@
      * URL, so an unencoded quote inside the query would otherwise end the match
      * and leave the credential after it standing in the line. Whitespace is
      * still the boundary, so a URL printed with a raw space in it is projected
-     * only up to that space.
+     * only up to that space — which is what the second pass below is for.
      */
     function redactLogText(text) {
       if (typeof text !== "string" || text.length === 0) return "";
-      return text.replace(/https?:\/\/\S+/gi, function (match) {
+      var projected = text.replace(/https?:\/\/\S+/gi, function (match) {
         var trailing = "";
         var punct = match.match(/['">.,;:!?)\]}]+$/);
         if (punct) {
@@ -739,6 +760,7 @@
         }
         return redactUrlForLog(match) + trailing;
       });
+      return redactCredentialValues(projected);
     }
 
     function assertNoSentinels(blob, sentinels) {

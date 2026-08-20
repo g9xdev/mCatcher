@@ -1280,6 +1280,53 @@ test("redactLogText matches a URL to whitespace so an in-query quote leaves no t
   );
 });
 
+test("redactLogText redacts credential values no URL match can claim", () => {
+  // A second, independent pass over the whole line. It makes no boundary
+  // decision, so a URL printed with a raw space in it — the match ends at the
+  // space — cannot leave its signature behind in the line as loose text.
+  const spaced = P.redactLogText("u=https://a.ex/x?a=b c&sig=SECRET_SIGNED_QUERY_XYZ");
+  assert.equal(spaced.includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(spaced, "u=https://a.ex/x c&sig=[redacted]");
+
+  // After a space, on a line with no URL on it at all.
+  assert.equal(
+    P.redactLogText("resuming with token=SECRET_SIGNED_QUERY_XYZ expires=99"),
+    "resuming with token=[redacted] expires=[redacted]"
+  );
+  // Inside quotes.
+  assert.equal(
+    P.redactLogText('header "Signature=SECRET_SIGNED_QUERY_XYZ" rejected'),
+    'header "Signature=[redacted]" rejected'
+  );
+  // The X-Amz-* family, whose names the bare alternatives would not cover.
+  assert.equal(
+    P.redactLogText(
+      "X-Amz-Signature=SECRET_SIGNED_QUERY_XYZ&X-Amz-Credential=SECRET_SIGNED_QUERY_XYZ"
+    ),
+    "X-Amz-Signature=[redacted]&X-Amz-Credential=[redacted]"
+  );
+  assert.equal(
+    P.redactLogText("X-Amz-Security-Token=SECRET_SIGNED_QUERY_XYZ next"),
+    "X-Amz-Security-Token=[redacted] next"
+  );
+
+  // Strictly additive: this pass can only remove more, never less. The format
+  // selector carries no credential-shaped name=value, so the line the widened
+  // URL match would have eaten must read exactly as it did before.
+  const selector =
+    "yt-dlp: requested https://site.example/watch?v=abc [bv*[height<=720]+ba/b[height<=720]]";
+  assert.equal(P.redactLogText(selector), selector);
+  assert.equal(
+    P.redactLogText("saved to D:\Vids\Movie Night.mp4 (2 connections)"),
+    "saved to D:\Vids\Movie Night.mp4 (2 connections)"
+  );
+
+  // A longer name that merely ends in a listed one is not a credential.
+  assert.equal(P.redactLogText("monkey=banana"), "monkey=banana");
+  assert.equal(P.redactLogText("passwordless=fine"), "passwordless=fine");
+  assert.equal(P.redactLogText("Key-Pair-Id=APKAEXAMPLE"), "Key-Pair-Id=APKAEXAMPLE");
+});
+
 test("redactUrlForLog keeps the allowlisted identity parameter and nothing else", () => {
   // Dropping the whole query collapsed every video to .../watch and every
   // googlevideo failure to .../videoplayback, so two distinct failures read as
