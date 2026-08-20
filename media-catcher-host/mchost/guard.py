@@ -476,14 +476,19 @@ def refuse_open(path):
 # ---------------------------------------------------------------------------
 # What may be handed to yt-dlp as a URL
 #
-# NOT a schema kind, for two reasons. `cast`'s field is also called "url" and
-# is NOT one: mchost/cast/legacy.py matches ^https?:// and serves anything else
-# as a LOCAL FILE, which is how casting a recording off disk works, so a kind
-# keyed on the field name would refuse the cast path. And a schema refusal is
-# an uncorrelated {"type":"error"} frame, while the structured ytdl path owes
-# its caller a terminal ytdl-error carrying the attemptToken. So the predicate
-# lives here, once, and each handler answers in its own protocol's shape --
-# the same division refuse_basename and refuse_open already use.
+# NOT a schema kind, and the reason is the SHAPE OF THE REFUSAL, not the reach
+# of a kind. MESSAGE_SCHEMA is keyed per command, so a URL kind on "ytdl"'s
+# url would never have touched "cast"'s (different entry, same field name);
+# cast does need to keep serving a local file for a recording off disk, but
+# that was never what a kind here would have broken.
+#
+# What a kind cannot do is answer in the right protocol. A schema refusal is a
+# {"type":"error"} frame — correlated (mc_host.py echoes guard.message_id), but
+# carrying an id, NOT the attemptToken. The structured ytdl path owes its
+# caller a terminal ytdl-error with that token on it, and a row waiting for one
+# does not settle on an error frame it cannot match to its attempt. So the
+# predicate lives here, once, and each handler answers in its own protocol's
+# shape -- the same division refuse_basename and refuse_open already use.
 # ---------------------------------------------------------------------------
 
 _URL_SCHEMES = frozenset({"http", "https"})
@@ -492,12 +497,23 @@ _URL_SCHEMES = frozenset({"http", "https"})
 def refuse_url(url):
     """None when `url` may be handed to yt-dlp, else a user-facing reason.
 
-    yt-dlp's positional argument is not merely a fetch target: its generic
-    extractor opens whatever scheme it is given, so "file:///C:/..." reads a
-    local file and "ftp://host/x" reaches somewhere the browser never went.
-    This is NOT about flag injection -- only one caller-controlled token
-    reaches argv on those paths, so a leading "-" is still just a URL to
-    yt-dlp -- it is about which schemes this helper is willing to open.
+    This guards TWO things, and the argv one is the sharper of them.
+
+    ARGV INJECTION. _ytdl_build_cmd appends the url LAST, and yt-dlp parses
+    with optparse, which reads a dash-leading trailing argument as an option
+    rather than a positional: parse_args(["-f","b","-o","t","-o://evil"])
+    returns out="://evil" and NO positional at all. Being the only
+    caller-controlled token in argv is therefore not protection -- it is
+    exactly the position an option is read from. A url of "--exec=calc.exe"
+    was consumable as yt-dlp's --exec. Requiring a scheme is what stops it: a
+    leading "-" can never parse as one, so every such shape is refused here.
+
+    SCHEME. yt-dlp's positional argument is also not merely a fetch target:
+    given a scheme its networking stack supports, the generic extractor
+    reaches somewhere the browser never went -- "ftp://host/x" is the plain
+    case. ("file:///C:/..." additionally needs yt-dlp's --enable-file-urls,
+    which this host never passes; it is refused here regardless, and the point
+    does not rest on it.)
 
     Padding and control characters are refused rather than trimmed so that
     what is CHECKED is what ships: urllib.parse.urlsplit strips leading
