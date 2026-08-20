@@ -1034,6 +1034,24 @@ test("the diagnostics ring never keeps a URL's userinfo, query or fragment", asy
   // Every producer — mclog for extension lines, the host/guardian "log" relay
   // for helper output — funnels through pushLog, which is what persists the
   // ring to storage.local and streams it to the Settings console.
+  //
+  // First, the line shape the shipped host actually emits: it redacts at its
+  // own seam, so what arrives here has already lost its signed query and
+  // keeps only the identity parameter. This is the case the extension's
+  // allowlist decides — without it the second pass would take ?v=abc back off
+  // every real host line, and a test that feeds the ring a raw signed query
+  // exercises a shape no host produces.
+  const asHostEmits =
+    "yt-dlp: ERROR https://site.example/watch?v=abc -> https://cdn.example/a/b.mp4";
+  h.nativePort.onMessage.emit({ type: "log", level: "warn", src: "host", msg: asHostEmits });
+  await settle();
+  let lines = h.broadcasts.filter((m) => m.type === "log-line");
+  assert.equal(lines.length >= 1, true);
+  assert.equal(lines[lines.length - 1].line.msg, asHostEmits);
+
+  // Second, a line no host redacted. The helper updates independently of the
+  // extension, so an older installed host still emits its query whole, and
+  // extension-side mclog lines are never redacted at their source.
   h.nativePort.onMessage.emit({
     type: "log",
     level: "warn",
@@ -1043,17 +1061,15 @@ test("the diagnostics ring never keeps a URL's userinfo, query or fragment", asy
   });
   await settle();
 
-  const lines = h.broadcasts.filter((m) => m.type === "log-line");
-  assert.equal(lines.length >= 1, true);
+  lines = h.broadcasts.filter((m) => m.type === "log-line");
+  assert.equal(lines.length >= 2, true);
   const line = lines[lines.length - 1];
   assert.equal(line.line.src, "host");
   assert.equal(line.line.level, "warn");
-  // ?v=abc survives: it says which video the line is about and cannot carry a
-  // credential. The signed query around it does not.
-  assert.equal(
-    line.line.msg,
-    "yt-dlp: ERROR https://site.example/watch?v=abc -> https://cdn.example/a/b.mp4"
-  );
+  // ?v=abc survives: it says which video the line is about, and it is short
+  // enough and plain enough for the identity allowlist to keep. The signed
+  // query around it does not.
+  assert.equal(line.line.msg, asHostEmits);
   assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_TOKEN"), false);
   assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_SIG"), false);
 });
