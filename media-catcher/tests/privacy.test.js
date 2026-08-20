@@ -1227,7 +1227,7 @@ test("redactLogText strips userinfo, query and fragment from every URL it finds"
     P.redactLogText(
       "yt-dlp: requested https://site.example/watch?v=abc&token=SECRET [bv*+ba]"
     ),
-    "yt-dlp: requested https://site.example/watch [bv*+ba]"
+    "yt-dlp: requested https://site.example/watch?v=abc [bv*+ba]"
   );
   assert.equal(
     P.redactLogText(
@@ -1277,5 +1277,51 @@ test("redactLogText matches a URL to whitespace so an in-query quote leaves no t
   assert.equal(
     P.redactLogText("ERROR: https://a.ex/x?sig=SECRET_SIGNED_QUERY_XYZ, retrying."),
     "ERROR: https://a.ex/x, retrying."
+  );
+});
+
+test("redactUrlForLog keeps the allowlisted identity parameter and nothing else", () => {
+  // Dropping the whole query collapsed every video to .../watch and every
+  // googlevideo failure to .../videoplayback, so two distinct failures read as
+  // one line. v and id name which media the line is about and cannot carry a
+  // credential; everything else, allowlist-style, is dropped.
+  assert.equal(
+    P.redactLogText("yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),
+    "yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  );
+  const a = P.redactLogText(
+    "403 https://r1.gv.example/videoplayback?expire=1&id=aaa11&sig=SECRET_SIGNED_QUERY_XYZ"
+  );
+  const b = P.redactLogText(
+    "403 https://r1.gv.example/videoplayback?expire=2&id=bbb22&sig=SECRET_SIGNED_QUERY_XYZ"
+  );
+  assert.notEqual(a, b, "two distinct failures must not collapse to one line");
+  assert.equal(a, "403 https://r1.gv.example/videoplayback?id=aaa11");
+  assert.equal(a.includes("SECRET_SIGNED_QUERY_XYZ"), false);
+  assert.equal(a.includes("expire"), false);
+
+  // Credential-shaped names never survive, whatever else is present.
+  assert.equal(
+    P.redactUrlForLog(
+      "https://a.ex/p?Signature=SECRET_SIGNED_QUERY_XYZ&token=S&key=S&sig=S&expire=9"
+    ),
+    "https://a.ex/p"
+  );
+  // Both allowlisted names survive together, in a fixed order.
+  assert.equal(
+    P.redactUrlForLog("https://a.ex/p?id=B2&hmac=SECRET_SIGNED_QUERY_XYZ&v=A1"),
+    "https://a.ex/p?v=A1&id=B2"
+  );
+  assert.equal(P.redactUrlForLog("https://a.ex/p?id=ok_1.2~3-4"), "https://a.ex/p?id=ok_1.2~3-4");
+  // Values fail closed: over-long, or anything but a plain identifier, is
+  // dropped, so a nested query can never ride back in through the allowlist.
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=" + "x".repeat(65)), "https://a.ex/p");
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=a%2Fb%3Ftoken%3DS"), "https://a.ex/p");
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v=a b"), "https://a.ex/p");
+  assert.equal(P.redactUrlForLog("https://a.ex/p?v="), "https://a.ex/p");
+  // Userinfo and fragment stay gone when an identity parameter is kept.
+  assert.equal(
+    P.redactUrlForLog("https://u:SECRET_SIGNED_QUERY_XYZ@a.ex/p?v=A1#SECRET_SIGNED_QUERY_XYZ"),
+    "https://a.ex/p?v=A1"
   );
 });

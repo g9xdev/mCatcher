@@ -918,9 +918,11 @@ test("the diagnostics ring never keeps a URL's userinfo, query or fragment", asy
   const line = lines[lines.length - 1];
   assert.equal(line.line.src, "host");
   assert.equal(line.line.level, "warn");
+  // ?v=abc survives: it says which video the line is about and cannot carry a
+  // credential. The signed query around it does not.
   assert.equal(
     line.line.msg,
-    "yt-dlp: ERROR https://site.example/watch -> https://cdn.example/a/b.mp4"
+    "yt-dlp: ERROR https://site.example/watch?v=abc -> https://cdn.example/a/b.mp4"
   );
   assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_TOKEN"), false);
   assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_SIG"), false);
@@ -940,7 +942,7 @@ test("a ring restored from storage is redacted before it can be read back", asyn
   // Restored lines precede the lines this session pushed during startup.
   assert.equal(
     logs.logs[0].msg,
-    "yt-dlp: requested https://site.example/watch"
+    "yt-dlp: requested https://site.example/watch?v=abc"
   );
   assert.equal(JSON.stringify(logs).includes("SECRET_TOKEN"), false);
 });

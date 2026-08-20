@@ -642,6 +642,40 @@
       return s;
     }
 
+    // Query parameters that say which media a line is about. Closed allowlist:
+    // Signature, token, sig, key and expire are not in it and cannot be added
+    // by a site, and a parameter nobody has vetted is dropped rather than kept.
+    // Without this the whole query went, so every video logged as .../watch and
+    // two different googlevideo failures collapsed to one .../videoplayback line.
+    var LOG_IDENTITY_PARAMS = ["v", "id"];
+    // A media id is a short plain identifier. Anything longer, or carrying a
+    // separator that could nest a second query, fails closed and is dropped.
+    var LOG_IDENTITY_VALUE_MAX = 64;
+    var LOG_IDENTITY_VALUE_RE = /^[A-Za-z0-9_.~-]+$/;
+
+    // The allowlisted part of a parsed URL's query, as "?v=…[&id=…]" or "".
+    // Emitted in LOG_IDENTITY_PARAMS order so the same URL always projects to
+    // the same line whatever order the site wrote its query in.
+    function identityQuery(u) {
+      var params = u && u.searchParams;
+      if (!params || typeof params.get !== "function") return "";
+      var kept = "";
+      for (var i = 0; i < LOG_IDENTITY_PARAMS.length; i++) {
+        var name = LOG_IDENTITY_PARAMS[i];
+        var value;
+        try {
+          value = params.get(name);
+        } catch (e) {
+          return "";
+        }
+        if (typeof value !== "string" || value.length === 0) continue;
+        if (value.length > LOG_IDENTITY_VALUE_MAX) continue;
+        if (!LOG_IDENTITY_VALUE_RE.test(value)) continue;
+        kept += (kept ? "&" : "?") + name + "=" + value;
+      }
+      return kept;
+    }
+
     function redactUrlForLog(url) {
       // Primitive strings only — never coerce objects/arrays via String().
       if (typeof url !== "string" || url.length === 0) return "[redacted]";
@@ -653,14 +687,19 @@
             var u = new URL(url);
             u.username = "";
             u.password = "";
+            var identity = identityQuery(u);
             u.search = "";
             u.hash = "";
-            // href after clearing userinfo/query/hash is scheme://host[:port]/path
-            return u.href;
+            // href after clearing userinfo/query/hash is scheme://host[:port]/path.
+            // identity is re-appended already checked against the value pattern,
+            // so nothing but [A-Za-z0-9_.~-] follows the "?".
+            return u.href + identity;
           }
         } catch (e) {
           // fall through to manual strip
         }
+        // No URL parser to read the query with, so the manual paths below keep
+        // no identity parameter at all — they drop the query outright.
         return manualRedactAbsoluteHttp(url);
       }
 
