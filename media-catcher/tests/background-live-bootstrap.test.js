@@ -24,6 +24,7 @@ const policyScripts = [
   "lib/live-media-assembler.js",
   "lib/media-size.js",
   "lib/beam-target.js",
+  "lib/beam-headers.js",
   "lib/background-adapters.js",
 ];
 
@@ -826,10 +827,10 @@ async function seedDetected(h, tabId, item) {
   await settle();
 }
 
-async function beam(h, src, sender) {
+async function beam(h, src, sender, context) {
   let answered = null;
-  h.sandbox.browser.runtime.onMessage.emit(
-    { type: "beam-video", src }, sender, (r) => { answered = r; });
+  const frame = Object.assign({ type: "beam-video", src }, context || {});
+  h.sandbox.browser.runtime.onMessage.emit(frame, sender, (r) => { answered = r; });
   await settle();
   await settle();
   return answered;
@@ -856,6 +857,88 @@ test("a beam of the element's own address reaches the helper as a url frame", as
   assert.equal(posts[0].url, "https://cdn.example/progressive.mp4");
   assert.ok(posts[0].id, "an id, or a refusal has nothing to come back to");
   assert.equal(answered && answered.ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// The SIGN-IN a gated stream needs
+//
+// BadApple fetches the address from its own process, where none of the
+// browser's request context applies, so a login-gated stream answers 403 to a
+// beam that carries nothing. The frame therefore grew an optional `headers`
+// field — and "optional" is load-bearing on the far side: BadApple branches on
+// the field's PRESENCE and its contract says in so many words that it "must
+// not be spelled as an empty object". A beam with nothing to carry has to look
+// exactly like every beam that predates the feature.
+// ---------------------------------------------------------------------------
+
+const PAGE = "https://site.example/watch?v=1";
+const UA = "Mozilla/5.0 (Windows NT 10.0; rv:142.0) Firefox/142.0";
+
+test("a beam from a page carries that page's Referer and User-Agent", async () => {
+  const h = await readyHarness();
+  await beam(h, "https://cdn.example/gated.m3u8", beamSender(7),
+    { pageUrl: PAGE, userAgent: UA });
+
+  const post = h.nativePosts.filter((p) => p && p.cmd === "badapple")[0];
+  assert.deepEqual(Object.keys(post).sort(), ["cmd", "headers", "id", "url"]);
+  // Through JSON, as the rest of this file compares native posts: background.js
+  // runs in a vm sandbox, so its objects carry that realm's prototype and a
+  // structural deepEqual fails on identity alone. JSON is also what actually
+  // crosses the port, so it is the truer comparison here anyway.
+  assert.deepEqual(JSON.parse(JSON.stringify(post.headers)),
+    { Referer: PAGE, "User-Agent": UA });
+});
+
+test("a beam with no usable context sends NO headers field at all", async () => {
+  const h = await readyHarness();
+  // about: is a real thing a frame's location can be, and it is not a
+  // credential. What must not happen is that dropping it leaves {} behind.
+  await beam(h, "https://cdn.example/open.mp4", beamSender(7),
+    { pageUrl: "about:blank", userAgent: "" });
+
+  const post = h.nativePosts.filter((p) => p && p.cmd === "badapple")[0];
+  assert.deepEqual(Object.keys(post).sort(), ["cmd", "id", "url"],
+    "absent, not empty: the engine branches on the field's presence");
+  assert.equal("headers" in post, false);
+});
+
+test("only the names BadApple accepts are ever composed", async () => {
+  const h = await readyHarness();
+  // A page cannot reach these values, but the frame is still input, and the
+  // answer to "what if it carried more" must be that nothing reads more.
+  await beam(h, "https://cdn.example/gated.m3u8", beamSender(7), {
+    pageUrl: PAGE,
+    userAgent: UA,
+    headers: { Authorization: "Bearer SECRET" },
+    Cookie: "sid=SECRET",
+  });
+
+  const post = h.nativePosts.filter((p) => p && p.cmd === "badapple")[0];
+  assert.deepEqual(Object.keys(post.headers).sort(), ["Referer", "User-Agent"]);
+  assert.equal(JSON.stringify(post).includes("SECRET"), false,
+    "nothing the frame invented reaches the port");
+});
+
+test("a beam's sign-in never reaches the log ring", async () => {
+  const h = await readyHarness();
+  const secretUa = "Mozilla/5.0 SECRET-AGENT-TOKEN";
+  const secretPage = "https://site.example/watch?session=SECRET-QUERY";
+  await beam(h, "https://cdn.example/gated.m3u8", beamSender(7),
+    { pageUrl: secretPage, userAgent: secretUa });
+
+  // The log line records that a beam happened and what resource it named —
+  // that is the whole of what a diagnostic needs. The credential half of the
+  // frame is written nowhere: these lines are persisted to storage.local and
+  // handed out by the Copy button, so anything in them outlives the beam.
+  const logs = h.runtimeMessages
+    .filter((m) => m && m.type === "log-line")
+    .map((m) => JSON.stringify(m.line))
+    .join("\n");
+  assert.equal(logs.includes("SECRET-AGENT-TOKEN"), false,
+    "the User-Agent is not a log line");
+  assert.equal(logs.includes("SECRET-QUERY"), false,
+    "the Referer's query is not a log line");
+  assert.match(logs, /beam:/, "the beam itself is still recorded");
 });
 
 test("a blob: element src is answered from the tab's detected media", async () => {

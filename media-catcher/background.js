@@ -3659,8 +3659,35 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             // comes back on — an id-less error frame is a click that did
             // nothing with no way to say so.
             const beamId = "beam" + (++downloadCounter);
-            nativePort.postMessage({ cmd: "badapple", id: beamId, url: target.url });
+            // The SIGN-IN a login-gated stream needs. BadApple fetches the
+            // address from its own process, where none of the browser's
+            // request context applies, so a gated stream answers 403 to a beam
+            // that carries nothing.
+            //
+            // Preference order is about ACCURACY, not availability.
+            // resolveHeaders is what this TAB actually put on the wire —
+            // captured by the same webRequest listener that feeds the download
+            // lane — so it beats anything the content script can infer about
+            // its own frame. The frame's own values are the fallback for a
+            // stream whose request we never saw.
+            const seen = resolveHeaders(sender.tab.id) || {};
+            const headers = self.McBeamHeaders.build({
+              referer: seen.referer
+                || (typeof msg.pageUrl === "string" ? msg.pageUrl : ""),
+              userAgent: seen.userAgent
+                || (typeof msg.userAgent === "string" ? msg.userAgent : ""),
+            });
+            const frame = { cmd: "badapple", id: beamId, url: target.url };
+            // ABSENT, never {}. The far end branches on the field's PRESENCE,
+            // and absence is what every beam predating this feature sends —
+            // build() answers null rather than {} for exactly this line.
+            if (headers) frame.headers = headers;
+            nativePort.postMessage(frame);
             rememberBeam(beamId, sender.tab.id, sender.frameId);
+            // The address, and NEVER the sign-in. This line is redacted, kept
+            // in the log ring, persisted to storage.local and handed out by the
+            // Copy button; a credential in it would outlive the beam in a file
+            // the user is invited to paste somewhere.
             mclog("info", "beam: " + target.url + " → BadApple");
             sendResponse({ ok: true, url: target.url, source: target.source });
           }

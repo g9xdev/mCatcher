@@ -698,6 +698,8 @@
     var locationRef = root.location || (typeof location !== "undefined" ? location : { href: "" });
     var windowRef = root.window || root;
     var cryptoRef = root.crypto || (typeof crypto !== "undefined" ? crypto : null);
+    var navigatorRef = root.navigator ||
+      (typeof navigator !== "undefined" ? navigator : { userAgent: "" });
 
     var documentNonce = createDocumentNonce(cryptoRef, function () {
       return Date.now();
@@ -1568,9 +1570,39 @@
         src = "";
       }
 
+      // THIS FRAME's own request context, offered as a fallback for the
+      // sign-in a gated stream needs. The background prefers what it actually
+      // observed on the wire for this tab and falls back to these; they are
+      // read HERE because only this frame knows its own location, and
+      // sender.tab.url is the TOP page — a different address whenever the
+      // video is framed, which is most of the time on a site that gates one.
+      //
+      // Nothing here is trusted downstream. The background drops a referer
+      // that is not http(s), the host refuses both again by name and by
+      // character class, and BadApple refuses them a third time. A page cannot
+      // reach these values anyway: a content script's location and navigator
+      // are the browser's, not the page's redefinitions of them.
+      var pageUrl = "";
+      var userAgent = "";
+      try {
+        pageUrl = String(locationRef.href || "");
+      } catch (eLoc) {
+        pageUrl = "";
+      }
+      try {
+        userAgent = String(navigatorRef.userAgent || "");
+      } catch (eUa) {
+        userAgent = "";
+      }
+
       var sent;
       try {
-        sent = api.runtime.sendMessage({ type: "beam-video", src: src });
+        sent = api.runtime.sendMessage({
+          type: "beam-video",
+          src: src,
+          pageUrl: pageUrl,
+          userAgent: userAgent,
+        });
       } catch (eSend) {
         sent = null;
       }

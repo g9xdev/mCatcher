@@ -230,6 +230,11 @@ function makeRoot(opts) {
     document: doc,
     location: { href: "https://site.example/watch", hostname: "site.example",
                 pathname: "/watch", search: "", origin: "https://site.example" },
+    // The frame's own navigator. Modelled because a beam carries this frame's
+    // User-Agent: a gated stream checks it, and a harness that left it out
+    // would let content.js fall through to whatever the test runner's global
+    // navigator happens to be and still look green.
+    navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; rv:142.0) Firefox/142.0" },
     innerWidth: opts.viewportWidth || 1280,
     innerHeight: opts.viewportHeight || 720,
     crypto: { randomUUID: () => "00000000-0000-4000-8000-00000000beef" },
@@ -984,10 +989,26 @@ test("nothing about the video leaves the page until a person clicks the icon", a
 
   const beams = root._messages.filter((m) => m && m.type === "beam-video");
   assert.equal(beams.length, 1);
-  assert.deepEqual(Object.keys(beams[0]).sort(), ["src", "type"],
-    "the frame names the element's src and nothing else");
+  // The element's src, plus this FRAME's own request context — and nothing
+  // else. The context is what lets a login-gated stream be beamed at all (the
+  // background composes Referer/User-Agent from it, preferring what it saw on
+  // the wire), and it is READ ONLY on the click: the assertion above is what
+  // says attaching an icon still tells nobody anything.
+  assert.deepEqual(Object.keys(beams[0]).sort(),
+    ["pageUrl", "src", "type", "userAgent"],
+    "the frame names the element's src and this frame's context, nothing else");
   assert.equal(beams[0].src, "blob:https://site.example/9f1c",
     "sent as-is: whether a blob: can be beamed is not this frame's decision");
+  // This frame's own location, not the top page's: sender.tab.url is a
+  // different address whenever the video is framed.
+  assert.equal(beams[0].pageUrl, root.location.href);
+  assert.equal(beams[0].userAgent, root.navigator.userAgent);
+  // Whatever else the page holds, a credential is not in this frame. The
+  // extension has no `cookies` permission and document.cookie cannot see the
+  // HttpOnly session cookie a gated stream uses, so composing one here would
+  // produce a beam that looks signed in and is not.
+  assert.equal(Object.keys(beams[0]).some((k) => /cookie/i.test(k)), false,
+    "no cookie leaves the page on a beam");
 });
 
 test("a click the page dispatched itself beams nothing", async () => {
