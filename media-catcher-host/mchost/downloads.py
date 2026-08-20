@@ -1481,6 +1481,15 @@ def handle_ytmeta(req):
     def worker():
         reqid = req.get("reqId")
         url = req.get("url") or ""
+        url_err = guard.refuse_url(url)
+        if url_err:
+            # The probe reads whatever it is pointed at and hands the result
+            # back to the popup, so the scheme matters here for the same
+            # reason it matters on the download path.
+            _h()._hlog("error", "yt-dlp -J: %s" % url_err, "ytdlp")
+            _h().send({"type": "ytmeta", "reqId": reqid, "ok": False,
+                       "error": "That isn't a link this helper can read."})
+            return
         deno = DENO or find_deno()
         lib = _ytdlp_lib()
         if lib.available():
@@ -3185,8 +3194,12 @@ def _handle_ytdl_structured(req):
     if not _ytdl_exact_nonblank_str(token):
         return
 
+    # guard.refuse_url is the scheme check: the exact-str tests above say the
+    # url is a nonblank built-in str and nothing more, and yt-dlp's generic
+    # extractor will open file:/ftp:/whatever it is handed (guard.refuse_url).
     if not _ytdl_exact_nonblank_str(jid) or not _ytdl_exact_nonblank_str(url) \
-            or not _ytdl_exact_nonblank_str(name):
+            or not _ytdl_exact_nonblank_str(name) \
+            or guard.refuse_url(url):
         _h().send({
             "type": "ytdl-error",
             "id": jid if _ytdl_exact_nonblank_str(jid) else None,
@@ -4036,6 +4049,15 @@ def _handle_ytdl_legacy(req):
     def worker():
         jid = req.get("id")
         url = req.get("url") or ""
+        url_err = guard.refuse_url(url)
+        if url_err:
+            # Refused BEFORE the acknowledgement below, because there is
+            # nothing to prepare: no runtime to fetch, no provider to start.
+            # The row goes straight to its one terminal frame.
+            _h()._hlog("error", "yt-dlp: %s" % url_err, "ytdlp")
+            _terminal({"type": "ytdl-error", "id": jid, "reason": "permanent",
+                       "error": "That isn't a link this helper can download."})
+            return
         # Acknowledge before the preflight: ensure_deno() can download a JS runtime
         # and start_pot_provider() waits on a socket bind, and until one of these
         # frames lands the row is indistinguishable from a dead helper.

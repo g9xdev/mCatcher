@@ -32,6 +32,7 @@ module can use it without an import-order hazard.
 import hashlib
 import os
 import re
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Field kinds
@@ -469,6 +470,56 @@ def refuse_open(path):
     if not _ext_ok(real):
         return ("refused: %s resolves to something this helper cannot open"
                 % os.path.basename(path))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# What may be handed to yt-dlp as a URL
+#
+# NOT a schema kind, for two reasons. `cast`'s field is also called "url" and
+# is NOT one: mchost/cast/legacy.py matches ^https?:// and serves anything else
+# as a LOCAL FILE, which is how casting a recording off disk works, so a kind
+# keyed on the field name would refuse the cast path. And a schema refusal is
+# an uncorrelated {"type":"error"} frame, while the structured ytdl path owes
+# its caller a terminal ytdl-error carrying the attemptToken. So the predicate
+# lives here, once, and each handler answers in its own protocol's shape --
+# the same division refuse_basename and refuse_open already use.
+# ---------------------------------------------------------------------------
+
+_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def refuse_url(url):
+    """None when `url` may be handed to yt-dlp, else a user-facing reason.
+
+    yt-dlp's positional argument is not merely a fetch target: its generic
+    extractor opens whatever scheme it is given, so "file:///C:/..." reads a
+    local file and "ftp://host/x" reaches somewhere the browser never went.
+    This is NOT about flag injection -- only one caller-controlled token
+    reaches argv on those paths, so a leading "-" is still just a URL to
+    yt-dlp -- it is about which schemes this helper is willing to open.
+
+    Padding and control characters are refused rather than trimmed so that
+    what is CHECKED is what ships: urllib.parse.urlsplit strips leading
+    whitespace and deletes tab/newline before it reads the scheme, so
+    "ht<tab>tp://h" parses as http here while the argv yt-dlp gets still has
+    the tab in it. Refusing keeps the two readings from ever differing.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return "refused: no address given"
+    if url != url.strip():
+        return "refused: that address is padded with whitespace"
+    for ch in url:
+        if ord(ch) < 32 or ord(ch) == 127:
+            return "refused: that address contains a control character"
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return "refused: that address could not be read as a URL"
+    if parts.scheme.lower() not in _URL_SCHEMES:
+        return "refused: only http and https addresses can be downloaded"
+    if not parts.netloc:
+        return "refused: that address names no host"
     return None
 
 

@@ -591,3 +591,35 @@ def test_no_untyped_container_kind_can_be_declared():
         guard._assert_kinds_declared({"save": {"convert": "dict"}})
     with pytest.raises(ValueError):
         guard._assert_kinds_declared({"save": {"convert": {"quality": "dict"}}})
+
+
+def test_refuse_url_covers_the_scheme_shapes():
+    r = guard.refuse_url
+    for ok in ("http://a.test/x", "https://a.test/x", "HTTPS://A.TEST/x",
+               "https://a.test:8443/v?q=1#f", "https://user:pw@a.test/x"):
+        assert r(ok) is None, ok
+    for bad in ("file:///C:/Windows/win.ini", "ftp://a.test/x",
+                "javascript:alert(1)", "data:text/plain,x", "ws://a.test/x",
+                r"C:\Windows\win.ini", r"\\a.test\share\x", "//a.test/x",
+                "http://", "http:/a", "not a url", "", "   ", None, 5, b"x",
+                " https://a.test/x", "https://a.test/x ",
+                "ht\ttp://a.test/x", "https://a.test/\x00x",
+                "https://a.test/x\n--exec"):
+        assert r(bad) is not None, repr(bad)
+
+
+def test_cast_url_is_not_a_yt_dlp_url():
+    """Why refuse_url is a handler call and not a schema kind on the field name.
+
+    cast's "url" is a media SOURCE: mchost/cast/legacy.py serves anything that
+    is not ^https?:// as a file on disk, which is how casting a finished
+    recording works. Typing every field named "url" would refuse that.
+    """
+    from mchost.cast import legacy
+
+    assert guard.MESSAGE_SCHEMA["cast"]["url"] == guard.STR
+    assert guard.validate_message(
+        {"cmd": "cast", "sub": "start", "id": "d1",
+         "url": r"C:\Users\me\Videos\clip.mp4"}) is None
+    entry = legacy._dlna_media_url(r"C:\Users\me\Videos\clip.mp4", None)
+    assert isinstance(entry, tuple)
