@@ -1137,26 +1137,33 @@
     //   - be broken by it. The container is position:fixed with an explicit
     //     size and `contain: layout style size`, so it contributes nothing to
     //     the page's layout wherever it is parked.
-    //   - swallow the click, or see it. Pointer events are stopped on the
-    //     container in the CAPTURE phase, so the page's bubble-phase handlers
-    //     never run. (A page listener capturing on document still sees the
-    //     event first; it sees a click on an anonymous div, not on the
-    //     player.)
+    //   - swallow the click, or see it. The container's handlers are CAPTURE
+    //     phase and are bound before the container is anywhere the page can
+    //     find it, so at the target they are the first listeners on that node
+    //     in EITHER phase, and they end the event there. A page handler bound
+    //     on the container sees nothing whichever phase it asked for, and
+    //     neither does one on an ancestor. What the page can still do is
+    //     capture on the document, above the container — and it sees a click
+    //     on an anonymous div, not on the player.
     //   - CLICK IT ITSELF. The container is a node in the page's DOM, so page
     //     script can find it and dispatch on it. beamClick drops any event
     //     the browser did not mark isTrusted, which is every event a script
     //     dispatched.
     //
-    // WHAT IT COSTS A FRAME WITH NO VIDEO: no timer of its own, no observer of
-    // its own, and no per-frame loop — the MutationObserver and the 12-second
-    // interval it re-checks from are content.js's, and the positioning loop
-    // exists only while an overlay does. It does bind capture-phase listeners
-    // of its own: the media and fullscreen events on the document, scroll and
-    // resize on the window. Those are the moments the answer can change.
-    // Mutations arrive in storms and are throttled to one re-check per
-    // BEAM_DEEP_MS, as are scroll and resize; a media event is NOT throttled,
-    // because it is the moment the answer changed and a storm of them is a
-    // page choosing to burn its own CPU. The sweep for shadow roots runs at
+    // WHAT IT COSTS A FRAME WITH NO VIDEO: no timer of its own and no observer
+    // of its own — the MutationObserver and the 12-second interval it
+    // re-checks from are content.js's already — and no per-frame loop, because
+    // the requestAnimationFrame loop that holds an icon on its corner exists
+    // only while an icon does. It does bind capture-phase listeners of its
+    // own: the media and fullscreen events on the document, scroll and resize
+    // on the window. Those are the moments the answer can change.
+    //
+    // Mutations, scrolls and resizes are throttled, but only the expensive
+    // half: DISCOVERY runs at most once per BEAM_DEEP_MS, and in between they
+    // cost a reposition of the overlays already up — which in a frame with
+    // none is a clock read and a return. A media event is NOT throttled at
+    // all, because it is the moment the answer changed and a storm of them is
+    // a page choosing to burn its own CPU. The sweep for shadow roots runs at
     // most once per BEAM_SHADOW_MS with a hard cap on elements examined,
     // whichever path asked for it.
     //

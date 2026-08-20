@@ -140,9 +140,32 @@ function makeNode(doc, tag, opts) {
       })(node);
       return out;
     },
-    // Test helper: fire an event through this node's capture listeners.
+    // Test helper: run this node's listeners for `type`, ignoring phase.
     _fire(type, event) {
       for (const entry of (node.listeners[type] || []).slice()) entry.fn(event || { type });
+    },
+    // Test helper: dispatch to this node the way a browser does when the node
+    // IS the (retargeted) target. The path is walked twice — a capturing
+    // traversal, then a bubbling one — and each traversal runs only its own
+    // listeners, in registration order. So every capture listener on the node
+    // precedes every bubble one however early the bubble one was bound.
+    // stopImmediatePropagation ends the traversal in progress; either stop
+    // call keeps the second traversal from starting.
+    //
+    // Checked against Firefox 154: a bubble listener bound first still runs
+    // after a capture listener bound second, on the same node, at the target.
+    _dispatchAtTarget(type, event) {
+      const ev = event || makeEvent(type);
+      const bound = (node.listeners[type] || []).slice();
+      const stoppedAll = () => ev._seen && (ev._seen.stop > 0 || ev._seen.stopImmediate > 0);
+      for (const capturing of [true, false]) {
+        if (stoppedAll()) break;
+        for (const entry of bound.filter((e) => e.capture === capturing)) {
+          if (ev._seen && ev._seen.stopImmediate > 0) break;
+          entry.fn(ev);
+        }
+      }
+      return ev;
     },
     _text() {
       let out = node.textContent || "";
@@ -613,6 +636,31 @@ test("clicking the icon never reaches the page's own handlers", async () => {
   assert.ok(event._seen.stop >= 1, "propagation stopped");
   assert.ok(event._seen.stopImmediate >= 1, "and stopped for good");
   assert.ok(event._seen.prevent >= 1, "the page's default for that spot is not run");
+});
+
+test("a page handler on the container itself never sees the click", async () => {
+  // The container is a node in the page's DOM, so page script can bind on it
+  // directly — including in the CAPTURE phase, which at the target runs
+  // before every bubble listener no matter who was bound first. The overlay's
+  // own handlers are capture and are bound before the container is reachable,
+  // so they are first in that traversal and end the event there.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root));
+  await installed(root);
+  const container = containers(root)[0];
+
+  let sawCapturing = 0;
+  let sawBubbling = 0;
+  container.addEventListener("click", function () { sawCapturing += 1; }, true);
+  container.addEventListener("click", function () { sawBubbling += 1; }, false);
+
+  container._dispatchAtTarget("click", makeEvent("click"));
+  await settle();
+
+  assert.equal(sawCapturing, 0, "a page capture listener on this node is not first");
+  assert.equal(sawBubbling, 0, "and a bubble one never gets a turn");
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 1,
+    "the click still worked — the page is excluded, not the button");
 });
 
 test("everything a click is made of is taken off the page's hands", async () => {
