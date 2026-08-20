@@ -289,6 +289,72 @@ def test_badapple_refuses_a_non_media_file(monkeypatch, tmp_path):
     assert "refus" in sent[0].get("error", "").lower()
 
 
+def test_badapple_vets_the_path_before_it_stats_it(monkeypatch, tmp_path):
+    """The ORDER of the two file-arm checks, which is a property on its own.
+
+    guard.refuse_open's docstring commits to it in as many words -- "evaluated
+    BEFORE that stat so a refused path is never probed for existence on the
+    caller's behalf" -- and handle_badapple's says why it matters: isfile() is
+    a stat on a caller-supplied path, and one naming a dead network share
+    blocks for as long as the SMB timeout takes, on a worker thread holding
+    nothing and answering nobody.
+
+    Swapping the two leaves every other assertion about this handler green,
+    because both orders refuse exactly the same paths. What changes is only
+    WHEN the filesystem is touched -- so nothing but this test can tell the
+    documented boundary from a coincidence.
+    """
+    from mchost import downloads as d
+
+    _fake_badapple(monkeypatch, tmp_path)
+    evil = tmp_path / "payload.exe"
+    evil.write_bytes(b"MZ")
+
+    # A spy that still answers truthfully: patching os.path.isfile is process
+    # wide for the life of the test, so it delegates rather than replaces.
+    statted = []
+    real_isfile = d.os.path.isfile
+    monkeypatch.setattr(d.os.path, "isfile",
+                        lambda pth: (statted.append(pth), real_isfile(pth))[1])
+
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "b7", "path": str(evil)})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "nothing was spawned"
+    assert str(evil) not in statted,         "the allowlist refused it without the filesystem ever being asked"
+
+
+def test_badapple_that_cannot_start_says_so_rather_than_going_quiet(monkeypatch, tmp_path):
+    """A spawn that raises is still an answer owed to whoever clicked.
+
+    Popen fails for ordinary reasons -- the executable replaced mid-upgrade, a
+    policy denying execution, an exhausted desktop heap. With the handler for
+    that made `pass`, the overlay's click resolves against nothing: no error
+    frame, no id, no message, and a person left watching a TV that was never
+    going to play. Every other refusal in this handler carries req["id"] for
+    exactly that reason, and this one is a refusal too.
+    """
+    _fake_badapple(monkeypatch, tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    def denied(*a, **k):
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(mc.subprocess, "Popen", denied)
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "b8", "path": str(clip)})
+    assert wait_for(lambda: bool(sent), timeout=2.0),         "the failure was answered, not swallowed"
+    assert sent[0].get("type") == "error", sent
+    assert sent[0].get("id") == "b8",         "the id is what lets the extension put this in front of the right row"
+    assert "failed to start" in sent[0].get("error", "").lower(), sent
+
+
 def test_badapple_opens_a_media_file_without_a_shell(monkeypatch, tmp_path):
     app = _fake_badapple(monkeypatch, tmp_path)
     clip = tmp_path / "clip.mp4"

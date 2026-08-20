@@ -920,6 +920,18 @@ test("a beam from outside a tab is refused before anything is resolved", async (
   const answered = await beam(h, "https://cdn.example/a.mp4", {});
   assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0);
   assert.equal(answered && answered.ok, false);
+
+  // On the REASON, not just on the refusal. `ok:false` alone does not
+  // distinguish this guard from the router's catch-all: with the sender.tab
+  // condition mutated to `if (false)`, `visibleFor(sender.tab.id)` reads `id`
+  // off undefined, the catch-all turns the TypeError into an ok:false answer,
+  // and a test that asked only "was it refused" stays green while the guard it
+  // names is gone. The two are not interchangeable — one is a decision, the
+  // other is a crash wearing the same shape.
+  assert.match(String(answered.error), /not in a tab/i,
+    "the named guard answered, not the catch-all");
+  assert.equal(/undefined|cannot read|typeerror/i.test(String(answered.error)), false,
+    "and a refusal never reads as an exception that got away");
 });
 
 test("a beam with no helper answers with an error, not silence", async () => {

@@ -946,6 +946,27 @@ test("a click the page dispatched itself beams nothing", async () => {
   assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 1);
 });
 
+test("a listener call carrying no event at all is refused, not thrown out of", async () => {
+  // The other half of the same guard. A browser always hands a listener an
+  // event, so this is defensive — but "defensive" is the claim, and without a
+  // test the code can stop making it. With `!e ||` gone, `e.isTrusted` throws
+  // a TypeError out of a listener bound to a node in the PAGE's DOM, and a
+  // listener that throws is not a listener that refused: the page sees the
+  // exception, and nothing in the overlay records that a beam was declined.
+  const root = makeRoot();
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+
+  assert.doesNotThrow(() => {
+    for (const entry of container.listeners.click) entry.fn(null);
+  }, "the guard returns; it does not fall through to a property read on null");
+  await settle();
+  await settle();
+  assert.equal(root._messages.filter((m) => m && m.type === "beam-video").length, 0,
+    "no event means no user, and no user means no beam");
+});
+
 // The button inside the container's closed shadow root — the thing a person
 // actually sees and presses.
 function overlayButton(container) {
@@ -1081,6 +1102,38 @@ test("a beam of the video's own address does not hedge", async () => {
   assert.match(text, /Sent to BadApple/);
   assert.equal(/detected on this tab/.test(text), false,
     "this element named the address; there is nothing to warn about");
+});
+
+test("a beam that never left the page is not reported as sent", async () => {
+  // The rejection arm of the send. sendMessage REJECTS when the extension
+  // context has gone away — met on every extension reload, with the old
+  // content script still bound to the page — and the click then reaches
+  // nothing at all: no background, no native port, no BadApple.
+  //
+  // Without this test the arm can be made to resolve ok:true and stay green,
+  // which would put "Sent to BadApple." in front of someone whose click did
+  // not leave the page. A false success is worse than the failure it hides,
+  // because the only correction available is to go and look at the TV.
+  const root = makeRoot({
+    onBeam: () => Promise.reject(new Error("Extension context invalidated.")),
+  });
+  root.document.body.appendChild(makeVideo(root, { currentSrc: "https://cdn.example/a.mp4" }));
+  await installed(root);
+  const container = containers(root)[0];
+
+  container._fire("click", makeEvent("click"));
+  await settle();
+  await settle();
+
+  const text = overlayMessage(container);
+  assert.equal(/Sent to BadApple/.test(text), false,
+    "nothing was sent, so nothing may say it was");
+  assert.match(text, /did not answer/, "the person is told the click went nowhere");
+
+  const panel = container._closedShadow.querySelectorAll("div")
+    .filter((n) => n.getAttribute("data-p") === "m")[0];
+  assert.equal(panel.getAttribute("data-tone"), "bad",
+    "and it is toned as the failure it is, not as a success");
 });
 
 test("a refusal is put in front of the person who clicked", async () => {
