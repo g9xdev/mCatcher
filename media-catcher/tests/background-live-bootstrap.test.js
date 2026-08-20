@@ -892,6 +892,29 @@ test("another tab's detected media is never beamed into this one", async () => {
   assert.equal(answered && answered.ok, false);
 });
 
+// The test above proves an EMPTY answer is not beamed. It does not prove the
+// message cannot CHOOSE the list: mutating the lookup to
+// `visibleFor(Number.isInteger(msg.tabId) ? msg.tabId : sender.tab.id)` left
+// all 38 tests in this file green, because none of them ever put a tabId in
+// the frame. sender.tab.id is the browser's word for where a frame is; a
+// field in the message is the sender's, and the sender is a content script in
+// a page's process.
+test("a beam frame naming another tab is still answered from the sender's", async () => {
+  const h = await readyHarness();
+  await seedDetected(h, 8, { kind: "hls", url: "https://cdn.example/other-tab.m3u8", ts: 5 });
+
+  let answered = null;
+  h.sandbox.browser.runtime.onMessage.emit(
+    { type: "beam-video", src: "blob:https://site.example/9f1c", tabId: 8 },
+    beamSender(7), (r) => { answered = r; });
+  await settle();
+  await settle();
+
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0,
+    "tab 8's stream is not tab 7's to name");
+  assert.equal(answered && answered.ok, false);
+});
+
 test("a beam from outside a tab is refused before anything is resolved", async () => {
   const h = await readyHarness();
   const answered = await beam(h, "https://cdn.example/a.mp4", {});
