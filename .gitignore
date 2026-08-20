@@ -34,6 +34,11 @@ media-catcher-host/cast_creds_*.json
 # zip is a downloaded artifact, not source.
 media-catcher-host/updates/
 
+# Agent scratch. The root one is already covered by the /* rule above, but a
+# nested copy (made by running a command from the wrong directory) is not, and
+# would be swept into a commit by `git add -A`.
+**/.superpowers/
+
 # Caches and cruft.
 **/__pycache__/
 *.pyc
