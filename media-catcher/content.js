@@ -1547,13 +1547,20 @@
         for (var i = 0; i < videos.length; i++) {
           var video = videos[i];
           var rect = beamRect(video);
-          var style = beamStyle(video);
-          var at = null;
-          var parent = null;
-          if (isBeamableVideo(video, { rect: rect, style: style, viewport: viewport })) {
-            at = beamIconRect(rect, viewport);
-            parent = beamParentFor(video, fullscreenEl);
+          // The free half of the predicate first. getComputedStyle is the one
+          // expensive read in this loop, and on a page full of ad slots most
+          // videos are already excluded by play state or size without it.
+          // The free half of the predicate first. getComputedStyle is the one
+          // expensive read in this loop, and on a page full of ad slots most
+          // videos are already excluded by play state or size without it.
+          if (!isBeamableVideo(video, { rect: rect, style: null, viewport: viewport })) {
+            beamDetach(video);
+            continue;
           }
+          var style = beamStyle(video);
+          var at = isBeamableVideo(video, { rect: rect, style: style, viewport: viewport })
+            ? beamIconRect(rect, viewport) : null;
+          var parent = at ? beamParentFor(video, fullscreenEl) : null;
           if (!at || !parent) { beamDetach(video); continue; }
           var rec = beamOverlays.get(video) || beamAttach(video);
           if (!rec) continue;

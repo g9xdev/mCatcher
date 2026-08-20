@@ -191,6 +191,7 @@ function makeRoot(opts) {
       disconnect() {}
     },
     getComputedStyle(el) {
+      root._styleReads += 1;
       return (el && el._computed) || { display: "block", visibility: "visible", opacity: "1" };
     },
     requestAnimationFrame(fn) { rafs.push(fn); return rafs.length; },
@@ -217,6 +218,7 @@ function makeRoot(opts) {
         onMessage: { addListener(fn) { responders.push(fn); } },
       },
     },
+    _styleReads: 0,
     _messages: messages,
     _responders: responders,
     _rafs: rafs,
@@ -443,6 +445,27 @@ test("an ad-sized and a hidden video are passed over while a real one is not", a
   root.document.body.appendChild(makeVideo(root, { rect: { left: 0, top: 0, width: 800, height: 450 } }));
   await installed(root);
   assert.equal(containers(root).length, 1, "one icon, on the one video worth one");
+});
+
+test("a page full of ad slots is not measured with getComputedStyle", async () => {
+  const root = makeRoot();
+  for (let i = 0; i < 20; i += 1) {
+    root.document.body.appendChild(makeVideo(root, {
+      rect: { left: 0, top: 0, width: 300, height: 100 },   // under the floor
+    }));
+  }
+  root.document.body.appendChild(makeVideo(root, {
+    rect: { left: 0, top: 0, width: 800, height: 450 },
+  }));
+  await installed(root);
+
+  assert.equal(containers(root).length, 1);
+  // getComputedStyle forces style resolution and is the one expensive read in
+  // the discovery loop. Only the candidate that already passed play state and
+  // size is worth paying it for.
+  assert.ok(root._styleReads <= 2,
+    "twenty ad slots must not cost twenty style resolutions (saw " +
+      root._styleReads + ")");
 });
 
 test("a frame with no video costs no animation frames and no elements", async () => {
