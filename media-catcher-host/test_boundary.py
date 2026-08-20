@@ -239,6 +239,174 @@ def test_refuse_open_covers_the_windows_shapes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 2b. `badapple` — a third shell verb on the same allowlist
+#
+# This is a new process-execution path, so it is worth being explicit about
+# which half of it the extension owns. It owns the FILE and nothing else. The
+# program that runs is chosen here, from a fixed list this host writes down;
+# there is no field, in this command or in any config the extension can reach,
+# that names an executable. That is the whole difference between "open this
+# video in a player" and "run this program", and it is the reason the argv
+# assertions below check position 0 specifically.
+# ---------------------------------------------------------------------------
+
+def test_badapple_is_typed_like_open_and_reveal():
+    assert guard.MESSAGE_SCHEMA["badapple"] == {"id": guard.ID, "path": guard.STR}, \
+        "badapple takes a correlation id and a file path — nothing else is read"
+
+
+def _fake_badapple(monkeypatch, tmp_path, installed=True):
+    """Stand in for the installed app, so the tests never depend on this
+    machine having BadApple. Returns the path find_badapple should report."""
+    from mchost import downloads as d
+
+    app = tmp_path / "Programs" / "BadApple" / "BadApple.App.exe"
+    if installed:
+        app.parent.mkdir(parents=True, exist_ok=True)
+        app.write_bytes(b"MZ")
+    monkeypatch.setattr(d, "find_badapple",
+                        lambda: str(app) if installed else None)
+    return str(app)
+
+
+def test_badapple_refuses_a_non_media_file(monkeypatch, tmp_path):
+    """The same guard.refuse_open allowlist `open` and `reveal` use. A media
+    player is still a program being handed a caller-supplied path."""
+    _fake_badapple(monkeypatch, tmp_path)
+    evil = tmp_path / "payload.exe"
+    evil.write_bytes(b"MZ")
+
+    ran = []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "b1", "path": str(evil)})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "BadApple was never spawned for the .exe"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "b1", sent
+    assert "refus" in sent[0].get("error", "").lower()
+
+
+def test_badapple_opens_a_media_file_without_a_shell(monkeypatch, tmp_path):
+    app = _fake_badapple(monkeypatch, tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\0")
+
+    ran = []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "b2", "path": str(clip)})
+    assert wait_for(lambda: bool(ran), timeout=2.0), "BadApple was spawned"
+    assert sent == [], "no error for a legitimate media file"
+    argv, kwargs = ran[0]
+    # --beam is BadApple's documented entry point: it forwards the path to an
+    # already-running instance instead of opening a second window. Launching
+    # the exe with a bare path is a different, undocumented interface.
+    assert argv[0] == [app, "--beam", str(clip)], argv
+    assert kwargs.get("shell") is not True, "argv list, never a shell string"
+
+
+def test_the_extension_cannot_choose_the_program_that_runs(monkeypatch, tmp_path):
+    """C1 reopened would look exactly like this: a field on the message that
+    reaches argv[0]. Unlisted keys are ignored rather than refused, so the
+    proof that they are inert has to be that none of them lands in the argv."""
+    app = _fake_badapple(monkeypatch, tmp_path)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\0")
+    payload = str(tmp_path / "payload.exe")
+
+    ran = []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({
+        "id": "b3", "path": str(clip),
+        # Every shape a caller might hope the handler reads.
+        "exe": payload, "app": payload, "player": payload, "command": payload,
+        "argv": [payload], "cwd": str(tmp_path), "shell": True,
+    })
+    assert wait_for(lambda: bool(ran), timeout=2.0), "BadApple was spawned"
+    argv, kwargs = ran[0]
+    assert argv[0][0] == app, "the host chose the program, not the message"
+    assert not any("payload.exe" in str(part) for part in argv[0]), argv
+    assert kwargs.get("shell") is not True
+
+
+def test_badapple_gate_is_media_exts_not_a_second_list(monkeypatch, tmp_path):
+    """The decision recorded as behaviour, not only as prose in the docstring.
+
+    BadApple's own filter is narrower than MEDIA_EXTS, and the two are NOT
+    intersected: one allowlist governs all three shell verbs, so there is no
+    second list to drift. What that costs is a .srt reaching an app that will
+    ignore it. What it buys is that .iso — the one suffix BadApple takes and
+    this host never writes — does not widen the shell-facing allowlist.
+    """
+    _fake_badapple(monkeypatch, tmp_path)
+    ran, sent = [], []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    iso = tmp_path / "disc.iso"
+    iso.write_bytes(b"\0")
+    mc.handle_badapple({"id": "b5", "path": str(iso)})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "an .iso is outside MEDIA_EXTS and is refused"
+    assert ".iso" not in guard.MEDIA_EXTS
+
+    subs = tmp_path / "clip.srt"
+    subs.write_bytes(b"\0")
+    mc.handle_badapple({"id": "b6", "path": str(subs)})
+    assert wait_for(lambda: bool(ran), timeout=2.0), \
+        "a MEDIA_EXTS suffix is passed on even where BadApple has no use for it"
+    assert len(sent) == 1, "the .srt drew no refusal of its own"
+
+
+def test_badapple_not_installed_answers_with_an_error(monkeypatch, tmp_path):
+    _fake_badapple(monkeypatch, tmp_path, installed=False)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\0")
+
+    ran = []
+    monkeypatch.setattr(mc.subprocess, "Popen", lambda *a, **k: ran.append((a, k)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple({"id": "b4", "path": str(clip)})
+    assert wait_for(lambda: bool(sent), timeout=2.0), "handle_badapple answered"
+    assert ran == [], "nothing was spawned"
+    assert sent[0].get("type") == "error" and sent[0].get("id") == "b4", sent
+    assert "badapple" in sent[0].get("error", "").lower(), \
+        "the UI can say what is missing"
+
+
+def test_find_badapple_reads_only_host_owned_candidates(monkeypatch, tmp_path):
+    """The locator is the security boundary: if a path could come from anywhere
+    the extension writes, naming the executable would be back."""
+    from mchost import tools
+
+    local = tmp_path / "Local"
+    app = local / "Programs" / "BadApple" / "BadApple.App.exe"
+    app.parent.mkdir(parents=True)
+    app.write_bytes(b"MZ")
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    assert tools.find_badapple() == str(app)
+
+    # An install that is not there is absent, not something else. A config file
+    # sitting next to the host does not get to answer the question.
+    empty = tmp_path / "Empty"
+    empty.mkdir()
+    monkeypatch.setenv("LOCALAPPDATA", str(empty))
+    cfg = tmp_path / "mc_config.json"
+    cfg.write_text(json.dumps({"badapple": str(tmp_path / "payload.exe")}))
+    monkeypatch.setattr(tools, "HERE", str(tmp_path))
+    assert tools.find_badapple() is None
+
+
+# ---------------------------------------------------------------------------
 # 3. A recording id is not a path component
 # ---------------------------------------------------------------------------
 

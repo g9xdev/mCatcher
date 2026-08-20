@@ -174,6 +174,13 @@ function h(tag, props, children) {
   return el;
 }
 
+// Byte figures for a row's size readout, decided once in
+// lib/popup-download-ui.js so both panes answer "how big is it" the same way.
+// Degrades to "not known" without the lib, as every other PopupUI call does.
+function sizeBytesOf(dl) {
+  return PopupUI ? PopupUI.downloadSizeBytes(dl) : { done: 0, total: 0 };
+}
+
 function humanSize(bytes) {
   if (!bytes) return "";
   const u = ["B", "KB", "MB", "GB"];
@@ -988,9 +995,10 @@ function renderLiveProgress(el, dl) {
       text: "Browser save — Firefox may ask where to put it (its “Always ask” setting). Enable the helper for silent saves to your folder." }));
   } else if (dl.status === "done") {
     const path = dl.savedPath || "";
+    const size = humanSize(sizeBytesOf(dl).total);
     const chip = h("div", { class: "savedchip" + (path ? " openable" : ""), role: "status",
       title: path ? path + " — click to open" : "" }, [
-      h("span", { class: "check", text: "✓" }), "Saved",
+      h("span", { class: "check", text: "✓" }), "Saved" + (size ? " · " + size : ""),
       path ? h("span", { class: "path", text: path, title: path }) : null,
     ]);
     if (path) chip.onclick = () => openDlFile(dl);
@@ -1045,6 +1053,13 @@ function renderProgress(el, dl) {
       renderNeedsUserActions(dl, wrap);
       el.querySelector(".slot").appendChild(wrap);
     }
+    // A job that completed without ever publishing a progress total lands here
+    // rather than on the bar below, and this branch returned before offering
+    // anything — the row read "Completed" and dead-ended.
+    if (sched === "completed" || dl.status === "done") {
+      const acts = fileActionRow(dl);
+      if (acts) el.querySelector(".slot").appendChild(acts);
+    }
     return;
   }
 
@@ -1075,13 +1090,21 @@ function renderProgress(el, dl) {
   else if (dl.status === "cancelled" || sched === "cancelled") { statusText = schedLabel || "Cancelled"; cls = "error"; }
   else statusText = schedLabel || "Downloading";
 
-  let right = dl.progress && dl.progress.total
-    ? (dl.progress.unit === "bytes"
-        ? humanSize(dl.progress.done) + " / " + humanSize(dl.progress.total)
-        : dl.progress.unit === "pct"
-          ? (dl.progress.stage === "merging" ? "merging…" : "")
-          : dl.progress.done + "/" + dl.progress.total + " seg")
-    : "";
+  // Byte and percent rows both reach the same humanSize pair: sizeBytesOf reads
+  // progress.totalBytes for the percent ones, where progress.total is the
+  // denominator 100 rather than a size. Segment rows have no byte figure at all
+  // and keep counting segments.
+  const size = sizeBytesOf(dl);
+  const p1 = dl.progress || {};
+  let right;
+  if (p1.unit === "pct" && p1.stage === "merging") right = "merging…";
+  else if (size.total) {
+    right = (dl.status === "done" || sched === "completed")
+      ? humanSize(size.total)
+      : humanSize(size.done) + " / " + humanSize(size.total);
+  } else if (p1.total && p1.unit !== "bytes" && p1.unit !== "pct") {
+    right = p1.done + "/" + p1.total + " seg";
+  } else right = "";
   if (dl.progress && dl.progress.bps > 0 && (dl.status === "downloading" || dl.status === "audio")) {
     right += (right ? "  ·  " : "") + humanSize(dl.progress.bps) + "/s";
   }
@@ -1195,16 +1218,35 @@ function helperOn() {
 function fileActionRow(dl, opts) {
   const row = h("div", { class: "dl-actions" });
   const canFile = (dl.savedPath && helperOn()) || dl.downloadId != null;
-  if (canFile) {
+  // A helper-saved file has a path and no downloads-API id, so the only route
+  // to it is the helper. When the helper is down these buttons used to be
+  // omitted entirely, which reads as "the feature was removed" rather than
+  // "the helper is not connected". The gate is unchanged; what changed is that
+  // it now says so.
+  const stranded = !canFile && !!dl.savedPath;
+  const why = "Native helper not connected — reconnect it to open this file";
+  if (canFile || stranded) {
     row.appendChild(h("button", { class: "btn ghost sm", text: "▶ Open",
-      title: "Open the file in your default player",
-      onClick: () => openDlFile(dl) }));
+      title: stranded ? why : "Open the file in your default player",
+      disabled: stranded ? "disabled" : null,
+      onClick: stranded ? null : () => openDlFile(dl) }));
     row.appendChild(h("button", { class: "btn ghost sm", text: "Folder",
-      title: "Show the file in its folder",
-      onClick: () => {
+      title: stranded ? why : "Show the file in its folder",
+      disabled: stranded ? "disabled" : null,
+      onClick: stranded ? null : () => {
         if (dl.savedPath && helperOn()) send({ type: "reveal-file", path: dl.savedPath });
         else { try { api.downloads.show(dl.downloadId); } catch (e) {} }
       } }));
+  }
+  // Hidden rather than disabled, and the asymmetry with the two above is
+  // deliberate: Open / Folder are always-present capabilities that happen to be
+  // unreachable right now, whereas BadApple is a separate application most
+  // machines will never have installed. The helper answers every ping with
+  // whether it found it, so this reflects the current machine.
+  if (dl.savedPath && helperOn() && helperStatus.badapple) {
+    row.appendChild(h("button", { class: "btn ghost sm", text: "Open in BadApple",
+      title: "Open this file in the BadApple player",
+      onClick: () => send({ type: "open-in-badapple", path: dl.savedPath }) }));
   }
   if (castUiReady && dl.savedPath) {
     row.appendChild(h("button", { class: "btn cast-btn sm", text: "Cast",
@@ -1294,8 +1336,7 @@ function renderQueueItem(dl) {
   const displayName = dl.requestedFilename || dl.name || "download";
 
   if (sched === "completed" || dl.status === "done") {
-    const size = dl.recorded && dl.recorded.bytes ? humanSize(dl.recorded.bytes)
-      : (p.total && p.unit === "bytes" ? humanSize(p.total) : "");
+    const size = humanSize(sizeBytesOf(dl).total);
     const name = h("div", { class: "dl-name openable", title: (dl.savedPath || displayName) + " — click to open",
       text: displayName, onClick: () => openDlFile(dl) });
     card.appendChild(h("div", { class: "dl-done-row" }, [
@@ -1405,8 +1446,9 @@ function renderQueueItem(dl) {
   fill.style.width = pct + "%";
   card.appendChild(h("div", { class: "track" }, [fill]));
 
+  const size = sizeBytesOf(dl);
   let left;
-  if (p.unit === "bytes" && p.total) left = pct + "% of " + humanSize(p.total);
+  if (size.total && (p.unit === "bytes" || p.unit === "pct")) left = pct + "% of " + humanSize(size.total);
   else if (p.unit === "pct") left = pct + "%";
   else if (p.total) left = p.done + "/" + p.total + " seg";
   else left = schedLabel || statusWord(dl.status);

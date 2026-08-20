@@ -575,6 +575,10 @@
       var progress = projectPrimitiveRecord(safeGet(job, "progress"), {
         done: "finite",
         total: "finite",
+        // The real byte total, beside `total` rather than inside it: on a
+        // percent-scaled row `total` is the denominator 100, so a size has
+        // nowhere else to travel.
+        totalBytes: "finite",
         bps: "finite",
         kbps: "finite",
         duration: "finite",

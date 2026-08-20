@@ -74,6 +74,46 @@
     }
   }
 
+  function positiveNumber(value) {
+    return typeof value === "number" && isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function isFinishedRow(dl) {
+    return dl.status === "done" || dl.status === "completed" || dl.state === "completed";
+  }
+
+  // How big is this file, in bytes: {done, total}, with 0 meaning "not known".
+  //
+  // ONE answer for both panes. The queue card already sized a finished row from
+  // dl.recorded.bytes and an in-flight one from progress.total; percent-scaled
+  // rows (yt-dlp reports a percentage) fitted neither, because on those
+  // progress.total is the denominator 100 that drives the bar and the real byte
+  // total travels beside it as progress.totalBytes. Rather than teaching each
+  // of the four render sites that distinction, they all ask here.
+  //
+  // `done` for a percent row is derived from the percentage, not reported: the
+  // helper's two progress sources (the yt-dlp library hook and the exe's stdout
+  // lines) agree on a percentage and a total and nothing else, so a
+  // bytes-so-far field would exist on one path only.
+  function downloadSizeBytes(dl) {
+    var none = { done: 0, total: 0 };
+    if (!dl || typeof dl !== "object") return none;
+    var progress = (dl.progress && typeof dl.progress === "object") ? dl.progress : {};
+    var recorded = (dl.recorded && typeof dl.recorded === "object") ? dl.recorded : {};
+
+    var total = positiveNumber(recorded.bytes) ||
+      positiveNumber(progress.totalBytes) ||
+      (progress.unit === "bytes" ? positiveNumber(progress.total) : 0);
+    if (!total) return none;
+    if (isFinishedRow(dl)) return { done: total, total: total };
+    if (progress.unit === "bytes") return { done: positiveNumber(progress.done), total: total };
+    if (progress.unit === "pct") {
+      var pct = Math.min(100, positiveNumber(progress.done));
+      return { done: Math.round((total * pct) / 100), total: total };
+    }
+    return { done: 0, total: total };
+  }
+
   function pathLeaf(value) {
     var s = String(value == null ? "" : value).trim();
     if (!s) return "";
@@ -200,6 +240,7 @@
 
   return Object.freeze({
     formatJobStatus: formatJobStatus,
+    downloadSizeBytes: downloadSizeBytes,
     validateSaveAsFilename: validateSaveAsFilename,
     decideSaveAsForm: decideSaveAsForm,
     buildDownloadMessage: buildDownloadMessage,

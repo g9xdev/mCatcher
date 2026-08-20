@@ -32,16 +32,27 @@ const MIME = {
   ".svg": "image/svg+xml",
 };
 
-const BROWSER_FAKE = `
+// Both panes are scroll containers, so a layout test has to be able to overflow
+// them. The row counts are parameters rather than constants: one row each is
+// enough to prove the widths, and many rows are what prove that a pane scrolls
+// inside its own box instead of growing the document.
+function browserFake(itemCount, downloadCount) {
+  return `
 <script>
 (function () {
   const settings = { showRail: true, showQueue: true, enableCasting: false,
                      maxConcurrentDownloads: 2, concurrency: 2, retries: 1 };
-  const items = [{ id: "media:opaque:1", tabId: 1, kind: "direct",
-                   proposedFilename: "11475-makemebi.net.mp4",
-                   sizeBytes: 1395864371, sizeConfidence: "exact", variants: [] }];
-  const downloads = [{ id: "job:opaque:1", state: "completed", mediaId: "media:opaque:1",
-                       name: "11475-makemebi.net.mp4", saveMode: "default" }];
+  const items = [], downloads = [];
+  for (let i = 1; i <= ${itemCount}; i += 1) {
+    items.push({ id: "media:opaque:" + i, tabId: 1, kind: "direct",
+                 proposedFilename: "11475-makemebi.net.mp4",
+                 sizeBytes: 1395864371, sizeConfidence: "exact", variants: [] });
+  }
+  for (let i = 1; i <= ${downloadCount}; i += 1) {
+    downloads.push({ id: "job:opaque:" + i, state: "completed",
+                     mediaId: "media:opaque:" + i,
+                     name: "11475-makemebi.net.mp4", saveMode: "default" });
+  }
   function respond(message) {
     if (!message) return {};
     if (message.type === "get-settings") return { settings: settings };
@@ -66,6 +77,7 @@ const BROWSER_FAKE = `
 })();
 </script>
 `;
+}
 
 const PROBE = `
 <script>
@@ -77,15 +89,33 @@ const PROBE = `
       const el = document.querySelector(sel);
       return el ? el.getBoundingClientRect().right : null;
     };
+    const bottom = (sel) => {
+      const el = document.querySelector(sel);
+      return el ? el.getBoundingClientRect().bottom : null;
+    };
+    // A pane that scrolls has content taller than its box. A pane that GROWS
+    // instead has the two equal and pushes everything after it down, which is
+    // the difference this reports.
+    const scrollState = (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      return { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+               bottom: el.getBoundingClientRect().bottom };
+    };
     await fetch("/__metrics", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
         rootScrollWidth: document.documentElement.scrollWidth,
+        rootScrollHeight: document.documentElement.scrollHeight,
         bodyRight: document.body.getBoundingClientRect().right,
         paneRight: right(".pane-right"),
         queueClearRight: right("#queue-clear"),
         footerRight: right(".foot") ,
+        footerBottom: bottom(".foot"),
+        rail: scrollState(".rail-scroll"),
+        list: scrollState("#list"),
         railVisible: document.querySelector(".pane-right")
           ? getComputedStyle(document.querySelector(".pane-right")).display !== "none" : false,
         railMode: document.documentElement.classList.contains("rail"),
@@ -97,7 +127,7 @@ const PROBE = `
 </script>
 `;
 
-function startServer(onMetrics) {
+function startServer(onMetrics, fake) {
   const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/__metrics") {
       let body = "";
@@ -115,7 +145,7 @@ function startServer(onMetrics) {
     try { data = fs.readFileSync(target); } catch (e) { res.writeHead(404).end(); return; }
     if (rel === "popup/popup.html") {
       let html = data.toString("utf8");
-      html = html.replace("</head>", BROWSER_FAKE + "</head>");
+      html = html.replace("</head>", fake + "</head>");
       html = html.replace("</body>", PROBE + "</body>");
       data = Buffer.from(html, "utf8");
     }
@@ -138,13 +168,14 @@ function writeProfile(dir) {
   ].join("\n"), "utf8");
 }
 
-async function measure(width, height) {
+async function measure(width, height, rows) {
+  rows = rows || { items: 1, downloads: 1 };
   let server = null, child = null, profileDir = null;
   let resolveMetrics, rejectMetrics;
   const metrics = new Promise((res, rej) => { resolveMetrics = res; rejectMetrics = rej; });
   const timer = setTimeout(() => rejectMetrics(new Error("no metrics at " + width)), 90000);
   try {
-    server = await startServer(resolveMetrics);
+    server = await startServer(resolveMetrics, browserFake(rows.items, rows.downloads));
     profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "mc-win-"));
     writeProfile(profileDir);
     child = spawn(FIREFOX, ["--headless", "--no-remote", "--profile", profileDir,
@@ -186,6 +217,39 @@ test("the main window renders the rail without clipping anything", opts, async (
   // "Clear done" sat outside the old popup; it is the visible symptom.
   assert.ok(m.queueClearRight !== null && m.queueClearRight <= limit,
     "Clear done clipped: right edge " + m.queueClearRight + " > " + limit);
+});
+
+// Vertical is the same failure the width tests were written for, turned 90°.
+// .rail-scroll carried overflow-y:auto and its scrollbar styling but not the
+// `flex: 1; min-height: 0` that html.rail .list has, and a flex child will not
+// shrink below its content without it — so the rail GREW instead of scrolling,
+// stretched .pane-right, stretched the grid row, and pushed .foot past the
+// bottom of a body that is overflow:hidden. One missing declaration, two
+// reported symptoms: no scrollbar on the downloads list, and no footer.
+test("both panes scroll inside themselves and the footer stays visible", opts, async () => {
+  const m = await measure(WINDOW_WIDTH, WINDOW_HEIGHT, { items: 40, downloads: 40 });
+  const limit = m.viewportHeight + 1;
+
+  assert.ok(m.rail, ".rail-scroll must exist in rail mode");
+  assert.ok(m.rail.scrollHeight > m.rail.clientHeight,
+    "the downloads rail must scroll its overflow, not grow: scrollHeight " +
+    m.rail.scrollHeight + " vs clientHeight " + m.rail.clientHeight);
+  assert.ok(m.rail.bottom <= limit,
+    "the rail's own box grew past the window: bottom " + m.rail.bottom + " > " + limit);
+
+  assert.ok(m.list, "#list must exist");
+  assert.ok(m.list.scrollHeight > m.list.clientHeight,
+    "the media list must scroll its overflow: scrollHeight " +
+    m.list.scrollHeight + " vs clientHeight " + m.list.clientHeight);
+  assert.ok(m.list.bottom <= limit,
+    "the media list grew past the window: bottom " + m.list.bottom + " > " + limit);
+
+  // The symptom the user actually reported. body is overflow:hidden, so a
+  // footer pushed below the fold is not scrolled to — it is simply gone.
+  assert.ok(m.footerBottom !== null && m.footerBottom <= limit,
+    "the footer was pushed out of the window: bottom " + m.footerBottom + " > " + limit);
+  assert.ok(m.rootScrollHeight <= limit,
+    "the document grew past the window: scrollHeight " + m.rootScrollHeight + " > " + limit);
 });
 
 test("the document fills the window rather than a fixed width", opts, async () => {

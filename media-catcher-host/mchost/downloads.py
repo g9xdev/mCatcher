@@ -35,6 +35,9 @@ from ctypes import wintypes
 # functions — and it imports no mchost sibling, so there is no import-order or
 # stale-copy hazard to route around.
 from mchost import guard
+# Where BadApple is installed — a host-owned lookup, imported here so
+# handle_badapple never has a path of its own to fall back on.
+from mchost.tools import find_badapple
 
 
 def _h():
@@ -1032,6 +1035,69 @@ def handle_reveal(req):
                 subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
         except Exception as e:
             _h().send({"type": "error", "error": "reveal failed: %s" % e})
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def handle_badapple(req):
+    """Open a saved file in BadApple (popup "Open in BadApple" button).
+
+    Two halves, and only one of them comes from the extension.
+
+    THE FILE is caller-supplied, so it goes through the SAME guard.refuse_open
+    allowlist as `open` and `reveal`. Refusal precedes the stat for the same
+    reason it does there — a refused path is never probed for existence on the
+    caller's behalf.
+
+    That allowlist is deliberately NOT intersected with the narrower set of
+    suffixes BadApple itself accepts (.mp4 .mkv .avi .mov .webm .m4v .ts .wmv
+    .flv .iso). MEDIA_EXTS is the security boundary and it is a superset here
+    in every direction that matters: it admits no suffix BadApple's list would
+    have excluded on safety grounds, only ones BadApple has no use for
+    (subtitles, thumbnails, audio-only containers) and silently ignores. A
+    second suffix list maintained beside the first would be free to drift from
+    it, and a drift in the permissive direction is a hole. .iso is the one
+    entry BadApple takes that MEDIA_EXTS does not, and it stays out: this host
+    never produces one, so admitting it would widen the shell-facing allowlist
+    for a file the helper did not write.
+
+    THE PROGRAM is not caller-supplied at all. find_badapple reads a fixed
+    list compiled into the host; no field of `req` reaches the argv, and the
+    schema lists only `id` and `path` as fields this handler reads. An argv
+    list with shell=False is the same spawn discipline every other subprocess
+    here uses: nothing is parsed as a command line, so a path with a space or
+    a quote in it is one argument.
+
+    `--beam` is BadApple's own flag for this: a second launch hands the path
+    to the instance already running over its single-instance channel and
+    exits, so clicking the button twice does not open a second window.
+
+    On a worker, like handle_open and handle_reveal: the isfile() is a stat on
+    a caller-supplied path, and one on a dead network share blocks for as long
+    as the SMB timeout takes. Shares no state with any other handler.
+    """
+    def worker():
+        path = req.get("path")
+        refusal = guard.refuse_open(path)
+        if refusal:
+            _h().send({"type": "error", "id": req.get("id"), "error": refusal})
+            return
+        if not os.path.isfile(path):
+            _h().send({"type": "error", "id": req.get("id"),
+                       "error": "file not found: %s" % path})
+            return
+        app = find_badapple()
+        if not app:
+            # Named, so the popup can tell the user what is missing rather than
+            # showing a button that did nothing.
+            _h().send({"type": "error", "id": req.get("id"),
+                       "error": "BadApple is not installed on this computer."})
+            return
+        cf, si = _no_window()
+        try:
+            subprocess.Popen([app, "--beam", path], creationflags=cf, startupinfo=si)
+        except Exception as e:
+            _h().send({"type": "error", "id": req.get("id"),
+                       "error": "BadApple failed to start: %s" % e})
     threading.Thread(target=worker, daemon=True).start()
 
 

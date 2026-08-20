@@ -28,6 +28,42 @@ def downloads_dir():
     return d if os.path.isdir(d) else os.path.expanduser("~")
 
 
+# ---- BadApple ----
+#
+# The popup's third file action hands a finished download to BadApple, a
+# separate player. WHICH PROGRAM RUNS IS DECIDED HERE and nowhere else.
+#
+# The extension names the file; it never names the program. That split is the
+# whole security content of the feature: a command carrying an executable path
+# is not "open this video in a player", it is "run this", which is the sandbox
+# escape guard.refuse_open exists to close. So the candidates below are a fixed
+# list compiled into the host — not a setting, not a config key, not a field on
+# the message. Nothing the extension can write is read on this path.
+#
+# One candidate today: the per-user location BadApple's installer writes to.
+# Adding another means editing this list, which is the intended way to extend
+# it. test_boundary.py pins that a config file next to the host cannot answer
+# the question instead.
+def _badapple_candidates():
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if not local:
+        return []
+    return [os.path.join(local, "Programs", "BadApple", "BadApple.App.exe")]
+
+
+def find_badapple():
+    """The installed BadApple executable, or None if it is not installed.
+
+    Probed per call rather than cached at import (as FFMPEG is) so an install
+    that happens while Firefox is already up is picked up by the next
+    heartbeat, instead of staying "not installed" for the whole session.
+    """
+    for path in _badapple_candidates():
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 # The folder the updater watches, and the reason it is not Downloads.
 #
 # _install_updates matches candidate packages on a filename prefix and then

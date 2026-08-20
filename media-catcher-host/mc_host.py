@@ -32,12 +32,17 @@ Protocol (JSON, native-messaging framed: 4-byte native-endian length + payload)
       # ytdl legacy path; the ytdl structured (Save As) path still creates
       # missing components by handle on purpose -- see
       # guard.resolve_existing_dir.
+    {"cmd":"badapple","path":P}    # open a saved file in the BadApple player
+      # Same MEDIA_EXTS allowlist as "open". The message names the FILE only;
+      # the host locates BadApple itself (mchost.tools.find_badapple), so no
+      # field here can choose which program runs. Answers with an error frame
+      # when BadApple is not installed.
     {"cmd":"update","extDir":D,"zipDir":D?,"profileDir":D?}  # self-update from a packaged zip
     {"cmd":"watch","enable":bool,"extDir":D?,"zipDir":D?}    # auto-install when a package appears
     {"cmd":"checkGithub","auto":bool?,"extDir":D?,"zipDir":D?}  # pull the latest GitHub release
     {"cmd":"discard","id":N}       # delete temp file
   host -> extension:
-    {"type":"pong","ffmpeg":bool,"ffmpegPath":str,"version":str}
+    {"type":"pong","ffmpeg":bool,"ffmpegPath":str,"version":str,"badapple":bool}
     {"type":"started","id":N}
     {"type":"progress","id":N,"bytes":B,"seconds":S}
     {"type":"stopped","id":N,"file":path,"bytes":B,"seconds":S}
@@ -80,7 +85,7 @@ from mchost.nm import init_io, send, read_message   # noqa: E402,F401
 
 # ---- tool discovery: moved to mchost/tools.py (Task C1) ------------------
 from mchost.tools import (HERE, TMPDIR, FFMPEG, find_ffmpeg, downloads_dir,   # noqa: E402,F401
-                          sanitize, update_staging_dir)
+                          find_badapple, sanitize, update_staging_dir)
 
 
 # ---- self-update ----------------------------------------------------------
@@ -864,10 +869,11 @@ from mchost.downloads import (_no_window, find_encoder, _codec_args, _safe_kill,
                               transcode, _finalize_move, _ask_save_path, _ask_folder)
 
 
-# ---- save / save-as / pick-folder / open / reveal / discard ---------------
+# ---- save / save-as / pick-folder / open / reveal / badapple / discard -----
 # Moved to mchost/downloads.py (Task C3 part 1).
 from mchost.downloads import (handle_save, handle_save_as, handle_pick_folder,   # noqa: E402,F401
-                              handle_open, handle_reveal, handle_discard)
+                              handle_open, handle_reveal, handle_badapple,
+                              handle_discard)
 
 
 # ---- YouTube (and other sites) via yt-dlp + bgutil PO-token provider ------
@@ -979,6 +985,10 @@ def main():
                           "ytdlp": bool(_downloads.YTDLP), "ytdlpVersion": ytdlp_version_cached(),
                           "node": bool(_downloads.NODE), "deno": bool(_downloads.DENO), "pot": _pot_alive(),
                           "cast": True,  # DLNA casting is stdlib — always available
+                          # Probed per beat, not cached: installing BadApple
+                          # while Firefox is up must not need a restart before
+                          # the popup offers the button.
+                          "badapple": bool(find_badapple()),
                           "ytdlProtocol": 2})
                 elif cmd == "ytdl":
                     handle_ytdl(msg)
@@ -1004,6 +1014,8 @@ def main():
                     handle_open(msg)
                 elif cmd == "reveal":
                     handle_reveal(msg)
+                elif cmd == "badapple":
+                    handle_badapple(msg)
                 elif cmd == "update":
                     handle_update(msg)
                 elif cmd == "watch":

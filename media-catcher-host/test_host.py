@@ -635,6 +635,7 @@ LOOP_DISPATCH = {
     "pickFolder": ("worker", ("handle_pick_folder",)),
     "open": ("worker", ("handle_open",)),
     "reveal": ("worker", ("handle_reveal",)),
+    "badapple": ("worker", ("handle_badapple",)),
     "update": ("worker", ("handle_update",)),
     "watch": ("inline",
               "reads and rewrites the small config file, then arms an OS watcher"),
