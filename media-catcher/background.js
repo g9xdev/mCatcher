@@ -206,7 +206,9 @@ api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   if (r && Array.isArray(r.mcLogs)) {
     logRing = r.mcLogs.map(redactLogLine).concat(logRing).slice(-LOG_CAP);
   }
-  if (r && Array.isArray(r.mcEvents)) updateEvents = r.mcEvents.concat(updateEvents).slice(-EVENT_CAP);
+  if (r && Array.isArray(r.mcEvents)) {
+    updateEvents = r.mcEvents.map(redactEventDetail).concat(updateEvents).slice(-EVENT_CAP);
+  }
   _persistDiag();
 }).catch(() => {});
 
@@ -229,6 +231,19 @@ function redactLogLine(line) {
   return line;
 }
 
+// Update events ride the same persisted write and the same Copy button: they go
+// to storage.local beside mcLogs and come back out of get-update-report. Their
+// free-text field gets the projection msg gets, for the same reason. Every
+// detail updates.py emits today is a literal English string; this is what
+// catches the first one that carries a signed URL. Non-string details project
+// to "" rather than passing through, and an event without a detail keeps none.
+function redactEventDetail(ev) {
+  if (ev && typeof ev === "object" && Object.prototype.hasOwnProperty.call(ev, "detail")) {
+    ev.detail = self.McPrivacy.redactLogText(ev.detail);
+  }
+  return ev;
+}
+
 function pushLog(line) {
   redactLogLine(line);
   logRing.push(line);
@@ -246,6 +261,7 @@ function mclog(level, msg) {
 
 function recordEvent(ev) {
   if (!ev) return;
+  redactEventDetail(ev);
   updateEvents.push(ev);
   if (updateEvents.length > EVENT_CAP) updateEvents = updateEvents.slice(-EVENT_CAP);
   broadcast({ type: "update-event", event: ev });

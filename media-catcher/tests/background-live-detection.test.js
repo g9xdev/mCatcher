@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { mediaCatcherRoot } = require("./harness/load-lib.js");
+const McPrivacy = require(path.join(mediaCatcherRoot, "lib", "privacy.js"));
 
 function event() {
   const listeners = [];
@@ -1054,6 +1055,58 @@ test("the diagnostics ring never keeps a URL's userinfo, query or fragment", asy
   );
   assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_TOKEN"), false);
   assert.equal(JSON.stringify(h.broadcasts).includes("SECRET_SIG"), false);
+});
+
+test("an update event's detail is redacted before it is persisted or copied", async () => {
+  const h = createHarness();
+  await settle();
+  // get-update-report asks the helper for a fresh report; answer it inline so
+  // the handler resolves and the copied payload can be inspected whole.
+  h.nativePort.postMessage = (message) => {
+    if (message && message.cmd === "getReport") {
+      h.nativePort.onMessage.emit({ type: "report", reqId: message.reqId, ok: true });
+    }
+  };
+
+  // Every updates.py detail is a literal English string today. Nothing catches
+  // the first one that is not, because recordEvent skipped the projection
+  // pushLog applies while _persistDiag writes mcEvents beside mcLogs.
+  h.nativePort.onMessage.emit({
+    type: "update-event",
+    event: {
+      ts: 1,
+      kind: "update-failed",
+      detail: "download failed: https://cdn.example/mc.zip?Signature=SECRET_EVENT_SIG#f",
+    },
+  });
+  await settle();
+
+  const report = await h.send({ type: "get-update-report" });
+  assert.equal(
+    report.events[report.events.length - 1].detail,
+    "download failed: https://cdn.example/mc.zip"
+  );
+  McPrivacy.assertNoSentinels(JSON.stringify(report), ["SECRET_EVENT_SIG"]);
+  McPrivacy.assertNoSentinels(JSON.stringify(h.broadcasts), ["SECRET_EVENT_SIG"]);
+});
+
+test("events restored from storage are redacted before they can be read back", async () => {
+  const h = createHarness({
+    mcEvents: [{
+      ts: 1,
+      kind: "update-failed",
+      detail: "download failed: https://cdn.example/mc.zip?Signature=SECRET_EVENT_SIG",
+    }],
+  });
+  await settle();
+  h.nativePort.postMessage = (message) => {
+    if (message && message.cmd === "getReport") {
+      h.nativePort.onMessage.emit({ type: "report", reqId: message.reqId, ok: true });
+    }
+  };
+  const report = await h.send({ type: "get-update-report" });
+  assert.equal(report.events[0].detail, "download failed: https://cdn.example/mc.zip");
+  McPrivacy.assertNoSentinels(JSON.stringify(report), ["SECRET_EVENT_SIG"]);
 });
 
 test("a ring restored from storage is redacted before it can be read back", async () => {
