@@ -5513,8 +5513,16 @@ def handle_pget(req):
                 return
 
             if final_path is None:
-                # Already finished and unregistered while the probe ran; the
-                # terminal frame has been sent and finish() is inert now.
+                # DEFENSIVE, and unreachable as this ships. _pget_claim_dest
+                # returns None only when the registry no longer points at this
+                # op, and nothing takes it away underneath a worker that has
+                # not finished: _pget_cancel sets flags and never unregisters,
+                # _pget_register refuses a second op on a live id, and the only
+                # unregister on this path is finish()'s -- which every caller
+                # returns from immediately. Kept because "claimed a path that
+                # no unregister will ever release" is the failure it prevents,
+                # and the guard costs one comparison. finish() is idempotent,
+                # so if the route ever opens the terminal is still exactly one.
                 finish("cancelled", "cancelled", "empty")
                 return
 
@@ -5823,7 +5831,8 @@ def handle_pget_single(req):
                 return
 
             if final_path is None:
-                # Already finished and unregistered; finish() is inert now.
+                # Defensive and unreachable today, exactly as on handle_pget's
+                # path: nothing unregisters a live op behind its own worker.
                 finish("cancelled", "cancelled", "empty")
                 return
 
