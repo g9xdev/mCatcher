@@ -1144,17 +1144,23 @@
     //     player.)
     //
     // WHAT IT COSTS A FRAME WITH NO VIDEO: no timers of its own, no observer
-    // of its own, no per-frame loop. It re-checks on the media events and DOM
-    // mutations content.js already listens for, at most once per
-    // BEAM_DEEP_MS, and sweeps for shadow roots at most once per
-    // BEAM_SHADOW_MS with a hard cap on elements examined.
+    // of its own, no per-frame loop. It rides content.js's existing
+    // MutationObserver and document listeners. Mutations arrive in storms and
+    // are throttled to one re-check per BEAM_DEEP_MS; a media event is NOT
+    // throttled, because it is the moment the answer changed and a storm of
+    // them is a page choosing to burn its own CPU. The sweep for shadow roots
+    // runs at most once per BEAM_SHADOW_MS with a hard cap on elements
+    // examined, whichever path asked for it.
     //
-    // WHAT IT CANNOT SEE: a video inside a CLOSED shadow root. There is no
-    // API that reaches one, so those get no icon and this makes no claim to
-    // cover them.
+    // WHAT IT CAN SEE INSIDE A SHADOW ROOT: an open one always, and a CLOSED
+    // one only where the browser hands content scripts
+    // Element.openOrClosedShadowRoot (Firefox's WebExtension-only accessor).
+    // That is feature-detected, never assumed: where it is absent, a video in
+    // a closed root gets no icon and this claims nothing more.
     // =====================================================================
 
     var beamOverlays = new Map();     // video element -> record
+    var beamContainers = new Set();   // the containers, by identity
     var beamRootsCache = null;
     var beamShadowAt = 0;
     var beamDeepAt = 0;
@@ -1174,6 +1180,9 @@
       "background:rgba(16,16,20,.66);border:1px solid rgba(255,255,255,.34);",
       "backdrop-filter:blur(2px)}",
       "button:hover{background:rgba(16,16,20,.9)}",
+      // `all:unset` above takes the focus ring with it, and the button is
+      // still reachable by keyboard.
+      "button:focus-visible{outline:2px solid #7dd3fc;outline-offset:2px}",
       // The AirPlay mark: a screen with a triangle pointing up into it.
       "span[data-p=s]{position:absolute;left:21%;top:23%;width:58%;height:36%;",
       "border:2px solid #fff;border-radius:2px}",
@@ -1231,11 +1240,35 @@
       return null;
     }
 
-    // Every root a <video> could be queried from: the document, plus the OPEN
-    // shadow roots reachable from it. Closed roots are not reachable and that
-    // includes this overlay's own containers, which is why the sweep never
-    // finds them. Capped and cached: an uncapped walk of a large page on every
-    // mutation is exactly the cost this lane is not allowed to have.
+    // One element's shadow root, if this browser will give it to us.
+    //
+    // `.shadowRoot` answers for an OPEN root and null for a closed one.
+    // Firefox additionally gives content scripts openOrClosedShadowRoot(),
+    // which answers for both -- real players do use closed roots, and without
+    // it they would silently get no icon. Feature-detected and wrapped: a
+    // browser without it lands on `.shadowRoot` and loses only the closed
+    // ones.
+    function beamShadowOf(el) {
+      try {
+        if (typeof el.openOrClosedShadowRoot === "function") {
+          var either = el.openOrClosedShadowRoot();
+          if (either) return either;
+        }
+      } catch (e) {}
+      try {
+        return el.shadowRoot || null;
+      } catch (e2) {
+        return null;
+      }
+    }
+
+    // Every root a <video> could be queried from: the document, plus the
+    // shadow roots reachable from it. This overlay's OWN containers are
+    // skipped by identity -- with openOrClosedShadowRoot available their
+    // closed roots are reachable too, and descending into one would find
+    // nothing and spend budget. Capped and cached: an uncapped walk of a large
+    // page on every mutation is exactly the cost this lane is not allowed to
+    // have.
     function beamSearchRoots(now) {
       if (beamRootsCache && (now - beamShadowAt) < BEAM_SHADOW_MS) return beamRootsCache;
       beamShadowAt = now;
@@ -1247,8 +1280,8 @@
         var all = qsa(current, "*");
         for (var i = 0; i < all.length && budget > 0; i++) {
           budget -= 1;
-          var shadow = null;
-          try { shadow = all[i].shadowRoot; } catch (e) { shadow = null; }
+          if (beamContainers.has(all[i])) continue;
+          var shadow = beamShadowOf(all[i]);
           if (shadow) { roots.push(shadow); queue.push(shadow); }
         }
       }
@@ -1299,6 +1332,12 @@
         return null;
       }
     }
+
+    // Everything a click is made of, taken off the page's hands. Stopping only
+    // `click` would still leave a player that acts on mousedown (many do) to
+    // pause the video under the icon.
+    var BEAM_SWALLOWED = ["mousedown", "mouseup", "pointerdown", "pointerup",
+                          "touchstart", "touchend", "dblclick", "contextmenu"];
 
     function beamSwallow(e) {
       try { if (e && typeof e.stopPropagation === "function") e.stopPropagation(); } catch (e1) {}
@@ -1421,6 +1460,7 @@
           }
         }
         beamOverlays.set(video, rec);
+        beamContainers.add(container);
         return rec;
       } catch (e2) {
         try { if (typeof container.remove === "function") container.remove(); } catch (e3) {}
@@ -1428,13 +1468,11 @@
       }
     }
 
-    var BEAM_SWALLOWED = ["mousedown", "mouseup", "pointerdown", "pointerup",
-                          "touchstart", "touchend", "dblclick", "contextmenu"];
-
     function beamDetach(video) {
       var rec = beamOverlays.get(video);
       if (!rec) return;
       beamOverlays["delete"](video);
+      beamContainers["delete"](rec.container);
       if (beamLastRecord === rec) beamLastRecord = null;
       try {
         if (rec.container && typeof rec.container.remove === "function") rec.container.remove();
@@ -1451,13 +1489,16 @@
 
     // Every property here is one a page rule could otherwise take back, which
     // is why they are all set inline and all !important rather than left to a
-    // stylesheet that page CSS outranks somewhere.
-    function beamPaint(rec, at, parent) {
+    // stylesheet that page CSS outranks somewhere. `deep` re-asserts the whole
+    // set rather than only the position: inline !important beats a stylesheet,
+    // but it does not survive a script that clears the style attribute, and
+    // re-writing twenty properties a few times a second costs nothing.
+    function beamPaint(rec, at, parent, deep) {
       var container = rec.container;
       if (parent && container.parentNode !== parent) {
         try { parent.appendChild(container); rec.parent = parent; } catch (e) { return false; }
       }
-      if (rec.left === at.left && rec.top === at.top && rec.painted) return true;
+      if (!deep && rec.left === at.left && rec.top === at.top && rec.painted) return true;
       rec.left = at.left;
       rec.top = at.top;
       rec.painted = true;
@@ -1517,7 +1558,7 @@
           var rec = beamOverlays.get(video) || beamAttach(video);
           if (!rec) continue;
           rec.style = style;
-          if (!beamPaint(rec, at, parent)) beamDetach(video);
+          if (!beamPaint(rec, at, parent, true)) beamDetach(video);
         }
       } else {
         var drop = [];

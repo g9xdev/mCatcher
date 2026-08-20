@@ -959,6 +959,20 @@ test("a host refusal for a beam reaches the frame that asked for it", async () =
     "and is still on the record in the log console");
 });
 
+// The beam is a NEW place a media address enters the log ring, and the ring is
+// persisted and copyable. It goes through the same projection every other
+// logged address does, so the signed query does not travel with it.
+test("the beam's log line keeps no signed query", async () => {
+  const h = await readyHarness();
+  await beam(h, "https://cdn.example/live/master.m3u8?token=SIGNED_SENTINEL", beamSender(7));
+
+  const lines = h.runtimeMessages.filter((m) => m && m.type === "log-line");
+  const beamLine = lines.filter((m) => /beam/i.test(String(m.line.msg))).pop();
+  assert.ok(beamLine, "a beam is worth a log line — a click that did nothing needs one");
+  assert.equal(String(beamLine.line.msg).includes("SIGNED_SENTINEL"), false,
+    "the token that authorises the stream is not diagnostic information");
+});
+
 test("a beam a second refusal cannot name twice is forgotten", async () => {
   const h = await readyHarness();
   await beam(h, "https://cdn.example/a.mp4", beamSender(7));

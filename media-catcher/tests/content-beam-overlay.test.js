@@ -468,6 +468,61 @@ test("a video inside an open shadow root is reached", async () => {
   assert.equal(containers(root).length, 1, "shadow DOM is where real players live");
 });
 
+test("a CLOSED shadow root is reached only through the accessor the browser offers", async () => {
+  // element.shadowRoot is null for a closed root. Firefox hands content
+  // scripts openOrClosedShadowRoot(), which is the only way in; without it a
+  // closed player is genuinely invisible and gets no icon.
+  const sealed = makeRoot();
+  const sealedHost = sealed.document.createElement("media-player");
+  sealed.document.body.appendChild(sealedHost);
+  sealedHost.attachShadow({ mode: "closed" }).appendChild(makeVideo(sealed));
+  await installed(sealed);
+  assert.equal(sealedHost.shadowRoot, null, "closed really is closed");
+  assert.equal(containers(sealed).length, 0,
+    "no accessor, no icon — and no pretence of one");
+
+  const open = makeRoot();
+  const host = open.document.createElement("media-player");
+  open.document.body.appendChild(host);
+  const shadow = host.attachShadow({ mode: "closed" });
+  shadow.appendChild(makeVideo(open));
+  host.openOrClosedShadowRoot = () => shadow;
+  await installed(open);
+  assert.equal(containers(open).length, 1, "with the accessor, the player is found");
+});
+
+test("the sweep never descends into the overlay's own closed root", async () => {
+  const root = makeRoot();
+  const decoy = root.document.createElement("some-widget");
+  root.document.body.appendChild(decoy);
+  root.document.body.appendChild(makeVideo(root));
+  await installed(root);
+  const container = containers(root)[0];
+
+  // With openOrClosedShadowRoot present, our OWN container's closed root is
+  // reachable too. Descending into it would be a walk that finds nothing and
+  // spends the sweep's budget on it.
+  let peekedOverlay = 0;
+  let peekedDecoy = 0;
+  container.openOrClosedShadowRoot = () => { peekedOverlay += 1; return container._closedShadow; };
+  decoy.openOrClosedShadowRoot = () => { peekedDecoy += 1; return null; };
+
+  // The root list is cached; step past that window so a real sweep runs,
+  // otherwise this test would be satisfied by the cache rather than the skip.
+  const realNow = Date.now;
+  Date.now = () => realNow() + 60000;
+  try {
+    root.document._fire("playing", { target: root.document.querySelector("video") });
+    root._pumpFrames(2);
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.ok(peekedDecoy >= 1, "a sweep really did run");
+  assert.equal(peekedOverlay, 0, "the overlay is skipped by identity, not by luck");
+  assert.equal(containers(root).length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // Not breaking the page
 // ---------------------------------------------------------------------------
