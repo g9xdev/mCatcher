@@ -775,3 +775,76 @@ test("clear then URL reuse never inherits the previous row's size", async () => 
   assert.equal(direct.length, 1);
   assert.equal(direct[0].sizeBytes, undefined, "a reused URL must not inherit a stale size");
 });
+
+test("a subframe DOM claim never suppresses another frame's report of the same file", async () => {
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const tabId = 7;
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const domReport = (sender, name, origin) => ({
+    type: "content-media",
+    item: { url: mediaUrl, kind: "direct", name, source: "dom" },
+    referrerUrl: sender.url,
+    frameOrigin: origin,
+    snapshot: Object.assign({}, pageSnapshot(), {
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      pageUrl: sender.url,
+      candidates: [{ kind: "visible-filename", value: name }],
+    }),
+  });
+
+  const h = createHarness();
+  await settle();
+
+  // content_scripts runs in all_frames, so a third-party ad iframe can report
+  // the honest page's media URL first and claim the row's name.
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+  await h.send(domReport(adFrame, "Free-iPhone.mp4", "https://ads.example"), adFrame);
+  assert.equal(h.captureDomMedia.length, 1);
+
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  await h.send(domReport(topFrame, "Movie Night.mp4", "https://site.example"), topFrame);
+  assert.equal(
+    h.captureDomMedia.length,
+    2,
+    "the honest frame must get its own detection, named from its own snapshot"
+  );
+  assert.equal(h.captureDomMedia[1].frameOrigin, "https://site.example");
+  assert.equal(h.captureDomMedia[1].snapshot.frameId, 0);
+
+  // A frame that repeats its own report still gets exactly one detection.
+  await h.send(domReport(topFrame, "Movie Night.mp4", "https://site.example"), topFrame);
+  await h.send(domReport(adFrame, "Free-iPhone.mp4", "https://ads.example"), adFrame);
+  assert.equal(h.captureDomMedia.length, 2, "same-frame repeats stay deduplicated");
+});
+
+test("a network claim is reused by a DOM report from any frame", async () => {
+  const mediaUrl = "https://cdn.example/movie.mp4";
+  const h = createHarness();
+  await settle();
+  emitNetwork(h, 7, mediaUrl, "video/mp4", "doc-7");
+  await eventually(() => h.captureNetwork.length === 1, "network direct promotion");
+
+  for (const frameId of [0, 2, 9]) {
+    const sender = {
+      tab: { id: 7, url: "https://site.example/watch" },
+      frameId,
+      documentId: "doc-" + frameId,
+      url: "https://frame.example/player",
+    };
+    await h.send({
+      type: "content-media",
+      item: { url: mediaUrl, kind: "direct", name: "movie.mp4", source: "dom" },
+      referrerUrl: sender.url,
+      frameOrigin: "https://frame.example",
+      snapshot: Object.assign({}, pageSnapshot(), { frameId }),
+    }, sender);
+  }
+  assert.equal(h.captureDomMedia.length, 0, "the network lane owns the file for every frame");
+  assert.equal(h.captureNetwork.length, 1);
+});

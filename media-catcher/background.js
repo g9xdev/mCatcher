@@ -259,7 +259,15 @@ const liveNetworkEvidence = new WeakMap();
 const liveControllerTabs = new Set();
 const liveControllerMediaIds = new Map();
 const livePromotedKeys = new Map();
+// tabId -> canonical direct source key -> the set of claimants for that
+// source. A DOM claimant is the reporting frame's frameId; NETWORK_CLAIM
+// stands for the network lane, which is not frame-attributable.
 const liveDirectSourceKeys = new Map();
+// The network lane's claimant. content_scripts runs in all_frames, so a DOM
+// claim is only ever reused by the frame that made it — otherwise an ad iframe
+// that reports the top page's media URL first would name the row the user then
+// sees for the honest video.
+const NETWORK_CLAIM = null;
 // tabId -> canonical direct source key -> the opaque media ID that owns it.
 // Late evidence for an owned source enriches that row instead of minting a
 // second one. Session-only; cleared with the rest of a tab's ownership.
@@ -1226,6 +1234,21 @@ function hasLiveDirectSource(tabId, url) {
   return !!keys && keys.has(directSourceKey(url));
 }
 
+// The frameId a content-script message is attributed to. Absent/hostile frame
+// ids collapse to the top frame rather than minting an unbounded claimant.
+function senderFrameKey(sender) {
+  return Number.isInteger(sender && sender.frameId) ? sender.frameId : 0;
+}
+
+// True when this frame may reuse an existing claim on the source: its own
+// earlier DOM claim, or any network claim.
+function domSourceAlreadyClaimed(tabId, url, frameKey) {
+  const keys = liveDirectSourceKeys.get(tabId);
+  const claimants = keys && keys.get(directSourceKey(url));
+  if (!claimants) return false;
+  return claimants.has(NETWORK_CLAIM) || claimants.has(frameKey);
+}
+
 // The opaque media ID that already owns this exact direct source, if any.
 function getLiveDirectOwner(tabId, url) {
   const bySource = liveDirectMediaOwners.get(tabId);
@@ -1274,9 +1297,10 @@ function forgetLiveSizesForTab(tabId) {
 }
 
 // Network and DOM are independent evidence producers for the same direct file.
-// Claim their shared tab-scoped identity at ingress so the controller receives
-// one source, while different directGroupKey values remain separate media.
-function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
+// Claim their shared identity at ingress so the controller receives one source,
+// while different directGroupKey values remain separate media. `claimant` says
+// who claimed: a reporting frame's frameId, or NETWORK_CLAIM.
+function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey, claimant) {
   liveControllerTabs.add(tabId);
   const ids = liveControllerMediaIds.get(tabId) || new Set();
   ids.add(mediaId);
@@ -1287,11 +1311,13 @@ function claimLiveMediaKey(tabId, key, mediaId, directUrls, claimGroupKey) {
     livePromotedKeys.set(tabId, keys);
   }
   if (Array.isArray(directUrls) && directUrls.length) {
-    const sources = liveDirectSourceKeys.get(tabId) || new Set();
+    const sources = liveDirectSourceKeys.get(tabId) || new Map();
     const owners = liveDirectMediaOwners.get(tabId) || new Map();
     for (const url of directUrls) {
       const sourceKey = directSourceKey(url);
-      sources.add(sourceKey);
+      const claimants = sources.get(sourceKey) || new Set();
+      claimants.add(claimant === undefined ? NETWORK_CLAIM : claimant);
+      sources.set(sourceKey, claimants);
       owners.set(sourceKey, mediaId);
     }
     liveDirectSourceKeys.set(tabId, sources);
@@ -1455,7 +1481,8 @@ async function promoteLiveNetworkItem(tabId, key, item, variants, probeSizeMetad
     key,
     mediaId,
     item.kind === "direct" ? (item.mirrors || [item.url]) : null,
-    true
+    true,
+    NETWORK_CLAIM
   );
   // Trusted probe/header totals first; a bitrate estimate only fills the gap
   // when nothing exact is known for this row.
@@ -3429,7 +3456,8 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (item && item.kind === "direct" && msg.snapshot && liveController) {
             const mediaUrl = item.url;
             const key = directGroupKey(mediaUrl);
-            if (!hasLiveDirectSource(sender.tab.id, mediaUrl)) {
+            const frameKey = senderFrameKey(sender);
+            if (!domSourceAlreadyClaimed(sender.tab.id, mediaUrl, frameKey)) {
               let mediaOrigin = "";
               try { mediaOrigin = new URL(mediaUrl).origin; } catch (e) {}
               const mediaId = liveController.captureDomMedia({
@@ -3445,7 +3473,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               // DOM owns only this exact canonical media URL. The broader
               // directGroupKey is a network mirror policy and must not collapse
               // distinct query-addressed DOM media.
-              claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false);
+              claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false, frameKey);
             }
           } else {
             item.name = item.name || shortName(item.url);
