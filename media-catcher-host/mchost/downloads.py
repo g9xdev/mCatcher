@@ -3781,13 +3781,17 @@ def _ytdl_refusal_frame(jid, op):
     """The terminal frame for a legacy job _pget_register turned away.
 
     "dest" is the retry-of-a-wedge case, where the id really is new and saying
-    otherwise would point the reader at the wrong thing.
+    otherwise would point the reader at the wrong thing. Nor does it clear
+    itself: the whole reason that claim outlives the cancel is that the worker
+    holding it cannot be unwound. Cancelling reaches a live child and frees it;
+    a wedge with no live child is held until the helper restarts. The message
+    names both, in that order, and promises neither on its own.
     """
     if op.get("refused") == "dest":
         return {"type": "ytdl-error", "id": jid, "reason": "busy",
                 "error": "Another download is still writing that video's file. "
-                         "It will free up on its own, or restart the helper "
-                         "to clear it."}
+                         "Cancelling that download may release it; if it "
+                         "doesn't, restarting the helper will."}
     return {"type": "ytdl-error", "id": jid, "reason": "spawn",
             "error": "Download id already in use."}
 
