@@ -4011,3 +4011,61 @@ def test_multi_range_cancel_is_prompt_while_a_segment_is_stalled(tmp_path, monke
     finally:
         hold.set()
         shutdown_server(httpd)
+
+
+def test_two_jobs_deriving_one_name_do_not_share_final_path(tmp_path, monkeypatch):
+    """Two concurrent pgets that derive the same filename get two paths.
+
+    _dedup only skips names that already EXIST on disk, and a pget's final
+    path is not created until os.replace at the very end. Two workers
+    resolving in that window therefore agree on one string -- one .part, one
+    set of segment files and one os.replace target -- so the second job
+    overwrites the first job's file and the user silently loses a download.
+    """
+    import mchost.downloads as d
+
+    sent = []
+    monkeypatch.setattr(mc, "send", lambda msg: sent.append(dict(msg)))
+    hold = threading.Event()
+    httpd, _state = run_server("range", hold=hold)
+    paths = {}
+
+    def results():
+        return [m for m in sent if m.get("type") == "pget-result"]
+
+    try:
+        url = server_url(httpd)
+        for jid in ("dupA", "dupB"):
+            mc.handle_pget({
+                "id": jid,
+                "attemptToken": "atk-" + jid,
+                "urls": [url],
+                "name": "clip.mp4",
+                "dir": str(tmp_path),
+                "maxConnections": 2,
+                "referer": "",
+                "userAgent": "t",
+            })
+
+        def resolved(jid):
+            return (d._PGET.get(jid) or {}).get("final_path")
+
+        assert wait_for(lambda: resolved("dupA") and resolved("dupB"),
+                        timeout=5.0), "both jobs never reached a final path"
+        paths["a"] = resolved("dupA")
+        paths["b"] = resolved("dupB")
+    finally:
+        hold.set()
+        wait_for(lambda: len(results()) == 2, timeout=15.0)
+        shutdown_server(httpd)
+
+    assert paths["a"] != paths["b"], "both jobs resolved %r" % (paths["a"],)
+
+    res = {m["id"]: m for m in results()}
+    assert set(res) == {"dupA", "dupB"}
+    for jid in ("dupA", "dupB"):
+        assert res[jid]["status"] == "completed", res[jid]
+        assert res[jid]["partState"] == "committed"
+    assert sorted(leftovers(tmp_path)) == ["clip (1).mp4", "clip.mp4"]
+    for name in ("clip.mp4", "clip (1).mp4"):
+        assert (tmp_path / name).read_bytes() == DEFAULT_PAYLOAD

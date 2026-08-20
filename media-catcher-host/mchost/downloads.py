@@ -280,10 +280,17 @@ def handle_snapshot(req):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _dedup(dest):
+def _dedup(dest, taken=None):
+    """The first "<name> (n)<ext>" nobody else has.
+
+    `taken` is a second, caller-supplied answer to "is this one spoken for" —
+    os.path.exists only knows about files that are already THERE, and a
+    download's final path is not created until the very end (_pget_claim_dest).
+    Omitted, this is the plain existence check every other caller wants.
+    """
     root, ext = os.path.splitext(dest)
     n = 1
-    while os.path.exists(dest):
+    while os.path.exists(dest) or (taken is not None and taken(dest)):
         dest = "%s (%d)%s" % (root, n, ext)
         n += 1
     return dest
@@ -4252,11 +4259,21 @@ def _handle_ytdl_legacy(req):
 # outcomes are structured pget-result messages (never browser handoff).
 _PGET = {}  # id -> operation dict (stop Event, cancel flag, optional yt-dlp proc)
 # Second index over the same entries: output-path claim -> the op holding it,
-# for ops that set a "dest" (see _ytdl_dest_key). Registering by id alone is
-# not enough on the legacy yt-dlp path, where a retry mints a FRESH id and the
-# output template is deterministic, so two writers can reach one file. Both
-# maps are written under _PGET_LOCK inside _pget_register/_pget_unregister and
-# nowhere else, so an entry is never in one and not the other.
+# for ops that set a "dest". Registering by id alone is not enough on the
+# legacy yt-dlp path, where a retry mints a FRESH id and the output template is
+# deterministic, so two writers can reach one file; nor on pget, where two jobs
+# with different ids can derive the same filename and _dedup cannot tell them
+# apart because neither has created the file yet.
+#
+# TWO KEY SPACES, which cannot collide because a tuple never equals a str:
+#   (normcase(outtmpl), url)  - legacy yt-dlp (_ytdl_dest_key), claimed at
+#                               registration, because yt-dlp does not produce a
+#                               concrete path until it has opened the file.
+#   normcase(final_path)      - pget (_pget_claim_dest), claimed later, when
+#                               the worker resolves its concrete path.
+# Both maps are written under _PGET_LOCK inside _pget_register /
+# _pget_claim_dest / _pget_unregister and nowhere else, and every claim is
+# released by the same _pget_drop_locked.
 _PGET_DEST = {}
 _PGET_LOCK = threading.Lock()  # short CAS only: register / lookup / unregister
 _PGET_MAX_CONN = 6
@@ -4963,6 +4980,9 @@ def _pget_register(jid, op):
     caller that reported "id already in use" for a freshly minted id would send
     whoever reads it after the wrong thing. Looking it up afterwards instead
     would be a second, unlocked read.
+
+    Only ops that already KNOW their path claim it here. pget does not: it
+    resolves one inside its worker, and claims it then (_pget_claim_dest).
     """
     dest = op.get("dest") if isinstance(op, dict) else None
     with _PGET_LOCK:
@@ -4977,6 +4997,43 @@ def _pget_register(jid, op):
         if dest is not None:
             _PGET_DEST[dest] = op
         return True
+
+
+def _pget_claim_dest(jid, op, dest):
+    """Resolve `dest` to a path no live job holds, and claim it for `op`.
+
+    _dedup on its own answers "does this file exist yet", and for a pget the
+    answer stays no until os.replace at the very end of the job. Two workers
+    that derive the same filename in that window therefore agree on one
+    string, and with it one .part, one set of segment files and one replace
+    target: the second job overwrites the first job's file and the user
+    silently loses a download. The registry is the other half of the question,
+    so a path a live op already claimed is taken exactly as an existing file
+    is, and the second job lands on "clip (1).mp4".
+
+    Deduping rather than refusing is the difference from the legacy yt-dlp
+    claim, and it is because the two are answering different questions. There,
+    the claim IS the identity of the job (same video, same folder, same
+    template) so a second one is a duplicate and is turned away. Here two jobs
+    that merely derived one name are two different downloads the user asked
+    for, and they can both have what they asked for under two names.
+
+    Returns the claimed path, or None when this op is no longer the registered
+    owner of `jid`: a job already finished has nothing left to claim, and
+    claiming would leave an entry no unregister will ever drop.
+
+    The dedup loop runs under _PGET_LOCK because the check and the claim have
+    to be one step; that puts a handful of stats inside the registry lock,
+    which is the price of the window not existing.
+    """
+    with _PGET_LOCK:
+        if _PGET.get(jid) is not op:
+            return None
+        path = _dedup(dest, taken=lambda p: os.path.normcase(p) in _PGET_DEST)
+        key = os.path.normcase(path)
+        op["dest"] = key
+        _PGET_DEST[key] = op
+        return path
 
 
 def _pget_kill_off_loop(proc, kill_children):
@@ -5351,13 +5408,22 @@ def handle_pget(req):
                 # No makedirs: resolve_existing_dir already required the
                 # destination to exist, so nothing on THIS path builds a
                 # tree (the structured ytdl lease still does, by design).
-                final_path = _dedup(os.path.join(out_dir, name))
+                # Claimed, not merely deduped: the path is not created until
+                # os.replace, so a concurrent job would otherwise resolve the
+                # same one (_pget_claim_dest).
+                final_path = _pget_claim_dest(jid, op, os.path.join(out_dir, name))
                 op["final_path"] = final_path
             except Exception:
                 if op.get("cancel_requested") or stop.is_set():
                     finish("cancelled", "cancelled", "empty")
                 else:
                     finish("failed", "local_io", "empty")
+                return
+
+            if final_path is None:
+                # Already finished and unregistered while the probe ran; the
+                # terminal frame has been sent and finish() is inert now.
+                finish("cancelled", "cancelled", "empty")
                 return
 
             if op.get("cancel_requested") or stop.is_set():
@@ -5653,7 +5719,8 @@ def handle_pget_single(req):
                 # No makedirs: resolve_existing_dir already required the
                 # destination to exist, so nothing on THIS path builds a
                 # tree (the structured ytdl lease still does, by design).
-                final_path = _dedup(os.path.join(out_dir, name))
+                # Claimed, not merely deduped: same window as handle_pget's.
+                final_path = _pget_claim_dest(jid, op, os.path.join(out_dir, name))
                 op["final_path"] = final_path
                 op["n"] = n
             except Exception:
@@ -5661,6 +5728,11 @@ def handle_pget_single(req):
                     finish("cancelled", "cancelled", "empty")
                 else:
                     finish("failed", "local_io", "empty")
+                return
+
+            if final_path is None:
+                # Already finished and unregistered; finish() is inert now.
+                finish("cancelled", "cancelled", "empty")
                 return
 
             if op.get("cancel_requested") or stop.is_set():
