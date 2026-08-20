@@ -1010,15 +1010,57 @@ function onLegacyNativeMessage(msg) {
   }
 }
 
+// Reject C0, DEL and C1 controls in a value that becomes an HTTP header. Same
+// rule as the message router's isSafeHttpContextString; this lane never enters
+// the router, whose export surface is deliberately three functions wide.
+function isSafeHttpContextString(v) {
+  return typeof v === "string" && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+}
+
+// A URL the helper may open. Mirrors the router's isAbsoluteHttpUrl, which
+// gates the pget lanes: nonblank, trim-stable, control-free, absolute http(s)
+// by both scheme text and parse.
+function isAbsoluteHttpUrl(v) {
+  if (typeof v !== "string" || v.trim().length === 0) return false;
+  if (v.trim() !== v || !isSafeHttpContextString(v)) return false;
+  if (!/^https?:\/\//i.test(v)) return false;
+  try {
+    const parsed = new URL(v);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (e) {
+    return false;
+  }
+}
+
+// The record lane is a raw postMessage — it never passes through the message
+// router, so the router's URL gate never sees it. It needs one of its own more
+// than the other lanes do: its URLs come from the body of a fetched manifest
+// rather than from webRequest or a gated content script, and an absolute URI
+// in a playlist resolves to itself, so a page can name any scheme it likes.
+// ffmpeg opens file://host/share as a UNC path, which is an outbound SMB
+// handshake carrying the user's NTLM credentials.
+//
+// Refusal throws: recordLiveHls's catch turns that into a failed row with a
+// reason on it, which is what the user needs to see. Silently recording
+// nothing, or dropping just the audio track, would leave the row waiting for
+// a stream that is never coming.
 function nativeRecord(dl, tabId, videoUrl, audioUrl) {
   const hdr = resolveHeaders(tabId);
+  const video = mediaKey(videoUrl);              // drop stale _HLS_msn, keep session
+  const audio = audioUrl ? mediaKey(audioUrl) : null;
+  if (!isAbsoluteHttpUrl(video) || (audio !== null && !isAbsoluteHttpUrl(audio))) {
+    throw new Error("Refused to record: the stream URL is not http(s).");
+  }
   nativePort.postMessage({
     cmd: "record",
     id: dl.id,
-    videoUrl: mediaKey(videoUrl),                 // drop stale _HLS_msn, keep session
-    audioUrl: audioUrl ? mediaKey(audioUrl) : null,
-    referer: hdr.referer || "",
-    userAgent: hdr.userAgent || "",
+    videoUrl: video,
+    audioUrl: audio,
+    // Page context becomes an ffmpeg -headers argument. The host gates control
+    // characters too; a value that would fail there is dropped rather than
+    // sent, and losing a Referer only costs the recording its page context.
+    referer: isSafeHttpContextString(hdr.referer) ? hdr.referer : "",
+    userAgent: isSafeHttpContextString(hdr.userAgent) ? hdr.userAgent : "",
     base: sanitizeFilename(dl.name || "recording"),
   });
 }

@@ -37,6 +37,7 @@ function clone(value) {
 
 function createHarness(storageSeed) {
   const runtimeMessages = event();
+  const requestHeaders = event();
   const headersReceived = event();
   const captureNetwork = [];
   const acceptPageSnapshot = [];
@@ -117,7 +118,7 @@ function createHarness(storageSeed) {
       onActivated: noopEvent(), onRemoved: noopEvent(), onUpdated: noopEvent(), query() { return Promise.resolve([]); },
       create() { return Promise.resolve(); }, update() { return Promise.resolve(); }, executeScript() { return Promise.resolve(); },
     },
-    webRequest: { onSendHeaders: noopEvent(), onHeadersReceived: headersReceived, onBeforeSendHeaders: noopEvent() },
+    webRequest: { onSendHeaders: requestHeaders, onHeadersReceived: headersReceived, onBeforeSendHeaders: noopEvent() },
     browserAction: { onClicked: noopEvent(), setBadgeText() {}, setBadgeBackgroundColor() {} },
     contextMenus: { onClicked: noopEvent(), removeAll(cb) { if (cb) cb(); }, create() {} },
     notifications: { onClicked: noopEvent(), onClosed: noopEvent(), create() {}, clear() {} },
@@ -202,7 +203,7 @@ function createHarness(storageSeed) {
   }
 
   return {
-    send, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
+    send, requestHeaders, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
     registerVariants, broadcasts, popupRows, controllerJobs, textBodies, dashParsed,
     nativePort,
     holdDirectProbe(url) {
@@ -1126,4 +1127,95 @@ test("a ring restored from storage is redacted before it can be read back", asyn
     "yt-dlp: requested https://site.example/watch?v=abc"
   );
   assert.equal(JSON.stringify(logs).includes("SECRET_TOKEN"), false);
+});
+
+// A ready helper is what routes a recording to ffmpeg instead of the in-browser
+// recorder, and a captured record command is what the host would act on.
+async function readyHelper(h) {
+  h.nativePort.onMessage.emit({ type: "pong", ffmpeg: true });
+  const posts = [];
+  h.nativePort.postMessage = (message) => { posts.push(clone(message)); };
+  await settle();
+  return posts;
+}
+
+function liveMaster(variantUri) {
+  return [
+    "#EXTM3U",
+    "#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1280x720",
+    variantUri,
+    "",
+  ].join("\n");
+}
+
+test("the record lane refuses a stream URL the helper must not open", async () => {
+  const h = createHarness();
+  await settle();
+  const posts = await readyHelper(h);
+
+  // This lane's URL comes from the body of a fetched manifest, not from
+  // webRequest or a gated content script, and an absolute URI in a playlist
+  // resolves to itself. ffmpeg opens file://host/share as a UNC path, so the
+  // recording would be an outbound SMB handshake carrying the user's
+  // credentials to whoever served the playlist.
+  const master = "https://site.example/live/master.m3u8";
+  h.textBodies.set(master, liveMaster("file://attacker.test/s/x"));
+
+  assert.deepEqual(await h.send({
+    type: "record-live",
+    item: { kind: "hls", url: master, name: "master.m3u8" },
+    tabId: 7,
+    filename: "Live",
+  }), { ok: true });
+
+  // Refusing silently would leave a row that never records and never says why,
+  // so the refusal has to be the visible failure of that row.
+  await eventually(
+    () => h.broadcasts.some((m) => m.type === "download-update" && m.download.status === "error"),
+    "the refused recording never surfaced as a failed row"
+  );
+  const updates = h.broadcasts.filter((m) => m.type === "download-update");
+  const failed = updates[updates.length - 1];
+  assert.equal(failed.download.status, "error");
+  assert.equal(typeof failed.download.error, "string");
+  assert.equal(failed.download.error.length > 0, true);
+  assert.equal(posts.some((m) => m && m.cmd === "record"), false, "nothing reached the helper");
+  assert.equal(JSON.stringify(posts).includes("attacker.test"), false);
+});
+
+test("the record lane sends no page header the host would have to sanitise", async () => {
+  const h = createHarness();
+  await settle();
+  const posts = await readyHelper(h);
+
+  // Page context is captured from the tab's own requests and handed to ffmpeg
+  // as -headers, where a control character is a header-injection primitive.
+  // The host gates it too; a value that would fail there should never be sent.
+  h.requestHeaders.emit({
+    tabId: 7,
+    requestHeaders: [
+      { name: "Referer", value: "https://site.example/watch\r\nX-Injected: SECRET_HEADER" },
+      { name: "User-Agent", value: "Detection Browser" },
+    ],
+  });
+
+  const master = "https://site.example/live/master.m3u8";
+  h.textBodies.set(master, liveMaster("https://site.example/live/hi.m3u8"));
+  assert.deepEqual(await h.send({
+    type: "record-live",
+    item: { kind: "hls", url: master, name: "master.m3u8" },
+    tabId: 7,
+    filename: "Live",
+  }), { ok: true });
+
+  await eventually(
+    () => posts.some((m) => m && m.cmd === "record"),
+    "the http(s) recording never reached the helper"
+  );
+  const record = posts.find((m) => m.cmd === "record");
+  assert.equal(record.videoUrl, "https://site.example/live/hi.m3u8");
+  assert.equal(record.audioUrl, null);
+  assert.equal(record.referer, "", "an unsendable Referer is dropped, not passed on");
+  assert.equal(record.userAgent, "Detection Browser");
+  assert.equal(JSON.stringify(posts).includes("SECRET_HEADER"), false);
 });
