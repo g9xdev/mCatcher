@@ -1,13 +1,16 @@
 /*
  * content.js — reports <video>/<source> srcs, the page/stream title, a
  * thumbnail frame, and a bounded document-scoped page-snapshot for filename
- * ranking. Blob/MediaSource srcs can't be downloaded from the DOM (they're
- * assembled in memory), but those streams are caught separately via the
- * network listener, so we simply skip them here.
+ * ranking. Only absolute http(s) srcs are reported: blob:/MediaSource srcs
+ * can't be downloaded from the DOM (they're assembled in memory) and are
+ * caught separately via the network listener, and every other scheme is a
+ * page-chosen string with no business reaching the background as media.
  *
- * Thumbnails: drawn from the playing <video> onto a canvas. MSE-fed players
- * (blob: src — most streaming sites) don't taint the canvas; a cross-origin
- * file src does, in which case toDataURL throws and we skip quietly.
+ * Thumbnails: drawn from the playing <video> onto a canvas, top frame only —
+ * the background keeps one per tab and shows it on every row of that tab.
+ * MSE-fed players (blob: src — most streaming sites) don't taint the canvas;
+ * a cross-origin file src does, in which case toDataURL throws and we skip
+ * quietly.
  *
  * Pure snapshot helpers are CommonJS-exportable for Node tests. In the browser
  * content-script path the factory self-installs; it does not publish a
