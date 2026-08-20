@@ -775,4 +775,29 @@ def test_record_still_records_an_ordinary_stream(monkeypatch):
     assert argv is not None
     assert argv.count("-i") == 2, argv
     assert "https://cdn.test/a.m3u8" in argv, argv
-    assert any("X-Injected" not in str(s) for s in argv)
+
+
+def test_record_keeps_a_referer_that_merely_spells_a_header_inside_its_own(
+        monkeypatch):
+    """Legal but adjacent: an injection's text without the CRLF that makes one.
+
+    ffmpeg_cmd joins Referer and User-Agent into ONE -headers value with a
+    literal CRLF between them, so the property worth pinning is that this
+    referer rides INSIDE the Referer line instead of becoming a third header,
+    and that the gate refuses on the control character rather than on the text.
+    The refusal half is test_record_refuses_control_characters_in_referer_and_
+    user_agent, which asserts argv is None; this is the other half.
+    """
+    jid = "recAdjacentHeaderText"
+    argv, sent = _record_argv(monkeypatch, {
+        "id": jid, "base": "clip",
+        "videoUrl": "https://cdn.test/v.m3u8",
+        "referer": "https://page.test/watch?q=X-Injected:%201",
+        "userAgent": "UA/1.0",
+    })
+    assert argv is not None, sent
+    headers = argv[argv.index("-headers") + 1]
+    lines = [ln for ln in headers.split("\r\n") if ln]
+    assert lines == ["Referer: https://page.test/watch?q=X-Injected:%201",
+                     "User-Agent: UA/1.0"], lines
+    assert all(not ln.startswith("X-Injected") for ln in lines), lines
