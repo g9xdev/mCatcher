@@ -1156,15 +1156,18 @@
     // runs at most once per BEAM_SHADOW_MS with a hard cap on elements
     // examined, whichever path asked for it.
     //
-    // WHAT IT CAN SEE INSIDE A SHADOW ROOT: an open one always, and a CLOSED
-    // one only where the browser hands content scripts
-    // Element.openOrClosedShadowRoot (Firefox's WebExtension-only accessor).
-    // That is feature-detected, never assumed: where it is absent, a video in
-    // a closed root gets no icon and this claims nothing more.
+    // WHAT IT CANNOT SEE: a video inside a CLOSED shadow root. `.shadowRoot`
+    // is null for one and nothing else in a content script's reach answers.
+    // Element.openOrClosedShadowRoot, which does answer, is ChromeOnly: in
+    // Firefox 154 every use of it in the browser's own code is a privileged
+    // PROPERTY read, and a content script runs on an expanded principal that
+    // is not the system principal. Firefox 154 also registers no `dom`
+    // WebExtension namespace, so there is no extension-facing wrapper for it
+    // either. A player in a closed root therefore gets no icon, and this
+    // claims nothing more.
     // =====================================================================
 
     var beamOverlays = new Map();     // video element -> record
-    var beamContainers = new Set();   // the containers, by identity
     var beamRootsCache = null;
     var beamShadowAt = 0;
     var beamDeepAt = 0;
@@ -1244,35 +1247,13 @@
       return null;
     }
 
-    // One element's shadow root, if this browser will give it to us.
-    //
-    // `.shadowRoot` answers for an OPEN root and null for a closed one.
-    // Firefox additionally gives content scripts openOrClosedShadowRoot(),
-    // which answers for both -- real players do use closed roots, and without
-    // it they would silently get no icon. Feature-detected and wrapped: a
-    // browser without it lands on `.shadowRoot` and loses only the closed
-    // ones.
-    function beamShadowOf(el) {
-      try {
-        if (typeof el.openOrClosedShadowRoot === "function") {
-          var either = el.openOrClosedShadowRoot();
-          if (either) return either;
-        }
-      } catch (e) {}
-      try {
-        return el.shadowRoot || null;
-      } catch (e2) {
-        return null;
-      }
-    }
-
-    // Every root a <video> could be queried from: the document, plus the
-    // shadow roots reachable from it. This overlay's OWN containers are
-    // skipped by identity -- with openOrClosedShadowRoot available their
-    // closed roots are reachable too, and descending into one would find
-    // nothing and spend budget. Capped and cached: an uncapped walk of a large
-    // page on every mutation is exactly the cost this lane is not allowed to
-    // have.
+    // Every root a <video> could be queried from: the document, plus the OPEN
+    // shadow roots reachable from it. `.shadowRoot` is the whole of what a
+    // content script gets: it answers for an open root and null for a closed
+    // one, and a closed one stays unreachable. That includes this overlay's
+    // own containers, which is why the sweep never finds them. Capped and
+    // cached: an uncapped walk of a large page on every mutation is exactly
+    // the cost this lane is not allowed to have.
     function beamSearchRoots(now) {
       if (beamRootsCache && (now - beamShadowAt) < BEAM_SHADOW_MS) return beamRootsCache;
       beamShadowAt = now;
@@ -1284,8 +1265,8 @@
         var all = qsa(current, "*");
         for (var i = 0; i < all.length && budget > 0; i++) {
           budget -= 1;
-          if (beamContainers.has(all[i])) continue;
-          var shadow = beamShadowOf(all[i]);
+          var shadow = null;
+          try { shadow = all[i].shadowRoot; } catch (e) { shadow = null; }
           if (shadow) { roots.push(shadow); queue.push(shadow); }
         }
       }
@@ -1490,7 +1471,6 @@
           }
         }
         beamOverlays.set(video, rec);
-        beamContainers.add(container);
         return rec;
       } catch (e2) {
         try { if (typeof container.remove === "function") container.remove(); } catch (e3) {}
@@ -1502,7 +1482,6 @@
       var rec = beamOverlays.get(video);
       if (!rec) return;
       beamOverlays["delete"](video);
-      beamContainers["delete"](rec.container);
       if (beamLastRecord === rec) beamLastRecord = null;
       try {
         if (rec.container && typeof rec.container.remove === "function") rec.container.remove();

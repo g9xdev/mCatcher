@@ -29,6 +29,14 @@ function load() {
   return loadLib("content.js");
 }
 
+// content.js with its commentary removed, so a test about what the CODE does
+// is not answered by prose about it. Only whole-line comments are dropped:
+// a trailing comment naming something this file forbids will fail the test
+// rather than slip past it, which is the safe direction to be wrong in.
+function codeLines(src) {
+  return src.split("\n").filter((line) => !/^\s*\/\//.test(line)).join("\n");
+}
+
 function settle() {
   return new Promise((resolve) => setImmediate(resolve));
 }
@@ -498,10 +506,7 @@ test("a video inside an open shadow root is reached", async () => {
   assert.equal(containers(root).length, 1, "shadow DOM is where real players live");
 });
 
-test("a CLOSED shadow root is reached only through the accessor the browser offers", async () => {
-  // element.shadowRoot is null for a closed root. Firefox hands content
-  // scripts openOrClosedShadowRoot(), which is the only way in; without it a
-  // closed player is genuinely invisible and gets no icon.
+test("a video inside a CLOSED shadow root gets no icon", async () => {
   const sealed = makeRoot();
   const sealedHost = sealed.document.createElement("media-player");
   sealed.document.body.appendChild(sealedHost);
@@ -509,48 +514,27 @@ test("a CLOSED shadow root is reached only through the accessor the browser offe
   await installed(sealed);
   assert.equal(sealedHost.shadowRoot, null, "closed really is closed");
   assert.equal(containers(sealed).length, 0,
-    "no accessor, no icon — and no pretence of one");
-
-  const open = makeRoot();
-  const host = open.document.createElement("media-player");
-  open.document.body.appendChild(host);
-  const shadow = host.attachShadow({ mode: "closed" });
-  shadow.appendChild(makeVideo(open));
-  host.openOrClosedShadowRoot = () => shadow;
-  await installed(open);
-  assert.equal(containers(open).length, 1, "with the accessor, the player is found");
+    "a closed player is invisible to a content script, and no pretence is made");
 });
 
-test("the sweep never descends into the overlay's own closed root", async () => {
-  const root = makeRoot();
-  const decoy = root.document.createElement("some-widget");
-  root.document.body.appendChild(decoy);
-  root.document.body.appendChild(makeVideo(root));
-  await installed(root);
-  const container = containers(root)[0];
-
-  // With openOrClosedShadowRoot present, our OWN container's closed root is
-  // reachable too. Descending into it would be a walk that finds nothing and
-  // spends the sweep's budget on it.
-  let peekedOverlay = 0;
-  let peekedDecoy = 0;
-  container.openOrClosedShadowRoot = () => { peekedOverlay += 1; return container._closedShadow; };
-  decoy.openOrClosedShadowRoot = () => { peekedDecoy += 1; return null; };
-
-  // The root list is cached; step past that window so a real sweep runs,
-  // otherwise this test would be satisfied by the cache rather than the skip.
-  const realNow = Date.now;
-  Date.now = () => realNow() + 60000;
-  try {
-    root.document._fire("playing", { target: root.document.querySelector("video") });
-    root._pumpFrames(2);
-  } finally {
-    Date.now = realNow;
-  }
-
-  assert.ok(peekedDecoy >= 1, "a sweep really did run");
-  assert.equal(peekedOverlay, 0, "the overlay is skipped by identity, not by luck");
-  assert.equal(containers(root).length, 1);
+test("no branch reaches for an accessor a content script does not have", () => {
+  // Element.openOrClosedShadowRoot does answer for a closed root, and the
+  // sweep used to reach for it as a method. It is ChromeOnly. Established
+  // against the shipped Firefox 154 rather than assumed:
+  //   - every use of it in Firefox's own code is a PROPERTY read, and
+  //     Firefox's own comments call it "the ChromeOnly property" and "the
+  //     chrome-only openOrClosedShadowRoot API";
+  //   - a content script runs in a sandbox built on an expanded principal
+  //     ([contentPrincipal, extensionPrincipal]), which is not the system
+  //     principal that ChromeOnly members are installed for;
+  //   - Firefox 154 registers no `dom` WebExtension namespace, so there is no
+  //     extension-facing wrapper for it either.
+  // A branch calling it could not run, and a branch reading it would read
+  // undefined. This is here so that re-adding one costs re-establishing the
+  // fact first.
+  assert.match(contentSrc, /beamSearchRoots/, "anchored: the sweep is in this file");
+  assert.equal(/openOrClosedShadowRoot/.test(codeLines(contentSrc)), false,
+    "the name may be explained in a comment; it may not be reached for in code");
 });
 
 // ---------------------------------------------------------------------------
