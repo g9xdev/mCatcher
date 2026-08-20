@@ -660,6 +660,140 @@ test("a straggling progress frame does not put a cancelled YouTube row back in f
     "the same URL must be startable again once the row is cancelled");
 });
 
+// The helper reports real bytes twice: `total` on every ytdl-progress frame and
+// `bytes` on ytdl-done. The row kept neither. progress.total was overwritten
+// with the literal 100 the percent bar divides by, and the terminal frame's
+// size went to the notification and was then dropped — so once progress
+// stopped there was nothing left on the row for either pane to render, and a
+// finished YouTube download showed no size at all.
+test("a YouTube row keeps the helper's byte total and its finished size", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  const item = { url: "https://www.youtube.com/watch?v=SIZE", kind: "youtube", name: "sized" };
+  await h.sandbox.downloadYouTube(item, 7, "sized.mp4", {});
+  await settle();
+  const id = h.nativePosts.filter((p) => p && p.cmd === "ytdl")[0].id;
+
+  const row = () => {
+    const updates = h.runtimeMessages.filter(
+      (m) => m && m.type === "download-update" && m.download && m.download.id === id);
+    assert.ok(updates.length, "the row is broadcast");
+    return updates[updates.length - 1].download;
+  };
+
+  h.nativeMessages.emit({ type: "ytdl-progress", id, pct: 12.5, total: 1181116006, bps: 4194304 });
+  await settle();
+  const live = row();
+  assert.equal(live.progress.unit, "pct", "the bar stays percent-scaled");
+  assert.equal(live.progress.total, 100, "the percent denominator is untouched");
+  assert.equal(live.progress.totalBytes, 1181116006,
+    "the helper's byte total must ride alongside the percent scale");
+
+  // The helper stops reporting a total once the merge starts; the last one it
+  // gave is still the size of the file being written.
+  h.nativeMessages.emit({ type: "ytdl-progress", id, pct: 99, stage: "merging" });
+  await settle();
+  assert.equal(row().progress.totalBytes, 1181116006,
+    "a frame with no total must not erase the total already known");
+
+  h.nativeMessages.emit({ type: "ytdl-done", id, bytes: 1181116006,
+                          file: "C:\\Users\\x\\Downloads\\sized.mp4" });
+  await settle();
+  const done = row();
+  assert.equal(done.status, "done");
+  assert.equal(done.recorded && done.recorded.bytes, 1181116006,
+    "a finished row must still know its size after progress stops");
+});
+
+// The extension's half of the BadApple lane. It names the FILE and nothing
+// else: if a frame from here could carry a program, the host's fixed candidate
+// list would be decoration — write a file anywhere, then ask the helper to run
+// it. Unlisted keys are ignored rather than refused on both sides of the port,
+// so the proof that they are inert is that none of them reaches the frame.
+test("the BadApple frame names the file and never a program", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true, badapple: true });
+  await settle();
+
+  // Whether BadApple exists is the HELPER's answer, relayed to the popup —
+  // the popup never goes looking for it, which is why it cannot name it.
+  const status = h.runtimeMessages.filter((m) => m && m.type === "helper-status");
+  assert.ok(status.length, "the helper's status reaches the popup");
+  assert.equal(status[status.length - 1].helper.badapple, true);
+
+  let answered = null;
+  h.sandbox.browser.runtime.onMessage.emit({
+    type: "open-in-badapple",
+    path: "C:\\Users\\x\\Downloads\\clip.mp4",
+    // Every shape a caller might hope the handler forwards.
+    exe: "C:\\Users\\x\\Downloads\\payload.exe",
+    app: "C:\\Users\\x\\Downloads\\payload.exe",
+    argv: ["C:\\Users\\x\\Downloads\\payload.exe"],
+  }, {}, (r) => { answered = r; });
+  await settle();
+
+  const posts = h.nativePosts.filter((p) => p && p.cmd === "badapple");
+  assert.equal(posts.length, 1, "one frame reaches the helper");
+  // Key-by-key rather than deepEqual: the frame is built inside the vm realm,
+  // so its prototype is not this realm's and deepStrictEqual would fail on
+  // two objects that are otherwise identical.
+  assert.deepEqual(Object.keys(posts[0]).sort(), ["cmd", "path"],
+    "exactly two keys, and neither of them names a program to run");
+  assert.equal(posts[0].path, "C:\\Users\\x\\Downloads\\clip.mp4");
+  assert.equal(JSON.stringify(posts[0]).toLowerCase().includes("payload.exe"), false,
+    "nothing the caller added rode along");
+  assert.equal(answered && answered.ok, true);
+});
+
+// A file the user can see but the helper cannot reach is a failure the UI has
+// to be able to say out loud, so the popup gets an error rather than silence.
+test("BadApple with no helper answers with an error, not silence", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+
+  let answered = null;
+  h.sandbox.browser.runtime.onMessage.emit(
+    { type: "open-in-badapple", path: "C:\\Users\\x\\Downloads\\clip.mp4" },
+    {}, (r) => { answered = r; });
+  await settle();
+
+  assert.equal(h.nativePosts.filter((p) => p && p.cmd === "badapple").length, 0);
+  assert.equal(answered && answered.ok, false, "the click is answered");
+  assert.match(String(answered && answered.error), /helper/i);
+});
+
+// open / reveal / badapple are all sent without an id, so a refusal from any of
+// them names no row. It used to be dropped where the row lookup fails, which
+// made "BadApple is not installed" indistinguishable from a button that did
+// nothing at all.
+test("a host error naming no row is logged rather than dropped", async () => {
+  const h = createHarness();
+  h.load();
+  h.settingsLoad.resolve({ settings: {} });
+  await settle();
+  h.nativeMessages.emit({ type: "pong", version: "1.10.0", ffmpeg: true });
+  await settle();
+
+  h.nativeMessages.emit({ type: "error", error: "BadApple is not installed on this computer." });
+  await settle();
+
+  const lines = h.runtimeMessages.filter((m) => m && m.type === "log-line");
+  const last = lines[lines.length - 1];
+  assert.ok(last, "the refusal reached the log console");
+  assert.equal(last.line.level, "error");
+  assert.match(last.line.msg, /BadApple is not installed/);
+});
+
 test("the live controller is driven by a clock", async () => {
   const h = createHarness();
   h.load();

@@ -453,6 +453,10 @@ function helperStatus() {
     ytdlpVersion: nativeInfo ? (nativeInfo.ytdlpVersion || "") : "",
     node: nativeInfo ? !!nativeInfo.node : false,
     pot: nativeInfo ? !!nativeInfo.pot : false,
+    // Whether the helper found BadApple installed. The popup shows the
+    // "Open in BadApple" action only when this is true, so a machine without
+    // it never gets a button that could only fail.
+    badapple: nativeInfo ? !!nativeInfo.badapple : false,
     error: nativeError,
   };
 }
@@ -925,6 +929,16 @@ function onLegacyNativeMessage(msg) {
     return;
   }
   const dl = activeDownloads.get(msg.id);
+  // A host error that names no live row. `open`, `reveal` and `badapple` are
+  // sent without an id, so a refusal from any of them — a suffix outside
+  // MEDIA_EXTS, a file that has since been moved, BadApple not installed —
+  // arrives with nothing to attach to and fell off here into silence. The log
+  // console is somewhere the user can actually read it.
+  if (!dl && msg.type === "error") {
+    pushLog({ ts: Date.now(), level: "error", src: "host",
+      msg: String(msg.error == null ? "Helper error" : msg.error) });
+    return;
+  }
   if (!dl) return;
   if (msg.type === "started") {
     dl.status = "recording";
@@ -969,12 +983,26 @@ function onLegacyNativeMessage(msg) {
     dl.status = "downloading";
     const pct = typeof msg.pct === "number" ? Math.max(0, Math.min(100, Math.round(msg.pct)))
                                             : (dl.progress ? dl.progress.done : 0);
-    dl.progress = { done: pct, total: 100, unit: "pct", bps: msg.bps || 0,
+    // `total` is the percent DENOMINATOR — the bar divides by it — so the real
+    // byte total rides beside it as totalBytes rather than overloading it. The
+    // helper stops reporting a size once it has nothing new to say (unknown
+    // length, or the merge), so the last one it gave is carried forward: it is
+    // still the size of the file being written.
+    const totalBytes = msg.total > 0 ? msg.total
+                                     : ((dl.progress && dl.progress.totalBytes) || 0);
+    dl.progress = { done: pct, total: 100, unit: "pct", totalBytes, bps: msg.bps || 0,
                     stage: msg.stage || "downloading", note: msg.note || "", live: true };
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "ytdl-done") {
     dl.status = "done"; dl.live = true; dl.savedPath = msg.file || "";
-    dl.progress = { done: 100, total: 100, unit: "pct" };
+    // The size of the file on disk, kept on the row and not only in the
+    // notification: progress stops here, so this is all a finished row has
+    // left to state its size from. `recorded` is where both panes already
+    // look for a produced file's size.
+    if (msg.bytes > 0) dl.recorded = { bytes: msg.bytes };
+    dl.progress = { done: 100, total: 100, unit: "pct",
+                    totalBytes: msg.bytes > 0 ? msg.bytes
+                                              : ((dl.progress && dl.progress.totalBytes) || 0) };
     broadcast({ type: "download-update", download: dl });
     addHistory({ name: dl.name || "YouTube", kind: "youtube", ts: Date.now() });
     notifyDone(dl.name || "YouTube video", fmtBytes(msg.bytes || 0), msg.file ? { path: msg.file } : null);
@@ -992,6 +1020,11 @@ function onLegacyNativeMessage(msg) {
     broadcast({ type: "download-update", download: dl });
   } else if (msg.type === "saved") {
     dl.status = "done"; dl.savedPath = msg.file; dl.convert = msg.convert || null;
+    // The size of the file that actually landed. `recorded` already carries
+    // what the recorder captured, but a convert re-encodes between there and
+    // here, so the finished row states the size of the file on disk rather
+    // than the size of the temp it came from.
+    if (msg.bytes > 0) dl.recorded = Object.assign({}, dl.recorded, { bytes: msg.bytes });
     broadcast({ type: "download-update", download: dl });
     addHistory({ name: dl.name || "recording", kind: "hls-live", ts: Date.now() });
     const extra = msg.convert ? convertSummary(msg.convert) : (msg.file || null);
@@ -3563,6 +3596,13 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         else sendResponse({ ok: false, error: "Native helper not available." });
       } else if (msg.type === "reveal-file") {
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "reveal", path: msg.path }); sendResponse({ ok: true }); }
+        else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "open-in-badapple") {
+        // Only the file crosses the port. The helper decides which executable
+        // BadApple is; naming one from here is the arbitrary-execution hole
+        // the open/reveal allowlist exists to close, so there is no field for
+        // it in the frame and none is added.
+        if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "badapple", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });
       } else if (msg.type === "dismiss-download") {
         activeDownloads.delete(msg.id);

@@ -463,6 +463,7 @@ test("API surface is frozen and complete", () => {
   assert.deepEqual(Object.keys(UI).sort(), [
     "buildDownloadMessage",
     "decideSaveAsForm",
+    "downloadSizeBytes",
     "formatJobStatus",
     "validateSaveAsFilename",
   ]);
