@@ -1300,7 +1300,7 @@ test("redactLogText redacts credential values no URL match can claim", () => {
   );
   // A quoted value is still a value. The value class excludes " and ' and
   // requires one character, so token="SECRET" matched nothing at all and
-  // passed both layers untouched -- the URL projection cannot claim it either,
+  // passed both layers untouched — the URL projection cannot claim it either,
   // since the line it sits on need not be a URL.
   assert.equal(
     P.redactLogText('resuming with token="SECRET_SIGNED_QUERY_XYZ"'),
@@ -1332,7 +1332,7 @@ test("redactLogText redacts credential values no URL match can claim", () => {
 
   // What the pass costs, pinned rather than claimed. It runs over the whole
   // line, so a credential-shaped name=value the URL projection deliberately
-  // KEPT -- one inside a path, or inside a local save path -- is redacted
+  // KEPT — one inside a path, or inside a local save path — is redacted
   // too, and the value runs to the next &, whitespace, quote or angle bracket
   // rather than to the next path separator. Two distinct clips can therefore
   // project to one line. That is the price of a pass that decides no
@@ -1376,8 +1376,8 @@ test("redactUrlForLog keeps the allowlisted identity parameter and nothing else"
   // googlevideo failure to .../videoplayback, so two distinct failures read as
   // one line. v and id name which media the line is about; everything else,
   // allowlist-style, is dropped. The two names are not proof against a
-  // credential -- nothing stops a provider spelling a signed link id=<sig>,
-  // and the pattern's alphabet is also base64url's -- so the value is capped
+  // credential — nothing stops a provider spelling a signed link id=<sig>,
+  // and the pattern's alphabet is also base64url's — so the value is capped
   // at a length a real media id has, which bounds what can ride out.
   assert.equal(
     P.redactLogText("yt-dlp: requested https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"),

@@ -650,7 +650,7 @@
     var LOG_IDENTITY_PARAMS = ["v", "id"];
     // A media id is a short plain identifier: YouTube's v is 11 characters,
     // googlevideo's id is 16. The cap is headroom over those, and it bounds
-    // the risk rather than removing it -- [A-Za-z0-9_.~-] is also the alphabet
+    // the risk rather than removing it — [A-Za-z0-9_.~-] is also the alphabet
     // of a base64url or hex token, so a provider that spells a signed link
     // id=<signature> has that value kept. At 64 a whole hex HMAC or a 256-bit
     // base64url token fitted; at 24 neither does. A separator that could nest
@@ -727,7 +727,7 @@
     // in it ends at the space, and the tail carrying the Signature stays in the
     // line as loose text; no boundary has to be decided to redact that tail.
     //
-    // It is additive, so it can only remove more than the projection does --
+    // It is additive, so it can only remove more than the projection does —
     // including, sometimes, a diagnostic the projection deliberately kept. A
     // name=value inside a path is claimed like any other: /token=1/clip.mp4
     // and /token=2/clip.mp4 both end as /token=[redacted], because the value
@@ -737,7 +737,7 @@
     // most of what looks like a false positive is what this pass is for. What
     // it costs is pinned in the tests rather than argued away here. The name
     // must be whole: a preceding name character (monkey=, passwordless=) means
-    // no match. A quoted value counts as a value -- token="S" and 'token': 'S'
+    // no match. A quoted value counts as a value — token="S" and 'token': 'S'
     // are both credentials, and excluding the quote from the value class used
     // to mean the whole line went through untouched. A ':' separator is
     // claimed only when the value is quoted, so an "Expires: Thu, 01 Dec"
