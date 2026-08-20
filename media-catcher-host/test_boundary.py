@@ -609,17 +609,60 @@ def test_refuse_url_covers_the_scheme_shapes():
 
 
 def test_cast_url_is_not_a_yt_dlp_url():
-    """Why refuse_url is a handler call and not a schema kind on the field name.
+    """The two "url" fields mean different things, and the schema is per-cmd.
 
     cast's "url" is a media SOURCE: mchost/cast/legacy.py serves anything that
     is not ^https?:// as a file on disk, which is how casting a finished
-    recording works. Typing every field named "url" would refuse that.
+    recording works. A kind on ytdl's url would not have reached this one --
+    MESSAGE_SCHEMA is keyed by command, so the two entries are independent, and
+    the comment above refuse_url no longer claims otherwise. What actually
+    keeps refuse_url out of the schema is the shape of the refusal; see
+    test_a_schema_refusal_cannot_carry_an_attempt_token.
     """
     from mchost.cast import legacy
 
     assert guard.MESSAGE_SCHEMA["cast"]["url"] == guard.STR
+    # Per-command, so the fields are not one declaration shared by name.
+    assert guard.MESSAGE_SCHEMA["cast"] is not guard.MESSAGE_SCHEMA["ytdl"]
     assert guard.validate_message(
         {"cmd": "cast", "sub": "start", "id": "d1",
          "url": r"C:\Users\me\Videos\clip.mp4"}) is None
     entry = legacy._dlna_media_url(r"C:\Users\me\Videos\clip.mp4", None)
     assert isinstance(entry, tuple)
+
+
+def test_refuse_url_covers_argv_injection_not_only_scheme():
+    """The url is the LAST argv entry, which is where an option is read from.
+
+    yt-dlp parses with optparse, and optparse reads a dash-leading trailing
+    argument as an option, not as a positional. Being the only
+    caller-controlled token in argv is therefore not protection. This asserts
+    the parser behaviour that makes it matter, so the reason written above
+    refuse_url cannot quietly stop being true.
+    """
+    import optparse
+
+    p = optparse.OptionParser()
+    p.add_option("-f", dest="fmt")
+    p.add_option("-o", dest="out")
+    opts, args = p.parse_args(["-f", "b", "-o", "t", "-o://evil"])
+    assert opts.out == "://evil", opts.out
+    assert args == [], args        # consumed as an option; no positional at all
+
+    # ...which is why every dash-leading shape is refused before argv.
+    for bad in ("--exec=calc.exe", "-o://evil", "--paths=C:/x",
+                "--enable-file-urls", "-", "--"):
+        assert guard.refuse_url(bad) is not None, bad
+
+
+def test_a_schema_refusal_cannot_carry_an_attempt_token():
+    """The true reason refuse_url is a handler call, not a schema kind.
+
+    A schema refusal IS correlated -- mc_host echoes guard.message_id on it --
+    but message_id only ever returns an id, never the attemptToken, and the
+    frame is a {"type":"error"}, not the ytdl-error a structured row waits for.
+    """
+    msg = {"cmd": "ytdl", "id": "j1", "attemptToken": "atk-1", "url": 5}
+    assert guard.validate_message(msg) is not None
+    assert guard.message_id(msg) == "j1"
+    assert guard.message_id({"cmd": "ytdl", "attemptToken": "atk-1"}) is None

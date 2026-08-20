@@ -707,6 +707,76 @@ test("a later frame's DOM claim never repoints the owner of an already-owned sou
   assert.equal(JSON.stringify(response).includes("SIGNED_SENTINEL"), false);
 });
 
+function remountHarness() {
+  const tabId = 7;
+  const mediaUrl = "https://cdn.example/movie.mp4?token=SIGNED_SENTINEL";
+  const frameSender = (frameId, documentId, frameUrl) => ({
+    tab: { id: tabId, url: "https://site.example/watch", title: "Movie Night" },
+    frameId,
+    documentId,
+    url: frameUrl,
+  });
+  const report = (sender, origin) => ({
+    type: "content-media",
+    item: { kind: "direct", url: mediaUrl, ts: 1 },
+    referrerUrl: sender.url,
+    frameOrigin: origin,
+    snapshot: Object.assign({}, pageSnapshot(), {
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      pageUrl: sender.url,
+    }),
+  });
+  return { tabId, mediaUrl, frameSender, report };
+}
+
+test("an SPA remounting its player iframe lists the clip once, not twice", async () => {
+  const h = createHarness();
+  await settle();
+  const { tabId, frameSender, report } = remountHarness();
+
+  // A remount is a new BrowsingContext: new frameId, empty boundUrls, so the
+  // player reports the file it already reported and mints a second detection.
+  const firstMount = frameSender(2, "doc-mount-1", "https://site.example/player");
+  await h.send(report(firstMount, "https://site.example"), firstMount);
+  const secondMount = frameSender(5, "doc-mount-2", "https://site.example/player");
+  await h.send(report(secondMount, "https://site.example"), secondMount);
+  assert.equal(h.captureDomMedia.length, 2, "each mount still mints its own detection");
+
+  const response = await h.send({ type: "get-media", tabId });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.deepEqual(
+    direct.map((row) => row.id),
+    ["media:opaque:1"],
+    "two rows with nothing to tell them apart are one clip"
+  );
+});
+
+test("a frame proposing its own name for the page's file keeps its own row", async () => {
+  const h = createHarness();
+  await settle();
+  const { tabId, frameSender, report } = remountHarness();
+  // The fold must not become the suppression per-frame claim scoping prevents:
+  // an ad iframe naming the honest page's file differently stays visible.
+  h.popupRows.set(tabId, [
+    { id: "media:opaque:1", proposedFilename: "Movie Night.mp4", kind: "direct", variants: [] },
+    { id: "media:opaque:2", proposedFilename: "Free-iPhone.mp4", kind: "direct", variants: [] },
+  ]);
+
+  const topFrame = frameSender(0, "doc-top", "https://site.example/watch");
+  await h.send(report(topFrame, "https://site.example"), topFrame);
+  const adFrame = frameSender(9, "doc-ad", "https://ads.example/unit");
+  await h.send(report(adFrame, "https://ads.example"), adFrame);
+
+  const response = await h.send({ type: "get-media", tabId });
+  const direct = response.items.filter((row) => row.kind === "direct");
+  assert.deepEqual(direct.map((row) => row.id), ["media:opaque:1", "media:opaque:2"]);
+  assert.deepEqual(
+    direct.map((row) => row.proposedFilename),
+    ["Movie Night.mp4", "Free-iPhone.mp4"]
+  );
+});
+
 test("network-first direct media keeps one row and publishes the probe Content-Range total", async () => {
   const h = createHarness();
   await settle();

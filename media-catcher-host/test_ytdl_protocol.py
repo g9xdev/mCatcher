@@ -5862,12 +5862,14 @@ class _NoLib:
 def test_non_http_url_never_reaches_ytdlp(tmp_path, monkeypatch):
     """file:, ftp:, javascript: and bare paths are refused before argv.
 
-    NOT flag injection: exactly one caller-controlled token reaches argv on
-    these paths, so a leading "-" is still only a URL to yt-dlp. What a
-    scheme buys is the generic extractor opening whatever it is handed --
-    file:///C:/... reads a local file, ftp:// reaches a host the browser never
-    visited. Both yt-dlp entry points are covered because the in-process one
-    parses the SAME argv the exe would have been given.
+    This covers flag injection too, and that is the sharper half: the url is
+    appended LAST and yt-dlp parses with optparse, which reads a dash-leading
+    trailing argument as an option, not a positional -- being the only
+    caller-controlled token in argv is the injection position, not protection.
+    The scheme half is the generic extractor reaching somewhere the browser
+    never went, ftp:// being the plain case. Both yt-dlp entry points are
+    covered because the in-process one parses the SAME argv the exe would
+    have been given.
     """
     import mchost.downloads as d
 

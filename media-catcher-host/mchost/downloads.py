@@ -3224,9 +3224,11 @@ def _handle_ytdl_structured(req):
     if not _ytdl_exact_nonblank_str(token):
         return
 
-    # guard.refuse_url is the scheme check: the exact-str tests above say the
-    # url is a nonblank built-in str and nothing more, and yt-dlp's generic
-    # extractor will open file:/ftp:/whatever it is handed (guard.refuse_url).
+    # guard.refuse_url does two jobs the exact-str tests above cannot: those
+    # say the url is a nonblank built-in str and nothing more. It has to be a
+    # URL because _ytdl_build_cmd appends it LAST and yt-dlp's optparse reads a
+    # dash-leading trailing argument as an OPTION, and because yt-dlp's generic
+    # extractor will reach a non-http scheme the browser never went to.
     if not _ytdl_exact_nonblank_str(jid) or not _ytdl_exact_nonblank_str(url) \
             or not _ytdl_exact_nonblank_str(name) \
             or guard.refuse_url(url):

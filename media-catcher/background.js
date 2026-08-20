@@ -286,6 +286,11 @@ const NETWORK_CLAIM = null;
 // Late evidence for an owned source enriches that row instead of minting a
 // second one. Session-only; cleared with the rest of a tab's ownership.
 const liveDirectMediaOwners = new Map();
+// tabId -> opaque media ID -> the canonical direct source key that DOM-lane row
+// was minted for. Read only by the render pass, to recognise a remounted frame's
+// repeat of one file. Network rows are absent by design: they carry mirrors, and
+// a shared mirror does not make two rows the same clip.
+const liveDirectRowSources = new Map();
 // opaque media ID -> frozen { sizeBytes, sizeConfidence }. Never holds URLs,
 // headers, or any other transport evidence.
 const liveSizeMetadata = new Map();
@@ -1308,6 +1313,16 @@ function forgetLiveSizesForTab(tabId) {
   const ids = liveControllerMediaIds.get(tabId);
   if (ids) for (const id of ids) liveSizeMetadata.delete(id);
   liveDirectMediaOwners.delete(tabId);
+  liveDirectRowSources.delete(tabId);
+}
+
+// Remember which canonical direct source a DOM-lane row was minted for, so the
+// render pass can recognise a remounted frame's repeat of one file.
+function rememberLiveDirectRowSource(tabId, mediaId, url) {
+  if (typeof mediaId !== "string" || !mediaId) return;
+  const sources = liveDirectRowSources.get(tabId) || new Map();
+  sources.set(mediaId, directSourceKey(url));
+  liveDirectRowSources.set(tabId, sources);
 }
 
 // Network and DOM are independent evidence producers for the same direct file.
@@ -2830,11 +2845,49 @@ function liveRowsForTab(tabId) {
   try {
     const rows = liveController.popupMedia(tabId);
     const ids = liveControllerMediaIds.get(tabId);
-    return Array.isArray(rows) && ids ? rows.filter((row) => row && ids.has(row.id)) : [];
+    if (!Array.isArray(rows) || !ids) return [];
+    return foldRemountedDirectRows(tabId, rows.filter((row) => row && ids.has(row.id)));
   } catch (e) {
     dlog("live popupMedia failed", e && e.message);
     return [];
   }
+}
+
+// An SPA that remounts its player iframe gives the new frame a new frameId and
+// an empty boundUrls set, so it reports the file the old mount already reported
+// and mints a second detection with nothing to tell the two rows apart.
+//
+// Folded here rather than by keying the claim on frame origin: an origin-scoped
+// claim would let any frame sharing the page's origin take the single row and
+// leave the other frame with none, which is the suppression per-frame claim
+// scoping exists to prevent — and a frame's origin reaches us through the
+// content script, where its frameId comes from the browser. So a row folds only
+// when it names the same canonical source AND is indistinguishable in what the
+// popup shows. A frame proposing its own name for the page's file still gets
+// its own row. Of a folded pair the owning row is kept: enrichment lands there.
+function foldRemountedDirectRows(tabId, rows) {
+  const sources = liveDirectRowSources.get(tabId);
+  if (!sources || rows.length < 2) return rows;
+  const owners = liveDirectMediaOwners.get(tabId);
+  const firstAt = new Map();
+  const out = [];
+  for (const row of rows) {
+    const sourceKey = sources.get(row.id);
+    if (typeof sourceKey !== "string") { out.push(row); continue; }
+    const identity = [
+      sourceKey,
+      typeof row.kind === "string" ? row.kind : "",
+      typeof row.proposedFilename === "string" ? row.proposedFilename : "",
+    ].join("\n");
+    const at = firstAt.get(identity);
+    if (at === undefined) {
+      firstAt.set(identity, out.length);
+      out.push(row);
+    } else if (owners && owners.get(sourceKey) === row.id) {
+      out[at] = row;
+    }
+  }
+  return out;
 }
 
 function decorateLiveRow(row, tabId) {
@@ -3494,6 +3547,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               // directGroupKey is a network mirror policy and must not collapse
               // distinct query-addressed DOM media.
               claimLiveMediaKey(sender.tab.id, key, mediaId, [mediaUrl], false, frameKey);
+              rememberLiveDirectRowSource(sender.tab.id, mediaId, mediaUrl);
             }
           } else {
             item.name = item.name || shortName(item.url);
