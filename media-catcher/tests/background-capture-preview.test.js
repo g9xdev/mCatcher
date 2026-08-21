@@ -221,3 +221,91 @@ test("the preview store is bounded, so a long session cannot grow it without lim
   assert.equal(size < 300, true, "every capture was retained: " + size);
   assert.equal(size > 0, true);
 });
+
+// ---------------------------------------------------------------------------
+// The other kind of row: one the live controller owns.
+//
+// get-media builds its items two different ways. A legacy detected item goes
+// through decorate(), which spreads the raw item and adds `preview`. A
+// live-controller row goes through decorateLiveRow(), which does NOT spread —
+// it builds a fresh object key by key, so a field it does not name is a field
+// the popup never sees. `preview` has to be named there or the whole feature
+// is silent for exactly the rows the popup renders most.
+// ---------------------------------------------------------------------------
+
+// A live-controller row, reachable through liveRowsForTab: the controller has
+// to report it AND the tab's id set has to admit it.
+function seedLiveRow(h, tabId, mediaId) {
+  h.evalInBackground(
+    "liveControllerTabs.add(" + tabId + "); " +
+    "liveControllerMediaIds.set(" + tabId + ", new Set([" + JSON.stringify(mediaId) + "]))");
+}
+
+function liveHarness(mediaId) {
+  return readyHarness({
+    popupMedia: () => [{ id: mediaId, proposedFilename: "live.mp4", kind: "direct" }],
+  });
+}
+
+test("a captured preview reaches a LIVE-CONTROLLER row, which is built key by key", async () => {
+  const h = await liveHarness("media-live-1");
+  seedLiveRow(h, 7, "media-live-1");
+  h.setContentReply(7, { ok: true, dataUrl: JPEG, why: null });
+
+  await h.send({ type: "capture-preview", identity: "id:media-live-1", tabId: 7 }, {});
+  const res = await h.send({ type: "get-media", tabId: 7 }, {});
+  const row = res.items.find((i) => i.id === "media-live-1");
+  assert.ok(row, "the live row reached the popup");
+  assert.equal(row.preview, JPEG,
+    "decorateLiveRow dropped the picture: its projection has to name `preview`");
+});
+
+test("a live row with no captured picture still says so, rather than omitting the field", async () => {
+  // The popup tells "not captured yet" from a field it can read. An absent key
+  // and a null one are the same to it only if the key is always present.
+  const h = await liveHarness("media-live-2");
+  seedLiveRow(h, 7, "media-live-2");
+
+  const res = await h.send({ type: "get-media", tabId: 7 }, {});
+  const row = res.items.find((i) => i.id === "media-live-2");
+  assert.ok(row);
+  assert.equal(Object.prototype.hasOwnProperty.call(row, "preview"), true);
+  assert.equal(row.preview, null);
+});
+
+test("one live row's picture does not become every live row's picture", async () => {
+  const h = await readyHarness({
+    popupMedia: () => [
+      { id: "media-live-a", proposedFilename: "a.mp4", kind: "direct" },
+      { id: "media-live-b", proposedFilename: "b.mp4", kind: "direct" },
+    ],
+  });
+  h.evalInBackground(
+    "liveControllerTabs.add(7); " +
+    "liveControllerMediaIds.set(7, new Set(['media-live-a', 'media-live-b']))");
+  h.setContentReply(7, { ok: true, dataUrl: JPEG, why: null });
+
+  await h.send({ type: "capture-preview", identity: "id:media-live-a", tabId: 7 }, {});
+  const res = await h.send({ type: "get-media", tabId: 7 }, {});
+  const a = res.items.find((i) => i.id === "media-live-a");
+  const b = res.items.find((i) => i.id === "media-live-b");
+  assert.equal(a.preview, JPEG);
+  assert.equal(b.preview, null, "a per-item picture spread across the tab");
+});
+
+test("a live row carries only the keys its projection names, plus preview", async () => {
+  // decorateLiveRow exists to keep raw controller state out of the popup. The
+  // new field must not turn it into a spread.
+  const h = await readyHarness({
+    popupMedia: () => [{
+      id: "media-live-3", proposedFilename: "c.mp4", kind: "direct",
+      secretish: "https://cdn.example/x?token=SECRET_ABC",
+    }],
+  });
+  h.evalInBackground(
+    "liveControllerTabs.add(7); liveControllerMediaIds.set(7, new Set(['media-live-3']))");
+
+  const res = await h.send({ type: "get-media", tabId: 7 }, {});
+  const row = res.items.find((i) => i.id === "media-live-3");
+  assert.equal(row.secretish, undefined, "the projection leaked a raw field");
+});

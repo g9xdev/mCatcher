@@ -359,6 +359,11 @@ test("promotes a probed network direct item and merges opaque frozen controller 
     sizeBytes: 10485760,
     sizeConfidence: "exact",
     thumb: null,
+    // Per-ITEM, beside the per-tab `thumb`. Present and null because nothing
+    // captured a frame for this row — the popup tells "not captured yet" from
+    // a field it can read. This deepEqual is what makes the projection's key
+    // set a decision: a key added to decorateLiveRow shows up here.
+    preview: null,
     pageTitle: "Movie Night",
   }]);
   assert.deepEqual(result.downloads, [{ id: "job:opaque:1", state: "queued" }]);

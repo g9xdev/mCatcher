@@ -3340,6 +3340,13 @@ function decorateLiveRow(row, tabId) {
     variants: Array.isArray(row.variants) ? row.variants.map(copyLiveVariantRow) : [],
     tabId,
     thumb: tabThumbs.get(tabId) || null,
+    // Per-ITEM, unlike `thumb` above which is one picture for the whole tab.
+    // This projection is built key by key rather than spread, so a field not
+    // named here is a field the popup never sees — and these are the rows the
+    // popup renders most. Always present, so "not captured yet" is a value the
+    // popup can read rather than an absent key. decorate() names it too, for
+    // the legacy detected items that do not come through here.
+    preview: previewFor(row),
   };
   // Only the validated scalar pair crosses into the public row — never the
   // record itself and never any raw evidence it was derived from.

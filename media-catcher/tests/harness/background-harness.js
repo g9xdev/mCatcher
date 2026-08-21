@@ -119,7 +119,14 @@ function createHarness(options) {
         acceptPageSnapshot() {},
         captureDomMedia() { return null; },
         registerVariants() { return []; },
-        popupMedia() { return Object.freeze([]); },
+        // A test that wants live-controller ROWS supplies them; the default is
+        // still an empty list, so no existing test sees a row it did not ask for.
+        popupMedia(tabId) {
+          const rows = typeof opts.popupMedia === "function"
+            ? opts.popupMedia(tabId)
+            : (opts.popupMedia || []);
+          return Object.freeze(Array.isArray(rows) ? rows : []);
+        },
         popupJobs() { return Object.freeze(opts.popupJobs || []); },
         async handleNativeMessage() { return false; },
         helperDisconnected() {},
@@ -204,30 +211,5 @@ function seedDownload(h, id) {
   return rowId;
 }
 
-
-// Bring the native port up the way background.js expects: `pong` with ffmpeg
-// present is the frame that flips nativeReady (see setNativeState).
-async function readyHarness(options) {
-  const h = createHarness(options);
-  await settle();
-  h.fromHost({ type: "pong", version: "1.0.0", ffmpeg: true, ffmpegPath: "C:\ff\ffmpeg.exe" });
-  await settle();
-  return h;
-}
-
-// Put a row in the REAL activeDownloads map. background.js declares it with a
-// top-level `const`, which lands in the context's lexical scope and so is
-// reachable from a later script evaluated in that same context — this is the
-// same Map the message handlers read, not a stand-in for it.
-function seedDownload(h, id) {
-  const rowId = id === undefined ? 4242 : id;
-  h.evalInBackground(
-    "activeDownloads.set(" + JSON.stringify(rowId) +
-    ", { id: " + JSON.stringify(rowId) + ", name: 'a.mp4', kind: 'direct', native: true," +
-    " status: 'done', savedPath: 'C:\\v\\a.mp4' })");
-  assert.equal(h.evalInBackground("activeDownloads.get(" + JSON.stringify(rowId) + ").status"),
-    "done", "the seeded row is in the map background.js reads");
-  return rowId;
-}
 
 module.exports = { createHarness, readyHarness, seedDownload, settle, clone, JPEG };
