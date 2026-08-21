@@ -153,6 +153,39 @@
       return false;
     }
 
+    // A per-item preview picture, carried to the popup as its own bytes.
+    //
+    // It deliberately does NOT go through isSuspiciousPopupString. That
+    // predicate rejects any string containing "//" because a scheme-relative
+    // network reference is what it is looking for, and a base64 body is drawn
+    // from [A-Za-z0-9+/], so "//" turns up in most real JPEGs — measured at 33
+    // of 36 encodes in tests/privacy-preview.test.js. Reusing the general rule
+    // therefore removes the picture and reports nothing.
+    //
+    // What replaces it is narrower than the general rule rather than looser:
+    // one literal prefix, one alphabet, terminal padding only, no control
+    // characters, and a length ceiling. There is no host, no query and no
+    // fragment in this shape, so there is nothing for the general rule's
+    // patterns to find; and because the bytes travel inline, admitting one
+    // fetches nothing.
+    var PREVIEW_DATA_URL_PREFIX = "data:image/jpeg;base64,";
+    var PREVIEW_DATA_URL_MAX = 200000;
+    var PREVIEW_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+    function isSafePreviewDataUrl(s) {
+      if (typeof s !== "string") return false;
+      if (s.length <= PREVIEW_DATA_URL_PREFIX.length) return false;
+      if (s.length > PREVIEW_DATA_URL_MAX) return false;
+      if (s.slice(0, PREVIEW_DATA_URL_PREFIX.length) !== PREVIEW_DATA_URL_PREFIX) return false;
+      var body = s.slice(PREVIEW_DATA_URL_PREFIX.length);
+      // Control characters cannot appear in the alphabet above, so this is
+      // covered already; kept explicit because it is the property that matters
+      // when this value is written into a page or a log line.
+      if (hasControlChars(body)) return false;
+      if (body.length < 4 || body.length % 4 !== 0) return false;
+      return PREVIEW_BASE64_RE.test(body);
+    }
+
     function sanitizePopupError(s) {
       if (typeof s !== "string") return undefined;
       if (isSuspiciousPopupString(s)) return "Download error";
@@ -880,6 +913,7 @@
 
     return {
       createEphemeral: createEphemeral,
+      isSafePreviewDataUrl: isSafePreviewDataUrl,
       projectSafeHistory: projectSafeHistory,
       projectPopupJob: projectPopupJob,
       redactUrlForLog: redactUrlForLog,

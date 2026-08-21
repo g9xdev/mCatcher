@@ -220,6 +220,84 @@ function rememberBeam(beamId, tabId, frameId) {
   pendingBeams.set(beamId, entry);
 }
 
+// The one gate every preview picture passes, whoever produced it. Both
+// producers are outside this file's trust: a content script runs in the page's
+// world, and the helper is another process. Answers the string when it is a
+// bounded base64 JPEG data URL and null otherwise, so a caller can only ever
+// store a value that has been checked.
+//
+// The predicate lives in lib/privacy.js next to the general popup-string rule
+// it deliberately does NOT reuse — see the note there on why that rule removes
+// a JPEG rather than passing it.
+function safePreview(value) {
+  return self.McPrivacy.isSafePreviewDataUrl(value) ? value : null;
+}
+
+// ---- host round trips that are not about a download row ----
+// delete / badapple-stop / thumb each ask the helper a question and wait for
+// one answer. They are keyed on a request id of their own, NOT on a download
+// id, and the difference is load-bearing rather than tidy:
+//
+// onLegacyNativeMessage settles a frame by doing `activeDownloads.get(msg.id)`
+// and then, for a {type:"error"}, setting `dl.status = "error"`. A refusal
+// carrying a download id therefore marks that download FAILED. For a delete
+// that is the wrong statement in the most misleading direction — the file is
+// still on disk precisely BECAUSE the delete was refused, and the row would
+// then claim the download itself had failed. pendingBeams learned this and
+// says so at its own guard; these three follow the same shape.
+//
+// The prefix is what keeps the two id spaces apart: a download id is a bare
+// number (++downloadCounter), so a prefixed string can never name one.
+const pendingHostRequests = new Map();   // reqId -> { resolve, timer, kind }
+const HOST_REQUEST_TIMEOUT_MS = 30000;
+
+function newHostRequestId(prefix) {
+  return prefix + (++downloadCounter);
+}
+
+// Register a request and hand back its id. `resolve` is called exactly once:
+// by the matching host frame, or by the expiry, whichever lands first.
+function rememberHostRequest(reqId, kind, resolve) {
+  const entry = { kind, resolve };
+  entry.timer = setTimeout(function expireHostRequest() {
+    if (!pendingHostRequests.has(reqId)) return;
+    pendingHostRequests.delete(reqId);
+    resolve({ ok: false, error: "The helper did not answer.", dataUrl: null });
+  }, HOST_REQUEST_TIMEOUT_MS);
+  pendingHostRequests.set(reqId, entry);
+}
+
+// Claim a reqId. Answers null when nothing is waiting — a late or unknown
+// frame is then an ordinary no-op rather than a second answer to a caller
+// that has already been told something.
+function claimHostRequest(reqId) {
+  if (typeof reqId !== "string" || !pendingHostRequests.has(reqId)) return null;
+  const entry = pendingHostRequests.get(reqId);
+  pendingHostRequests.delete(reqId);
+  if (entry.timer) clearTimeout(entry.timer);
+  return entry;
+}
+
+// Post one request frame and return the promise its answer settles.
+// A frame is only built when the port is up, so a missing helper is answered
+// here rather than thrown into a postMessage that has nowhere to go.
+function askHost(prefix, kind, buildFrame) {
+  return new Promise((resolve) => {
+    if (!nativePort || !nativeReady) {
+      resolve({ ok: false, error: "Native helper not available.", dataUrl: null });
+      return;
+    }
+    const reqId = newHostRequestId(prefix);
+    rememberHostRequest(reqId, kind, resolve);
+    try {
+      nativePort.postMessage(buildFrame(reqId));
+    } catch (e) {
+      claimHostRequest(reqId);
+      resolve({ ok: false, error: "The helper could not be reached.", dataUrl: null });
+    }
+  });
+}
+
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
   // "connecting to the native helper…" line — must survive the async restore.
@@ -965,6 +1043,36 @@ function onLegacyNativeMessage(msg) {
       api.tabs.sendMessage(beam.tabId, { type: "beam-result", ok: false, error: text },
         Number.isInteger(beam.frameId) ? { frameId: beam.frameId } : undefined);
     } catch (e) { /* the frame is gone; the log line above still stands */ }
+    return;
+  }
+  // The answer to a delete / badapple-stop / thumb request. Claimed HERE,
+  // before the row lookup below, for the reason written at pendingHostRequests:
+  // past this point a frame is read as a statement about a download row, and
+  // `{type:"error"}` sets that row's status to "error". A refused delete is not
+  // a failed download — the file it names is still on disk — so it must never
+  // reach a line that can say otherwise. A frame that also happens to carry an
+  // `id` is claimed here too, and stops here.
+  if (msg.type === "delete-result" || msg.type === "badapple-stop-result") {
+    const req = claimHostRequest(msg.reqId);
+    if (req) {
+      const ok = msg.ok === true;
+      req.resolve({ ok, error: ok ? null : String(
+        msg.error == null ? "The helper refused." : msg.error) });
+    }
+    return;
+  }
+  if (msg.type === "thumb-result") {
+    const req = claimHostRequest(msg.reqId);
+    if (req) {
+      // The helper is a separate process. What it sends back is checked against
+      // the same shape a content-script capture has to satisfy before it can
+      // become a value the popup renders.
+      const dataUrl = safePreview(msg.dataUrl);
+      req.resolve(dataUrl
+        ? { ok: true, error: null, dataUrl, atSeconds: msg.atSeconds }
+        : { ok: false, dataUrl: null, atSeconds: msg.atSeconds,
+            error: String(msg.error == null ? "No frame was returned." : msg.error) });
+    }
     return;
   }
   const dl = activeDownloads.get(msg.id);
@@ -3633,6 +3741,34 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // context of the popup click).
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "open", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "delete-file") {
+        // Deleting is the helper's to do or refuse — it owns the allowlist that
+        // decides which paths may be touched at all. `downloadId` is carried by
+        // the popup message for the row's own bookkeeping and is deliberately
+        // NOT put on the wire: the frame the helper answers is keyed on a
+        // request id, so its refusal can never be read as a row's failure.
+        if (typeof msg.path !== "string" || !msg.path) {
+          sendResponse({ ok: false, error: "No file to delete." });
+        } else {
+          askHost("del", "delete", (reqId) => ({ cmd: "delete", reqId, path: msg.path }))
+            .then((r) => sendResponse({ ok: r.ok, error: r.error }));
+          return true;
+        }
+      } else if (msg.type === "badapple-stop") {
+        askHost("bas", "badapple-stop", (reqId) => ({ cmd: "badapple-stop", reqId }))
+          .then((r) => sendResponse({ ok: r.ok, error: r.error }));
+        return true;
+      } else if (msg.type === "thumb-file") {
+        // A frame from a file already ON DISK. The helper is handed a path and
+        // never a url: it must not be the thing that opens a stream address.
+        if (typeof msg.path !== "string" || !msg.path) {
+          sendResponse({ ok: false, dataUrl: null, error: "No file to read." });
+        } else {
+          const at = Number.isFinite(msg.atSeconds) && msg.atSeconds >= 0 ? msg.atSeconds : 0;
+          askHost("thm", "thumb", (reqId) => ({ cmd: "thumb", reqId, path: msg.path, atSeconds: at }))
+            .then((r) => sendResponse({ ok: r.ok, dataUrl: r.dataUrl || null, error: r.error }));
+          return true;
+        }
       } else if (msg.type === "reveal-file") {
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "reveal", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });

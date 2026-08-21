@@ -11,6 +11,7 @@ const SIGNED = "https://cdn.example/file.mp4?token=SECRET_SIGNED_QUERY_XYZ&exp=9
 const COOKIE = "session=SECRET_COOKIE_ABC";
 const PUBLIC_KEYS = [
   "createEphemeral",
+  "isSafePreviewDataUrl",
   "projectSafeHistory",
   "projectPopupJob",
   "redactUrlForLog",
@@ -98,7 +99,7 @@ test("assertNoSentinels fails when signed query leaks", () => {
 
 // --- Exact public surface + dual export ---
 
-test("exports exactly the seven public keys", () => {
+test("exports exactly the eight public keys", () => {
   assert.deepEqual(Object.keys(P).sort(), PUBLIC_KEYS.slice().sort());
   for (const k of PUBLIC_KEYS) {
     assert.equal(typeof P[k], "function", k);
