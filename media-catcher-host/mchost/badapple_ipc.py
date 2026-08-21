@@ -142,6 +142,50 @@ def pipe_name():
     return PIPE_PREFIX + str(session_id())
 
 
+# The named-pipe namespace, which is listable as a directory. The spelling
+# matters: os.listdir accepts "//./pipe/" and rejects the r"\\.\pipe" form the
+# names themselves use, so this constant is not free to be tidied into the
+# same shape as PIPE_PREFIX.
+PIPE_DIR = "//./pipe/"
+
+
+def _pipe_is_hosted(name):
+    """True when something is hosting the named pipe `name` right now.
+
+    LOOKS, does not CONNECT. Opening the pipe is what send_beam does, and it
+    costs something: a single-instance server hands its waiting instance to
+    whoever connects, so a probe that connects and writes nothing gives
+    BadApple a connection to accept and read EOF from. Enumerating the
+    namespace touches no server at all.
+    """
+    try:
+        want = name.rsplit("\\", 1)[-1].lower()
+        return any(entry.lower() == want for entry in os.listdir(PIPE_DIR))
+    except Exception:
+        return False
+
+
+def is_running():
+    """True when a BadApple is hosting THIS SESSION's command pipe.
+
+    The name is machine-global and suffixed with the session id, so a BadApple
+    in another logon of this user is deliberately not this one.
+
+    TWO HONEST LIMITS, both of which the callers are written around:
+
+      * it says the NAME is hosted, not that BadApple hosts it -- the same
+        limit _pipe_owner_is_current_user has, and for the same reason there
+        is nothing better available.
+      * it says an instance EXISTS, not what that instance is playing. There
+        is no query verb on this channel: the grammar is `--beam "<target>"`
+        and an optional token, with no reply channel to answer on.
+
+    False when the namespace cannot be read. The question a caller asks is
+    "should this host start a process", and "could not tell" is not a yes.
+    """
+    return _pipe_is_hosted(pipe_name())
+
+
 # ---------------------------------------------------------------------------
 # Win32
 # ---------------------------------------------------------------------------

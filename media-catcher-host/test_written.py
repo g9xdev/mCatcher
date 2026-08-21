@@ -121,6 +121,171 @@ def test_a_corrupt_line_does_not_hide_the_records_around_it(ledger, tmp_path):
     assert written.was_written(str(good)) is True
 
 
+def test_a_file_from_an_earlier_session_survives_the_first_record_of_this_one(
+        ledger, tmp_path):
+    """The ledger must not answer only for the process that is reading it.
+
+    This helper respawns per Firefox connection, so ALMOST every file the popup
+    can see was recorded by a process that has since exited: the in-memory
+    cache starts empty and the file on disk holds everything. A record() that
+    seeds the cache from that empty start and then STAMPS it as a faithful read
+    of the file makes every earlier line invisible for the rest of the session
+    -- which is every file the user is likely to delete or thumbnail.
+
+    forget_cache() stands in for the respawn: it is exactly the state a fresh
+    interpreter has.
+    """
+    yesterday = tmp_path / "yesterday.mp4"
+    yesterday.write_bytes(b"x")
+    assert written.record(str(yesterday)) is True
+
+    written.forget_cache()                      # a NEW host process starts here
+    today = tmp_path / "today.mp4"
+    today.write_bytes(b"x")
+    assert written.record(str(today)) is True   # ... and records before it reads
+
+    assert written.was_written(str(today)) is True
+    assert written.was_written(str(yesterday)) is True, (
+        "a file recorded by an earlier host process is still this host's to "
+        "delete; the ledger on disk is the answer, not what this process "
+        "happens to have appended")
+
+
+def test_a_record_never_hides_a_line_another_process_appended(ledger, tmp_path):
+    """The same hazard from the side that does not need a respawn.
+
+    A second Firefox variant runs its own copy of this helper against the SAME
+    ledger. Our own append must not stamp the cache as covering lines that
+    arrived between our last read and our write.
+    """
+    mine = tmp_path / "mine.mp4"
+    mine.write_bytes(b"x")
+    written.record(str(mine))
+    assert written.was_written(str(mine)) is True      # cache now holds a stamp
+
+    theirs = tmp_path / "theirs.mp4"
+    theirs.write_bytes(b"x")
+    with io.open(str(ledger), "a", encoding="utf-8") as fh:   # the other process
+        fh.write(json.dumps(
+            {"path": str(theirs),
+             "key": os.path.normcase(os.path.realpath(str(theirs))),
+             "at": 1}) + "\n")
+
+    second = tmp_path / "second.mp4"
+    second.write_bytes(b"x")
+    written.record(str(second))                        # our append, after theirs
+
+    assert written.was_written(str(theirs)) is True, (
+        "a line this process did not write is still in the file, and the "
+        "cache must not claim to have read it")
+    assert written.was_written(str(second)) is True
+
+
+def test_record_answers_false_rather_than_raising(ledger, tmp_path, monkeypatch):
+    """The docstring's promise, held to each of the three calls that could break it.
+
+    Every caller is a download that has already SUCCEEDED -- the bytes are on
+    disk and the frame announcing them is about to go out. A throw out of
+    record() there does not lose a ledger line, it loses the frame.
+    """
+    import types
+
+    mine = tmp_path / "clip.mp4"
+    mine.write_bytes(b"x")
+
+    def boom(*a, **k):
+        raise RuntimeError("no")
+
+    # (a) the second realpath -- _key's is already guarded, this one was not.
+    real = os.path.realpath
+    calls = []
+
+    def once_then_boom(path):
+        calls.append(path)
+        if len(calls) > 1:
+            raise OSError("resolution failed")
+        return real(path)
+
+    monkeypatch.setattr(written.os.path, "realpath", once_then_boom)
+    assert written.record(str(mine)) is False
+    monkeypatch.undo()
+
+    # (b) the line itself
+    monkeypatch.setattr(written, "_PATH_OVERRIDE", str(ledger))
+    monkeypatch.setattr(written, "json", types.SimpleNamespace(dumps=boom))
+    assert written.record(str(mine)) is False
+    monkeypatch.undo()
+
+    # (c) the timestamp
+    monkeypatch.setattr(written, "_PATH_OVERRIDE", str(ledger))
+    monkeypatch.setattr(written, "time", types.SimpleNamespace(time=boom))
+    assert written.record(str(mine)) is False
+
+
+def test_a_line_too_long_to_be_one_of_ours_is_neither_written_nor_believed(
+        ledger, tmp_path):
+    """_MAX_LINE, pinned at BOTH ends, because one end alone is a disagreement.
+
+    READ: a line over the cap is skipped rather than parsed, so a ledger that
+    has had something else appended to it cannot hand this host a path to act
+    on by burying it in one enormous well-formed line.
+
+    WRITE: record() refuses a line it could not read back. A Windows path may
+    legally be ~32,000 characters, and JSON-escaping a path doubles every
+    separator; without this half, record() would answer True for a file
+    was_written() then denies -- a row the popup shows and cannot act on, with
+    nothing anywhere saying why.
+    """
+    good = tmp_path / "good.mp4"
+    good.write_bytes(b"x")
+    written.record(str(good))
+
+    smuggled = os.path.join(str(tmp_path), "smuggled.mp4")
+    entry = {"path": smuggled,
+             "key": os.path.normcase(os.path.realpath(smuggled)),
+             "at": 1, "pad": "P" * written._MAX_LINE}
+    line = json.dumps(entry)
+    assert len(line) > written._MAX_LINE, len(line)
+    with io.open(str(ledger), "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    written.forget_cache()
+
+    assert written.was_written(smuggled) is False, (
+        "an oversized line is not one this module wrote, so the path in it is "
+        "not one this host admits to having written")
+    assert written.was_written(str(good)) is True, (
+        "and skipping it costs its own line, not the ones around it")
+
+    huge = "C:" + os.sep + "a" * written._MAX_LINE + ".mp4"
+    assert written.record(huge) is False, (
+        "record does not write a line was_written would then skip")
+    assert written.was_written(huge) is False
+
+
+def test_no_test_in_this_suite_writes_to_the_production_ledger():
+    """The ledger the INSTALLED host uses is not test scratch.
+
+    written.py's default path is tools.HERE/written-files.jsonl -- inside the
+    source tree, and on an installed copy it is the real record of the user's
+    real downloads. A test that drives a download lane without redirecting it
+    appends there forever: 882 lines of pytest tmp paths had accumulated in
+    this tree before conftest's autouse redirect existed, growing ~43KB per
+    run.
+
+    Two claims, and the pair is deliberate. The first says the redirect is
+    ACTIVE, so it fails the moment the autouse fixture is dropped. The second
+    says the production file on this machine is byte for byte what it was when
+    this session started, so it fails if anything reached past the redirect.
+    """
+    import conftest
+
+    assert written.ledger_path() != written._DEFAULT_PATH, (
+        "conftest's autouse ledger redirect is not in place; every test that "
+        "finishes a download is appending to %s" % written._DEFAULT_PATH)
+    assert conftest.production_ledger_state() == conftest.PRODUCTION_LEDGER_AT_START, (
+        "%s changed during this run" % conftest.PRODUCTION_LEDGER)
+
+
 def test_nothing_shaped_wrong_is_ever_known(ledger):
     for bad in (None, "", "   ", 7, {"a": 1}, ["a"], b"a.mp4"):
         assert written.was_written(bad) is False, bad

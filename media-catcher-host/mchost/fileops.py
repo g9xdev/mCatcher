@@ -63,10 +63,13 @@ dimensions: JPEG size depends on content, and a 320px-WIDE frame of a very
 tall video is not small.
 """
 import base64
+import ctypes
 import os
 import subprocess
 import threading
+from ctypes import wintypes
 
+from mchost import badapple_ipc
 from mchost import guard
 from mchost import tools
 from mchost import written
@@ -80,6 +83,41 @@ def _h():
     """Call-time shim lookup, the same convention downloads/hlog/config use."""
     import mc_host
     return mc_host
+
+
+# ---------------------------------------------------------------------------
+# Win32, for the one question Python's own file API cannot ask
+#
+# CPython's open() and os.open() take the CRT's default sharing (_SH_DENYNO),
+# so they succeed on a file another process is holding and tell us nothing.
+# Asking for the file with NO sharing is the question _file_is_held needs, and
+# CreateFileW is the only way to ask it.
+#
+# Declared here rather than borrowed from badapple_ipc's identical block: that
+# module's is part of writing to a pipe, and a file-lock probe reaching into
+# another module's private handle for a DLL is a coupling that buys nothing.
+# ---------------------------------------------------------------------------
+
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_NONE = 0
+_OPEN_EXISTING = 3
+_ERROR_SHARING_VIOLATION = 32
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+_K32 = None
+
+
+def _kernel32():
+    global _K32
+    if _K32 is None:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.HANDLE]
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        _K32 = k
+    return _K32
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +162,9 @@ SHORT_CLIP_AT_SECONDS = 1
 # is not going to finish — a file on a share that went away mid-read.
 FFMPEG_TIMEOUT = 30
 
-# Bounded twice, and by insertion order. The count is the working set the
-# popup actually asks for (one screen of rows, re-asked each time it opens);
+# Bounded twice, and evicted least-recently-USED first -- dict order, with
+# _cache_get moving a key it answers to the end. The count is the working set
+# the popup actually asks for (one screen of rows, re-asked each time it opens);
 # the byte budget is what keeps the count honest, because an entry is a data:
 # URL and MAX_JPEG_BYTES says one can be 512KB base64. 64 of those would be
 # 32MB held by a helper that is otherwise idle.
@@ -174,6 +213,34 @@ def _guarded_target(path):
 # delete
 # ---------------------------------------------------------------------------
 
+def _file_is_held(path):
+    """True when some process on this machine has `path` open.
+
+    CreateFileW with dwShareMode 0 asks Windows for the file with NO sharing,
+    and Windows refuses that with a sharing violation when ANY other handle on
+    the file is open, whatever sharing THAT handle allowed. So this is a direct
+    answer to "would the os.remove below hit a sharing violation", without
+    reading a byte and without a second guess about which programs lock what.
+
+    The handle is closed immediately. Nothing is read, written or truncated:
+    GENERIC_READ with OPEN_EXISTING creates nothing and modifies nothing.
+
+    FALSE when the file is free, when it is not there, and when the probe
+    itself fails. All three answer the only question the caller asks — should
+    this host go stopping a player over this file — with "no reason to".
+    """
+    try:
+        k = _kernel32()
+        handle = k.CreateFileW(path, _GENERIC_READ, _FILE_SHARE_NONE, None,
+                               _OPEN_EXISTING, 0, None)
+    except Exception:
+        return False
+    if handle == _INVALID_HANDLE_VALUE or handle is None:
+        return ctypes.get_last_error() == _ERROR_SHARING_VIOLATION
+    k.CloseHandle(handle)
+    return False
+
+
 def _release_local_holders(path):
     """Let go of `path` here, so the os.remove after it is not fighting us.
 
@@ -182,13 +249,34 @@ def _release_local_holders(path):
 
       (a) BadApple, which may be PLAYING the file. Stopped through the same
           --stop the popup's stop button uses, so there is one way to stop it
-          rather than two that can drift.
+          rather than two that can drift. CONDITIONAL — see below.
 
       (b) this host's OWN local media server (mchost/cast/legacy.py). It
           serves a cast file over plain HTTP from _DLNA["media"] and opens the
           file per request; a cast that ended without an explicit stop leaves
           its token registered for the rest of the session. Stopping BadApple
           does not touch it, which is the part that is easy to miss.
+
+    (b) IS UNCONDITIONAL, because it costs the user nothing: retiring a token
+    in this process's own dict is not something they can see. (a) is a process
+    the user is watching, and ending it is not a side effect a delete gets to
+    have for free.
+
+    WHAT THE CONDITION CAN AND CANNOT BE. "Is BadApple playing THIS file" is
+    not answerable from here: their command pipe takes `--beam "<target>"` and
+    an optional credential, with no query verb and no reply channel. The two
+    facts that ARE answerable are asked instead, and the stop needs both:
+
+        the file is held open by SOMETHING   (_file_is_held, above)
+      AND a BadApple is running at all       (badapple_ipc.is_running)
+
+    Neither is the question we would rather ask. Together they rule out the
+    two cases that were plainly wrong — a delete of a file nobody has open
+    ending someone's unrelated playback, and a `--stop` that STARTS BadApple
+    purely to tell it to stop — and they leave one case over-broad: BadApple
+    running, the file held by something else, playback of something unrelated
+    ended. Narrowing that one needs a verb on their side, not a cleverer probe
+    on this one.
 
     What (b) CANNOT do is close a handle a response already holds: _serve_file
     keeps the file open for the length of one response, and a response in
@@ -199,7 +287,8 @@ def _release_local_holders(path):
     Best effort on both: a holder that will not let go is a reason for the
     remove to fail with a message, not a reason to fail before trying.
     """
-    _spawn_badapple_stop()
+    if _file_is_held(path) and badapple_ipc.is_running():
+        _spawn_badapple_stop()
     try:
         from mchost.cast import legacy
         legacy.release_local_path(path)
@@ -369,8 +458,20 @@ def _run_ffmpeg_frame(path, at):
 
 
 def _cache_get(key):
+    """The entry, and reading it COUNTS as using it.
+
+    The eviction below walks insertion order, so without the re-insert here it
+    is FIFO: the popup asks for every visible row each time it opens, an answer
+    off the cache writes nothing, and the row the user looks at every single
+    time would be evicted in favour of one decoded once and never asked for
+    again. Moving the key to the end makes the order least-recently-USED.
+    """
     with _THUMB_LOCK:
-        return _THUMB_CACHE.get(key)
+        hit = _THUMB_CACHE.get(key)
+        if hit is not None:
+            _THUMB_CACHE.pop(key)
+            _THUMB_CACHE[key] = hit
+        return hit
 
 
 def _cache_put(key, value):

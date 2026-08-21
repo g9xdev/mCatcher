@@ -23,6 +23,11 @@ path (a re-download of the same name lands on the same dedup'd name), and a
 tombstone would then have to be un-done to keep that second file deletable.
 Growth is one line, about 120 bytes, per file this host finishes; the read is
 cached against the file's own (mtime, size) so the ordinary case is one stat.
+An APPEND drops that cache rather than adding to it. The cache is only ever a
+parse of the whole file, and this helper respawns per Firefox connection --
+so what a running process has appended is a tiny and unrepresentative part of
+what the file holds, and treating it as the whole would hide every file an
+earlier session wrote.
 
 WHERE IT LIVES
 --------------
@@ -59,7 +64,9 @@ _LOCK = threading.Lock()
 _CACHE = {"stamp": None, "keys": frozenset()}
 
 # One line is a path plus a timestamp. A line longer than this is not one this
-# module wrote, so it is skipped rather than parsed.
+# module wrote, so it is skipped rather than parsed -- and record() enforces
+# the SAME cap on the way out, which is what makes that sentence true rather
+# than merely likely: a Windows path may legally run to ~32,000 characters.
 _MAX_LINE = 8192
 
 
@@ -142,24 +149,48 @@ def record(path):
     """Append `path` to the ledger. True when a line was written.
 
     Never raises: every caller is a download that has already succeeded, and a
-    ledger this host cannot write is not a reason to fail one.
+    ledger this host cannot write is not a reason to fail one. That promise is
+    what puts the WHOLE body inside the try -- realpath, json.dumps and the
+    clock can throw exactly as the write can, and a throw here does not lose a
+    ledger line, it loses the frame that was about to announce the file.
     """
     key = _key(path)
     if key is None:
         return False
-    line = json.dumps({"path": os.path.realpath(path), "key": key,
-                       "at": int(time.time() * 1000)},
-                      ensure_ascii=True)
     try:
+        line = json.dumps({"path": os.path.realpath(path), "key": key,
+                           "at": int(time.time() * 1000)},
+                          ensure_ascii=True)
+        if len(line) > _MAX_LINE:
+            # _load_locked skips a line this long, so writing one would mean
+            # answering True for a file was_written() then denies -- a row the
+            # popup shows and cannot act on. Answering False here is the same
+            # failure the read-only-install case already has, and it is at
+            # least the one the caller is told about.
+            return False
         with _LOCK:
             with io.open(ledger_path(), "a", encoding="utf-8") as fh:
                 # One write of one line: O_APPEND makes concurrent appends from
                 # a second host process interleave by line rather than by byte.
                 fh.write(line + "\n")
-            # The stamp this cache was built against is now stale; rather than
-            # re-read the file here, add the key and re-stamp.
-            _CACHE["keys"] = frozenset(_CACHE["keys"] | {key})
-            _CACHE["stamp"] = _stamp(ledger_path())
+            # DROPPED, not patched up. The tempting cheap move -- add this key
+            # and re-stamp -- is only sound when what is held IS the parse of
+            # the file as it stood before this append, and the two cases where
+            # it is not are the ordinary ones:
+            #
+            #   * a fresh process holds an EMPTY set that was never a read of
+            #     anything. Stamping that as current makes every line an
+            #     earlier host session wrote answer False for the rest of this
+            #     one, and this helper respawns per Firefox connection, so that
+            #     is nearly every file the popup can offer to delete.
+            #   * a second host process (another Firefox variant) may have
+            #     appended between our last read and this write; its lines are
+            #     in the file and not in our set.
+            #
+            # The next was_written() re-reads. That costs one parse of a file
+            # of ~120-byte lines, on a verb the user has to click for.
+            _CACHE["stamp"] = None
+            _CACHE["keys"] = frozenset()
         return True
     except Exception:
         return False

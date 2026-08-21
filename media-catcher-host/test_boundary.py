@@ -1547,8 +1547,11 @@ def test_delete_releases_the_local_holders_before_it_removes(monkeypatch, tmp_pa
       (b) this host's OWN local media server (mchost/cast/legacy.py), which
           serves a cast file over plain HTTP and opens it per request.
           Stopping BadApple does not touch that one.
+
+    (a) is CONDITIONAL — see the three tests below it. This one is about the
+    ORDER, so both conditions are forced true and the order is what is read.
     """
-    from mchost import fileops
+    from mchost import badapple_ipc, fileops
     from mchost.cast import legacy
 
     written = _ledger(monkeypatch, tmp_path)
@@ -1556,6 +1559,8 @@ def test_delete_releases_the_local_holders_before_it_removes(monkeypatch, tmp_pa
     written.record(mine)
     app = _fake_badapple(monkeypatch, tmp_path)
     monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(fileops, "_file_is_held", lambda p: True)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)
 
     order = []
     monkeypatch.setattr(fileops.subprocess, "Popen",
@@ -1655,6 +1660,206 @@ def test_the_media_server_stops_serving_a_path_it_is_asked_to_release():
         assert legacy.release_local_path(mine) == 0, "releasing twice is a no-op"
     finally:
         legacy._DLNA["media"] = before
+
+
+# --- delete does not stop a BadApple that has nothing to do with this file ---
+#
+# _release_local_holders spawns `BadApple --stop` before the remove. Spawning
+# it UNCONDITIONALLY means every tidy-up of a finished download ends whatever
+# the user happens to be watching — and, when BadApple is not running at all,
+# STARTS a process purely to tell it to stop.
+#
+# What this host can and cannot establish, stated plainly:
+#
+#   * "BadApple is playing THIS file" is NOT answerable from here. Their
+#     command pipe's grammar is `--beam "<target>" [--headers <token>]` — one
+#     verb, no query, no reply channel (mchost/badapple_ipc.py, and BadApple's
+#     own docs/protocol/wire-contract.json "ipc").
+#   * "something on this machine holds this file open" IS answerable, by
+#     asking Windows for the file with no sharing and reading the refusal.
+#   * "a BadApple is hosting this session's command pipe" IS answerable, by
+#     looking in the pipe namespace — which is the same fact send_beam learns
+#     by connecting, learned without connecting.
+#
+# So the stop is gated on the conjunction of the two answerable ones. It is
+# narrower than the question we would rather ask, and it is honest about which
+# question it is.
+
+
+def test_a_file_nothing_has_open_is_not_held_and_one_this_process_opened_is(
+        tmp_path):
+    """The probe, against real handles rather than a stub of itself.
+
+    CreateFileW with dwShareMode 0 fails with a sharing violation when ANY
+    other handle on the file is open, whatever sharing that handle allowed —
+    so Python's own open() is enough to make it say so.
+    """
+    from mchost import fileops
+
+    mine = _media(tmp_path)
+    assert fileops._file_is_held(mine) is False, "nothing has it open"
+    with open(mine, "rb"):
+        assert fileops._file_is_held(mine) is True, "this process has it open"
+    assert fileops._file_is_held(mine) is False, "and let it go again"
+    assert fileops._file_is_held(os.path.join(str(tmp_path), "nope.mp4")) is False, (
+        "a file that is not there is not one anybody is holding")
+
+
+def test_the_badapple_pipe_probe_reads_the_namespace_without_connecting():
+    """`is_running` LOOKS; it does not open the pipe.
+
+    Connecting would consume the single-instance server's waiting instance and
+    hand it a connection that writes no line. Enumerating the namespace is
+    read-only, and it answers the same question.
+
+    Driven against a pipe this test creates, under a name of its own — never
+    BadApple's, because standing up `badapple-cmd-<session>` on a machine where
+    BadApple is running is squatting on the name it needs.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    from mchost import badapple_ipc
+
+    name = r"\\.\pipe\mchost-probe-%d" % os.getpid()
+    assert badapple_ipc._pipe_is_hosted(name) is False, "nothing hosts it yet"
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                   wintypes.DWORD, wintypes.DWORD,
+                                   wintypes.DWORD, wintypes.DWORD,
+                                   wintypes.DWORD, wintypes.LPVOID]
+    k.CreateNamedPipeW.restype = wintypes.HANDLE
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k.CreateNamedPipeW(name, 1, 0, 1, 512, 512, 0, None)
+    assert handle and handle != ctypes.c_void_p(-1).value, ctypes.get_last_error()
+    try:
+        assert badapple_ipc._pipe_is_hosted(name) is True
+    finally:
+        k.CloseHandle(handle)
+    assert badapple_ipc._pipe_is_hosted(name) is False, "and gone with it"
+
+
+def test_is_running_asks_about_this_sessions_pipe(monkeypatch):
+    """The name matters: it is machine-global and suffixed with the session id,
+    so a BadApple in another logon of this user is not this session's."""
+    from mchost import badapple_ipc
+
+    asked = []
+    monkeypatch.setattr(badapple_ipc, "_pipe_is_hosted",
+                        lambda n: (asked.append(n), True)[1])
+    assert badapple_ipc.is_running() is True
+    assert asked == [badapple_ipc.pipe_name()], asked
+    assert asked[0].startswith(badapple_ipc.PIPE_PREFIX), asked
+
+
+def test_delete_does_not_start_badapple_when_nothing_is_holding_the_file(
+        monkeypatch, tmp_path):
+    """The ordinary delete: a finished download, nobody playing it.
+
+    Nothing needs releasing, so nothing is spawned. Before this, deleting a
+    row ended whatever BadApple was showing — a file it had never been given.
+    """
+    from mchost import badapple_ipc, fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)  # and playing
+
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d20", "path": mine})
+
+    assert _answer(sent, "delete-result")["ok"] is True, sent
+    assert not os.path.exists(mine)
+    assert ran == [], (
+        "nothing had the file open, so there was nothing to stop: %s" % (ran,))
+
+
+def test_delete_does_not_start_badapple_merely_to_tell_it_to_stop(
+        monkeypatch, tmp_path):
+    """The file IS held — by something that is not BadApple, because BadApple
+    is not running.
+
+    Spawning `--stop` here starts a process that cannot possibly be holding
+    the file, and _spawn_badapple_stop's own docstring says the host cannot
+    promise that process puts no window up. The remove that follows reports
+    Windows' own sentence about who is holding it, which is the answer.
+    """
+    from mchost import badapple_ipc, fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(fileops, "_file_is_held", lambda p: True)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: False)
+
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d21", "path": mine})
+    assert _answer(sent, "delete-result")["ok"] is True, sent
+    assert ran == [], "no BadApple was running to stop: %s" % (ran,)
+
+
+def test_delete_stops_badapple_when_it_is_running_and_the_file_is_held(
+        monkeypatch, tmp_path):
+    """The case the stop is FOR, and the only one it fires in."""
+    from mchost import badapple_ipc, fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(fileops, "_file_is_held", lambda p: True)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)
+
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d22", "path": mine})
+    assert _answer(sent, "delete-result")["ok"] is True, sent
+    assert ran == [(app, "--stop")], ran
+
+
+def test_the_stop_button_is_not_gated_the_way_delete_is(monkeypatch, tmp_path):
+    """The gate belongs to `delete`, not to `--stop`.
+
+    The popup's stop button IS the user asking for playback to end. It takes no
+    path — there is no file to ask about — and a person pressing stop has said
+    what they want more clearly than any probe could.
+    """
+    from mchost import badapple_ipc, fileops
+
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(fileops, "_file_is_held", lambda p: False)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: False)
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple_stop({"reqId": "s3"})
+    assert _answer(sent, "badapple-stop-result")["ok"] is True, sent
+    assert ran == [(app, "--stop")], ran
 
 
 # --- badapple-stop ---
@@ -1848,13 +2053,115 @@ def test_thumb_re_reads_a_file_that_changed_under_the_same_name(
     assert len(runs) == 1, "the changed file was decoded again, not served stale"
 
 
+def test_a_boolean_offset_is_not_read_as_one_second(monkeypatch, tmp_path):
+    """bool is a subclass of int in Python, so `{"atSeconds": true}` would seek
+    to 1s without the exclusion — the same trap guard's own "num" kind spells
+    out for `{"seq": true}`.
+
+    guard.validate_message refuses a boolean there first, and this is the
+    second line: _at_seconds is also reached by handle_thumb calls that did not
+    come off the wire, and a guard whose only proof is another module's guard
+    is one refactor from being nothing.
+    """
+    from mchost import fileops
+
+    assert guard._is_num(True) is False, "the wire refuses it first"
+    for value in (True, False):
+        assert fileops._at_seconds(value) == fileops.DEFAULT_AT_SECONDS, value
+
+
+def test_a_negative_offset_reads_as_the_default_and_never_reaches_ffmpeg(
+        monkeypatch, tmp_path):
+    """guard.NUM admits -5: a negative offset DOES arrive here off the wire.
+
+    It is not a position in a file, and `-ss -5` is an argument to ffmpeg
+    rather than an error, so it reads as the default instead.
+    """
+    from mchost import fileops
+
+    assert fileops._at_seconds(-5) == fileops.DEFAULT_AT_SECONDS
+    assert fileops._at_seconds(-0.001) == fileops.DEFAULT_AT_SECONDS
+    assert fileops._at_seconds(0) == 0, "zero IS a position in a file"
+
+    written = _ledger(monkeypatch, tmp_path)
+    clip = _media(tmp_path)
+    written.record(clip)
+    offsets = []
+    monkeypatch.setattr(
+        fileops, "_run_ffmpeg_frame",
+        lambda path, at: (offsets.append(at), (None, "no frame"))[1])
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_thumb({"reqId": "t20", "path": clip, "atSeconds": -5})
+    _answer(sent, "thumb-result")
+    assert offsets and all(at >= 0 for at in offsets), offsets
+    assert offsets[0] == fileops.DEFAULT_AT_SECONDS, offsets
+
+
+def test_ffmpeg_output_that_is_not_a_jpeg_is_not_sent_as_one(monkeypatch, tmp_path):
+    """returncode 0 is not the same claim as "this is a picture".
+
+    ffmpeg exits 0 having written nothing at all when a filter produces no
+    frame, and the bytes on stdout are whatever the muxer put there. They are
+    about to be base64'd into a data:image/jpeg URL the popup renders, so the
+    magic number is what makes that label true rather than assumed.
+    """
+    from mchost import fileops
+
+    class _Done(object):
+        def __init__(self, out):
+            self.returncode = 0
+            self.stdout = out
+            self.stderr = b""
+
+    for body in (b"", b"<!doctype html>", b"RIFF\x00\x00\x00\x00WEBP"):
+        monkeypatch.setattr(fileops.subprocess, "run",
+                            lambda *a, **k: _Done(body))
+        data, error = fileops._run_ffmpeg_frame(str(tmp_path / "clip.mp4"), 2)
+        assert data is None, (body, data[:16])
+        assert error and "clip.mp4" in error, (body, error)
+
+    monkeypatch.setattr(fileops.subprocess, "run",
+                        lambda *a, **k: _Done(b"\xff\xd8\xff\xdb-and-so-on"))
+    data, error = fileops._run_ffmpeg_frame(str(tmp_path / "clip.mp4"), 2)
+    assert data == b"\xff\xd8\xff\xdb-and-so-on" and error is None, (data, error)
+
+
+def test_the_thumb_cache_keeps_the_row_the_popup_keeps_asking_for():
+    """Eviction is least-recently-USED, and a read is a use.
+
+    The popup asks for every visible row each time it opens, and an answer off
+    the cache writes nothing. Under plain insertion order those re-asks count
+    for nothing, and the row the user looks at every time is evicted in favour
+    of one decoded once and never asked for again.
+    """
+    from mchost import fileops
+
+    fileops.forget_thumb_cache()
+    try:
+        keys = [("row%d" % i, 0, 0, 1) for i in range(fileops._THUMB_CACHE_MAX)]
+        for key in keys:
+            fileops._cache_put(key, ("x", 1))
+
+        assert fileops._cache_get(keys[0]) == ("x", 1), "still there, and read"
+        fileops._cache_put(("row-new", 0, 0, 1), ("x", 1))   # forces one out
+
+        assert keys[0] in fileops._THUMB_CACHE, (
+            "the row that was asked for again survived")
+        assert keys[1] not in fileops._THUMB_CACHE, (
+            "and the one nobody has looked at since it was decoded went")
+    finally:
+        fileops.forget_thumb_cache()
+
+
 def test_the_thumb_cache_is_bounded_by_bytes_as_well_as_by_count():
     """A count bound alone is not a memory bound here.
 
     An entry is a data: URL, and MAX_JPEG_BYTES permits one of 512KB base64;
     64 of those is 32MB held by a helper that is otherwise idle waiting on a
-    pipe. Both bounds evict oldest-first, so what survives is what the popup
-    asked for most recently."""
+    pipe. Both bounds evict least-recently-used first — see the test above for
+    what makes a read a use."""
     from mchost import fileops
 
     fileops.forget_thumb_cache()
