@@ -7,16 +7,23 @@
 // the user sees. That is pinned in tests/background-live-detection.test.js at
 // "a frame proposing its own name for the page's file keeps its own row" and
 // "a subframe DOM claim never suppresses another frame's report of the same
-// file", and this module is written to leave it alone: a fold requires the
-// proposed names to AGREE, not merely the sources.
+// file", and this module is written to leave it alone.
 //
-// Two kinds of duplicate are folded.
+// Two kinds of duplicate are folded, and they are decided on DIFFERENT
+// evidence. Only the first is a name check, so the rule is written out per
+// case rather than as one sentence that would be false for the other.
 //
 //   Query churn — one source reported more than once with different volatile
 //   query parameters. Only parameters on a known-volatile list are dropped,
 //   because the alternative (dropping the whole query) folds together two
 //   genuinely different resources served from one path, which is how a great
 //   many CDNs address files. A parameter that SELECTS the resource stays.
+//
+//   This is the case the ad-iframe reasoning above is about: two reports of
+//   ONE address, where the only question is whose proposed name wins. So this
+//   fold requires the proposed names to AGREE, not merely the sources — see
+//   sameName below, and the tests at "two frames proposing DIFFERENT names for
+//   the same URL both keep their row".
 //
 //   A master playlist and the variants of its own stream. background.js's
 //   keepHighestRendition already collapses same-directory variants down to the
@@ -25,6 +32,17 @@
 //   preferHighestRendition setting, the variants of a master's own stream fold
 //   into it — the master is the row a download should use, since it is what
 //   carries the full ladder.
+//
+//   This fold does NOT consult the proposed names, and cannot: a master is
+//   named for the stream and a variant for its rung, so they disagree in the
+//   ordinary case ("Stream.m3u8" beside "1080.m3u8") and a name check would
+//   switch the fold off entirely. Nor is a name check what protects anything
+//   here. The ad-iframe risk is one address claimed by two reporters; a master
+//   and a variant are DIFFERENT addresses, and what decides the fold is
+//   ownership of the directory the variant sits in — see owningMasterDir, and
+//   the tests at "a variant of a DIFFERENT stream is not folded into this
+//   master". Pinned at "a master folds its own variants even though their
+//   proposed names differ".
 (function (root, factory) {
   "use strict";
   var api = factory();

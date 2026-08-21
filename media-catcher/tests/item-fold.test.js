@@ -13,14 +13,19 @@
 // content_scripts runs in all_frames, so a third-party ad iframe can report the
 // honest page's media URL and propose "Free-iPhone.mp4" for it. Folding on URL
 // alone would let whichever frame reported FIRST decide the name of the row the
-// user sees. So the rule here is: same source AND same proposed name folds;
-// same source with different proposed names does not.
+// user sees. So the rule for two reports of ONE address is: same source AND
+// same proposed name folds; same source with different proposed names does not.
 //
 // What does fold:
 //   - query churn: one source reported twice with different volatile query
-//     parameters (cache-busters, session tokens, expiry stamps)
+//     parameters (cache-busters, session tokens, expiry stamps) — name-checked,
+//     because this is the case above: one address, two reporters
 //   - an HLS master and the variants of its own stream, under the existing
-//     preferHighestRendition setting
+//     preferHighestRendition setting — NOT name-checked, because these are
+//     different addresses rather than rival claims on one, and a master and a
+//     rung are named differently in the ordinary case. What bounds this fold is
+//     directory ownership, pinned at "a variant of a DIFFERENT stream is not
+//     folded into this master".
 //
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -208,6 +213,33 @@ test("a master and the variants of its own stream fold to the master", () => {
   assert.equal(out.length, 1, "three rows for one stream");
   assert.equal(out[0].isMaster, true, "the master is what a download should use");
   assert.equal(out[0].duplicatesFolded, 2);
+});
+
+test("a master folds its own variants even though their proposed names differ", () => {
+  // The name check that governs a query-churn fold does NOT govern this one,
+  // and the module header says so per case rather than as a blanket claim. It
+  // could not govern it: a master is named for the stream and a rung for its
+  // height, so the two disagree in the ordinary case and a name check would
+  // switch this fold off altogether. What bounds it instead is the directory
+  // test below ("a variant of a DIFFERENT stream is not folded into this
+  // master") — these are different addresses, not two reporters of one.
+  const out = fold([
+    hls("https://cdn.example/s/master.m3u8", { isMaster: true, proposedFilename: "Stream.m3u8" }),
+    hls("https://cdn.example/s/1080/index.m3u8", { proposedFilename: "1080.m3u8" }),
+  ], { preferHighestRendition: true });
+  assert.equal(out.length, 1, "a rung of this master's own stream is not a second row");
+  assert.equal(out[0].isMaster, true);
+  assert.equal(out[0].proposedFilename, "Stream.m3u8", "the master's own name survives");
+});
+
+test("a variant naming another stream's file still folds only by directory", () => {
+  // The other half of the same statement: agreeing names do not buy a fold
+  // across streams, so nothing here is a name rule in disguise.
+  const out = fold([
+    hls("https://cdn.example/s/master.m3u8", { isMaster: true, proposedFilename: "Same.m3u8" }),
+    hls("https://cdn.example/OTHER/1080/index.m3u8", { proposedFilename: "Same.m3u8" }),
+  ], { preferHighestRendition: true });
+  assert.equal(out.length, 2, "an identical name folded two different streams together");
 });
 
 test("without preferHighestRendition the master and its variants all stay", () => {
