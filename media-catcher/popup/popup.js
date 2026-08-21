@@ -9,6 +9,12 @@ let allTabs = false;
 const downloadState = new Map();   // id -> download
 const itemDownloadId = new Map();  // item identity -> download id (progress binding)
 const itemElements = new Map();    // item identity -> rendered element
+// Download ids whose file the user deleted from disk. The record lives beside
+// the rows because the rows themselves are replaced wholesale: a controller
+// snapshot rebuilds every job object, savedPath and all, so a flag written onto
+// a job would be gone by the next snapshot and the row would offer Open on a
+// file that is no longer there. Pruned in renderQueue against the live rows.
+const deletedRows = new Set();
 
 function isSafeOpaqueId(value) {
   return typeof value === "string" &&
@@ -115,6 +121,7 @@ const queueEl = document.getElementById("queue");
 const queueTitleEl = document.getElementById("queue-title");
 const queueCountEl = document.getElementById("queue-count");
 const castSlotEl = document.getElementById("cast-slot");
+const badAppleSlotEl = document.getElementById("badapple-slot");
 const castTitleEl = document.getElementById("cast-title");
 const hdrCastBtn = document.getElementById("hdr-cast");
 const leftCountEl = document.getElementById("left-count");
@@ -190,8 +197,16 @@ function humanSize(bytes) {
 }
 
 // Managed opaque rows state their size from validated metadata only — an
-// unvalidated item.size must never be relabelled as an exact total. Legacy
-// rows keep their existing exact transfer size.
+// unvalidated item.size must never be relabelled as an exact total. A legacy
+// row's item.size is no more trusted: it is whatever a probe or a variant left
+// there, so it goes through the same validator, tagged exact because that is
+// what a transfer total is. A value that is not a positive safe integer is not
+// a size, and says so.
+//
+// One story for "not known yet", the same on every surface that states a size
+// (these rows, the Downloads cards below, and the Save As window): "Size
+// unknown". An empty string leaves a blank where a size belongs, which reads as
+// a row that failed to render one rather than a size nobody knows yet.
 function mediaSizeLabel(item) {
   const sizeApi = (typeof McMediaSize !== "undefined") ? McMediaSize : null;
   if (item && typeof item.id === "string") {
@@ -201,7 +216,35 @@ function mediaSizeLabel(item) {
       humanSize
     );
   }
-  return item && item.size ? humanSize(item.size) : "";
+  // Without the lib the row still states a total it already has rather than
+  // going silent — the same degradation the Downloads cards make below.
+  if (!sizeApi) return item && item.size ? humanSize(item.size) : "Size unknown";
+  return sizeApi.sizeLabel(
+    { sizeBytes: item && item.size, sizeConfidence: "exact" },
+    humanSize
+  );
+}
+
+// The same three-way answer for a DOWNLOAD row: bytes actually transferred are
+// exact and win; a figure derived from bitrate and duration is marked "Est.";
+// nothing known says so. lib/media-size.js decides which, so the two panes and
+// the Save As window cannot drift apart. Without the lib the row still states
+// an exact total it already has rather than going silent.
+//
+// Both figures can say "exact" and they are not the same claim: the record's
+// total is what a server announced about the resource, the transferred count is
+// what this machine moved. chooseSize gives a tie to its second argument, so
+// the transferred count goes there — otherwise "transferred bytes win" would
+// hold only against an estimate.
+function downloadSizeLabel(dl) {
+  const total = sizeBytesOf(dl).total;
+  const sizeApi = (typeof McMediaSize !== "undefined") ? McMediaSize : null;
+  if (!sizeApi) return total ? humanSize(total) : "Size unknown";
+  const chosen = sizeApi.chooseSize(
+    { sizeBytes: dl && dl.sizeBytes, sizeConfidence: dl && dl.sizeConfidence },
+    total ? { sizeBytes: total, sizeConfidence: "exact" } : null
+  );
+  return sizeApi.sizeLabel(chosen, humanSize);
 }
 
 // H.265 conversion outcome: before/after sizes, percent, and which version kept.
@@ -345,6 +388,10 @@ async function refresh() {
 function render(items) {
   listEl.replaceChildren();
   itemElements.clear();
+  // The thumbnails this named belong to rows that no longer exist; a frame
+  // arriving for one of them has nothing to paint until renderItem below puts
+  // the row back.
+  previewSlots.clear();
   footCount.textContent = items.length + (items.length === 1 ? " stream" : " streams");
   if (leftCountEl) leftCountEl.textContent = items.length;
   renderHelperBadge();
@@ -381,6 +428,11 @@ function render(items) {
     itemElements.set(itemIdentity(item), el);
     listEl.appendChild(el);
   }
+
+  // Asking here rather than in refresh() ties the request to what was actually
+  // painted. Every painted row is a candidate — this does not read the viewport,
+  // so it is the cap, not scroll position, that keeps the burst small.
+  requestPreviews(ordered);
 }
 
 // Color-coded native-helper health flag in the footer. Click to re-check.
@@ -391,7 +443,48 @@ const HELPER_UI = {
   disconnected: { cls: "off",  label: "in-browser",    tip: "Native helper not connected — recording runs in-browser. Click to reconnect (offers the installer if that fails)." },
 };
 
+// Playback in the BadApple player, which is a separate application from the
+// DLNA casting below it and from the downloads underneath. The control lives
+// here, with the casting UI, because next to "Now casting" the thing it stops
+// is plainly the thing being played; in the Downloads header, beside "Clear
+// done", the same button reads as stopping the downloads. The label repeats
+// that, so the reading does not depend on where the eye lands.
+//
+// Shown only when the helper reports BadApple present — the same gate the
+// "Open in BadApple" file action uses, and for the same reason: a control that
+// could only ever fail is not offered.
+function renderBadAppleSlot() {
+  if (!badAppleSlotEl) return;
+  if (!(helperOn() && helperStatus.badapple)) { badAppleSlotEl.replaceChildren(); return; }
+  const err = h("div", { class: "progress-label error", role: "status" });
+  async function onStopClick() {
+    if (stop.disabled) return;
+    stop.disabled = true;
+    err.textContent = "";
+    let resp = null;
+    try {
+      resp = await send({ type: "badapple-stop" });
+    } catch (e) {
+      resp = { ok: false, error: (e && e.message) || "Couldn't reach the player." };
+    }
+    stop.disabled = false;
+    if (!resp || resp.ok === false) err.textContent = (resp && resp.error) || "Couldn't stop playback.";
+  }
+  const stop = h("button", {
+    class: "btn ghost sm",
+    text: "■ Stop BadApple playback",
+    title: "Stops playback in the BadApple player. Your downloads are not affected.",
+    onClick: onStopClick,
+  });
+  badAppleSlotEl.replaceChildren(h("div", { class: "rail-card badapple-card" }, [
+    h("div", { class: "badapple-title", text: "BadApple player" }),
+    stop,
+    err,
+  ]));
+}
+
 function renderHelperBadge() {
+  renderBadAppleSlot();
   const badge = document.getElementById("helper-badge");
   if (!badge) return;
   const ui = HELPER_UI[helperStatus.state] || HELPER_UI.disconnected;
@@ -441,6 +534,132 @@ function bitrateLabel(item) {
   return "";
 }
 
+// The picture of the media itself, as background sends it. It goes straight
+// into an <img src>, and the record it comes from is untrusted, so only a
+// data:image/ URL is accepted — anything else would turn this field into a
+// network fetch or a scheme the popup never meant to run.
+//
+// Both halves of the test carry weight. The value must BE a string, not merely
+// stringify into one, so an object with its own toString cannot name the src.
+// And the match is anchored: a remote URL may contain "data:image/" anywhere in
+// its path, query or fragment, and an unanchored test would accept it.
+//
+// This is `preview`, not `thumb`: `thumb` already exists and holds a screenshot
+// of the PAGE (background.js sets it on every YouTube download), so reading the
+// picture from there would show a web page where the file's own frame belongs.
+function previewSrc(value) {
+  return typeof value === "string" && /^data:image\//i.test(value) ? value : null;
+}
+
+// ---------------------------------------------------------------------------
+// Asking for a left-pane row's frame
+//
+// The frame is captured in the page, not here: the popup sends
+// {type:"capture-preview", identity, tabId} and background.js reaches the tab's
+// content script for it. Until the branch carrying that handler is merged,
+// background has no case for this type and the message falls out of its chain
+// unanswered — so the request either comes back carrying no frame, which is
+// remembered as "cannot" below, or never settles and holds one of the in-flight
+// slots. Either way the asks stay bounded and the rows keep their placeholders;
+// the picture appears once the two halves are merged.
+//
+// The ask is on demand and bounded, because a capture is not free and can be
+// permanently impossible. Four pieces of bookkeeping, each doing one job:
+//
+//   previewPending  a request is out and no answer has come back. Also the
+//                   in-flight count, so a tab full of rows does not fire a
+//                   capture for every one of them at once.
+//   previewCannot   the answer carried no usable frame. A cross-origin <video>
+//                   taints the canvas and no later attempt untaints it, so
+//                   without this the next render asks again, forever.
+//   previewFrames   the frames this popup has received, so a row keeps its
+//                   picture across renders that happen before background has
+//                   put the frame on the record it sends back.
+//   previewSlots    the thumbnail of each row the last render painted, so an
+//                   arriving frame can be dropped onto that one row instead of
+//                   re-rendering the list under the user's cursor.
+//
+// previewFrames and previewSlots hold only what the popup window has seen; the
+// window is short-lived and both are dropped with it.
+const PREVIEW_IN_FLIGHT_CAP = 3;
+const previewPending = new Set();   // identity -> asked, no answer yet
+const previewCannot = new Set();    // identity -> answered with no frame; never re-asked
+const previewFrames = new Map();    // identity -> data URL this popup received
+const previewSlots = new Map();     // identity -> {thumb, fno} of the painted row
+
+// The tab whose content script holds the media element. An item detected on
+// another tab (the All tabs view) carries its own; otherwise it is the tab the
+// popup is watching, the same fallback the Save As message uses.
+function previewTabIdOf(item) {
+  return Number.isInteger(item && item.tabId) ? item.tabId : currentTabId;
+}
+
+// Whether this row is worth one capture request right now.
+function wantsPreview(item, identity) {
+  if (!item) return false;
+  // Already has a picture of the file: from the record, or from an answer this
+  // popup already received.
+  if (previewSrc(item.preview)) return false;
+  if (previewFrames.has(identity)) return false;
+  // Answered "cannot" once, so it cannot now either.
+  if (previewCannot.has(identity)) return false;
+  // Asked and still waiting: one request per identity, not one per render.
+  if (previewPending.has(identity)) return false;
+  // Rows that have no frame to give. A DRM stream is decoded where the page
+  // cannot read it back, so a canvas draw of that <video> returns no pixels.
+  if (item.drm) return false;
+  // Without a tab the request has nowhere to go, and without an id or a URL
+  // there is no name in it for background to match a record by. `identity` is
+  // built from exactly those two fields.
+  if (!Number.isInteger(previewTabIdOf(item))) return false;
+  if (!isSafeOpaqueId(item.id) && !(typeof item.url === "string" && item.url)) return false;
+  return true;
+}
+
+// Ask for the frames the rows just painted are missing, up to the cap. Rows the
+// cap holds back are left untouched — no pending entry, no refusal — so the
+// next render picks them up once answers free the slots.
+//
+// `identity` is itemIdentity's value, so a controller row names an opaque id and
+// a legacy row names its media URL. Background already holds both — this is the
+// same shape the cast and download messages send it — but the identity is what
+// background matches a record by, so it is the row's name that travels.
+function requestPreviews(items) {
+  if (!Array.isArray(items)) return;
+  for (const item of items) {
+    if (previewPending.size >= PREVIEW_IN_FLIGHT_CAP) return;
+    const identity = itemIdentity(item);
+    if (!wantsPreview(item, identity)) continue;
+    previewPending.add(identity);
+    Promise.resolve(send({ type: "capture-preview", identity, tabId: previewTabIdOf(item) }))
+      .then((response) => settlePreview(identity, response))
+      .catch(() => settlePreview(identity, null));
+  }
+}
+
+// One answer, one freed slot. Anything that is not a usable frame — a refusal,
+// a reply this popup cannot read, no reply at all — is remembered as "cannot",
+// because the alternative is asking again on the next render and every render
+// after it. The frame itself is checked by previewSrc: the reply is as
+// untrusted as the record field, and must not become a network fetch.
+function settlePreview(identity, response) {
+  previewPending.delete(identity);
+  const src = previewSrc(response && response.preview);
+  if (!src) { previewCannot.add(identity); return; }
+  previewFrames.set(identity, src);
+  paintPreview(identity, src);
+}
+
+// Put the frame on the one row it belongs to. Deliberately not a re-render: the
+// list is rebuilt wholesale by render(), which would drop whatever the user has
+// focused or scrolled to.
+function paintPreview(identity, src) {
+  const slot = previewSlots.get(identity);
+  if (!slot) return;                       // that row is no longer on screen
+  slot.thumb.classList.remove("ph", "cam", "file");
+  slot.thumb.replaceChildren(h("img", { src, alt: "" }), slot.fno);
+}
+
 function renderItem(item) {
   const kind = item.kind || "direct";
   const kindLabel = kind === "youtube" ? "YouTube" : kind.toUpperCase();
@@ -478,10 +697,17 @@ function renderItem(item) {
   // Thumbnail: captured frame if we have one, else a tinted placeholder.
   const camish = kind === "hls" || kind === "dash" || item.isLive;
   const fno = item.isLive ? "LIVE" : (item.duration ? fmtDuration(item.duration) : kindLabel);
-  const thumb = h("div", { class: "thumb" + (item.thumb ? "" : " ph " + (camish ? "cam" : "file")) }, [
-    item.thumb ? h("img", { src: item.thumb, alt: "" }) : null,
-    h("span", { class: "fno", text: fno }),
+  // The media's own frame if there is one, else a frame this popup was already
+  // handed for this row, else the per-tab page screenshot this slot already
+  // showed, else the tinted placeholder.
+  const pic = previewSrc(item.preview) || previewFrames.get(identity) || item.thumb || null;
+  const fnoEl = h("span", { class: "fno", text: fno });
+  const thumb = h("div", { class: "thumb" + (pic ? "" : " ph " + (camish ? "cam" : "file")) }, [
+    pic ? h("img", { src: pic, alt: "" }) : null,
+    fnoEl,
   ]);
+  // Where a frame that arrives later goes, so it lands on this row alone.
+  previewSlots.set(identity, { thumb, fno: fnoEl });
 
   const info = h("div", { class: "item-info" }, [
     h("div", { class: "name", title: item.url, text: displayName }),
@@ -1158,6 +1384,22 @@ function showLabel(el, text, cls) {
 // Side panel — global downloads queue + casting (both opt-in via Settings)
 // ========================================================================
 
+// Arrival order for the pane, from lib/queue-order.js. It is created lazily and
+// kept for the life of the popup, because the sequence it hands out is only
+// meaningful when every render consults the same one.
+//
+// Why a side map and not a field on the row: applyLiveJobsUpdate deletes and
+// re-inserts the projected job OBJECTS on every controller snapshot, so a stamp
+// written onto a job is gone by the next snapshot. Why not createdAt: the
+// yt-dlp download records background.js builds carry none, and lib/privacy.js
+// copies createdAt onto a projected job only when that job already has one, so
+// a sort on it would leave rows tied.
+let queueOrder = null;
+function queueOrderer() {
+  if (!queueOrder && typeof McQueueOrder !== "undefined") queueOrder = McQueueOrder.createQueueOrder();
+  return queueOrder;
+}
+
 // Rank groups a download for ordering: active first, then held, done, failed.
 function queueRank(dl) {
   const sched = schedulerStateOf(dl);
@@ -1179,8 +1421,17 @@ function queueRank(dl) {
 function renderQueue() {
   if (!queueEl) return;
   if (!uiSettings.showQueue) { queueEl.replaceChildren(); if (queueCountEl) queueCountEl.textContent = "0"; return; }
-  const all = Array.from(downloadState.values());
-  all.sort((a, b) => queueRank(a) - queueRank(b)); // stable → insertion order within a group
+  // Forget the deleted-file marks for rows that are no longer in the pane, so
+  // the set tracks the live rows rather than everything ever deleted.
+  for (const id of Array.from(deletedRows)) if (!downloadState.has(id)) deletedRows.delete(id);
+  const rows = Array.from(downloadState.values());
+  // Rank still groups the pane; within a group the newest row comes first.
+  // Without the lib the pane falls back to rank-only, the way every other
+  // optional popup module degrades.
+  const orderer = queueOrderer();
+  const all = orderer
+    ? orderer.order(rows, { idOf: (dl) => dl.id, rankOf: queueRank })
+    : rows.sort((a, b) => queueRank(a) - queueRank(b));
   const active = all.filter((dl) => queueRank(dl) === 0).length;
   if (queueCountEl) queueCountEl.textContent = String(active);
   queueEl.replaceChildren();
@@ -1212,11 +1463,31 @@ function helperOn() {
   return helperStatus.state === "ready" || helperStatus.state === "no-ffmpeg";
 }
 
+function rowIsDeleted(dl) {
+  return !!(dl && typeof deletedRows !== "undefined" && deletedRows.has(dl.id));
+}
+
+// How long a Delete stays armed before it goes back to asking. Deletion is
+// permanent, so an armed button left on screen is not allowed to be the state a
+// stray later click lands on.
+const DELETE_ARM_MS = 4000;
+
 // File actions for a download that has (or is producing) a file on disk. The
 // queue card and the item card both use this so starting a download NEVER
 // strands the user without Open / Folder / Cast for that file.
 function fileActionRow(dl, opts) {
   const row = h("div", { class: "dl-actions" });
+  // The file this row was a handle to is gone by the user's own confirmed
+  // choice. The row stays — it is the record of what happened — and states the
+  // outcome instead of offering controls that would all point at nothing.
+  if (rowIsDeleted(dl)) {
+    row.appendChild(h("span", { class: "deleted-note", text: "File deleted" }));
+    if (opts && opts.dismiss) {
+      row.appendChild(h("button", { class: "btn ghost sm", text: "Dismiss",
+        onClick: () => { send({ type: "dismiss-download", id: dl.id }); downloadState.delete(dl.id); renderQueue(); } }));
+    }
+    return row;
+  }
   const canFile = (dl.savedPath && helperOn()) || dl.downloadId != null;
   // A helper-saved file has a path and no downloads-API id, so the only route
   // to it is the helper. When the helper is down these buttons used to be
@@ -1256,6 +1527,67 @@ function fileActionRow(dl, opts) {
   if (opts && opts.dismiss) {
     row.appendChild(h("button", { class: "btn ghost sm", text: "Dismiss",
       onClick: () => { send({ type: "dismiss-download", id: dl.id }); downloadState.delete(dl.id); renderQueue(); } }));
+  }
+  // Delete, rightmost, on any row that has file actions at all. There is no
+  // undo — the file is not moved to a recycle bin — so the control arms on the
+  // first click and only acts on the second. It is disabled with a reason,
+  // never hidden, for the same reason Open and Folder above are: an absent
+  // control reads as a removed feature rather than an unavailable one.
+  if (canFile || stranded) {
+    const canDelete = !!(dl.savedPath && helperOn());
+    const whyNoDelete = !dl.savedPath
+      ? "No saved file on disk yet — nothing to delete"
+      : "Native helper not connected — reconnect it to delete this file";
+    const del = h("button", {
+      class: "btn ghost sm danger", text: "Delete",
+      title: canDelete ? "Delete this file from disk — permanent, and asks first" : whyNoDelete,
+      disabled: canDelete ? null : "disabled",
+      onClick: canDelete ? onDeleteClick : null,
+    });
+    let armed = false;
+    let armTimer = null;
+    function disarm() {
+      armed = false;
+      if (armTimer != null) { clearTimeout(armTimer); armTimer = null; }
+      del.textContent = "Delete";
+      del.classList.remove("armed");
+    }
+    async function onDeleteClick() {
+      if (!armed) {
+        armed = true;
+        del.textContent = "Confirm delete";
+        del.title = "Deletes this file from disk. It is not moved to the recycle bin.";
+        del.classList.add("armed");
+        armTimer = setTimeout(disarm, DELETE_ARM_MS);
+        return;
+      }
+      disarm();
+      del.disabled = true;
+      del.textContent = "Deleting…";
+      let resp = null;
+      try {
+        resp = await send({
+          type: "delete-file",
+          downloadId: dl.downloadId == null ? null : dl.downloadId,
+          path: dl.savedPath,
+        });
+      } catch (e) {
+        resp = { ok: false, error: (e && e.message) || "Delete failed" };
+      }
+      if (resp && resp.ok) {
+        deletedRows.add(dl.id);
+        // This row repaints now; the rest of the pane repaints from the same
+        // record, so both panes agree before the next update arrives.
+        row.replaceChildren(h("span", { class: "deleted-note", text: "File deleted" }));
+        renderQueue();
+        return;
+      }
+      del.disabled = false;
+      del.textContent = "Delete";
+      del.title = (resp && resp.error) || "Delete failed";
+      del.classList.add("failed");
+    }
+    row.appendChild(del);
   }
   return row.childElementCount ? row : null;
 }
@@ -1331,20 +1663,26 @@ function renderNeedsUserActions(dl, card) {
 function renderQueueItem(dl) {
   const p = dl.progress || {};
   const card = h("div", { class: "rail-card dl", dataset: { id: String(dl.id) } });
+  // Before any branch, so every kind of card carries the frame — running,
+  // finished or failed, it is the same file.
+  const pic = previewSrc(dl.preview);
+  if (pic) card.appendChild(h("img", { class: "dl-thumb", src: pic, alt: "" }));
   const sched = schedulerStateOf(dl);
   const schedLabel = formatJobStatusLabel(dl);
   const displayName = dl.requestedFilename || dl.name || "download";
 
   if (sched === "completed" || dl.status === "done") {
-    const size = humanSize(sizeBytesOf(dl).total);
+    // Always a size, never a blank: downloadSizeLabel answers "not known yet"
+    // out loud.
+    const size = downloadSizeLabel(dl);
     const name = h("div", { class: "dl-name openable", title: (dl.savedPath || displayName) + " — click to open",
       text: displayName, onClick: () => openDlFile(dl) });
     card.appendChild(h("div", { class: "dl-done-row" }, [
       h("span", { class: "dl-check", text: "✓" }),
       name,
     ]));
-    const doneLabel = schedLabel || ("Done" + (size ? " · " + size : ""));
-    card.appendChild(h("div", { class: "progress-label done", text: doneLabel + (schedLabel && size ? " · " + size : "") }));
+    const doneLabel = (schedLabel || "Done") + " · " + size;
+    card.appendChild(h("div", { class: "progress-label done", text: doneLabel }));
     if (dl.convert) card.appendChild(h("div", { class: "note", text: h265Note(dl.convert) }));
     const acts = fileActionRow(dl, { dismiss: true });
     if (acts) card.appendChild(acts);
@@ -1414,7 +1752,10 @@ function renderQueueItem(dl) {
       onClick: () => send({ type: "cancel", id: dl.id }) }));
   }
   card.appendChild(top);
-  const spec = queueSpec(dl);
+  // A live recording states the bytes captured so far on its own label line and
+  // has no knowable final size while it runs, so it is left out of this one —
+  // "Size unknown" beside a growing byte count contradicts the line under it.
+  const spec = [queueSpec(dl), recording ? "" : downloadSizeLabel(dl)].filter(Boolean).join(" · ");
   if (spec) card.appendChild(h("div", { class: "dl-spec", text: spec }));
 
   if (recording) {

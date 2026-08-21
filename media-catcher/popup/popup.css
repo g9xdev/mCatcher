@@ -519,6 +519,28 @@ input:focus-visible {
   box-shadow: none;
 }
 
+/* Delete. Muted until it is armed: the first click is a question, and only the
+   armed state is styled as the destructive act it then is. */
+.btn.danger {
+  color: var(--danger);
+  border-color: rgba(255, 153, 164, 0.24);
+}
+
+.btn.danger:hover {
+  background: rgba(255, 153, 164, 0.12);
+  border-color: rgba(255, 153, 164, 0.42);
+}
+
+.btn.danger.armed {
+  color: #fff;
+  background: var(--danger-fill);
+  border-color: transparent;
+}
+
+.btn.danger.failed {
+  border-color: rgba(255, 153, 164, 0.5);
+}
+
 .btn.ghost:hover {
   color: var(--text);
   background: var(--surface-hover);
@@ -951,7 +973,7 @@ html.rail, html.rail body { height: 100%; }
 
 html.rail .main {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 240px;
+  grid-template-columns: minmax(0, 1fr) 320px;
   /* The row is the height .main was given, not the height its content wants.
      A default `auto` row sizes to the taller pane, so both panes overflowed
      the grid however well bounded .main itself was. */
@@ -1153,6 +1175,33 @@ input.scrub:disabled { opacity: 0.7; cursor: default; }
 .dl .note { margin-top: 6px; color: var(--text-tertiary); font-size: 10px; line-height: 1.5; }
 .dl .note em { color: var(--success); font-style: normal; }
 .dl-actions { display: flex; gap: 6px; margin-top: 8px; }
+/* What a row says once its file has been deleted. */
+.deleted-note { color: var(--text-tertiary); font-size: 10px; font-style: normal; align-self: center; }
+
+/* The frame captured from the media itself, on a queue card. 16:9 fixes the
+   box's height against the rail's width, so a frame of any dimensions occupies
+   the same space and a card does not resize as the picture decodes. It does not
+   reserve height on a card with no frame: renderQueueItem appends this element
+   only when there is a picture, so a frameless card carries no empty box. */
+.dl-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
+  object-fit: cover;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-md);
+  background: #171b22;
+  margin-bottom: 8px;
+}
+
+/* Playback in the BadApple player — a separate application from the casting
+   session above it and from the downloads below. */
+.badapple-card { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.badapple-title {
+  color: var(--text-tertiary);
+  font-size: 9.5px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
 .queue-empty {
   border-style: dashed;
   color: var(--text-tertiary);
