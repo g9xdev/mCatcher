@@ -25,6 +25,7 @@ const policyScripts = [
   "lib/media-size.js",
   "lib/beam-target.js",
   "lib/beam-headers.js",
+  "lib/item-fold.js",
   "lib/background-adapters.js",
 ];
 

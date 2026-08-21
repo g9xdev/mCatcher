@@ -3201,6 +3201,14 @@ function visibleFor(tabId) {
   let items = Array.from(map.values())
     .filter((it) => !isChild(tabId, it.url) && !isTooSmall(it) && !isDeadPlaylist(it) && !isNotVideo(it));
   if (settings.preferHighestRendition) items = keepHighestRendition(items);
+  // Last, so it sees what the popup would otherwise render. The fold requires
+  // two rows to AGREE about the proposed filename, which is what keeps it from
+  // becoming the suppression per-frame claim scoping exists to prevent — an ad
+  // iframe reporting the page's media URL under its own name keeps its own row
+  // (pinned in tests/background-live-detection.test.js).
+  items = self.McItemFold.foldItems(items, {
+    preferHighestRendition: !!settings.preferHighestRendition,
+  });
   return items;
 }
 
