@@ -220,6 +220,123 @@ function rememberBeam(beamId, tabId, frameId) {
   pendingBeams.set(beamId, entry);
 }
 
+// ---- per-item preview pictures ----
+//
+// `preview` is NOT `thumb`, and the difference is scope rather than kind.
+// tabThumbs holds ONE picture per TAB — content.js's captureThumb() draws the
+// largest decoded <video> to a canvas at quality 0.65 — and decorate()
+// attaches that same picture to every row of the tab. previewByIdentity is
+// keyed per item and filled when the popup asks for a particular row, so two
+// rows on one tab can show different pictures, and a row backed by a file
+// already on disk can show a frame the page never had.
+//
+// Both fields are carried; writing a per-item frame into `thumb` would put one
+// row's picture on every row of its tab.
+const previewByIdentity = new Map();     // itemIdentity -> data: URL
+const previewTabs = new Map();           // itemIdentity -> tabId, so a closed tab's clear up
+const PREVIEW_CACHE_MAX = 120;
+// Encoding a JPEG runs on the page's main thread. Asking every tab at once
+// makes a popup open stutter every video the user has open, so requests past
+// this many are queued rather than issued.
+const PREVIEW_MAX_INFLIGHT = 3;
+let previewInflight = 0;
+const previewQueue = [];
+
+// The popup's key for a row, recomputed here so get-media can look one up.
+// Mirrors itemIdentity/isSafeOpaqueId in popup/popup.js — the two have to
+// agree, since the popup sends the string and this reads it back.
+function isSafeOpaqueId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function itemIdentity(item) {
+  if (item && isSafeOpaqueId(item.id)) return "id:" + item.id;
+  return "url:" + (item && typeof item.url === "string" ? item.url : "");
+}
+
+// What the popup may ask about. The identity it sends is a cache KEY, so the
+// only requirements are that it is one of the two shapes popup.js mints and
+// that it is bounded — a 5000-character key would otherwise be retained.
+function isSafePopupIdentity(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) return false;
+  if (value.slice(0, 3) === "id:") return isSafeOpaqueId(value.slice(3));
+  return value.slice(0, 4) === "url:" && value.length > 4;
+}
+
+function previewFor(item) {
+  const stored = previewByIdentity.get(itemIdentity(item));
+  return typeof stored === "string" ? stored : null;
+}
+
+function rememberPreview(identity, tabId, dataUrl) {
+  // Oldest out first. Map iterates in insertion order, so the first key is the
+  // least recently ADDED — re-storing an identity re-inserts it below.
+  if (previewByIdentity.has(identity)) previewByIdentity.delete(identity);
+  previewByIdentity.set(identity, dataUrl);
+  previewTabs.set(identity, tabId);
+  while (previewByIdentity.size > PREVIEW_CACHE_MAX) {
+    const oldest = previewByIdentity.keys().next().value;
+    previewByIdentity.delete(oldest);
+    previewTabs.delete(oldest);
+  }
+}
+
+function forgetTabPreviews(tabId) {
+  for (const [identity, tid] of Array.from(previewTabs.entries())) {
+    if (tid === tabId) {
+      previewTabs.delete(identity);
+      previewByIdentity.delete(identity);
+    }
+  }
+}
+
+function runNextPreview() {
+  while (previewInflight < PREVIEW_MAX_INFLIGHT && previewQueue.length > 0) {
+    const job = previewQueue.shift();
+    previewInflight += 1;
+    job().then(function releaseSlot() {
+      previewInflight -= 1;
+      runNextPreview();
+    });
+  }
+}
+
+// Ask one page for the frame it is currently showing, and settle on what
+// happens. Never rejects: every outcome is an answer the popup can render.
+function capturePreview(identity, tabId) {
+  return new Promise((resolve) => {
+    previewQueue.push(function askThePage() {
+      return api.tabs.sendMessage(tabId, { type: "capture-frame" })
+        .then((reply) => {
+          const dataUrl = reply && reply.ok === true ? safePreview(reply.dataUrl) : null;
+          if (dataUrl) {
+            rememberPreview(identity, tabId, dataUrl);
+            resolve({ ok: true, error: null });
+            return;
+          }
+          // A cross-origin <video> taints the canvas and toDataURL throws, so
+          // the page cannot answer with a picture. For this extension that is
+          // the ordinary case rather than a fault, and the tab already has a
+          // picture of its own — fall back to it rather than showing nothing.
+          //
+          // Only for a taint. A reply whose dataUrl was REFUSED above does not
+          // fall back: showing a different picture would make a rejected
+          // string look like a successful capture.
+          const tainted = reply && reply.ok !== true && reply.why === "tainted";
+          const tabPicture = tainted ? tabThumbs.get(tabId) : null;
+          if (tabPicture) {
+            rememberPreview(identity, tabId, tabPicture);
+            resolve({ ok: true, error: null });
+            return;
+          }
+          resolve({ ok: false, error: "No frame could be read from this video." });
+        })
+        .catch(() => resolve({ ok: false, error: "This page could not be reached." }));
+    });
+    runNextPreview();
+  });
+}
+
 // The one gate every preview picture passes, whoever produced it. Both
 // producers are outside this file's trust: a content script runs in the page's
 // world, and the helper is another process. Answers the string when it is a
@@ -3366,6 +3483,9 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const decorate = (it, tid) => Object.assign({}, it, {
           tabId: tid,
           thumb: tabThumbs.get(tid) || null,
+          // Per-ITEM, unlike thumb above which is per-tab. Always present, so
+          // the popup can tell "not captured yet" from a field it never sees.
+          preview: previewFor(it),
           pageTitle: it.pageTitle || tabTitle(tid) || undefined,
         });
         // Kick a YouTube format probe for any not-yet-enriched item on the tab(s) —
@@ -3741,6 +3861,19 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // context of the popup click).
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "open", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "capture-preview") {
+        // The frame is read IN THE PAGE, by the content script, from the
+        // <video> already decoding there. The alternative — handing the stream
+        // address to the helper — would mean a second, unauthenticated fetch
+        // of a resource the browser has already decoded.
+        if (!isSafePopupIdentity(msg.identity) || !Number.isInteger(msg.tabId)) {
+          sendResponse({ ok: false, error: "Nothing to preview." });
+        } else if (previewByIdentity.has(msg.identity)) {
+          sendResponse({ ok: true, error: null });     // already captured
+        } else {
+          capturePreview(msg.identity, msg.tabId).then(sendResponse);
+          return true;
+        }
       } else if (msg.type === "delete-file") {
         // Deleting is the helper's to do or refuse — it owns the allowlist that
         // decides which paths may be touched at all. `downloadId` is carried by
@@ -3941,6 +4074,7 @@ api.tabs.onRemoved.addListener((tabId) => {
   tabContext.delete(tabId);
   childUrls.delete(tabId);
   tabThumbs.delete(tabId);
+  forgetTabPreviews(tabId);
   segDirsByTab.delete(tabId);
   audioTrackByTab.delete(tabId);
 });
@@ -3957,6 +4091,7 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
     tabContext.delete(tabId);
     childUrls.delete(tabId);
     tabThumbs.delete(tabId);
+    forgetTabPreviews(tabId);
     segDirsByTab.delete(tabId);
     audioTrackByTab.delete(tabId);
     updateBadge(tabId);

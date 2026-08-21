@@ -252,6 +252,7 @@ test("CommonJS export surface is frozen with exact public keys", () => {
   assert.deepEqual(Object.keys(api).sort(), [
     "beamIconRect",
     "buildPageSnapshot",
+    "captureVideoFrame",
     "collectFilenameCandidates",
     "createDocumentNonce",
     "isBeamableVideo",
