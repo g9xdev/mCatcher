@@ -178,11 +178,19 @@
       if (s.length > PREVIEW_DATA_URL_MAX) return false;
       if (s.slice(0, PREVIEW_DATA_URL_PREFIX.length) !== PREVIEW_DATA_URL_PREFIX) return false;
       var body = s.slice(PREVIEW_DATA_URL_PREFIX.length);
-      // Control characters cannot appear in the alphabet above, so this is
-      // covered already; kept explicit because it is the property that matters
-      // when this value is written into a page or a log line.
-      if (hasControlChars(body)) return false;
       if (body.length < 4 || body.length % 4 !== 0) return false;
+      // No control character survives this: PREVIEW_BASE64_RE is anchored at
+      // both ends with no `m` flag, so a JS `$` matches the end of the string
+      // and nothing else — not even before a trailing newline, the way some
+      // other regex dialects do. A body carrying CR, LF, NUL or DEL therefore
+      // fails the alphabet test.
+      //
+      // There was an explicit hasControlChars(body) call here as well. It was
+      // removed rather than left: no input could distinguish its presence from
+      // its absence, so it was a guard no test could ever pin, sitting where it
+      // read as the thing doing the work. The property it stood for is pinned
+      // by behaviour instead, at "a control character anywhere in the body is
+      // refused" in tests/privacy-preview.test.js.
       return PREVIEW_BASE64_RE.test(body);
     }
 
