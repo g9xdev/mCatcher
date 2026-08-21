@@ -125,7 +125,6 @@ test("a master plus its top variant's playlist yields a bitrate and a duration",
   assert.deepEqual(out, {
     durationSeconds: 16,
     selectedBandwidth: 5000000,
-    describesHeight: 1080,
   });
 });
 
@@ -158,15 +157,15 @@ test("no duration, or no bandwidth, yields no evidence rather than half of it", 
   assert.equal(masterBitrateEvidence(null, null), null);
 });
 
-test("describesHeight is carried so the popup can say which rendition it means", () => {
+test("the record carries exactly the two fields media-size.js reads, and nothing else", () => {
+  // The shape is the contract. A third field would be one nobody reads: this
+  // record has one consumer, estimatedSizeFromBitrate, and it reads a duration
+  // and a bandwidth. WHICH rung the number describes is said in prose at the
+  // module header and by the "estimated" confidence the size comes back with —
+  // not by a field no reader ever asked for.
   const { masterBitrateEvidence } = load();
   const out = masterBitrateEvidence(master({ variants: [
     { uri: "a", bandwidth: 800000, height: 480 },
   ] }), media());
-  assert.equal(out.describesHeight, 480);
-
-  const noHeight = masterBitrateEvidence(master({ variants: [
-    { uri: "a", bandwidth: 800000 },
-  ] }), media());
-  assert.equal(noHeight.describesHeight, null);
+  assert.deepEqual(Object.keys(out).sort(), ["durationSeconds", "selectedBandwidth"]);
 });

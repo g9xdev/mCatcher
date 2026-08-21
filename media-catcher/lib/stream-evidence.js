@@ -21,9 +21,16 @@
 // preferHighestRendition downloads. A user who picks a lower rendition from
 // the quality menu downloads LESS than this says. That is a choice rather than
 // a measurement, which is why the record is only ever fed to
-// estimatedSizeFromBitrate — it can never come back "exact" — and why
-// describesHeight is carried alongside, so a caller can say which rung it
-// means instead of implying it measured the file.
+// estimatedSizeFromBitrate — so the size it yields can never come back
+// "exact", and the popup renders it with an "Est." prefix rather than as a
+// figure that measured the file.
+//
+// The record therefore carries exactly the two fields that consumer reads: a
+// duration and a bandwidth. An earlier draft also carried the top rung's
+// HEIGHT, for a caller that would name the rung — no such caller was ever
+// written, in this module's consumer or in the popup, so the field was removed
+// rather than left looking load-bearing. The record's key set is pinned in
+// tests/stream-evidence.test.js.
 (function (root, factory) {
   "use strict";
   var api = factory();
@@ -110,7 +117,6 @@
       // The field name media-size.js reads first, and the one that says this
       // describes a SELECTED rung rather than the stream as a whole.
       selectedBandwidth: bandwidth,
-      describesHeight: finitePositive(read(top, "height")),
     };
   }
 

@@ -2316,7 +2316,6 @@ async function enrichHls(tabId, key) {
             if (evidence) {
               item.duration = evidence.durationSeconds;
               item.bandwidth = evidence.selectedBandwidth;
-              item.sizeDescribesHeight = evidence.describesHeight;
             }
           }
         } catch (e) { /* best-effort — pattern-based filtering still applies */ }
