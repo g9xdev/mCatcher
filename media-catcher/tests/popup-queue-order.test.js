@@ -159,6 +159,52 @@ test("the arrival map tracks the live rows rather than growing forever", () => {
   assert.equal(h.sandbox.queueOrder.size(), 1);
 });
 
+// The memo in queueOrderer() IS the arrival record. Rebuild the orderer on
+// every render and each row's "arrival" collapses to wherever this snapshot's
+// array happened to put it — which the controller, not the popup, decides.
+test("queueOrderer hands back the same orderer on every render", () => {
+  const h = harness();
+  const first = h.sandbox.queueOrderer();
+  add(h, { id: 1, status: "downloading", progress: {} });
+  assert.ok(first, "the lib is present, so there is an orderer");
+  assert.equal(h.sandbox.queueOrderer(), first,
+    "a fresh orderer per render throws away every arrival it recorded");
+});
+
+// The discriminating case: a snapshot that lists the rows in an order that
+// contradicts the order they arrived in. Every other ordering test here feeds
+// the rows array in arrival order, so a rebuilt-per-render orderer would still
+// answer correctly by accident.
+test("arrival order survives a snapshot that lists the rows the other way round", () => {
+  const h = harness();
+  h.sandbox.applyLiveJobsUpdate({ jobs: [
+    { id: "job:a", mediaId: "media:a", state: "running" },
+  ] });
+  // job:b starts second, but the controller lists it first from here on.
+  h.sandbox.applyLiveJobsUpdate({ jobs: [
+    { id: "job:b", mediaId: "media:b", state: "running" },
+    { id: "job:a", mediaId: "media:a", state: "running" },
+  ] });
+  assert.deepEqual(painted(h), ["job:b", "job:a"],
+    "newest first means newest by arrival, not by position in the snapshot");
+
+  // And the reverse: the row that arrived first must not be promoted just
+  // because a later snapshot lists it first.
+  const g = harness();
+  g.sandbox.applyLiveJobsUpdate({ jobs: [
+    { id: "job:x", mediaId: "media:x", state: "running" },
+  ] });
+  g.sandbox.applyLiveJobsUpdate({ jobs: [
+    { id: "job:x", mediaId: "media:x", state: "running" },
+    { id: "job:y", mediaId: "media:y", state: "running" },
+  ] });
+  g.sandbox.applyLiveJobsUpdate({ jobs: [
+    { id: "job:y", mediaId: "media:y", state: "running" },
+    { id: "job:x", mediaId: "media:x", state: "running" },
+  ] });
+  assert.deepEqual(painted(g), ["job:y", "job:x"]);
+});
+
 test("a deleted-file mark is forgotten once its row leaves the pane", () => {
   const h = harness();
   add(h, { id: 1, status: "done", savedPath: "C:/x/a.mp4" });

@@ -568,6 +568,42 @@ test("a queue preview that is not an image data URL is refused", () => {
   }
 });
 
+// The scheme test is ANCHORED at the start of the value, not a substring
+// search. A remote URL is free to CONTAIN "data:image/" anywhere in its path,
+// query or fragment, and the attacker picks that text; an unanchored test would
+// put that URL in an <img src>, which is a network fetch to the attacker's host
+// — the one thing a data: URL can never do.
+test("a remote URL that merely contains data:image/ is refused", () => {
+  for (const hostile of [
+    "https://evil.example/x#data:image/png",
+    "https://evil.example/data:image/png/f.jpg",
+    "https://evil.example/f?x=data:image/png",
+    "  data:image/png;base64,iVBORw0KGgo=",
+  ]) {
+    const h = harness();
+    assert.equal(h.sandbox.previewSrc(hostile), null, "refused: " + hostile);
+    const card = h.sandbox.renderQueueItem({
+      id: 45, name: "clip", status: "done", savedPath: "C:\\x\\clip.mp4", preview: hostile,
+    });
+    assert.equal(images(card).length, 0, "no <img src> for: " + hostile);
+  }
+});
+
+// The value has to BE a string, not merely stringify into one. `preview` rides
+// on a page-derived record, so an object carrying its own toString is a shape
+// that can arrive here; coercing before the scheme test would let that object
+// name the src.
+test("an object that stringifies to a data: URL is refused", () => {
+  const h = harness();
+  const hostile = { toString: function () { return PIXEL; } };
+  assert.equal(h.sandbox.previewSrc(hostile), null,
+    "only a string is a picture; anything else is refused before the scheme test");
+  const card = h.sandbox.renderQueueItem({
+    id: 46, name: "clip", status: "done", savedPath: "C:\\x\\clip.mp4", preview: hostile,
+  });
+  assert.equal(images(card).length, 0);
+});
+
 // ---------------------------------------------------------------------------
 // 6. How big is it, on the right-hand pane
 //
@@ -606,6 +642,35 @@ test("an exact transferred total beats a metadata estimate", () => {
   assert.match(textOf(card), /1\.1 GB/);
   assert.equal(/Est\./.test(textOf(card)), false,
     "the bytes actually written are not an estimate");
+});
+
+// Both figures can carry the same "exact" word, and they are not the same
+// claim: the record's total is what the server announced about the resource,
+// the transferred count is what this machine actually moved. The tie goes to
+// the transferred count — that is the whole reason downloadSizeLabel offers it
+// at all.
+test("a transferred total wins the tie against a record that also says exact", () => {
+  const h = harness();
+  const card = h.sandbox.renderQueueItem({
+    id: 56, name: "clip", status: "done", savedPath: "C:\\x\\clip.mp4",
+    recorded: { bytes: GIG }, sizeBytes: 1024, sizeConfidence: "exact",
+  });
+  assert.match(textOf(card), /1\.1 GB/, "the bytes that landed are the size of the file");
+  assert.equal(/1\.0 KB/.test(textOf(card)), false,
+    "the announced total must not overwrite the count measured here");
+});
+
+// The other direction, so "transferred always wins" cannot be read as
+// "transferred is the only thing consulted".
+test("a record's exact total is what a card with nothing transferred shows", () => {
+  const h = harness();
+  const card = h.sandbox.renderQueueItem({
+    id: 57, name: "clip", kind: "direct", status: "downloading",
+    sizeBytes: GIG, sizeConfidence: "exact",
+    progress: { done: 12, total: 100, unit: "pct" },
+  });
+  assert.match(textOf(card), /1\.1 GB/);
+  assert.equal(/Est\./.test(textOf(card)), false);
 });
 
 test("a running card states the size it is heading for", () => {

@@ -197,8 +197,11 @@ function humanSize(bytes) {
 }
 
 // Managed opaque rows state their size from validated metadata only — an
-// unvalidated item.size must never be relabelled as an exact total. Legacy
-// rows keep their existing exact transfer size.
+// unvalidated item.size must never be relabelled as an exact total. A legacy
+// row's item.size is no more trusted: it is whatever a probe or a variant left
+// there, so it goes through the same validator, tagged exact because that is
+// what a transfer total is. A value that is not a positive safe integer is not
+// a size, and says so.
 //
 // One story for "not known yet", the same on every surface that states a size
 // (these rows, the Downloads cards below, and the Save As window): "Size
@@ -213,7 +216,13 @@ function mediaSizeLabel(item) {
       humanSize
     );
   }
-  return item && item.size ? humanSize(item.size) : "Size unknown";
+  // Without the lib the row still states a total it already has rather than
+  // going silent — the same degradation the Downloads cards make below.
+  if (!sizeApi) return item && item.size ? humanSize(item.size) : "Size unknown";
+  return sizeApi.sizeLabel(
+    { sizeBytes: item && item.size, sizeConfidence: "exact" },
+    humanSize
+  );
 }
 
 // The same three-way answer for a DOWNLOAD row: bytes actually transferred are
@@ -221,13 +230,19 @@ function mediaSizeLabel(item) {
 // nothing known says so. lib/media-size.js decides which, so the two panes and
 // the Save As window cannot drift apart. Without the lib the row still states
 // an exact total it already has rather than going silent.
+//
+// Both figures can say "exact" and they are not the same claim: the record's
+// total is what a server announced about the resource, the transferred count is
+// what this machine moved. chooseSize gives a tie to its second argument, so
+// the transferred count goes there — otherwise "transferred bytes win" would
+// hold only against an estimate.
 function downloadSizeLabel(dl) {
   const total = sizeBytesOf(dl).total;
   const sizeApi = (typeof McMediaSize !== "undefined") ? McMediaSize : null;
   if (!sizeApi) return total ? humanSize(total) : "Size unknown";
   const chosen = sizeApi.chooseSize(
-    total ? { sizeBytes: total, sizeConfidence: "exact" } : null,
-    { sizeBytes: dl && dl.sizeBytes, sizeConfidence: dl && dl.sizeConfidence }
+    { sizeBytes: dl && dl.sizeBytes, sizeConfidence: dl && dl.sizeConfidence },
+    total ? { sizeBytes: total, sizeConfidence: "exact" } : null
   );
   return sizeApi.sizeLabel(chosen, humanSize);
 }
@@ -514,6 +529,11 @@ function bitrateLabel(item) {
 // into an <img src>, and the record it comes from is untrusted, so only a
 // data:image/ URL is accepted — anything else would turn this field into a
 // network fetch or a scheme the popup never meant to run.
+//
+// Both halves of the test carry weight. The value must BE a string, not merely
+// stringify into one, so an object with its own toString cannot name the src.
+// And the match is anchored: a remote URL may contain "data:image/" anywhere in
+// its path, query or fragment, and an unanchored test would accept it.
 //
 // This is `preview`, not `thumb`: `thumb` already exists and holds a screenshot
 // of the PAGE (background.js sets it on every YouTube download), so reading the

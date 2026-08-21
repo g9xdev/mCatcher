@@ -1178,8 +1178,11 @@ input.scrub:disabled { opacity: 0.7; cursor: default; }
 /* What a row says once its file has been deleted. */
 .deleted-note { color: var(--text-tertiary); font-size: 10px; font-style: normal; align-self: center; }
 
-/* The frame captured from the media itself, on a queue card. 16:9 keeps a card
-   the same height whether or not the frame arrived. */
+/* The frame captured from the media itself, on a queue card. 16:9 fixes the
+   box's height against the rail's width, so a frame of any dimensions occupies
+   the same space and a card does not resize as the picture decodes. It does not
+   reserve height on a card with no frame: renderQueueItem appends this element
+   only when there is a picture, so a frameless card carries no empty box. */
 .dl-thumb {
   width: 100%;
   aspect-ratio: 16 / 9;

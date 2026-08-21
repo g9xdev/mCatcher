@@ -1243,6 +1243,30 @@ test("legacy non-opaque rows keep their existing exact transfer size text", () =
   );
 });
 
+// "lib/media-size.js decides, so the panes and the Save As window cannot drift
+// apart" is only true if EVERY row goes through it. A legacy row's item.size is
+// as untrusted as an opaque row's sizeBytes — it is whatever a probe or a
+// variant put there — so it is validated by the same function rather than
+// handed straight to the formatter.
+test("a legacy row's size goes through the size lib, not around it", () => {
+  const h = sizeRenderHarness();
+  const lib = loadLib("lib/media-size.js");
+  const viaLib = (bytes) =>
+    lib.sizeLabel({ sizeBytes: bytes, sizeConfidence: "exact" }, h.sandbox.humanSize);
+
+  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4", size: 1024 }),
+    viaLib(1024), "the same bytes must read the same on every surface");
+
+  // Shapes the validator rejects and a bare formatter does not.
+  for (const junk of ["1024", 1024.5, -5, Number.MAX_SAFE_INTEGER + 2, true]) {
+    assert.equal(
+      h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4", size: junk }),
+      "Size unknown",
+      "a byte count that is not a positive safe integer is not a size: " + String(junk)
+    );
+  }
+});
+
 test("a legacy row with no size states that on the card, not by omission", () => {
   const h = sizeRenderHarness();
   h.sandbox.render([{ url: "https://cdn.example/legacy.mp4", kind: "direct", name: "legacy.mp4" }]);
