@@ -488,6 +488,79 @@
     return true;
   }
 
+  // ---- preview frame capture ----
+  //
+  // Drawn from the <video> that is already decoding in this page. The
+  // alternative — handing the stream URL to the helper and letting it fetch —
+  // would mean a second, unauthenticated request for a resource whose pixels
+  // are already on screen, so the capture stays here.
+  //
+  // 640px on the long edge at quality 0.6: a preview is rendered into a rail
+  // cell a few hundred pixels wide, and the string is carried inline through
+  // the message port, so the frame is sized for the cell rather than the
+  // source. PREVIEW_MAX_CHARS is the refusal point, below privacy.js's own
+  // 200000 ceiling so an oversized frame is dropped where it is made.
+  var PREVIEW_LONG_EDGE = 640;
+  var PREVIEW_QUALITY = 0.6;
+  var PREVIEW_MAX_CHARS = 180000;
+  var PREVIEW_PREFIX = "data:image/jpeg;base64,";
+
+  // Read the current frame of a playing video. NEVER writes currentTime:
+  // seeking an element someone is watching moves their playback, and the frame
+  // that is wanted is the one already showing.
+  //
+  // Answers {ok, dataUrl, why}. why === "tainted" is the cross-origin case and
+  // is expected rather than exceptional — a <video> fed from another origin
+  // without CORS taints the canvas, and toDataURL then throws SecurityError.
+  // The caller falls back to the per-tab page screenshot on that answer.
+  function captureVideoFrame(video, deps) {
+    var makeCanvas = deps && typeof deps.makeCanvas === "function" ? deps.makeCanvas : null;
+    if (!makeCanvas) return { ok: false, dataUrl: null, why: "no-canvas" };
+
+    var w, h;
+    try {
+      if (!video || typeof video !== "object") return { ok: false, dataUrl: null, why: "no-frame" };
+      if (video.paused !== false || video.ended) return { ok: false, dataUrl: null, why: "no-frame" };
+      // HAVE_CURRENT_DATA: below this there is no decoded frame to draw.
+      if (!(finiteNum(video, "readyState") >= 2)) return { ok: false, dataUrl: null, why: "no-frame" };
+      w = finiteNum(video, "videoWidth");
+      h = finiteNum(video, "videoHeight");
+      if (!(w > 0) || !(h > 0)) return { ok: false, dataUrl: null, why: "no-frame" };
+    } catch (e) {
+      return { ok: false, dataUrl: null, why: "no-frame" };
+    }
+
+    // Scaled DOWN only. Enlarging a small frame spends bytes on nothing.
+    var scale = Math.min(1, PREVIEW_LONG_EDGE / Math.max(w, h));
+    var outW = Math.max(1, Math.round(w * scale));
+    var outH = Math.max(1, Math.round(h * scale));
+
+    var raw;
+    try {
+      var canvas = makeCanvas();
+      if (!canvas) return { ok: false, dataUrl: null, why: "no-canvas" };
+      canvas.width = outW;
+      canvas.height = outH;
+      var ctx = canvas.getContext("2d");
+      if (!ctx || typeof ctx.drawImage !== "function") {
+        return { ok: false, dataUrl: null, why: "no-canvas" };
+      }
+      ctx.drawImage(video, 0, 0, outW, outH);
+      raw = canvas.toDataURL("image/jpeg", PREVIEW_QUALITY);
+    } catch (e) {
+      // The one failure that is routine rather than broken.
+      if (e && e.name === "SecurityError") return { ok: false, dataUrl: null, why: "tainted" };
+      return { ok: false, dataUrl: null, why: "draw-failed" };
+    }
+
+    if (typeof raw !== "string" || raw.slice(0, PREVIEW_PREFIX.length) !== PREVIEW_PREFIX) {
+      return { ok: false, dataUrl: null, why: "not-jpeg" };
+    }
+    if (raw.length <= PREVIEW_PREFIX.length) return { ok: false, dataUrl: null, why: "not-jpeg" };
+    if (raw.length > PREVIEW_MAX_CHARS) return { ok: false, dataUrl: null, why: "too-large" };
+    return { ok: true, dataUrl: raw, why: null };
+  }
+
   // Where the icon goes: the top-right corner of the part of the video that is
   // actually on screen, so a half-scrolled player still shows a reachable icon
   // instead of one parked above the viewport. Null when the visible sliver has
@@ -1950,6 +2023,40 @@
             }
             return;
           }
+          // A preview frame for a popup row. Answered from the element that is
+          // already decoding in this page — see captureVideoFrame for why the
+          // capture is here and not in the helper, and why it does not seek.
+          if (msg && msg.type === "capture-frame") {
+            var answer = { ok: false, dataUrl: null, why: "no-video" };
+            try {
+              var found = beamVideos(Date.now());
+              // The biggest decoded frame on the page. On a page whose real
+              // player sits among muted autoplay ad slots, area is what tells
+              // them apart, and the ads are usually the small ones.
+              var best = null;
+              var bestArea = 0;
+              for (var vi = 0; vi < found.length; vi++) {
+                var cand = found[vi];
+                var area = finiteNum(cand, "videoWidth") * finiteNum(cand, "videoHeight");
+                if (cand && cand.paused === false && !cand.ended && area > bestArea) {
+                  best = cand;
+                  bestArea = area;
+                }
+              }
+              if (best) {
+                answer = captureVideoFrame(best, {
+                  makeCanvas: function () { return documentRef.createElement("canvas"); },
+                });
+              }
+            } catch (eCap) {
+              answer = { ok: false, dataUrl: null, why: "no-video" };
+            }
+            try {
+              sendResponse({ ok: answer.ok === true, dataUrl: answer.dataUrl || null,
+                why: answer.why || null });
+            } catch (eResp) {}
+            return;
+          }
           // The helper refused a beam. `badapple` answers nothing on success,
           // so this only ever arrives for a failure, and it arrives late —
           // after the click has already been answered ok. Shown on the overlay
@@ -1969,6 +2076,7 @@
     buildPageSnapshot: buildPageSnapshot,
     createDocumentNonce: createDocumentNonce,
     isBeamableVideo: isBeamableVideo,
+    captureVideoFrame: captureVideoFrame,
     beamIconRect: beamIconRect,
     install: install,
   });

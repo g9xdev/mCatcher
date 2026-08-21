@@ -46,6 +46,7 @@ function createHarness(storageSeed) {
   const broadcasts = [];
   const popupRows = new Map();
   const textBodies = new Map();
+  const fetchLog = [];
   const dashParsed = new Map();
   const directProbeGates = new Map();
   const controllerJobs = Object.freeze([{ id: "job:opaque:1", state: "queued" }]);
@@ -135,6 +136,11 @@ function createHarness(storageSeed) {
     AbortController,
     setTimeout() { return 1; }, clearTimeout() {},
     fetch(url) {
+      // Logged FIRST, for every request and whichever branch answers it. A log
+      // kept inside one branch cannot see the requests the others make, and a
+      // test asserting "no request was added" would then be measuring the
+      // branch rather than the fetch.
+      fetchLog.push(url);
       if (url === "https://cdn.example/movie.mp4") {
         const makeResponse = () => {
           const head = new Uint8Array([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70]);
@@ -203,6 +209,11 @@ function createHarness(storageSeed) {
   }
 
   return {
+    // Reads a background.js top-level binding. Those are `const` declarations
+    // in the context's lexical scope, so a later script in the SAME context
+    // resolves them — this is the real map, not a copy of one.
+    evalInBackground(expr) { return vm.runInContext(expr, sandbox, { filename: "test-probe" }); },
+    fetchLog,
     send, requestHeaders, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
     registerVariants, broadcasts, popupRows, controllerJobs, textBodies, dashParsed,
     nativePort,
@@ -352,6 +363,11 @@ test("promotes a probed network direct item and merges opaque frozen controller 
     sizeBytes: 10485760,
     sizeConfidence: "exact",
     thumb: null,
+    // Per-ITEM, beside the per-tab `thumb`. Present and null because nothing
+    // captured a frame for this row — the popup tells "not captured yet" from
+    // a field it can read. This deepEqual is what makes the projection's key
+    // set a decision: a key added to decorateLiveRow shows up here.
+    preview: null,
     pageTitle: "Movie Night",
   }]);
   assert.deepEqual(result.downloads, [{ id: "job:opaque:1", state: "queued" }]);
@@ -1234,4 +1250,70 @@ test("the record lane sends no page header the host would have to sanitise", asy
   assert.equal(record.referer, "", "an unsendable Referer is dropped, not passed on");
   assert.equal(record.userAgent, "Detection Browser");
   assert.equal(JSON.stringify(posts).includes("SECRET_HEADER"), false);
+});
+
+test("the fetch log records EVERY request, so a `no request added` claim can be measured", async () => {
+  // The assertion in the next test is only worth what the log underneath it
+  // sees. The stub answers more than playlist bodies — a direct item is probed
+  // with a ranged GET of its own — so a log kept only in the playlist branch
+  // would report an empty list for a harness that had just fetched something,
+  // and "no request was added" would be unfalsifiable rather than measured.
+  const h = createHarness();
+  await settle();
+  emitNetwork(h, 41, "https://cdn.example/movie.mp4", "video/mp4", "doc-41");
+  await eventually(() => h.captureNetwork.length === 1, "direct promotion");
+  assert.deepEqual(h.fetchLog, ["https://cdn.example/movie.mp4"],
+    "the probe's request is invisible to the log: " + JSON.stringify(h.fetchLog));
+});
+
+test("an HLS master gains a duration and a top-rung bitrate from the playlist already fetched", async () => {
+  // Before this, only the media-playlist branch of enrichment set item.duration
+  // and a master declared no bitrate, so a master row could only ever read
+  // "Size unknown" — while the numbers to estimate one were already in hand.
+  // The master branch fetches and parses the top variant's playlist for live
+  // and DRM detection; this reads that same parsed object and adds no request.
+  const h = createHarness();
+  await settle();
+
+  const master = "https://stream.example/ladder/master.m3u8";
+  // The highest bandwidth is listed SECOND in the manifest on purpose. The
+  // fetch log below shows which playlist is actually read, and it is the 1080
+  // one — lib/hls.js:91 sorts variants descending, so variants[0] is already
+  // the top rung. Duration and bitrate therefore describe the SAME rendition.
+  h.textBodies.set(master, [
+    "#EXTM3U",
+    '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,CODECS="avc1.4d401f"',
+    "720.m3u8",
+    '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.640028"',
+    "1080.m3u8",
+  ].join("\n"));
+  const playlist = "#EXTM3U\n#EXTINF:6,\na.ts\n#EXTINF:4,\nb.ts\n#EXT-X-ENDLIST";
+  h.textBodies.set("https://stream.example/ladder/720.m3u8", playlist);
+  h.textBodies.set("https://stream.example/ladder/1080.m3u8", playlist);
+
+  emitNetwork(h, 31, master, "application/vnd.apple.mpegurl", null);
+  await eventually(() => h.captureNetwork.length === 1, "master promotion");
+
+  // The enriched item is consumed by promotion, so the observable end of this
+  // pipeline is liveSizeMetadata — what rememberLiveSize stored for the row,
+  // via estimatedSizeForItem(item) reading the duration and bandwidth the
+  // enrichment set. That is the figure the popup renders.
+  // The cost, stated as a measurement rather than a claim: the same two
+  // fetches the master branch already made — the master and ONE variant
+  // playlist. Gathering the size evidence adds neither. The log this reads
+  // records every request the stub answers, whichever branch answers it —
+  // pinned by the test above, because a partial log would make this deepEqual
+  // agree with itself rather than with what was fetched.
+  assert.deepEqual(h.fetchLog, [master, "https://stream.example/ladder/1080.m3u8"],
+    "a fetch was added: " + JSON.stringify(h.fetchLog));
+
+  const stored = JSON.parse(h.evalInBackground(
+    "JSON.stringify(Array.from(liveSizeMetadata.values()))"));
+  assert.equal(stored.length, 1, "one row, one size");
+  assert.equal(stored[0].sizeConfidence, "estimated",
+    "a ladder is a choice rather than a measurement, so never exact");
+  // 6000000 bits/s (the HIGHEST rung, not variants[0]'s 2500000) x 10s / 8.
+  assert.equal(stored[0].sizeBytes, Math.round((6000000 * 10) / 8),
+    "the top rung's bitrate over the duration summed from the variant playlist");
+
 });

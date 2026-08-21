@@ -220,6 +220,258 @@ function rememberBeam(beamId, tabId, frameId) {
   pendingBeams.set(beamId, entry);
 }
 
+// ---- per-item preview pictures ----
+//
+// `preview` is NOT `thumb`, and the difference is scope rather than kind.
+// tabThumbs holds ONE picture per TAB — content.js's captureThumb() draws the
+// largest decoded <video> to a canvas at quality 0.65 — and decorate()
+// attaches that same picture to every row of the tab. previewByIdentity is
+// keyed per item and filled when the popup asks for a particular row, so two
+// rows on one tab can show different pictures, and a row backed by a file
+// already on disk can show a frame the page never had.
+//
+// Both fields are carried; writing a per-item frame into `thumb` would put one
+// row's picture on every row of its tab.
+const previewByIdentity = new Map();     // itemIdentity -> data: URL
+const previewTabs = new Map();           // itemIdentity -> tabId, so a closed tab's clear up
+const PREVIEW_CACHE_MAX = 120;
+// Encoding a JPEG runs on the page's main thread. Asking every tab at once
+// makes a popup open stutter every video the user has open, so requests past
+// this many are queued rather than issued.
+const PREVIEW_MAX_INFLIGHT = 3;
+let previewInflight = 0;
+const previewQueue = [];
+
+// The popup's key for a row, recomputed here so get-media can look one up.
+// Mirrors itemIdentity/isSafeOpaqueId in popup/popup.js — the two have to
+// agree, since the popup sends the string and this reads it back.
+function isSafeOpaqueId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function itemIdentity(item) {
+  if (item && isSafeOpaqueId(item.id)) return "id:" + item.id;
+  return "url:" + (item && typeof item.url === "string" ? item.url : "");
+}
+
+// What the popup may ask about. The identity it sends is a cache KEY, so the
+// only requirements are that it is one of the two shapes popup.js mints and
+// that it is bounded — a 5000-character key would otherwise be retained.
+function isSafePopupIdentity(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) return false;
+  if (value.slice(0, 3) === "id:") return isSafeOpaqueId(value.slice(3));
+  return value.slice(0, 4) === "url:" && value.length > 4;
+}
+
+function previewFor(item) {
+  const stored = previewByIdentity.get(itemIdentity(item));
+  return typeof stored === "string" ? stored : null;
+}
+
+function rememberPreview(identity, tabId, dataUrl) {
+  // Oldest out first. Map iterates in insertion order, so the first key is the
+  // least recently ADDED — re-storing an identity re-inserts it below.
+  if (previewByIdentity.has(identity)) previewByIdentity.delete(identity);
+  previewByIdentity.set(identity, dataUrl);
+  previewTabs.set(identity, tabId);
+  // A row for this media may already be live and rendering.
+  pushPreviewToDownloads();
+  while (previewByIdentity.size > PREVIEW_CACHE_MAX) {
+    const oldest = previewByIdentity.keys().next().value;
+    previewByIdentity.delete(oldest);
+    previewTabs.delete(oldest);
+  }
+}
+
+// The identity an activeDownloads row answers to.
+//
+// popup/popup.js's downloadItemIdentity() reads mediaId first and then url,
+// because the popup renders BOTH kinds of download row: a live-controller job,
+// which carries a mediaId, and a row from this map, which does not. This
+// function is only ever asked about the second kind, so it has only the url
+// case — an "id:" case here would be a branch nothing could take.
+//
+// That is a property of the routing rather than an accident. The `download`
+// handler sends an item with a STRING id to the live controller and refuses an
+// item whose id is present but any other shape, so only an item with NO id
+// reaches the paths that call activeDownloads.set — and the popup keys such an
+// item "url:…" too. Pinned in tests/background-download-preview.test.js at "an
+// activeDownloads row is matched by url, because it can never have a mediaId".
+//
+// Null when the row has no url either: a row no capture can be matched to,
+// rather than a row to guess at.
+function downloadIdentity(dl) {
+  if (dl && typeof dl.url === "string" && dl.url) return "url:" + dl.url;
+  return null;
+}
+
+// Put the stored picture on a row, if there is one for it. Called when a row
+// is created, so a capture taken before the download started is not lost.
+function attachPreviewToDownload(dl) {
+  const identity = downloadIdentity(dl);
+  if (!identity) return false;
+  const stored = previewByIdentity.get(identity);
+  if (typeof stored !== "string" || dl.preview === stored) return false;
+  dl.preview = stored;
+  return true;
+}
+
+// And the other direction: a picture that arrives while a row is already live.
+// download-update carries the RAW download object — it does not pass
+// projectPopupJob, which only live-jobs-updated does — so the field is read
+// straight off `dl` by the popup, and the value put here has already been
+// through isSafePreviewDataUrl at ingress.
+// Every row is offered the store; attachPreviewToDownload decides by deriving
+// the row's own identity, so there is no second copy of that rule here to
+// disagree with it. Only a row that actually changed is rebroadcast.
+function pushPreviewToDownloads() {
+  for (const dl of activeDownloads.values()) {
+    if (attachPreviewToDownload(dl)) {
+      broadcast({ type: "download-update", download: dl });
+    }
+  }
+}
+
+function forgetTabPreviews(tabId) {
+  for (const [identity, tid] of Array.from(previewTabs.entries())) {
+    if (tid === tabId) {
+      previewTabs.delete(identity);
+      previewByIdentity.delete(identity);
+    }
+  }
+}
+
+function runNextPreview() {
+  while (previewInflight < PREVIEW_MAX_INFLIGHT && previewQueue.length > 0) {
+    const job = previewQueue.shift();
+    previewInflight += 1;
+    job().then(function releaseSlot() {
+      previewInflight -= 1;
+      runNextPreview();
+    });
+  }
+}
+
+// Ask one page for the frame it is currently showing, and settle on what
+// happens. Never rejects: every outcome is an answer the popup can render.
+function capturePreview(identity, tabId) {
+  return new Promise((resolve) => {
+    previewQueue.push(function askThePage() {
+      return api.tabs.sendMessage(tabId, { type: "capture-frame" })
+        .then((reply) => {
+          const dataUrl = reply && reply.ok === true ? safePreview(reply.dataUrl) : null;
+          if (dataUrl) {
+            rememberPreview(identity, tabId, dataUrl);
+            resolve({ ok: true, error: null });
+            return;
+          }
+          // A cross-origin <video> taints the canvas and toDataURL throws, so
+          // the page cannot answer with a picture. For this extension that is
+          // the ordinary case rather than a fault, and the tab already has a
+          // picture of its own — fall back to it rather than showing nothing.
+          //
+          // Only for a taint. A reply whose dataUrl was REFUSED above does not
+          // fall back: showing a different picture would make a rejected
+          // string look like a successful capture.
+          const tainted = reply && reply.ok !== true && reply.why === "tainted";
+          const tabPicture = tainted ? tabThumbs.get(tabId) : null;
+          if (tabPicture) {
+            rememberPreview(identity, tabId, tabPicture);
+            resolve({ ok: true, error: null });
+            return;
+          }
+          resolve({ ok: false, error: "No frame could be read from this video." });
+        })
+        .catch(() => resolve({ ok: false, error: "This page could not be reached." }));
+    });
+    runNextPreview();
+  });
+}
+
+// The one gate every preview picture passes, whoever produced it. Both
+// producers are outside this file's trust: a content script runs in the page's
+// world, and the helper is another process. Answers the string when it is a
+// bounded base64 JPEG data URL and null otherwise, so a caller can only ever
+// store a value that has been checked.
+//
+// The predicate lives in lib/privacy.js next to the general popup-string rule
+// it deliberately does NOT reuse — see the note there on why that rule removes
+// a JPEG rather than passing it.
+function safePreview(value) {
+  return self.McPrivacy.isSafePreviewDataUrl(value) ? value : null;
+}
+
+// ---- host round trips that are not about a download row ----
+// delete / badapple-stop / thumb each ask the helper a question and wait for
+// one answer. They are keyed on a request id of their own, NOT on a download
+// id, and the difference is load-bearing rather than tidy:
+//
+// onLegacyNativeMessage settles a frame by doing `activeDownloads.get(msg.id)`
+// and then, for a {type:"error"}, setting `dl.status = "error"`. A refusal
+// carrying a download id therefore marks that download FAILED. For a delete
+// that is the wrong statement in the most misleading direction — the file is
+// still on disk precisely BECAUSE the delete was refused, and the row would
+// then claim the download itself had failed. pendingBeams learned this and
+// says so at its own guard; these three follow the same shape.
+//
+// The prefix is what keeps the two id spaces apart: a download id is a bare
+// number (++downloadCounter), so a prefixed string can never name one.
+//
+// None of the three verbs exists in media-catcher-host on this branch — its
+// dispatch is an if/elif chain over `cmd` with no else, so an unknown cmd is
+// dropped in silence. Every one of these round trips therefore ends at the
+// expiry below today, which is why the expiry is a measured path rather than a
+// fallback: see tests/background-host-requests.test.js.
+const pendingHostRequests = new Map();   // reqId -> { resolve, timer, kind }
+const HOST_REQUEST_TIMEOUT_MS = 30000;
+
+function newHostRequestId(prefix) {
+  return prefix + (++downloadCounter);
+}
+
+// Register a request and hand back its id. `resolve` is called exactly once:
+// by the matching host frame, or by the expiry, whichever lands first.
+function rememberHostRequest(reqId, kind, resolve) {
+  const entry = { kind, resolve };
+  entry.timer = setTimeout(function expireHostRequest() {
+    if (!pendingHostRequests.has(reqId)) return;
+    pendingHostRequests.delete(reqId);
+    resolve({ ok: false, error: "The helper did not answer.", dataUrl: null });
+  }, HOST_REQUEST_TIMEOUT_MS);
+  pendingHostRequests.set(reqId, entry);
+}
+
+// Claim a reqId. Answers null when nothing is waiting — a late or unknown
+// frame is then an ordinary no-op rather than a second answer to a caller
+// that has already been told something.
+function claimHostRequest(reqId) {
+  if (typeof reqId !== "string" || !pendingHostRequests.has(reqId)) return null;
+  const entry = pendingHostRequests.get(reqId);
+  pendingHostRequests.delete(reqId);
+  if (entry.timer) clearTimeout(entry.timer);
+  return entry;
+}
+
+// Post one request frame and return the promise its answer settles.
+// A frame is only built when the port is up, so a missing helper is answered
+// here rather than thrown into a postMessage that has nowhere to go.
+function askHost(prefix, kind, buildFrame) {
+  return new Promise((resolve) => {
+    if (!nativePort || !nativeReady) {
+      resolve({ ok: false, error: "Native helper not available.", dataUrl: null });
+      return;
+    }
+    const reqId = newHostRequestId(prefix);
+    rememberHostRequest(reqId, kind, resolve);
+    try {
+      nativePort.postMessage(buildFrame(reqId));
+    } catch (e) {
+      claimHostRequest(reqId);
+      resolve({ ok: false, error: "The helper could not be reached.", dataUrl: null });
+    }
+  });
+}
+
 api.storage.local.get(["mcLogs", "mcEvents"]).then((r) => {
   // Merge (don't overwrite): lines pushed synchronously during startup — e.g. the
   // "connecting to the native helper…" line — must survive the async restore.
@@ -511,6 +763,7 @@ async function downloadYouTube(item, tabId, filename, opts) {
                thumb: item.thumb || null,
                progress: { done: 0, total: 100, unit: "pct", live: true, stage: "resolving", note: "Preparing" } };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
   if (!nativeReady || !nativePort) {
     dl.status = "error";
@@ -922,6 +1175,7 @@ function onLegacyNativeMessage(msg) {
       if (!fb) return;
       d = { id: msg.id, name: fb.finalName, kind: "direct", live: true, status: "downloading", url: fb.item.url };
       activeDownloads.set(msg.id, d);
+      attachPreviewToDownload(d);
     }
     d.status = "downloading"; d.live = true;
     d.progress = { done: msg.bytes || 0, total: msg.total || 0, unit: "bytes", live: false };
@@ -965,6 +1219,36 @@ function onLegacyNativeMessage(msg) {
       api.tabs.sendMessage(beam.tabId, { type: "beam-result", ok: false, error: text },
         Number.isInteger(beam.frameId) ? { frameId: beam.frameId } : undefined);
     } catch (e) { /* the frame is gone; the log line above still stands */ }
+    return;
+  }
+  // The answer to a delete / badapple-stop / thumb request. Claimed HERE,
+  // before the row lookup below, for the reason written at pendingHostRequests:
+  // past this point a frame is read as a statement about a download row, and
+  // `{type:"error"}` sets that row's status to "error". A refused delete is not
+  // a failed download — the file it names is still on disk — so it must never
+  // reach a line that can say otherwise. A frame that also happens to carry an
+  // `id` is claimed here too, and stops here.
+  if (msg.type === "delete-result" || msg.type === "badapple-stop-result") {
+    const req = claimHostRequest(msg.reqId);
+    if (req) {
+      const ok = msg.ok === true;
+      req.resolve({ ok, error: ok ? null : String(
+        msg.error == null ? "The helper refused." : msg.error) });
+    }
+    return;
+  }
+  if (msg.type === "thumb-result") {
+    const req = claimHostRequest(msg.reqId);
+    if (req) {
+      // The helper is a separate process. What it sends back is checked against
+      // the same shape a content-script capture has to satisfy before it can
+      // become a value the popup renders.
+      const dataUrl = safePreview(msg.dataUrl);
+      req.resolve(dataUrl
+        ? { ok: true, error: null, dataUrl, atSeconds: msg.atSeconds }
+        : { ok: false, dataUrl: null, atSeconds: msg.atSeconds,
+            error: String(msg.error == null ? "No frame was returned." : msg.error) });
+    }
     return;
   }
   const dl = activeDownloads.get(msg.id);
@@ -2017,6 +2301,12 @@ async function enrichHls(tabId, key) {
       item.hasSubtitles = Object.keys(parsed.subtitleGroups || {}).length > 0;
       // Probe the top variant so we can suppress its segments (they'd otherwise
       // flood the list) and learn whether the master is a live broadcast.
+      //
+      // `variants[0]` is the HIGHEST bandwidth: lib/hls.js:91 sorts them
+      // descending. Measured, not assumed — a fetch log in the master size
+      // test shows the 1080 playlist being the one this line fetches from a
+      // manifest that lists 720 first. So the duration read from vparsed below
+      // and the bitrate read from the master describe the SAME rendition.
       const top = parsed.variants[0];
       if (top && top.codecs) item.codec = codecLabel(top.codecs);
       if (top) {
@@ -2030,6 +2320,22 @@ async function enrichHls(tabId, key) {
               (vparsed.encryption.method !== "AES-128" ||
                (vparsed.encryption.keyFormat && vparsed.encryption.keyFormat !== "identity")));
             registerSegments(tabId, vparsed);
+            // The durations in vparsed were fetched for the checks above and
+            // then discarded, which is why a master row read "Size unknown"
+            // while the numbers to estimate one were in hand. No extra request
+            // is made here; this reads what is already parsed.
+            //
+            // The figure describes the HIGHEST-bandwidth rung — the one this
+            // branch already fetched, and the one preferHighestRendition
+            // downloads. A user who picks a lower rung from the quality menu
+            // downloads LESS than it says. That is a choice rather than a
+            // measurement, so it only ever reaches estimatedSizeFromBitrate
+            // and renders "Est." — see lib/stream-evidence.js.
+            const evidence = self.McStreamEvidence.masterBitrateEvidence(parsed, vparsed);
+            if (evidence) {
+              item.duration = evidence.durationSeconds;
+              item.bandwidth = evidence.selectedBandwidth;
+            }
           }
         } catch (e) { /* best-effort — pattern-based filtering still applies */ }
       }
@@ -2364,6 +2670,7 @@ async function downloadHls(item, tabId, filename, chosenVariantUrl) {
   const id = ++downloadCounter;
   const dl = { id, url: item.url, status: "parsing", progress: { done: 0, total: 0 }, name: filename };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
 
   try {
@@ -2500,6 +2807,7 @@ async function recordLiveHls(item, tabId, filename, videoUrl, existingDl, audioU
   dl.quality = quality || null;   // { resolution, height, bandwidth } if known
   dl.progress = { done: 0, total: 0, live: true, bytes: 0, duration: 0, kbps: 0 };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
 
   try {
@@ -2670,6 +2978,7 @@ async function downloadDash(item, tabId, filename, chosenVariantId) {
   const id = ++downloadCounter;
   const dl = { id, url: item.url, status: "parsing", progress: { done: 0, total: 0 }, name: filename };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
   try {
     const text = await fetchText(tabId, item.url);
@@ -2933,6 +3242,14 @@ function visibleFor(tabId) {
   let items = Array.from(map.values())
     .filter((it) => !isChild(tabId, it.url) && !isTooSmall(it) && !isDeadPlaylist(it) && !isNotVideo(it));
   if (settings.preferHighestRendition) items = keepHighestRendition(items);
+  // Last, so it sees what the popup would otherwise render. The fold requires
+  // two rows to AGREE about the proposed filename, which is what keeps it from
+  // becoming the suppression per-frame claim scoping exists to prevent — an ad
+  // iframe reporting the page's media URL under its own name keeps its own row
+  // (pinned in tests/background-live-detection.test.js).
+  items = self.McItemFold.foldItems(items, {
+    preferHighestRendition: !!settings.preferHighestRendition,
+  });
   return items;
 }
 
@@ -3029,6 +3346,13 @@ function decorateLiveRow(row, tabId) {
     variants: Array.isArray(row.variants) ? row.variants.map(copyLiveVariantRow) : [],
     tabId,
     thumb: tabThumbs.get(tabId) || null,
+    // Per-ITEM, unlike `thumb` above which is one picture for the whole tab.
+    // This projection is built key by key rather than spread, so a field not
+    // named here is a field the popup never sees — and these are the rows the
+    // popup renders most. Always present, so "not captured yet" is a value the
+    // popup can read rather than an absent key. decorate() names it too, for
+    // the legacy detected items that do not come through here.
+    preview: previewFor(row),
   };
   // Only the validated scalar pair crosses into the public row — never the
   // record itself and never any raw evidence it was derived from.
@@ -3258,6 +3582,9 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const decorate = (it, tid) => Object.assign({}, it, {
           tabId: tid,
           thumb: tabThumbs.get(tid) || null,
+          // Per-ITEM, unlike thumb above which is per-tab. Always present, so
+          // the popup can tell "not captured yet" from a field it never sees.
+          preview: previewFor(it),
           pageTitle: it.pageTitle || tabTitle(tid) || undefined,
         });
         // Kick a YouTube format probe for any not-yet-enriched item on the tab(s) —
@@ -3633,6 +3960,63 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // context of the popup click).
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "open", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });
+      } else if (msg.type === "capture-preview") {
+        // The frame is read IN THE PAGE, by the content script, from the
+        // <video> already decoding there. The alternative — handing the stream
+        // address to the helper — would mean a second, unauthenticated fetch
+        // of a resource the browser has already decoded.
+        if (!isSafePopupIdentity(msg.identity) || !Number.isInteger(msg.tabId)) {
+          sendResponse({ ok: false, error: "Nothing to preview." });
+        } else if (previewByIdentity.has(msg.identity)) {
+          sendResponse({ ok: true, error: null });     // already captured
+        } else {
+          capturePreview(msg.identity, msg.tabId).then(sendResponse);
+          return true;
+        }
+      } else if (msg.type === "delete-file") {
+        // What is checked HERE is only that there is a path: a non-empty
+        // string. Whether that path may be deleted is not decided in this
+        // process — the extension has no view of the disk, and a check written
+        // here would be a second opinion that the process doing the deleting
+        // is free to disagree with. So the frame goes out as it stands and the
+        // answer is whatever comes back.
+        //
+        // Stated as it is rather than as a design intent: media-catcher-host
+        // on this branch has NO `delete` command. Its dispatch is an if/elif
+        // chain over `cmd` with no else, so this frame is read, matched by
+        // nothing, and dropped without a reply — and what answers the popup is
+        // this request's own 30s expiry, with "The helper did not answer."
+        // Pinned in tests/background-host-requests.test.js at "a request the
+        // helper never answers is settled by its own 30s expiry". A helper that
+        // implements the verb is what turns that into a real refusal; nothing
+        // on this side has to change for it.
+        //
+        // `downloadId` is carried by the popup message for the row's own
+        // bookkeeping and is deliberately NOT put on the wire: the frame the
+        // helper answers is keyed on a request id, so its refusal can never be
+        // read as a row's failure.
+        if (typeof msg.path !== "string" || !msg.path) {
+          sendResponse({ ok: false, error: "No file to delete." });
+        } else {
+          askHost("del", "delete", (reqId) => ({ cmd: "delete", reqId, path: msg.path }))
+            .then((r) => sendResponse({ ok: r.ok, error: r.error }));
+          return true;
+        }
+      } else if (msg.type === "badapple-stop") {
+        askHost("bas", "badapple-stop", (reqId) => ({ cmd: "badapple-stop", reqId }))
+          .then((r) => sendResponse({ ok: r.ok, error: r.error }));
+        return true;
+      } else if (msg.type === "thumb-file") {
+        // A frame from a file already ON DISK. The helper is handed a path and
+        // never a url: it must not be the thing that opens a stream address.
+        if (typeof msg.path !== "string" || !msg.path) {
+          sendResponse({ ok: false, dataUrl: null, error: "No file to read." });
+        } else {
+          const at = Number.isFinite(msg.atSeconds) && msg.atSeconds >= 0 ? msg.atSeconds : 0;
+          askHost("thm", "thumb", (reqId) => ({ cmd: "thumb", reqId, path: msg.path, atSeconds: at }))
+            .then((r) => sendResponse({ ok: r.ok, dataUrl: r.dataUrl || null, error: r.error }));
+          return true;
+        }
       } else if (msg.type === "reveal-file") {
         if (nativePort && nativeReady) { nativePort.postMessage({ cmd: "reveal", path: msg.path }); sendResponse({ ok: true }); }
         else sendResponse({ ok: false, error: "Native helper not available." });
@@ -3805,6 +4189,7 @@ api.tabs.onRemoved.addListener((tabId) => {
   tabContext.delete(tabId);
   childUrls.delete(tabId);
   tabThumbs.delete(tabId);
+  forgetTabPreviews(tabId);
   segDirsByTab.delete(tabId);
   audioTrackByTab.delete(tabId);
 });
@@ -3821,6 +4206,7 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
     tabContext.delete(tabId);
     childUrls.delete(tabId);
     tabThumbs.delete(tabId);
+    forgetTabPreviews(tabId);
     segDirsByTab.delete(tabId);
     audioTrackByTab.delete(tabId);
     updateBadge(tabId);
