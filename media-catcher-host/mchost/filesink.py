@@ -16,6 +16,9 @@ import time
 import uuid
 
 from mchost import guard
+# The ledger of files this host wrote: the committed file below is one,
+# and `delete` refuses a path with no record.
+from mchost import written
 
 # Firefox native-messaging payload ceiling is 1 MiB framed. Base64 expands by
 # 4/3 plus JSON envelope, so keep decoded chunks well under that.
@@ -677,6 +680,7 @@ def handle_file_commit(req):
                    attempt_token=sink.attempt_token)
             return
 
+        written.record(committed)
         _send({
             "type": "file-committed",
             "sinkId": sink_id,

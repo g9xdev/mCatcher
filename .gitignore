@@ -33,6 +33,9 @@ media-catcher-host/cast_creds_*.json
 # update_staging_dir() creates this inside the tracked tree; a staged release
 # zip is a downloaded artifact, not source.
 media-catcher-host/updates/
+# mchost/written.py's ledger of files this host wrote — per-machine runtime
+# state in the same directory, for the same reason.
+media-catcher-host/written-files.jsonl
 
 # Agent scratch. The root one is already covered by the /* rule above, but a
 # nested copy (made by running a command from the wrong directory) is not, and

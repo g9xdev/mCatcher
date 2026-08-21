@@ -42,6 +42,12 @@ from mchost import badapple_ipc
 # Where BadApple is installed — a host-owned lookup, imported here so
 # handle_badapple never has a path of its own to fall back on.
 from mchost.tools import find_badapple
+# The ledger of files this host wrote. Every frame below that names a produced
+# file appends to it first, because `delete` will later refuse a path with no
+# record — a file announced to the popup and missing from the ledger is a row
+# the user can see and cannot delete. Imported as a MODULE so the suite can
+# point it at a ledger of its own.
+from mchost import written
 
 
 def _h():
@@ -145,6 +151,9 @@ def run_job(job, req):
     except Exception:
         pass
     job.finished.set()
+    # Before the frame, everywhere: the popup can act on a path the moment it
+    # arrives, and `delete` answers from the ledger.
+    written.record(job.temp)
     _h().send({"type": "stopped", "id": job.id, "file": job.temp,
                "bytes": job.bytes, "seconds": round(job.seconds, 1)})
 
@@ -324,7 +333,9 @@ def handle_snapshot(req):
                         job.partial = dest
                         # Sized here: outside the lock the next snapshot to this
                         # same dest could truncate the file before the read.
-                        written = os.path.getsize(dest)
+                        # Named wrote_bytes, not `written`: the module of that
+                        # name is the ledger this worker also appends to.
+                        wrote_bytes = os.path.getsize(dest)
                 if not live:
                     # Discarded mid-copy. Take the checkpoint back out of the
                     # user's Downloads, and the temp with it: handle_discard's
@@ -336,7 +347,8 @@ def handle_snapshot(req):
                     _rm_quiet(job.temp)
                     return
             # Never across the pipe write, which can block.
-            _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": written,
+            written.record(dest)
+            _h().send({"type": "snapshot", "id": jid, "file": dest, "bytes": wrote_bytes,
                        "seconds": round(job.seconds, 1)})
         except Exception as e:
             _h().send({"type": "error", "id": jid, "error": "save-now failed: %s" % e})
@@ -702,6 +714,7 @@ def _finalize_move(job, jid, dest, req=None):
     conv = (req or {}).get("convert")
     if conv and conv.get("codec") in ("h265", "av1"):
         codec = conv["codec"]
+        written.record(dest)
         _h().send({"type": "converting", "id": jid, "file": dest, "codec": codec})
         res = transcode(dest, codec, conv.get("quality", "visually-lossless"), conv.get("encoder", "auto"),
                         on_progress=lambda pct, j=jid, c=codec: _h().send({"type": "convert-progress", "id": j, "pct": pct, "codec": c}))
@@ -711,6 +724,9 @@ def _finalize_move(job, jid, dest, req=None):
                      "kept": codec if res["converted"] else "orig"}
 
     bytes_ = os.path.getsize(dest) if os.path.isfile(dest) else 0
+    # `dest` is rebound above when a transcode kept its own output, so this is
+    # a second path, not the one the "converting" frame named.
+    written.record(dest)
     _h().send({"type": "saved", "id": jid, "file": dest, "bytes": bytes_, "convert": conv_info})
 
 
@@ -3561,6 +3577,7 @@ def _handle_ytdl_structured(req):
         })
 
     def emit_done(path, size):
+        written.record(path)
         emit({
             "type": "ytdl-done",
             "id": jid,
@@ -4272,6 +4289,7 @@ def _ytdl_download_via_lib(jid, url, fmt, outtmpl, deno, pot, claim=None):
     if op.get("cancel_requested"):
         _cancelled()
     elif path and os.path.isfile(path):
+        written.record(path)
         _terminal({"type": "ytdl-done", "id": jid, "file": path,
                    "bytes": os.path.getsize(path)})
         _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(path))
@@ -4453,6 +4471,7 @@ def _handle_ytdl_legacy(req):
                 except Exception:
                     size = None
                 if type(size) is int and size >= 0:
+                    written.record(filepath)
                     _terminal({"type": "ytdl-done", "id": jid, "file": filepath, "bytes": size})
                     _h()._hlog("info", "yt-dlp: saved %s" % os.path.basename(filepath))
                 else:
@@ -4626,6 +4645,9 @@ def _pget_send_result(id, attemptToken, status, mode, failureCategory, partState
     if status == "completed" and partState == "committed" and file is not None:
         size = _pget_nonneg_int_bytes(bytes)
         if size is not None:
+            # Paired with the frame, not with the terminal: a failed or
+            # cancelled pget carries no file and leaves no record.
+            written.record(file)
             msg["file"] = file
             msg["bytes"] = size
     _h().send(msg)
@@ -5904,6 +5926,7 @@ def handle_pget(req):
                 conv = req.get("convert")
                 if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
                     codec = conv["codec"]
+                    written.record(final_path)
                     try:
                         _h().send({
                             "type": "converting",
@@ -6197,6 +6220,7 @@ def handle_pget_single(req):
                     conv = req.get("convert")
                     if conv and conv.get("codec") in ("h265", "av1") and _h().FFMPEG:
                         codec = conv["codec"]
+                        written.record(final_path)
                         try:
                             _h().send({
                                 "type": "converting",
