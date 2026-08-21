@@ -283,11 +283,24 @@ function rememberPreview(identity, tabId, dataUrl) {
   }
 }
 
-// The identity a DOWNLOAD row answers to. Mirrors downloadItemIdentity() in
-// popup/popup.js: mediaId first, then url. Null when the row is neither, which
-// is a row no capture can be matched to rather than a row to guess at.
+// The identity an activeDownloads row answers to.
+//
+// popup/popup.js's downloadItemIdentity() reads mediaId first and then url,
+// because the popup renders BOTH kinds of download row: a live-controller job,
+// which carries a mediaId, and a row from this map, which does not. This
+// function is only ever asked about the second kind, so it has only the url
+// case — an "id:" case here would be a branch nothing could take.
+//
+// That is a property of the routing rather than an accident. The `download`
+// handler sends an item with a STRING id to the live controller and refuses an
+// item whose id is present but any other shape, so only an item with NO id
+// reaches the paths that call activeDownloads.set — and the popup keys such an
+// item "url:…" too. Pinned in tests/background-download-preview.test.js at "an
+// activeDownloads row is matched by url, because it can never have a mediaId".
+//
+// Null when the row has no url either: a row no capture can be matched to,
+// rather than a row to guess at.
 function downloadIdentity(dl) {
-  if (dl && isSafeOpaqueId(dl.mediaId)) return "id:" + dl.mediaId;
   if (dl && typeof dl.url === "string" && dl.url) return "url:" + dl.url;
   return null;
 }
