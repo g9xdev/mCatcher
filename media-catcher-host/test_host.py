@@ -636,6 +636,13 @@ LOOP_DISPATCH = {
     "open": ("worker", ("handle_open",)),
     "reveal": ("worker", ("handle_reveal",)),
     "badapple": ("worker", ("handle_badapple",)),
+    "badapple-stop": ("worker", ("handle_badapple_stop",)),
+    # os.remove on a caller-supplied path, after a process start and a lock
+    # release. Every step of it is a filesystem touch on a path that can name
+    # a dead network share.
+    "delete": ("worker", ("handle_delete",)),
+    # a process start plus a decode.
+    "thumb": ("worker", ("handle_thumb",)),
     "update": ("worker", ("handle_update",)),
     "watch": ("inline",
               "reads and rewrites the small config file, then arms an OS watcher"),

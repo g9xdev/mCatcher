@@ -490,6 +490,54 @@ def _stop_media_server():
     _close_media_server(srv)
 
 
+def release_local_path(path):
+    """Retire every token serving `path`. Returns how many entries went.
+
+    WHY ANOTHER LANE CALLS THIS. mchost/fileops.py removes a saved file, and
+    this server is a holder of that file inside this same process: _serve_file
+    opens it per request, and an entry stays in _DLNA["media"] for the rest of
+    the session unless a cast is explicitly stopped. Stopping BadApple does not
+    touch it. Dropping the entry is what makes the token stop resolving, so no
+    NEW request opens a handle on a file about to be removed.
+
+    WHAT IT CANNOT DO is close a handle a response ALREADY holds: _serve_file
+    keeps the file open for the length of one response, and a response in
+    flight when this runs keeps its handle until it ends. The caller's
+    os.remove reports whatever is left rather than waiting on it.
+
+    Matched on normcase(realpath), not on the string: the path arriving from
+    the popup has been out through the extension and back, and Windows accepts
+    either separator and compares case-insensitively. A remote entry (one with
+    a `url`, which this server PROXIES rather than opens) is not a local holder
+    and is left alone.
+
+    Under _DLNA_SRV_LOCK, the same lock _dlna_media_url claims a token under,
+    so a registration racing this either happens entirely before it (and is
+    dropped) or entirely after (and is a new cast of a file that is about to
+    stop existing, which the request itself will discover).
+    """
+    try:
+        want = os.path.normcase(os.path.realpath(path))
+    except Exception:
+        return 0
+    with _DLNA_SRV_LOCK:
+        kept = {}
+        gone = 0
+        for token, ent in _DLNA["media"].items():
+            local = ent.get("path") if isinstance(ent, dict) else None
+            if isinstance(local, str):
+                try:
+                    same = os.path.normcase(os.path.realpath(local)) == want
+                except Exception:
+                    same = False
+                if same:
+                    gone += 1
+                    continue
+            kept[token] = ent
+        _DLNA["media"] = kept
+    return gone
+
+
 def _dlna_media_url(source, device_ip=None):
     """Register a local path or remote URL; return (LAN URL the TV fetches, ctype).
 

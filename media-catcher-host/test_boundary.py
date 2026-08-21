@@ -21,6 +21,8 @@ import struct
 import subprocess
 import sys
 
+import pytest
+
 from conftest import HOST, load_host, wait_for
 
 mc = load_host()
@@ -253,10 +255,12 @@ def test_refuse_open_covers_the_windows_shapes(tmp_path):
 def test_badapple_is_typed_like_open_and_reveal_plus_a_url():
     assert guard.MESSAGE_SCHEMA["badapple"] == {
         "id": guard.ID, "path": guard.STR, "url": guard.STR,
+        "show": guard.BOOL,
         "headers": {"Cookie": guard.STR, "Referer": guard.STR,
                     "User-Agent": guard.STR},
     }, ("badapple takes a correlation id, ONE source — a file path or a URL — "
-        "and, only alongside a URL, the sign-in that source needs")
+        "the sign-in that source needs (only alongside a URL), and whether "
+        "the window the beam lands in should be brought up")
 
 
 def _fake_badapple(monkeypatch, tmp_path, installed=True):
@@ -1277,3 +1281,696 @@ def test_record_keeps_a_referer_that_merely_spells_a_header_inside_its_own(
     assert lines == ["Referer: https://page.test/watch?q=X-Injected:%201",
                      "User-Agent: UA/1.0"], lines
     assert all(not ln.startswith("X-Injected") for ln in lines), lines
+
+
+# ---------------------------------------------------------------------------
+# 2c. `delete` and `thumb` — the two verbs that take a path and then act on the
+#     FILE, rather than handing it to another program
+#
+# `open`, `reveal` and `badapple` all end in "hand this path to something
+# else", and guard.refuse_open is the whole gate because the danger is what the
+# shell does with a suffix. These two are different: delete removes the file
+# permanently, and thumb reads its bytes. Both need a second answer refuse_open
+# cannot give.
+#
+# refuse_open answers a question about SHAPE — is this the KIND of file this
+# helper deals in. A .mp4 the user shot on a phone and copied into Downloads
+# has exactly the same shape as one this host produced, so shape alone would
+# let the extension delete it. mchost/written.py answers the other question,
+# "did THIS HOST write it", and both verbs require BOTH answers.
+#
+# The refusal tests below come in pairs on purpose: one satisfies the ledger
+# and is refused on shape, one satisfies the shape and is refused on the
+# ledger. Either check deleted on its own leaves one of the pair red.
+#
+# There is deliberately NO `url` field on thumb. Host-side fetching of a remote
+# stream URL would make this helper an HTTP client pointed wherever the
+# extension says, reaching whatever this machine can route to; the frame takes
+# a local path this host wrote, and nothing else.
+# ---------------------------------------------------------------------------
+
+
+# A real clip, decoded by the real ffmpeg. These tests are about a frame THIS
+# HOST produced, so a stubbed decoder would pin the stub.
+@pytest.fixture(scope="module")
+def _clip_master(tmp_path_factory):
+    from mchost import tools
+
+    if not tools.FFMPEG:
+        pytest.skip("no ffmpeg on this machine to decode a frame with")
+    out = str(tmp_path_factory.mktemp("clipsrc") / "master.mp4")
+    subprocess.run([tools.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi",
+                    "-i", "testsrc=size=640x360:rate=15:duration=3",
+                    "-pix_fmt", "yuv420p", out], check=True, timeout=180)
+    return out
+
+
+@pytest.fixture
+def host_clip(_clip_master, tmp_path):
+    """A per-test copy: one of these tests appends to the file on purpose."""
+    import shutil
+
+    dest = os.path.join(str(tmp_path), "clip.mp4")
+    shutil.copyfile(_clip_master, dest)
+    return dest
+
+
+def _ledger(monkeypatch, tmp_path):
+    """Point the written-files ledger at this test's own file."""
+    from mchost import written
+
+    monkeypatch.setattr(written, "_PATH_OVERRIDE",
+                        str(tmp_path / "written-files.jsonl"))
+    written.forget_cache()
+    return written
+
+
+def _media(where, name="clip.mp4", body=b"video-bytes"):
+    p = os.path.join(str(where), name)
+    with open(p, "wb") as fh:
+        fh.write(body)
+    return p
+
+
+def _replies(sent, kind):
+    """Only the frames of this kind. The host interleaves {"type":"log"} ones
+    -- thumb writes ffmpeg's own text there when a seek finds no frame -- so a
+    wait on "anything arrived" can wake on the log and read the reply before
+    it exists."""
+    return [m for m in sent if m.get("type") == kind]
+
+
+def _answer(sent, kind, timeout=90.0, n=1):
+    wait_for(lambda: len(_replies(sent, kind)) >= n, timeout=timeout)
+    got = _replies(sent, kind)
+    assert len(got) >= n, "fewer than %d %s frames in %s" % (n, kind, sent)
+    return got[n - 1]
+
+
+# --- the schema, by equality (the discipline `badapple` is already pinned with)
+
+def test_delete_is_typed_as_a_request_id_and_one_path():
+    assert guard.MESSAGE_SCHEMA["delete"] == {
+        "reqId": guard.ID, "path": guard.STR,
+    }, ("delete takes a correlation id and the one file to remove — no "
+        "directory, no glob, no recursion flag")
+
+
+def test_badapple_stop_is_typed_as_a_request_id_and_nothing_else():
+    assert guard.MESSAGE_SCHEMA["badapple-stop"] == {
+        "reqId": guard.ID,
+    }, ("--stop is a bare flag: there is nothing for the caller to name, and "
+        "the program that runs is find_badapple's answer, not a field")
+
+
+def test_thumb_is_typed_as_a_local_path_and_an_offset_with_no_url():
+    assert guard.MESSAGE_SCHEMA["thumb"] == {
+        "reqId": guard.ID, "path": guard.STR, "atSeconds": guard.NUM,
+    }, "thumb reads ONE local file at ONE offset"
+    assert "url" not in guard.MESSAGE_SCHEMA["thumb"], (
+        "a url field here would have the host fetch an address the extension "
+        "chose, reaching whatever this machine can route to. The frame carries "
+        "a path this host itself wrote and nothing else.")
+
+
+def test_thumb_never_reads_a_url_field_even_when_one_is_sent():
+    """Unlisted keys are ignored by the schema by design, so the handler is
+    where a smuggled `url` has to die. Read off the SOURCE: there is no code
+    in handle_thumb that could give one any effect."""
+    import io as _io
+
+    src = _io.open(os.path.join(os.path.dirname(HOST), "mchost", "fileops.py"),
+                   encoding="utf-8").read()
+    start = src.index("def handle_thumb")
+    end = src.find("\ndef ", start + 1)
+    body = src[start:end if end > 0 else len(src)]
+    assert 'get("url")' not in body and "get('url')" not in body, (
+        "handle_thumb reads a url field; there is no such field and there is "
+        "not meant to be one")
+
+
+# --- delete: the two halves of the AND, each killed on its own ---
+
+def test_delete_refuses_a_media_file_this_host_never_wrote(monkeypatch, tmp_path):
+    """The ledger half. Shape alone admits this file — it IS a .mp4 — so what
+    refuses it is that nothing here produced it."""
+    _ledger(monkeypatch, tmp_path)
+    theirs = _media(tmp_path, "holiday.mp4")
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d1", "path": theirs})
+    r = _answer(sent, "delete-result", timeout=5.0)
+    assert r["reqId"] == "d1" and r["ok"] is False, r
+    assert os.path.isfile(theirs), "the file is still there"
+    # A reason a person can act on: it names the file and says what is missing,
+    # rather than "refused".
+    assert "holiday.mp4" in r["error"], r
+    assert "download" in r["error"].lower(), r
+
+
+def test_delete_refuses_an_executable_even_when_it_is_in_the_ledger(
+        monkeypatch, tmp_path):
+    """The shape half, with the ledger half deliberately satisfied.
+
+    A ledger record is not permission to remove anything. Recording the .exe
+    first is what makes this test kill the refuse_open call specifically."""
+    written = _ledger(monkeypatch, tmp_path)
+    evil = _media(tmp_path, "payload.exe", b"MZ")
+    assert written.record(evil) is True
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d2", "path": evil})
+
+    r = _answer(sent, "delete-result")
+    assert r["ok"] is False, r
+    assert os.path.isfile(evil), "the executable is still there"
+    assert "payload.exe" in r["error"], r
+
+
+def test_delete_refuses_a_traversal_out_of_a_folder_it_did_write_in(
+        monkeypatch, tmp_path):
+    """`..` is not refused by spelling — it is resolved, and the file it
+    RESOLVES ONTO is the one asked about. A path that walks out of the folder
+    this host saved into, onto something it never wrote, is refused because of
+    where it lands, which is the check that survives a change of spelling."""
+    written = _ledger(monkeypatch, tmp_path)
+    sub = os.path.join(str(tmp_path), "saved")
+    os.mkdir(sub)
+    written.record(_media(sub, "clip.mp4"))
+    theirs = _media(tmp_path, "elsewhere.mp4")
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    mc.handle_delete({"reqId": "d3",
+                      "path": os.path.join(sub, "..", "elsewhere.mp4")})
+
+    r = _answer(sent, "delete-result")
+    assert r["ok"] is False, r
+    assert os.path.isfile(theirs), "the file the traversal pointed at survives"
+
+
+def test_delete_resolves_a_detour_back_onto_the_file_it_did_write(
+        monkeypatch, tmp_path):
+    from mchost import fileops
+
+    """The same resolution, in the direction that has to keep WORKING.
+
+    The popup's copy of a path travels out through the extension and back, so
+    the spelling that arrives is not guaranteed to be the one recorded.
+    saved/../saved/clip.mp4 is the same file as saved/clip.mp4, and one ledger
+    answer covers both."""
+    written = _ledger(monkeypatch, tmp_path)
+    sub = os.path.join(str(tmp_path), "saved")
+    os.mkdir(sub)
+    mine = _media(sub, "clip.mp4")
+    written.record(mine)
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: None)
+    mc.handle_delete({"reqId": "d4",
+                      "path": os.path.join(sub, "..", "saved", "clip.mp4")})
+
+    r = _answer(sent, "delete-result")
+    assert r["ok"] is True, r
+    assert not os.path.exists(mine), "the recorded file was removed"
+
+
+def test_delete_refuses_a_non_media_suffix_it_never_recorded(monkeypatch, tmp_path):
+    """Both halves failing at once, across suffixes the allowlist exists for."""
+    _ledger(monkeypatch, tmp_path)
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    for i, name in enumerate(("notes.txt", "run.bat", "task.lnk", "key.pem",
+                              "noext")):
+        target = _media(tmp_path, name, b"x")
+        mc.handle_delete({"reqId": "dn%d" % i, "path": target})
+        r = _answer(sent, "delete-result", timeout=5.0, n=i + 1)
+        assert r["ok"] is False, (name, r)
+        assert os.path.isfile(target), name
+
+
+def test_delete_removes_a_recorded_file_permanently(monkeypatch, tmp_path):
+    from mchost import fileops
+
+    """The verb doing its job, the way the owner chose it: os.remove, not a
+    Recycle Bin move. The confirm step lives in the popup."""
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: None)
+
+    mc.handle_delete({"reqId": "d5", "path": mine})
+
+    assert _answer(sent, "delete-result") == {
+        "type": "delete-result", "reqId": "d5", "ok": True, "error": None}, sent
+    assert not os.path.exists(mine)
+    # Permanent: nothing moved it aside, so the folder holds only the ledger.
+    assert sorted(os.listdir(str(tmp_path))) == ["written-files.jsonl"], \
+        os.listdir(str(tmp_path))
+
+
+def test_delete_releases_the_local_holders_before_it_removes(monkeypatch, tmp_path):
+    """Two things IN THIS PROCESS's reach can be holding the file open, and
+    both are let go BEFORE os.remove — an order that matters, because a
+    release after the remove releases nothing.
+
+      (a) BadApple, which may be playing it, through the same --stop the
+          popup's stop button uses, so there is one way to stop it.
+      (b) this host's OWN local media server (mchost/cast/legacy.py), which
+          serves a cast file over plain HTTP and opens it per request.
+          Stopping BadApple does not touch that one.
+    """
+    from mchost import fileops
+    from mchost.cast import legacy
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+
+    order = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: order.append(("spawn", tuple(argv))))
+    monkeypatch.setattr(legacy, "release_local_path",
+                        lambda p: (order.append(("release", p)), 0)[1])
+    real_remove = os.remove
+    monkeypatch.setattr(fileops.os, "remove",
+                        lambda p: (order.append(("remove", p)), real_remove(p))[1])
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d6", "path": mine})
+    assert _answer(sent, "delete-result")["ok"] is True, sent
+
+    kinds = [k for k, _ in order]
+    assert "spawn" in kinds and "release" in kinds and "remove" in kinds, order
+    assert kinds.index("spawn") < kinds.index("remove"), order
+    assert kinds.index("release") < kinds.index("remove"), order
+    assert order[kinds.index("spawn")][1] == (app, "--stop"), order
+
+
+def test_delete_reports_a_sharing_violation_and_does_not_retry(
+        monkeypatch, tmp_path):
+    """Windows refuses to unlink a file another process still has open. That is
+    an answer, not a transient: something is holding it and will go on holding
+    it. Report the reason and stop — a retry loop here is a worker spinning on
+    a file the user was told nothing about."""
+    from mchost import fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: None)
+
+    calls = []
+
+    def _held(path):
+        calls.append(path)
+        raise PermissionError(32, "The process cannot access the file because "
+                                  "it is being used by another process")
+
+    monkeypatch.setattr(fileops.os, "remove", _held)
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d7", "path": mine})
+
+    r = _answer(sent, "delete-result")
+    assert r["ok"] is False, r
+    assert "another process" in r["error"], r
+    assert len(calls) == 1, "one attempt, then the reason; no loop: %s" % calls
+
+
+def test_delete_of_a_recorded_file_that_is_already_gone_says_so(
+        monkeypatch, tmp_path):
+    from mchost import fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    gone = os.path.join(str(tmp_path), "gone.mp4")
+    written.record(gone)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: None)
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d8", "path": gone})
+    r = _answer(sent, "delete-result")
+    assert r["ok"] is False and "gone.mp4" in r["error"], r
+
+
+def test_the_media_server_stops_serving_a_path_it_is_asked_to_release():
+    """The half of (b) that is a claim about the cast lane's own state.
+
+    _DLNA["media"] maps an opaque token to a file, and a token stays registered
+    for the whole session — a cast that ended without an explicit stop leaves
+    its entry behind, still fetchable and still opened per request. Releasing
+    the path is what makes the token stop resolving.
+
+    What it does NOT do is close a handle a response already holds: _serve_file
+    keeps the file open for the length of one response. delete reports the
+    sharing violation that follows rather than retrying.
+    """
+    from mchost.cast import legacy
+
+    mine = os.path.join(os.path.dirname(HOST), "mchost", "written.py")
+    before = dict(legacy._DLNA["media"])
+    legacy._DLNA["media"] = {
+        "a" * 32: {"path": mine.upper(), "ctype": "video/mp4"},
+        "b" * 32: {"path": mine.replace("\\", "/"), "ctype": "video/mp4"},
+        "c" * 32: {"url": "https://cdn.test/v.mp4", "ctype": "video/mp4"},
+    }
+    try:
+        assert legacy.release_local_path(mine) == 2, (
+            "both spellings of the same file went; a remote entry is not a "
+            "local holder and stays")
+        assert list(legacy._DLNA["media"]) == ["c" * 32], legacy._DLNA["media"]
+        assert legacy.release_local_path(mine) == 0, "releasing twice is a no-op"
+    finally:
+        legacy._DLNA["media"] = before
+
+
+# --- badapple-stop ---
+
+def test_badapple_stop_spawns_a_bare_stop_flag(monkeypatch, tmp_path):
+    """argv list, shell=False, and position 0 is the host's own answer. The
+    caller names nothing: no field on this frame can reach argv at all."""
+    from mchost import fileops
+
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append((argv, k)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    # The two fields the OTHER badapple verb takes, smuggled onto this one.
+    mc.handle_badapple_stop({"reqId": "s1", "path": r"C:\evil.exe",
+                             "url": "http://evil.test/"})
+    assert wait_for(lambda: bool(sent), timeout=3.0)
+
+    assert len(ran) == 1, ran
+    argv, kwargs = ran[0]
+    assert isinstance(argv, list), "a list, so nothing is parsed as a command line"
+    assert argv == [app, "--stop"], argv
+    assert kwargs.get("shell", False) is False, kwargs
+    assert _answer(sent, "badapple-stop-result") == {
+        "type": "badapple-stop-result", "reqId": "s1", "ok": True,
+        "error": None}, sent
+
+
+def test_badapple_stop_says_so_when_badapple_is_not_installed(
+        monkeypatch, tmp_path):
+    from mchost import fileops
+
+    monkeypatch.setattr(fileops, "find_badapple", lambda: None)
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda *a, **k: ran.append(a))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_badapple_stop({"reqId": "s2"})
+    assert wait_for(lambda: bool(sent), timeout=3.0)
+
+    assert ran == [], ran
+    r = _answer(sent, "badapple-stop-result")
+    assert r["ok"] is False and "BadApple" in r["error"], r
+
+
+def test_badapple_show_rides_alongside_the_beam_only_when_asked(
+        monkeypatch, tmp_path):
+    """The existing verb gains one optional flag. Absent and false must produce
+    the argv the shipped extension already sends, unchanged."""
+    from mchost import downloads as d
+
+    app = _fake_badapple(monkeypatch, tmp_path)
+    clip = _media(tmp_path)
+
+    def _argv(req):
+        ran = []
+        monkeypatch.setattr(d.subprocess, "Popen",
+                            lambda argv, **k: ran.append(argv))
+        sent = []
+        monkeypatch.setattr(mc, "send", sent.append)
+        mc.handle_badapple(req)
+        assert wait_for(lambda: bool(ran) or bool(sent), timeout=3.0), sent
+        return ran[0] if ran else None
+
+    assert _argv({"id": "b1", "path": clip}) == [app, "--beam", clip]
+    assert _argv({"id": "b2", "path": clip, "show": False}) == [app, "--beam", clip]
+    assert _argv({"id": "b3", "path": clip, "show": True}) == [
+        app, "--beam", clip, "--show"]
+
+
+# --- thumb ---
+
+def test_thumb_refuses_the_same_two_ways_delete_does(monkeypatch, tmp_path):
+    """Reading a file is milder than removing one, but the path is the same
+    caller-supplied path, so it is held to the same rule."""
+    from mchost import fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    theirs = _media(tmp_path, "holiday.mp4")          # media, not recorded
+    evil = _media(tmp_path, "payload.exe", b"MZ")
+    written.record(evil)                              # recorded, not media
+
+    ran = []
+    monkeypatch.setattr(fileops, "_run_ffmpeg_frame",
+                        lambda *a, **k: ran.append(a))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    outside = os.path.join(str(tmp_path), "saved", "..", "holiday.mp4")
+    for i, bad in enumerate((theirs, evil, outside)):
+        mc.handle_thumb({"reqId": "t%d" % i, "path": bad})
+        r = _answer(sent, "thumb-result", timeout=5.0, n=i + 1)
+        assert r["dataUrl"] is None, r
+        assert r["error"], r
+    assert ran == [], "ffmpeg never ran on a refused path"
+
+
+def test_thumb_returns_a_jpeg_data_url_and_echoes_the_offset(
+        monkeypatch, tmp_path, host_clip):
+    import base64
+
+    written = _ledger(monkeypatch, tmp_path)
+    written.record(host_clip)
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_thumb({"reqId": "t9", "path": host_clip, "atSeconds": 2})
+
+    r = _answer(sent, "thumb-result")
+    assert r["error"] is None, r
+    assert r["atSeconds"] == 2, r
+    assert r["dataUrl"].startswith("data:image/jpeg;base64,"), r["dataUrl"][:40]
+    raw = base64.b64decode(r["dataUrl"].split(",", 1)[1])
+    assert raw[:2] == b"\xff\xd8" and raw[-2:] == b"\xff\xd9", "a whole JPEG"
+
+
+def test_thumb_falls_back_to_the_first_second_of_a_short_clip(
+        monkeypatch, tmp_path, host_clip):
+    """The default offset is 15s and most saved videos are longer than that.
+    Seeking past the end of a 3-second one returns no frame at all, so the
+    fallback is what keeps a short download from showing nothing."""
+    written = _ledger(monkeypatch, tmp_path)
+    written.record(host_clip)
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_thumb({"reqId": "t10", "path": host_clip})   # no atSeconds -> 15
+
+    r = _answer(sent, "thumb-result")
+    assert r["error"] is None, r
+    assert r["dataUrl"].startswith("data:image/jpeg;base64,"), r
+    assert r["atSeconds"] == 1, (
+        "the frame that came back is the one near the start, and the reply "
+        "says so rather than repeating the 15 that was asked for: %r"
+        % {k: v for k, v in r.items() if k != "dataUrl"})
+
+
+def test_thumb_answers_a_second_time_without_running_ffmpeg_again(
+        monkeypatch, tmp_path, host_clip):
+    """Cached on (realpath, mtime, size). The popup asks for every visible row
+    each time it opens."""
+    from mchost import fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    written.record(host_clip)
+    fileops.forget_thumb_cache()
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_thumb({"reqId": "t11", "path": host_clip, "atSeconds": 2})
+    first = _answer(sent, "thumb-result")["dataUrl"]
+    assert first
+
+    runs = []
+    monkeypatch.setattr(fileops, "_run_ffmpeg_frame",
+                        lambda *a, **k: (runs.append(a), (None, "must not run"))[1])
+    mc.handle_thumb({"reqId": "t12", "path": host_clip, "atSeconds": 2})
+    second = _answer(sent, "thumb-result", timeout=10.0, n=2)
+    assert runs == [], "the second ask was answered from the cache"
+    assert second["dataUrl"] == first, second
+
+
+def test_thumb_re_reads_a_file_that_changed_under_the_same_name(
+        monkeypatch, tmp_path, host_clip):
+    """A re-download lands on the same deduplicated name. A cache keyed on the
+    path alone would serve the OLD file's frame for the new one."""
+    from mchost import fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    written.record(host_clip)
+    fileops.forget_thumb_cache()
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+    mc.handle_thumb({"reqId": "t13", "path": host_clip, "atSeconds": 2})
+    assert _answer(sent, "thumb-result")["dataUrl"], sent
+
+    with open(host_clip, "ab") as fh:
+        fh.write(b"\x00" * 4096)          # size changes, so the cache key does
+    runs = []
+    real = fileops._run_ffmpeg_frame
+    monkeypatch.setattr(fileops, "_run_ffmpeg_frame",
+                        lambda *a, **k: (runs.append(a), real(*a, **k))[1])
+    mc.handle_thumb({"reqId": "t14", "path": host_clip, "atSeconds": 2})
+    _answer(sent, "thumb-result", n=2)
+    assert len(runs) == 1, "the changed file was decoded again, not served stale"
+
+
+def test_the_thumb_cache_is_bounded_by_bytes_as_well_as_by_count():
+    """A count bound alone is not a memory bound here.
+
+    An entry is a data: URL, and MAX_JPEG_BYTES permits one of 512KB base64;
+    64 of those is 32MB held by a helper that is otherwise idle waiting on a
+    pipe. Both bounds evict oldest-first, so what survives is what the popup
+    asked for most recently."""
+    from mchost import fileops
+
+    fileops.forget_thumb_cache()
+    try:
+        big = "d" * (1024 * 1024)
+        for i in range(20):
+            fileops._cache_put(("big%d" % i, 0, 0, 1), (big, 1))
+        assert fileops._THUMB_CACHE_HELD[0] <= fileops._THUMB_CACHE_BYTES, (
+            fileops._THUMB_CACHE_HELD[0])
+        assert ("big19", 0, 0, 1) in fileops._THUMB_CACHE, "the newest stayed"
+
+        fileops.forget_thumb_cache()
+        for i in range(fileops._THUMB_CACHE_MAX * 2):
+            fileops._cache_put(("small%d" % i, 0, 0, 1), ("x", 1))
+        assert len(fileops._THUMB_CACHE) <= fileops._THUMB_CACHE_MAX, (
+            len(fileops._THUMB_CACHE))
+    finally:
+        fileops.forget_thumb_cache()
+
+
+def test_a_very_tall_video_is_fitted_into_the_box_not_just_narrowed(
+        monkeypatch, tmp_path, _clip_master):
+    """The other half of the ceiling, and the one that decides the REAL sizes.
+
+    "320px wide" bounds one dimension. A 320x1706 frame is still 320px wide,
+    and the same random-noise content that measured 111,709 bytes at 320x320
+    measured 595,793 at 320x1706 — five times as much, from a constraint that
+    looks satisfied. So the scale has to be a BOX, and this decodes an actual
+    tall video rather than reading the filter string, because what matters is
+    the picture that comes out.
+    """
+    from mchost import tools, written as w, fileops
+
+    if not tools.FFMPEG:
+        pytest.skip("no ffmpeg on this machine to decode a frame with")
+    tall = os.path.join(str(tmp_path), "tall.mp4")
+    subprocess.run([tools.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi",
+                    "-i", "testsrc=size=240x1600:rate=10:duration=2",
+                    "-pix_fmt", "yuv420p", tall], check=True, timeout=180)
+    _ledger(monkeypatch, tmp_path)
+    w.record(tall)
+    fileops.forget_thumb_cache()
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_thumb({"reqId": "t16", "path": tall, "atSeconds": 1})
+    r = _answer(sent, "thumb-result")
+    assert r["error"] is None, r
+
+    import base64
+    raw = base64.b64decode(r["dataUrl"].split(",", 1)[1])
+    assert len(raw) <= fileops.MAX_JPEG_BYTES, len(raw)
+    width, height = _jpeg_size(raw)
+    assert width <= fileops.THUMB_BOX and height <= fileops.THUMB_BOX, (
+        "%dx%d does not fit the %dpx box"
+        % (width, height, fileops.THUMB_BOX))
+    # and it is still the video's own shape, not a squashed square
+    assert height > width, "a 240x1600 source stays taller than it is wide"
+
+
+def _jpeg_size(raw):
+    """(width, height) off the JPEG's own SOF marker — no image library."""
+    i = 2
+    while i + 9 < len(raw):
+        assert raw[i] == 0xFF, i
+        marker = raw[i + 1]
+        seglen = (raw[i + 2] << 8) | raw[i + 3]
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return ((raw[i + 7] << 8) | raw[i + 8],
+                    (raw[i + 5] << 8) | raw[i + 6])
+        i += 2 + seglen
+    raise AssertionError("no SOF marker in the JPEG")
+
+
+def test_a_thumb_frame_cannot_exceed_the_native_messaging_ceiling(
+        monkeypatch, tmp_path):
+    """MEASURED, not assumed.
+
+    Firefox's own modules/NativeMessaging.sys.mjs (read out of omni.ja on this
+    machine) caps what a native application may SEND at
+    MAX_READ = 1024 * 1024 bytes, lowerable by the pref
+    webextensions.native-messaging.max-input-message-bytes. A frame over the
+    cap does not fail one request: _startRead throws an ExtensionError and the
+    whole port goes down, taking every live download row with it.
+
+    So the frame this verb produces has to be bounded BY CONSTRUCTION, and the
+    bound is checked on the encoded bytes rather than argued from the pixel
+    dimensions — JPEG size depends on content, and a 320px-wide frame of a very
+    tall video is not small. Worst case measured with ffmpeg on pure random
+    noise fitted into the 320x320 box this verb scales into: 111,709 bytes at
+    -q:v 2, which is 149KB base64 and 14% of the ceiling.
+
+    fileops.MAX_JPEG_BYTES is the bound, enforced on the encoder's ACTUAL
+    output: a frame that comes out over it is answered as an error, never sent.
+    """
+    from mchost import fileops
+
+    assert fileops.NATIVE_FRAME_CEILING == 1024 * 1024
+    # base64 is 4 bytes out per 3 in, plus the data: prefix and the JSON
+    # envelope; the budget has to leave room for all of it.
+    encoded = (fileops.MAX_JPEG_BYTES + 2) // 3 * 4
+    assert encoded + 4096 < fileops.NATIVE_FRAME_CEILING, (
+        "MAX_JPEG_BYTES=%d base64-encodes to %d, which does not fit under %d"
+        % (fileops.MAX_JPEG_BYTES, encoded, fileops.NATIVE_FRAME_CEILING))
+
+    written = _ledger(monkeypatch, tmp_path)
+    clip = _media(tmp_path)
+    written.record(clip)
+    monkeypatch.setattr(
+        fileops, "_run_ffmpeg_frame",
+        lambda *a, **k: (b"\xff\xd8" + b"Z" * fileops.MAX_JPEG_BYTES, None))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_thumb({"reqId": "t15", "path": clip, "atSeconds": 2})
+    r = _answer(sent, "thumb-result")
+    assert r["dataUrl"] is None and r["error"], r
+    assert len(json.dumps(r).encode("utf-8")) < fileops.NATIVE_FRAME_CEILING, r

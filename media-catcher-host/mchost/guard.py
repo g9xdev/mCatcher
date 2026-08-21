@@ -151,8 +151,28 @@ MESSAGE_SCHEMA = {
     # their values; it does NOT enforce the allowlist, because unlisted keys
     # are ignored here by design -- normalize_beam_headers is what refuses a
     # fourth name, in the handler, beside the mutual-exclusion check.
-    "badapple": {"id": ID, "path": STR, "url": STR,
+    #
+    # `show` is the ONE field on this command that is not about the source. A
+    # beam the user started from mCatcher's popup should bring BadApple's
+    # window up; one the overlay sent from a page it was already showing
+    # should not steal focus. Absent and false are the same, and are what
+    # every beam sent before this field existed did.
+    "badapple": {"id": ID, "path": STR, "url": STR, "show": BOOL,
                  "headers": {"Cookie": STR, "Referer": STR, "User-Agent": STR}},
+    # Nothing to name: --stop is a bare flag and the program is
+    # tools.find_badapple's answer.
+    "badapple-stop": {"reqId": ID},
+    # The two verbs that act on a saved file rather than handing it to another
+    # program (mchost/fileops.py). Both take ONE path, and both check it
+    # against the written-files ledger as well as refuse_open's allowlist --
+    # shape alone cannot tell a file this host downloaded from one that merely
+    # looks like it.
+    "delete": {"reqId": ID, "path": STR},
+    # LOCAL PATH ONLY, and the absence of a `url` here is the decision. A
+    # thumbnail of a remote stream would mean this host fetching an address
+    # the extension chose, reaching whatever this machine can route to; the
+    # picture is not worth that. A `url` added to this entry re-opens it.
+    "thumb": {"reqId": ID, "path": STR, "atSeconds": NUM},
     "update": {"extDir": STR, "zipDir": STR, "profileDir": STR, "silent": BOOL},
     "watch": {"enable": BOOL, "extDir": STR, "zipDir": STR},
     "checkGithub": {"auto": BOOL, "force": BOOL, "extDir": STR, "zipDir": STR,

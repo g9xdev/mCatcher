@@ -929,6 +929,15 @@ from mchost.cast.legacy import (_PYLIBS, _CAST, _PYATV_SRC, ensure_pyatv,   # no
 # DLNA/AirPlay functions still in this file until Task C4 step 2 moves them.
 from mchost.cast import handle_cast   # noqa: E402,F401
 
+# ---- what this host does to a saved file itself ---------------------------
+# delete removes one permanently and thumb reads one frame out of it. Neither
+# hands the path to another program, so neither is `open`'s shape and neither
+# is downloads: they live in mchost/fileops.py, behind guard.refuse_open AND
+# the written-files ledger.
+from mchost.fileops import (handle_delete, handle_thumb,   # noqa: E402,F401
+                            handle_badapple_stop)
+
+
 # ---- Settings probe -------------------------------------------------------
 # The checks that isolated the Defender-scanning incident, in their own module:
 # downloads.py is already past 4000 lines and this is not downloads.
@@ -1020,6 +1029,12 @@ def main():
                     handle_reveal(msg)
                 elif cmd == "badapple":
                     handle_badapple(msg)
+                elif cmd == "badapple-stop":
+                    handle_badapple_stop(msg)
+                elif cmd == "delete":
+                    handle_delete(msg)
+                elif cmd == "thumb":
+                    handle_thumb(msg)
                 elif cmd == "update":
                     handle_update(msg)
                 elif cmd == "watch":

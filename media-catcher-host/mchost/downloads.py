@@ -1219,9 +1219,19 @@ def handle_badapple(req):
                        else "BadApple would not accept the beam.")
             return
 
+        # `--show` rides ARGV and only argv. It is a display preference, not a
+        # source and not a credential, so it is safe on a command line every
+        # process this user runs can read -- which is exactly why the sign-in
+        # is not. The credentialed route above goes down the pipe, whose line
+        # format (badapple_ipc.format_beam_command) carries a target and a
+        # token and nothing else; a beam that carries a sign-in therefore
+        # cannot carry this, and does not claim to.
+        argv = [app, "--beam", target]
+        if req.get("show") is True:
+            argv.append("--show")
         cf, si = _no_window()
         try:
-            subprocess.Popen([app, "--beam", target], creationflags=cf, startupinfo=si)
+            subprocess.Popen(argv, creationflags=cf, startupinfo=si)
         except Exception as e:
             refuse("BadApple failed to start: %s" % e)
     threading.Thread(target=worker, daemon=True).start()
