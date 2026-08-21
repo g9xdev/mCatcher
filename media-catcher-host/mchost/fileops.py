@@ -37,11 +37,20 @@ delete with a confirm step in the popup, so the reversal the user gets is the
 dialog, not a second copy of the file taking up the space they were trying to
 free.
 
-Before removing, it lets go of the file HERE — see _release_local_holders. A
-sharing violation after that is REPORTED with the reason Windows gave, and not
-retried: something outside this process is holding the file and will go on
-holding it, so a loop is a worker spinning on a file the user was told nothing
-about.
+Before removing, it lets go of the file HERE — see _release_local_holders —
+and when that meant asking BadApple to stop, it WAITS for the handle to
+actually go. Asking is not the same as it having happened: `--stop` is a
+process start, and the release lands later, in another process. A remove fired
+the instant that Popen returns runs while the file is still open, and fails in
+exactly the case the button exists for.
+
+The wait is on the CONDITION (_file_is_held), not on a guessed interval, and it
+is bounded — see STOP_RELEASE_TIMEOUT_S. A sharing violation AFTER that is
+REPORTED and not retried, because there is nothing left to retry for: the one
+holder this host can ask to leave has been asked and given its bound, and what
+is left is outside this host's reach. When the bound ran out, the report says
+so and names what was asked (see _remove_failure) — "access denied" about a
+file the user can watch playing is not something anyone can act on.
 
 WHAT THUMB DOES, AND WHAT IT WILL NOT DO
 ----------------------------------------
@@ -67,6 +76,7 @@ import ctypes
 import os
 import subprocess
 import threading
+import time
 from ctypes import wintypes
 
 from mchost import badapple_ipc
@@ -225,6 +235,16 @@ def _file_is_held(path):
     The handle is closed immediately. Nothing is read, written or truncated:
     GENERIC_READ with OPEN_EXISTING creates nothing and modifies nothing.
 
+    IT IS NOT ENTIRELY WITHOUT EFFECT, THOUGH, and the omission is worth
+    stating: dwShareMode 0 asks for the file with no sharing, so for as long as
+    THIS handle is open the probe itself denies sharing — another process
+    opening the file inside that window gets the very violation this function
+    exists to detect. The window is one CreateFileW and one CloseHandle apart,
+    and the callers are a delete click and _wait_for_release's poll below, so
+    landing in it is unlikely. It is not impossible, which is why this belongs
+    on the delete path and is not a probe to reach for wherever a file's state
+    happens to be interesting.
+
     FALSE when the file is free, when it is not there, and when the probe
     itself fails. All three answer the only question the caller asks — should
     this host go stopping a player over this file — with "no reason to".
@@ -241,15 +261,74 @@ def _file_is_held(path):
     return False
 
 
+# How long to wait for a stop we asked for to actually reach the file.
+#
+# WHAT HAS TO HAPPEN INSIDE IT, in order: our Popen creates a SECOND BadApple
+# process; that process's runtime starts; it finds the single-instance pipe and
+# writes `--stop`; the instance that is playing handles the message and closes
+# the file. The expensive term is the process start, not the release — and it
+# is a WARM start, because the gate that got us here already established that a
+# BadApple is running, so the binaries are in the page cache.
+#
+# 5s, against badapple_ipc.LAUNCH_TIMEOUT_S = 20s, which is the same shape of
+# budget for the COLD case: a BadApple that is not running yet and has a window
+# to put up. This is the warm case and it is also in front of a click the user
+# is watching — past a few seconds "it did not let go" is the truer answer than
+# more waiting, and the button is still there to press again.
+STOP_RELEASE_TIMEOUT_S = 5.0
+
+# The gap between questions. The ordinary case is expected to finish in one or
+# two of these, so a short interval is what makes the common delete feel
+# immediate; the cost of it being this short is at most a hundred wakeups
+# across the whole bound.
+_RELEASE_POLL_S = 0.05
+
+
+def _wait_for_release(path, timeout=STOP_RELEASE_TIMEOUT_S):
+    """True when `path` stopped being held before `timeout` ran out.
+
+    CONDITION-BASED, not a sleep. The thing waited for is the same
+    _file_is_held the caller's gate just asked, so a release is noticed within
+    one poll of it happening rather than at the end of an interval someone
+    guessed. A fixed sleep would have to be the pessimistic number EVERY time
+    — and would still be wrong in the case it was chosen for.
+
+    BOUNDED, because the condition may never come true. The stop is best
+    effort and the gate that fired is over-broad on purpose (see
+    _release_local_holders): the holder may be something `--stop` has no
+    authority over, and then this returns False forever. A False is the
+    caller's cue to say what happened, not to wait more.
+
+    The FIRST question comes before the first sleep: a stop that had already
+    landed by the time we got here should cost nothing.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _file_is_held(path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_RELEASE_POLL_S)
+
+
 def _release_local_holders(path):
     """Let go of `path` here, so the os.remove after it is not fighting us.
+
+    Returns True when a stop was asked for and the file was STILL held when
+    the bound ran out — the one thing the caller cannot see for itself, and
+    the thing that turns a bare sharing violation into a sentence that names
+    what was asked.
 
     TWO holders this process can reach, and both have to go BEFORE the remove
     — a release afterwards releases nothing.
 
       (a) BadApple, which may be PLAYING the file. Stopped through the same
           --stop the popup's stop button uses, so there is one way to stop it
-          rather than two that can drift. CONDITIONAL — see below.
+          rather than two that can drift. CONDITIONAL — see below — and
+          WAITED FOR, because `--stop` is a process start and the release it
+          asks for happens afterwards, in another process. Returning as soon
+          as Popen returns would put the remove in a race it loses in exactly
+          the case this branch exists to serve.
 
       (b) this host's OWN local media server (mchost/cast/legacy.py). It
           serves a cast file over plain HTTP from _DLNA["media"] and opens the
@@ -285,25 +364,52 @@ def _release_local_holders(path):
     is left.
 
     Best effort on both: a holder that will not let go is a reason for the
-    remove to fail with a message, not a reason to fail before trying.
+    remove to fail with a message, not a reason to fail before trying. That is
+    why the timeout below is REPORTED rather than returned as a refusal — the
+    remove is still attempted, because _file_is_held is a probe and os.remove
+    is the authority, and a probe that is wrong must not be able to veto a
+    delete that would have worked.
+
+    NOTHING IS WAITED FOR WHEN NOTHING IS HOLDING THE FILE. The ordinary
+    delete — a finished download, nobody playing it — never enters this branch
+    at all: the condition is asked once and the remove follows.
     """
+    stop_timed_out = False
     if _file_is_held(path) and badapple_ipc.is_running():
         _spawn_badapple_stop()
+        stop_timed_out = not _wait_for_release(path)
     try:
         from mchost.cast import legacy
         legacy.release_local_path(path)
     except Exception:
         pass
+    return stop_timed_out
 
 
-def _remove_failure(path, exc):
+def _remove_failure(path, exc, after_stop_timeout=False):
     """The user-facing half of an OSError from os.remove.
 
     strerror is Windows' own sentence ("The process cannot access the file
     because it is being used by another process"), which says more than any
-    rewording of it would.
+    rewording of it would. It is KEPT in both branches, because it is the part
+    that covers the holder this host could not name.
+
+    What it does not say is what was already tried. When the stop was asked for
+    and the bound ran out, that is the most useful fact anyone has: it names
+    BadApple as the thing that was asked, says how long it was given, and
+    leaves the reader with something to do. Windows' sentence alone, on a file
+    the user can see playing, reads as the delete button being broken.
+
+    HONEST ABOUT WHICH HOLDER. It does not claim BadApple is holding the file:
+    the gate that fired is over-broad, so the true holder may be something
+    else entirely. It says what was asked and what is still true.
     """
     detail = getattr(exc, "strerror", None) or str(exc)
+    if after_stop_timeout:
+        return ("could not delete %s: BadApple was asked to stop, and %gs "
+                "later something on this computer still had the file open "
+                "(%s). Close whatever is playing it and try again."
+                % (os.path.basename(path), STOP_RELEASE_TIMEOUT_S, detail))
     return "could not delete %s: %s" % (os.path.basename(path), detail)
 
 
@@ -335,16 +441,20 @@ def handle_delete(req):
                           % os.path.basename(target))
             return
 
-        _release_local_holders(target)
+        stop_timed_out = _release_local_holders(target)
         try:
             os.remove(target)
         except OSError as e:
-            # ONE attempt. A sharing violation is an answer about who is
-            # holding the file, not a transient to sit on.
-            answer(False, _remove_failure(target, e))
+            # ONE attempt, because the waiting has already happened: the call
+            # above returns only when the file was released or when the holder
+            # it could ask was given its bound and did not. A violation here is
+            # an answer about a holder outside this host's reach, not a
+            # transient to sit on — and `stop_timed_out` is what lets the
+            # answer say which of the two it is.
+            answer(False, _remove_failure(target, e, stop_timed_out))
             return
         except Exception as e:
-            answer(False, _remove_failure(target, e))
+            answer(False, _remove_failure(target, e, stop_timed_out))
             return
         answer(True)
 

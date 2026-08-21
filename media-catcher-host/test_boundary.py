@@ -1561,6 +1561,10 @@ def test_delete_releases_the_local_holders_before_it_removes(monkeypatch, tmp_pa
     monkeypatch.setattr(fileops, "find_badapple", lambda: app)
     monkeypatch.setattr(fileops, "_file_is_held", lambda p: True)
     monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)
+    # A probe stubbed to "held forever" means the wait after the stop runs its
+    # whole bound. This test is about the ORDER, not the bound, so the clock is
+    # the fake one and the seconds are not spent.
+    monkeypatch.setattr(fileops, "time", _FakeClock())
 
     order = []
     monkeypatch.setattr(fileops.subprocess, "Popen",
@@ -1705,12 +1709,20 @@ def test_a_file_nothing_has_open_is_not_held_and_one_this_process_opened_is(
         "a file that is not there is not one anybody is holding")
 
 
-def test_the_badapple_pipe_probe_reads_the_namespace_without_connecting():
-    """`is_running` LOOKS; it does not open the pipe.
+def test_the_badapple_pipe_probe_does_not_spend_the_instance_it_finds():
+    """`is_running` LOOKS; it does not CONNECT — and this is what tells the two
+    apart, because a probe that DID connect would answer the same True.
 
-    Connecting would consume the single-instance server's waiting instance and
-    hand it a connection that writes no line. Enumerating the namespace is
-    read-only, and it answers the same question.
+    Connecting is not free. A single-instance server has ONE waiting instance
+    and hands it to whoever gets there first, so a probe that took it would
+    give BadApple a connection that writes no line — and leave the real beam
+    behind it to find the pipe busy. Enumerating the namespace touches no
+    server at all.
+
+    The pipe here is created with nMaxInstances 1, the shape BadApple's is, so
+    a connect is SPENDABLE and the difference is observable. The second half is
+    the control: it connects for real and shows the instance is gone
+    afterwards, which is what makes the first half's assertion mean anything.
 
     Driven against a pipe this test creates, under a name of its own — never
     BadApple's, because standing up `badapple-cmd-<session>` on a machine where
@@ -1730,11 +1742,43 @@ def test_the_badapple_pipe_probe_reads_the_namespace_without_connecting():
                                    wintypes.DWORD, wintypes.DWORD,
                                    wintypes.DWORD, wintypes.LPVOID]
     k.CreateNamedPipeW.restype = wintypes.HANDLE
+    k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                              wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                              wintypes.HANDLE]
+    k.CreateFileW.restype = wintypes.HANDLE
     k.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = ctypes.c_void_p(-1).value
+    _ERROR_PIPE_BUSY = 231
+
+    def connect():
+        """A client, opened the way _open_pipe opens it."""
+        return k.CreateFileW(name, 0x40000000, 0, None, 3, 0, None)
+
+    # PIPE_ACCESS_INBOUND, byte mode, ONE instance.
     handle = k.CreateNamedPipeW(name, 1, 0, 1, 512, 512, 0, None)
-    assert handle and handle != ctypes.c_void_p(-1).value, ctypes.get_last_error()
+    assert handle and handle != invalid, ctypes.get_last_error()
     try:
-        assert badapple_ipc._pipe_is_hosted(name) is True
+        for _ in range(3):
+            assert badapple_ipc._pipe_is_hosted(name) is True
+
+        # Three answers later the waiting instance is STILL waiting, so a real
+        # client can take it. A probe built on CreateFileW would have spent it
+        # on the first question and this open would fail.
+        client = connect()
+        assert client and client != invalid, (
+            "the probe took the instance the beam needs: error %d"
+            % ctypes.get_last_error())
+        k.CloseHandle(client)
+
+        # The control, and the reason the line above is not vacuous:
+        # connecting DOES spend it. The server has not called
+        # DisconnectNamedPipe, so the next open is refused with
+        # ERROR_PIPE_BUSY — which is exactly what _open_pipe reads as "nothing
+        # is hosting it yet" and would then LAUNCH a second BadApple over.
+        spent = connect()
+        assert spent == invalid and ctypes.get_last_error() == _ERROR_PIPE_BUSY, (
+            "a connect that cost nothing would make the check above prove "
+            "nothing: handle %r, error %d" % (spent, ctypes.get_last_error()))
     finally:
         k.CloseHandle(handle)
     assert badapple_ipc._pipe_is_hosted(name) is False, "and gone with it"
@@ -1816,7 +1860,13 @@ def test_delete_does_not_start_badapple_merely_to_tell_it_to_stop(
 
 def test_delete_stops_badapple_when_it_is_running_and_the_file_is_held(
         monkeypatch, tmp_path):
-    """The case the stop is FOR, and the only one it fires in."""
+    """The case the stop is FOR, and the only one it fires in.
+
+    The probe is stubbed to "held forever" while the file itself is free, which
+    is also the case where a probe is WRONG — and the delete still succeeds.
+    _file_is_held is a probe; os.remove is the authority, and a probe that says
+    the wrong thing must not be able to veto a delete that works.
+    """
     from mchost import badapple_ipc, fileops
 
     written = _ledger(monkeypatch, tmp_path)
@@ -1826,6 +1876,7 @@ def test_delete_stops_badapple_when_it_is_running_and_the_file_is_held(
     monkeypatch.setattr(fileops, "find_badapple", lambda: app)
     monkeypatch.setattr(fileops, "_file_is_held", lambda p: True)
     monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)
+    monkeypatch.setattr(fileops, "time", _FakeClock())   # the bound, not spent
 
     ran = []
     monkeypatch.setattr(fileops.subprocess, "Popen",
@@ -1836,6 +1887,218 @@ def test_delete_stops_badapple_when_it_is_running_and_the_file_is_held(
     mc.handle_delete({"reqId": "d22", "path": mine})
     assert _answer(sent, "delete-result")["ok"] is True, sent
     assert ran == [(app, "--stop")], ran
+
+
+# --- asking BadApple to stop is not the same as it having stopped ---
+#
+# `--stop` is a Popen: it returns as soon as the process is CREATED, and the
+# release it asks for happens later, in another process, after that process's
+# runtime has started and written the single-instance pipe. An os.remove fired
+# the instant Popen returns therefore runs while the handle is still open, and
+# fails with a sharing violation — in precisely the case the gate above exists
+# to serve, a file BadApple is playing.
+#
+# So the release is WAITED for, on the condition itself (_file_is_held) rather
+# than on a guessed interval, and the wait is bounded because the condition may
+# never come true: the stop is best effort and the gate is over-broad on
+# purpose, so the holder may be something `--stop` has no authority over.
+
+
+class _FakeClock:
+    """time.monotonic and time.sleep, wound by the sleeps themselves.
+
+    The bound is a number of SECONDS, and a test that actually spent them would
+    be a several-second test for a branch that is pure arithmetic. Winding a
+    fake clock from sleep() makes the assertion about the bound exact and costs
+    no wall time — and it is also how a test can tell "waited the whole bound"
+    from "returned early", which a real clock only makes probable.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_delete_waits_for_the_stop_to_land_and_then_removes_the_file(
+        monkeypatch, tmp_path):
+    """The case the whole button was asked for: BadApple is playing the file,
+    and deleting it WORKS.
+
+    The hold here is a REAL handle, not a stub of one. CPython's open() takes
+    the CRT's default sharing, which does not include FILE_SHARE_DELETE, so
+    os.remove on this file genuinely fails with Windows' own sharing violation
+    while it is open — which is what makes this test fail if the remove stops
+    waiting for the release.
+
+    The release is tied to the POLL, not to the wall clock: the handle goes on
+    the third question, so "it let go partway through the wait" happens at a
+    defined point rather than a probable one.
+    """
+    from mchost import badapple_ipc, fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)
+
+    holder = open(mine, "rb")
+    probe = fileops._file_is_held
+    seen = []
+
+    def held(path):
+        seen.append(path)
+        if len(seen) == 3 and not holder.closed:
+            holder.close()          # the stop lands, mid-wait
+        return probe(path)
+
+    monkeypatch.setattr(fileops, "_file_is_held", held)
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    try:
+        mc.handle_delete({"reqId": "d23", "path": mine})
+        r = _answer(sent, "delete-result", timeout=30.0)
+    finally:
+        if not holder.closed:
+            holder.close()
+
+    assert r["ok"] is True, r
+    assert not os.path.exists(mine), "the file the user asked about is gone"
+    assert ran == [(app, "--stop")], ran
+    assert len(seen) >= 3, (
+        "the remove fired straight after the spawn instead of waiting for the "
+        "release it asked for: the file was asked about %d time(s)" % len(seen))
+
+
+def test_delete_that_waits_out_the_bound_names_what_it_asked_to_stop(
+        monkeypatch, tmp_path):
+    """The holder that never lets go. Two claims, and the second is the one a
+    wait like this gets wrong:
+
+      * the answer NAMES what was asked to release the file and what the person
+        can do about it. "Access denied" is true and useless.
+      * the wait ENDS. A condition that never comes true is the ordinary way a
+        poll becomes a worker spinning forever on a file nobody was told about.
+
+    The clock is injected, so "it waited the whole bound and no further" is read
+    off exact numbers. The poll ceiling is the safety net: an unbounded wait
+    trips it and the test reports THAT, rather than hanging the run.
+    """
+    from mchost import badapple_ipc, fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)
+    clock = _FakeClock()
+    monkeypatch.setattr(fileops, "time", clock)
+
+    holder = open(mine, "rb")           # and it never lets go
+    probe = fileops._file_is_held
+    seen = []
+    overrun = []
+    # Four times the polls the bound allows, so an honest bound cannot reach it
+    # and a missing one always does. Answering False at the ceiling ends the
+    # loop, which is what turns "unbounded" into a failed assertion instead of
+    # a run that never finishes.
+    ceiling = int(4 * fileops.STOP_RELEASE_TIMEOUT_S / fileops._RELEASE_POLL_S)
+
+    def held(path):
+        seen.append(path)
+        if len(seen) > ceiling:
+            overrun.append(len(seen))
+            return False
+        return probe(path)
+
+    monkeypatch.setattr(fileops, "_file_is_held", held)
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    try:
+        mc.handle_delete({"reqId": "d24", "path": mine})
+        r = _answer(sent, "delete-result", timeout=30.0)
+    finally:
+        holder.close()
+
+    assert overrun == [], (
+        "the wait went past %d polls — four times what the bound allows — so "
+        "there is no bound" % ceiling)
+    assert ran == [(app, "--stop")], ran
+    assert r["ok"] is False, r
+    assert os.path.exists(mine), "nothing was removed"
+
+    # It waited the WHOLE bound before saying so, and stopped there.
+    assert clock.now >= fileops.STOP_RELEASE_TIMEOUT_S, clock.now
+    assert clock.now < fileops.STOP_RELEASE_TIMEOUT_S + 2 * fileops._RELEASE_POLL_S, \
+        clock.now
+    assert len(seen) <= ceiling, len(seen)
+
+    # The reason, in the terms the person reading it can act in.
+    assert "clip.mp4" in r["error"], r
+    assert "BadApple" in r["error"], r
+    assert ("%g" % fileops.STOP_RELEASE_TIMEOUT_S) in r["error"], (
+        "the answer says how long it waited, so 'still open' is a fact with a "
+        "size rather than a shrug: %r" % (r["error"],))
+    # Windows' own sentence survives inside it: it is the part that covers the
+    # holder this host never asked, because it could not name it.
+    assert "another process" in r["error"], r
+
+
+def test_delete_of_a_file_nothing_holds_never_waits_at_all(
+        monkeypatch, tmp_path):
+    """The ordinary delete — a finished download, nobody playing it — pays
+    nothing for the wait above.
+
+    BadApple is running here, and still nothing is spawned and nothing is
+    slept: the condition that opens that whole branch is "something has this
+    file open", and it is false. One question, asked once, then the remove.
+    """
+    from mchost import badapple_ipc, fileops
+
+    written = _ledger(monkeypatch, tmp_path)
+    mine = _media(tmp_path)
+    written.record(mine)
+    app = _fake_badapple(monkeypatch, tmp_path)
+    monkeypatch.setattr(fileops, "find_badapple", lambda: app)
+    monkeypatch.setattr(badapple_ipc, "is_running", lambda: True)   # and playing
+
+    clock = _FakeClock()
+    monkeypatch.setattr(fileops, "time", clock)
+    probe = fileops._file_is_held
+    seen = []
+    monkeypatch.setattr(fileops, "_file_is_held",
+                        lambda p: (seen.append(p), probe(p))[1])
+    ran = []
+    monkeypatch.setattr(fileops.subprocess, "Popen",
+                        lambda argv, **k: ran.append(tuple(argv)))
+    sent = []
+    monkeypatch.setattr(mc, "send", sent.append)
+
+    mc.handle_delete({"reqId": "d25", "path": mine})
+    assert _answer(sent, "delete-result")["ok"] is True, sent
+    assert not os.path.exists(mine)
+    assert ran == [], "nothing had it open, so there was nothing to stop: %s" % (ran,)
+    assert clock.slept == [], (
+        "a delete of a free file waited on something: %s" % (clock.slept,))
+    assert len(seen) == 1, (
+        "the fast path asks once and goes: %d question(s)" % len(seen))
 
 
 def test_the_stop_button_is_not_gated_the_way_delete_is(monkeypatch, tmp_path):

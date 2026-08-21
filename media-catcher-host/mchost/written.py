@@ -150,9 +150,15 @@ def record(path):
 
     Never raises: every caller is a download that has already succeeded, and a
     ledger this host cannot write is not a reason to fail one. That promise is
-    what puts the WHOLE body inside the try -- realpath, json.dumps and the
-    clock can throw exactly as the write can, and a throw here does not lose a
-    ledger line, it loses the frame that was about to announce the file.
+    what puts everything below that CAN throw inside the try -- json.dumps, the
+    clock and the write itself throw exactly as readily as each other, and a
+    throw there does not lose a ledger line, it loses the frame that was about
+    to announce the file.
+
+    The one step OUTSIDE the try is _key, and it keeps the promise on its own
+    rather than by being covered here: its realpath is already wrapped, and it
+    answers None where it would otherwise raise -- which is the same answer as
+    a path this module will not record.
     """
     key = _key(path)
     if key is None:
