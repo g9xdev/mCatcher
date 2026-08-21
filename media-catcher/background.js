@@ -274,10 +274,48 @@ function rememberPreview(identity, tabId, dataUrl) {
   if (previewByIdentity.has(identity)) previewByIdentity.delete(identity);
   previewByIdentity.set(identity, dataUrl);
   previewTabs.set(identity, tabId);
+  // A row for this media may already be live and rendering.
+  pushPreviewToDownloads();
   while (previewByIdentity.size > PREVIEW_CACHE_MAX) {
     const oldest = previewByIdentity.keys().next().value;
     previewByIdentity.delete(oldest);
     previewTabs.delete(oldest);
+  }
+}
+
+// The identity a DOWNLOAD row answers to. Mirrors downloadItemIdentity() in
+// popup/popup.js: mediaId first, then url. Null when the row is neither, which
+// is a row no capture can be matched to rather than a row to guess at.
+function downloadIdentity(dl) {
+  if (dl && isSafeOpaqueId(dl.mediaId)) return "id:" + dl.mediaId;
+  if (dl && typeof dl.url === "string" && dl.url) return "url:" + dl.url;
+  return null;
+}
+
+// Put the stored picture on a row, if there is one for it. Called when a row
+// is created, so a capture taken before the download started is not lost.
+function attachPreviewToDownload(dl) {
+  const identity = downloadIdentity(dl);
+  if (!identity) return false;
+  const stored = previewByIdentity.get(identity);
+  if (typeof stored !== "string" || dl.preview === stored) return false;
+  dl.preview = stored;
+  return true;
+}
+
+// And the other direction: a picture that arrives while a row is already live.
+// download-update carries the RAW download object — it does not pass
+// projectPopupJob, which only live-jobs-updated does — so the field is read
+// straight off `dl` by the popup, and the value put here has already been
+// through isSafePreviewDataUrl at ingress.
+// Every row is offered the store; attachPreviewToDownload decides by deriving
+// the row's own identity, so there is no second copy of that rule here to
+// disagree with it. Only a row that actually changed is rebroadcast.
+function pushPreviewToDownloads() {
+  for (const dl of activeDownloads.values()) {
+    if (attachPreviewToDownload(dl)) {
+      broadcast({ type: "download-update", download: dl });
+    }
   }
 }
 
@@ -706,6 +744,7 @@ async function downloadYouTube(item, tabId, filename, opts) {
                thumb: item.thumb || null,
                progress: { done: 0, total: 100, unit: "pct", live: true, stage: "resolving", note: "Preparing" } };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
   if (!nativeReady || !nativePort) {
     dl.status = "error";
@@ -1117,6 +1156,7 @@ function onLegacyNativeMessage(msg) {
       if (!fb) return;
       d = { id: msg.id, name: fb.finalName, kind: "direct", live: true, status: "downloading", url: fb.item.url };
       activeDownloads.set(msg.id, d);
+      attachPreviewToDownload(d);
     }
     d.status = "downloading"; d.live = true;
     d.progress = { done: msg.bytes || 0, total: msg.total || 0, unit: "bytes", live: false };
@@ -2589,6 +2629,7 @@ async function downloadHls(item, tabId, filename, chosenVariantUrl) {
   const id = ++downloadCounter;
   const dl = { id, url: item.url, status: "parsing", progress: { done: 0, total: 0 }, name: filename };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
 
   try {
@@ -2725,6 +2766,7 @@ async function recordLiveHls(item, tabId, filename, videoUrl, existingDl, audioU
   dl.quality = quality || null;   // { resolution, height, bandwidth } if known
   dl.progress = { done: 0, total: 0, live: true, bytes: 0, duration: 0, kbps: 0 };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
 
   try {
@@ -2895,6 +2937,7 @@ async function downloadDash(item, tabId, filename, chosenVariantId) {
   const id = ++downloadCounter;
   const dl = { id, url: item.url, status: "parsing", progress: { done: 0, total: 0 }, name: filename };
   activeDownloads.set(id, dl);
+  attachPreviewToDownload(dl);
   broadcast({ type: "download-update", download: dl });
   try {
     const text = await fetchText(tabId, item.url);
