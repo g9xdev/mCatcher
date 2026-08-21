@@ -136,6 +136,11 @@ function createHarness(storageSeed) {
     AbortController,
     setTimeout() { return 1; }, clearTimeout() {},
     fetch(url) {
+      // Logged FIRST, for every request and whichever branch answers it. A log
+      // kept inside one branch cannot see the requests the others make, and a
+      // test asserting "no request was added" would then be measuring the
+      // branch rather than the fetch.
+      fetchLog.push(url);
       if (url === "https://cdn.example/movie.mp4") {
         const makeResponse = () => {
           const head = new Uint8Array([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70]);
@@ -163,7 +168,6 @@ function createHarness(storageSeed) {
         return Promise.resolve(makeResponse());
       }
       if (textBodies.has(url)) {
-        fetchLog.push(url);
         const bytes = new TextEncoder().encode(textBodies.get(url));
         return Promise.resolve({
           ok: true,
@@ -1248,6 +1252,20 @@ test("the record lane sends no page header the host would have to sanitise", asy
   assert.equal(JSON.stringify(posts).includes("SECRET_HEADER"), false);
 });
 
+test("the fetch log records EVERY request, so a `no request added` claim can be measured", async () => {
+  // The assertion in the next test is only worth what the log underneath it
+  // sees. The stub answers more than playlist bodies — a direct item is probed
+  // with a ranged GET of its own — so a log kept only in the playlist branch
+  // would report an empty list for a harness that had just fetched something,
+  // and "no request was added" would be unfalsifiable rather than measured.
+  const h = createHarness();
+  await settle();
+  emitNetwork(h, 41, "https://cdn.example/movie.mp4", "video/mp4", "doc-41");
+  await eventually(() => h.captureNetwork.length === 1, "direct promotion");
+  assert.deepEqual(h.fetchLog, ["https://cdn.example/movie.mp4"],
+    "the probe's request is invisible to the log: " + JSON.stringify(h.fetchLog));
+});
+
 test("an HLS master gains a duration and a top-rung bitrate from the playlist already fetched", async () => {
   // Before this, only the media-playlist branch of enrichment set item.duration
   // and a master declared no bitrate, so a master row could only ever read
@@ -1282,7 +1300,10 @@ test("an HLS master gains a duration and a top-rung bitrate from the playlist al
   // enrichment set. That is the figure the popup renders.
   // The cost, stated as a measurement rather than a claim: the same two
   // fetches the master branch already made — the master and ONE variant
-  // playlist. Gathering the size evidence adds neither.
+  // playlist. Gathering the size evidence adds neither. The log this reads
+  // records every request the stub answers, whichever branch answers it —
+  // pinned by the test above, because a partial log would make this deepEqual
+  // agree with itself rather than with what was fetched.
   assert.deepEqual(h.fetchLog, [master, "https://stream.example/ladder/1080.m3u8"],
     "a fetch was added: " + JSON.stringify(h.fetchLog));
 

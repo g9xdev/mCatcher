@@ -276,3 +276,75 @@ test("a result frame naming an unknown reqId is ignored quietly", async () => {
   await settle();
   assert.equal(h.updatesFor(id).length, before);
 });
+
+// ---------------------------------------------------------------------------
+// What settles a request the helper never answers
+// ---------------------------------------------------------------------------
+
+test("a request the helper never answers is settled by its own 30s expiry", async () => {
+  // This is not a hypothetical on this branch. media-catcher-host's dispatch
+  // is an if/elif chain over `cmd` with no else, and it has no `delete`,
+  // `thumb` or `badapple-stop` case — so these frames are read, matched by
+  // nothing, and dropped without a reply. The expiry is therefore the ONLY
+  // thing that answers the popup today, which is why it is measured rather
+  // than assumed.
+  const h = await readyHarness();
+  const pending = h.send({ type: "delete-file", downloadId: 1, path: "C:\v\a.mp4" }, {});
+  await settle();
+  assert.ok(h.lastHost("delete"), "the frame went out");
+
+  const expiry = h.timers.filter((t) => t && t.ms === 30000);
+  assert.equal(expiry.length, 1, "one expiry was armed, at the documented interval");
+
+  h.runTimers();
+  const answer = await pending;
+  assert.equal(answer.ok, false);
+  assert.equal(answer.error, "The helper did not answer.",
+    "the popup is told the helper was silent, not left waiting on it");
+});
+
+test("an expired request is forgotten, so a late answer cannot resolve it twice", async () => {
+  const h = await readyHarness();
+  const pending = h.send({ type: "badapple-stop" }, {});
+  await settle();
+  const frame = h.lastHost("badapple-stop");
+
+  h.runTimers();
+  assert.equal((await pending).ok, false);
+  assert.equal(h.evalInBackground("pendingHostRequests.size"), 0,
+    "the expired entry stayed in the map and would answer a second time");
+
+  // A late frame on that reqId now names nothing.
+  h.fromHost({ type: "badapple-stop-result", reqId: frame.reqId, ok: true, error: null });
+  await settle();
+});
+
+test("an answered request leaves nothing behind for its expiry to find", async () => {
+  const h = await readyHarness();
+  const pending = h.send({ type: "delete-file", downloadId: 1, path: "C:\v\a.mp4" }, {});
+  await settle();
+  const frame = h.lastHost("delete");
+  h.fromHost({ type: "delete-result", reqId: frame.reqId, ok: true, error: null });
+  assert.deepEqual(await pending, { ok: true, error: null });
+
+  // Measured BEFORE the timers run: an entry the answer failed to claim would
+  // still be there for the expiry to pick up and answer a second time, and
+  // running the expiry first would tidy the evidence away.
+  assert.equal(h.evalInBackground("pendingHostRequests.size"), 0,
+    "the answered request was still registered");
+  h.runTimers();
+  await settle();
+  assert.equal(h.evalInBackground("pendingHostRequests.size"), 0);
+});
+
+test("a thumb request without a string path is refused here, not forwarded", async () => {
+  // The same guard `delete-file` has. Without the type half of it, a numeric
+  // or object `path` is truthy and reaches the helper as a path.
+  const h = await readyHarness();
+  for (const bad of [undefined, null, "", 42, {}, [], true]) {
+    const answer = await h.send({ type: "thumb-file", path: bad, atSeconds: 3 }, {});
+    assert.equal(answer.ok, false, String(bad));
+    assert.equal(answer.dataUrl, null, String(bad));
+  }
+  assert.equal(h.lastHost("thumb"), null, "a non-string path was put on the wire");
+});

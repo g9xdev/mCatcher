@@ -416,6 +416,12 @@ function safePreview(value) {
 //
 // The prefix is what keeps the two id spaces apart: a download id is a bare
 // number (++downloadCounter), so a prefixed string can never name one.
+//
+// None of the three verbs exists in media-catcher-host on this branch — its
+// dispatch is an if/elif chain over `cmd` with no else, so an unknown cmd is
+// dropped in silence. Every one of these round trips therefore ends at the
+// expiry below today, which is why the expiry is a measured path rather than a
+// fallback: see tests/background-host-requests.test.js.
 const pendingHostRequests = new Map();   // reqId -> { resolve, timer, kind }
 const HOST_REQUEST_TIMEOUT_MS = 30000;
 
@@ -3968,11 +3974,27 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return true;
         }
       } else if (msg.type === "delete-file") {
-        // Deleting is the helper's to do or refuse — it owns the allowlist that
-        // decides which paths may be touched at all. `downloadId` is carried by
-        // the popup message for the row's own bookkeeping and is deliberately
-        // NOT put on the wire: the frame the helper answers is keyed on a
-        // request id, so its refusal can never be read as a row's failure.
+        // What is checked HERE is only that there is a path: a non-empty
+        // string. Whether that path may be deleted is not decided in this
+        // process — the extension has no view of the disk, and a check written
+        // here would be a second opinion that the process doing the deleting
+        // is free to disagree with. So the frame goes out as it stands and the
+        // answer is whatever comes back.
+        //
+        // Stated as it is rather than as a design intent: media-catcher-host
+        // on this branch has NO `delete` command. Its dispatch is an if/elif
+        // chain over `cmd` with no else, so this frame is read, matched by
+        // nothing, and dropped without a reply — and what answers the popup is
+        // this request's own 30s expiry, with "The helper did not answer."
+        // Pinned in tests/background-host-requests.test.js at "a request the
+        // helper never answers is settled by its own 30s expiry". A helper that
+        // implements the verb is what turns that into a real refusal; nothing
+        // on this side has to change for it.
+        //
+        // `downloadId` is carried by the popup message for the row's own
+        // bookkeeping and is deliberately NOT put on the wire: the frame the
+        // helper answers is keyed on a request id, so its refusal can never be
+        // read as a row's failure.
         if (typeof msg.path !== "string" || !msg.path) {
           sendResponse({ ok: false, error: "No file to delete." });
         } else {
