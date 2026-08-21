@@ -2282,6 +2282,12 @@ async function enrichHls(tabId, key) {
       item.hasSubtitles = Object.keys(parsed.subtitleGroups || {}).length > 0;
       // Probe the top variant so we can suppress its segments (they'd otherwise
       // flood the list) and learn whether the master is a live broadcast.
+      //
+      // `variants[0]` is the HIGHEST bandwidth: lib/hls.js:91 sorts them
+      // descending. Measured, not assumed — a fetch log in the master size
+      // test shows the 1080 playlist being the one this line fetches from a
+      // manifest that lists 720 first. So the duration read from vparsed below
+      // and the bitrate read from the master describe the SAME rendition.
       const top = parsed.variants[0];
       if (top && top.codecs) item.codec = codecLabel(top.codecs);
       if (top) {
@@ -2295,6 +2301,23 @@ async function enrichHls(tabId, key) {
               (vparsed.encryption.method !== "AES-128" ||
                (vparsed.encryption.keyFormat && vparsed.encryption.keyFormat !== "identity")));
             registerSegments(tabId, vparsed);
+            // The durations in vparsed were fetched for the checks above and
+            // then discarded, which is why a master row read "Size unknown"
+            // while the numbers to estimate one were in hand. No extra request
+            // is made here; this reads what is already parsed.
+            //
+            // The figure describes the HIGHEST-bandwidth rung — the one this
+            // branch already fetched, and the one preferHighestRendition
+            // downloads. A user who picks a lower rung from the quality menu
+            // downloads LESS than it says. That is a choice rather than a
+            // measurement, so it only ever reaches estimatedSizeFromBitrate
+            // and renders "Est." — see lib/stream-evidence.js.
+            const evidence = self.McStreamEvidence.masterBitrateEvidence(parsed, vparsed);
+            if (evidence) {
+              item.duration = evidence.durationSeconds;
+              item.bandwidth = evidence.selectedBandwidth;
+              item.sizeDescribesHeight = evidence.describesHeight;
+            }
           }
         } catch (e) { /* best-effort — pattern-based filtering still applies */ }
       }

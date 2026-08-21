@@ -46,6 +46,7 @@ function createHarness(storageSeed) {
   const broadcasts = [];
   const popupRows = new Map();
   const textBodies = new Map();
+  const fetchLog = [];
   const dashParsed = new Map();
   const directProbeGates = new Map();
   const controllerJobs = Object.freeze([{ id: "job:opaque:1", state: "queued" }]);
@@ -162,6 +163,7 @@ function createHarness(storageSeed) {
         return Promise.resolve(makeResponse());
       }
       if (textBodies.has(url)) {
+        fetchLog.push(url);
         const bytes = new TextEncoder().encode(textBodies.get(url));
         return Promise.resolve({
           ok: true,
@@ -203,6 +205,11 @@ function createHarness(storageSeed) {
   }
 
   return {
+    // Reads a background.js top-level binding. Those are `const` declarations
+    // in the context's lexical scope, so a later script in the SAME context
+    // resolves them — this is the real map, not a copy of one.
+    evalInBackground(expr) { return vm.runInContext(expr, sandbox, { filename: "test-probe" }); },
+    fetchLog,
     send, requestHeaders, headersReceived, captureNetwork, acceptPageSnapshot, captureDomMedia,
     registerVariants, broadcasts, popupRows, controllerJobs, textBodies, dashParsed,
     nativePort,
@@ -1234,4 +1241,53 @@ test("the record lane sends no page header the host would have to sanitise", asy
   assert.equal(record.referer, "", "an unsendable Referer is dropped, not passed on");
   assert.equal(record.userAgent, "Detection Browser");
   assert.equal(JSON.stringify(posts).includes("SECRET_HEADER"), false);
+});
+
+test("an HLS master gains a duration and a top-rung bitrate from the playlist already fetched", async () => {
+  // Before this, only the media-playlist branch of enrichment set item.duration
+  // and a master declared no bitrate, so a master row could only ever read
+  // "Size unknown" — while the numbers to estimate one were already in hand.
+  // The master branch fetches and parses the top variant's playlist for live
+  // and DRM detection; this reads that same parsed object and adds no request.
+  const h = createHarness();
+  await settle();
+
+  const master = "https://stream.example/ladder/master.m3u8";
+  // The highest bandwidth is listed SECOND in the manifest on purpose. The
+  // fetch log below shows which playlist is actually read, and it is the 1080
+  // one — lib/hls.js:91 sorts variants descending, so variants[0] is already
+  // the top rung. Duration and bitrate therefore describe the SAME rendition.
+  h.textBodies.set(master, [
+    "#EXTM3U",
+    '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,CODECS="avc1.4d401f"',
+    "720.m3u8",
+    '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.640028"',
+    "1080.m3u8",
+  ].join("\n"));
+  const playlist = "#EXTM3U\n#EXTINF:6,\na.ts\n#EXTINF:4,\nb.ts\n#EXT-X-ENDLIST";
+  h.textBodies.set("https://stream.example/ladder/720.m3u8", playlist);
+  h.textBodies.set("https://stream.example/ladder/1080.m3u8", playlist);
+
+  emitNetwork(h, 31, master, "application/vnd.apple.mpegurl", null);
+  await eventually(() => h.captureNetwork.length === 1, "master promotion");
+
+  // The enriched item is consumed by promotion, so the observable end of this
+  // pipeline is liveSizeMetadata — what rememberLiveSize stored for the row,
+  // via estimatedSizeForItem(item) reading the duration and bandwidth the
+  // enrichment set. That is the figure the popup renders.
+  // The cost, stated as a measurement rather than a claim: the same two
+  // fetches the master branch already made — the master and ONE variant
+  // playlist. Gathering the size evidence adds neither.
+  assert.deepEqual(h.fetchLog, [master, "https://stream.example/ladder/1080.m3u8"],
+    "a fetch was added: " + JSON.stringify(h.fetchLog));
+
+  const stored = JSON.parse(h.evalInBackground(
+    "JSON.stringify(Array.from(liveSizeMetadata.values()))"));
+  assert.equal(stored.length, 1, "one row, one size");
+  assert.equal(stored[0].sizeConfidence, "estimated",
+    "a ladder is a choice rather than a measurement, so never exact");
+  // 6000000 bits/s (the HIGHEST rung, not variants[0]'s 2500000) x 10s / 8.
+  assert.equal(stored[0].sizeBytes, Math.round((6000000 * 10) / 8),
+    "the top rung's bitrate over the duration summed from the variant playlist");
+
 });
