@@ -595,7 +595,7 @@ function loadPopupRenderHarness() {
   };
   const pieces = [
     "isSafeOpaqueId", "itemIdentity", "hostOf", "proposedFilenameOf", "displayNameOf", "fmtDuration",
-    "bitrateLabel", "mediaSizeLabel", "renderQualities", "renderItem", "render",
+    "bitrateLabel", "mediaSizeLabel", "previewSrc", "renderQualities", "renderItem", "render",
   ].map((name) => extractNamedFunction(source, name));
   vm.runInNewContext(pieces.join("\n") + "\nthis.render = render;", sandbox);
   return { sandbox, starts, progress, listEl, sentMessages };
@@ -1225,15 +1225,28 @@ test("an unvalidated item.size can never relabel an opaque row as exact", () => 
   }
 });
 
+// One story for "not known yet" across every surface that states a size: the
+// left pane's rows, the Downloads pane's cards, and the Save As window all say
+// "Size unknown". A legacy row used to render an empty string here, which left
+// a blank where a size belongs — indistinguishable from a row that forgot to
+// render one. lib/media-size.js already said "Size unknown" for the opaque rows
+// and for the Save As window, so that is the wording the other surface adopts
+// rather than a third phrasing.
 test("legacy non-opaque rows keep their existing exact transfer size text", () => {
   const h = sizeRenderHarness();
   assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4", size: 1024 }), "1.0 KB");
-  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4" }), "");
+  assert.equal(h.sandbox.mediaSizeLabel({ url: "https://cdn.example/a.mp4" }), "Size unknown");
   assert.equal(h.sandbox.mediaSizeLabel({ id: "media:s7:1" }), "Size unknown");
   assert.equal(
     h.sandbox.mediaSizeLabel({ id: "media:s8:1", sizeBytes: 1024, sizeConfidence: "estimated" }),
     "Est. 1.0 KB"
   );
+});
+
+test("a legacy row with no size states that on the card, not by omission", () => {
+  const h = sizeRenderHarness();
+  h.sandbox.render([{ url: "https://cdn.example/legacy.mp4", kind: "direct", name: "legacy.mp4" }]);
+  assert.match(cardText(h.listEl.children[0]), /Size unknown/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1296,6 +1309,78 @@ test("a managed row without its own tabId falls back to the current tab", () => 
   h.sandbox.render([{ id: "media:opaque:3", kind: "direct", proposedFilename: "clip.mp4" }]);
   clickSaveAs(h, h.listEl.children[0]);
   assert.equal(h.sentMessages.at(-1).tabId, 7);
+});
+
+// ---------------------------------------------------------------------------
+// The picture on a left-pane row
+//
+// `preview` is the frame captured from the media itself. `thumb` already
+// existed and holds a screenshot of the PAGE the media was found on, set on
+// every YouTube download by background.js — so the two are not interchangeable,
+// and a preview must not be rendered from the page screenshot's field or the
+// row shows a picture of a web page as if it were the file.
+// ---------------------------------------------------------------------------
+
+function thumbOf(row) {
+  return popupNodes(row, (node) => /(^|\s)thumb(\s|$)/.test(String(node.props.class || "")))[0];
+}
+
+function imageIn(node) {
+  return popupNodes(node, (n) => n.tag === "img")[0];
+}
+
+const PIXEL = "data:image/png;base64,iVBORw0KGgo=";
+
+test("a row's own preview frame is what the thumbnail shows", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{ id: "media:p1:1", kind: "direct", proposedFilename: "clip.mp4", preview: PIXEL }]);
+  const thumb = thumbOf(h.listEl.children[0]);
+  assert.ok(thumb, "the row still has a thumbnail slot");
+  assert.equal(imageIn(thumb).props.src, PIXEL);
+  assert.equal(/(^|\s)ph(\s|$)/.test(String(thumb.props.class)), false,
+    "and it is no longer the placeholder");
+});
+
+test("the preview frame wins over the page screenshot", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:p2:1", kind: "direct", proposedFilename: "clip.mp4",
+    preview: PIXEL, thumb: "data:image/png;base64,PAGESHOT",
+  }]);
+  assert.equal(imageIn(thumbOf(h.listEl.children[0])).props.src, PIXEL,
+    "a picture of the page is not a picture of the file");
+});
+
+test("with no preview the existing page screenshot still shows", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{
+    id: "media:p3:1", kind: "direct", proposedFilename: "clip.mp4",
+    thumb: "data:image/png;base64,PAGESHOT",
+  }]);
+  assert.equal(imageIn(thumbOf(h.listEl.children[0])).props.src, "data:image/png;base64,PAGESHOT");
+});
+
+test("with neither, the placeholder is untouched", () => {
+  const h = loadPopupRenderHarness();
+  h.sandbox.render([{ id: "media:p4:1", kind: "hls", proposedFilename: "clip.mp4" }]);
+  const thumb = thumbOf(h.listEl.children[0]);
+  assert.match(String(thumb.props.class), /ph/);
+  assert.match(String(thumb.props.class), /cam/, "an HLS row keeps its camera tint");
+  assert.equal(imageIn(thumb), undefined, "and renders no image element");
+});
+
+test("a preview that is not an image data URL is refused", () => {
+  const h = loadPopupRenderHarness();
+  for (const hostile of ["https://cdn.example/frame.png", "javascript:alert(1)",
+                         "data:text/html,<script>", 42, {}]) {
+    const harnessed = loadPopupRenderHarness();
+    harnessed.sandbox.render([{ id: "media:p5:1", kind: "direct", proposedFilename: "c.mp4", preview: hostile }]);
+    const thumb = thumbOf(harnessed.listEl.children[0]);
+    assert.equal(imageIn(thumb), undefined,
+      "a field on an untrusted record must not become a fetch: " + String(hostile));
+    assert.match(String(thumb.props.class), /ph/);
+  }
+  assert.ok(h);
 });
 
 test("non-opaque legacy rows keep the inline form and never serialize a URL", () => {

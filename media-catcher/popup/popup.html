@@ -72,6 +72,10 @@
       <div class="pane-title" id="cast-title">Now casting</div>
       <div class="rail-scroll" id="rail">
         <div id="cast-slot"></div>
+        <!-- Playback in the BadApple player. It sits with the casting UI, not in
+             the Downloads header, where a "Stop" beside "Clear done" would read
+             as stopping the downloads. -->
+        <div id="badapple-slot"></div>
         <div class="pane-title sub" id="queue-title">
           Downloads <span class="count" id="queue-count">0</span>
           <span class="spacer"></span>
@@ -97,6 +101,7 @@
   <script src="../lib/download-intent.js"></script>
   <script src="../lib/popup-download-ui.js"></script>
   <script src="../lib/media-size.js"></script>
+  <script src="../lib/queue-order.js"></script>
   <script src="popup.js"></script>
 </body>
 
