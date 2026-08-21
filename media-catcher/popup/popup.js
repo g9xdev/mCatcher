@@ -388,6 +388,10 @@ async function refresh() {
 function render(items) {
   listEl.replaceChildren();
   itemElements.clear();
+  // The thumbnails this named belong to rows that no longer exist; a frame
+  // arriving for one of them has nothing to paint until renderItem below puts
+  // the row back.
+  previewSlots.clear();
   footCount.textContent = items.length + (items.length === 1 ? " stream" : " streams");
   if (leftCountEl) leftCountEl.textContent = items.length;
   renderHelperBadge();
@@ -424,6 +428,11 @@ function render(items) {
     itemElements.set(itemIdentity(item), el);
     listEl.appendChild(el);
   }
+
+  // Asking here rather than in refresh() ties the request to what was actually
+  // painted. Every painted row is a candidate — this does not read the viewport,
+  // so it is the cap, not scroll position, that keeps the burst small.
+  requestPreviews(ordered);
 }
 
 // Color-coded native-helper health flag in the footer. Click to re-check.
@@ -542,6 +551,115 @@ function previewSrc(value) {
   return typeof value === "string" && /^data:image\//i.test(value) ? value : null;
 }
 
+// ---------------------------------------------------------------------------
+// Asking for a left-pane row's frame
+//
+// The frame is captured in the page, not here: the popup sends
+// {type:"capture-preview", identity, tabId} and background.js reaches the tab's
+// content script for it. Until the branch carrying that handler is merged,
+// background has no case for this type and the message falls out of its chain
+// unanswered — so the request either comes back carrying no frame, which is
+// remembered as "cannot" below, or never settles and holds one of the in-flight
+// slots. Either way the asks stay bounded and the rows keep their placeholders;
+// the picture appears once the two halves are merged.
+//
+// The ask is on demand and bounded, because a capture is not free and can be
+// permanently impossible. Four pieces of bookkeeping, each doing one job:
+//
+//   previewPending  a request is out and no answer has come back. Also the
+//                   in-flight count, so a tab full of rows does not fire a
+//                   capture for every one of them at once.
+//   previewCannot   the answer carried no usable frame. A cross-origin <video>
+//                   taints the canvas and no later attempt untaints it, so
+//                   without this the next render asks again, forever.
+//   previewFrames   the frames this popup has received, so a row keeps its
+//                   picture across renders that happen before background has
+//                   put the frame on the record it sends back.
+//   previewSlots    the thumbnail of each row the last render painted, so an
+//                   arriving frame can be dropped onto that one row instead of
+//                   re-rendering the list under the user's cursor.
+//
+// previewFrames and previewSlots hold only what the popup window has seen; the
+// window is short-lived and both are dropped with it.
+const PREVIEW_IN_FLIGHT_CAP = 3;
+const previewPending = new Set();   // identity -> asked, no answer yet
+const previewCannot = new Set();    // identity -> answered with no frame; never re-asked
+const previewFrames = new Map();    // identity -> data URL this popup received
+const previewSlots = new Map();     // identity -> {thumb, fno} of the painted row
+
+// The tab whose content script holds the media element. An item detected on
+// another tab (the All tabs view) carries its own; otherwise it is the tab the
+// popup is watching, the same fallback the Save As message uses.
+function previewTabIdOf(item) {
+  return Number.isInteger(item && item.tabId) ? item.tabId : currentTabId;
+}
+
+// Whether this row is worth one capture request right now.
+function wantsPreview(item, identity) {
+  if (!item) return false;
+  // Already has a picture of the file: from the record, or from an answer this
+  // popup already received.
+  if (previewSrc(item.preview)) return false;
+  if (previewFrames.has(identity)) return false;
+  // Answered "cannot" once, so it cannot now either.
+  if (previewCannot.has(identity)) return false;
+  // Asked and still waiting: one request per identity, not one per render.
+  if (previewPending.has(identity)) return false;
+  // Rows that have no frame to give. A DRM stream is decoded where the page
+  // cannot read it back, so a canvas draw of that <video> returns no pixels.
+  if (item.drm) return false;
+  // Without a tab the request has nowhere to go, and without an id or a URL
+  // there is no name in it for background to match a record by. `identity` is
+  // built from exactly those two fields.
+  if (!Number.isInteger(previewTabIdOf(item))) return false;
+  if (!isSafeOpaqueId(item.id) && !(typeof item.url === "string" && item.url)) return false;
+  return true;
+}
+
+// Ask for the frames the rows just painted are missing, up to the cap. Rows the
+// cap holds back are left untouched — no pending entry, no refusal — so the
+// next render picks them up once answers free the slots.
+//
+// `identity` is itemIdentity's value, so a controller row names an opaque id and
+// a legacy row names its media URL. Background already holds both — this is the
+// same shape the cast and download messages send it — but the identity is what
+// background matches a record by, so it is the row's name that travels.
+function requestPreviews(items) {
+  if (!Array.isArray(items)) return;
+  for (const item of items) {
+    if (previewPending.size >= PREVIEW_IN_FLIGHT_CAP) return;
+    const identity = itemIdentity(item);
+    if (!wantsPreview(item, identity)) continue;
+    previewPending.add(identity);
+    Promise.resolve(send({ type: "capture-preview", identity, tabId: previewTabIdOf(item) }))
+      .then((response) => settlePreview(identity, response))
+      .catch(() => settlePreview(identity, null));
+  }
+}
+
+// One answer, one freed slot. Anything that is not a usable frame — a refusal,
+// a reply this popup cannot read, no reply at all — is remembered as "cannot",
+// because the alternative is asking again on the next render and every render
+// after it. The frame itself is checked by previewSrc: the reply is as
+// untrusted as the record field, and must not become a network fetch.
+function settlePreview(identity, response) {
+  previewPending.delete(identity);
+  const src = previewSrc(response && response.preview);
+  if (!src) { previewCannot.add(identity); return; }
+  previewFrames.set(identity, src);
+  paintPreview(identity, src);
+}
+
+// Put the frame on the one row it belongs to. Deliberately not a re-render: the
+// list is rebuilt wholesale by render(), which would drop whatever the user has
+// focused or scrolled to.
+function paintPreview(identity, src) {
+  const slot = previewSlots.get(identity);
+  if (!slot) return;                       // that row is no longer on screen
+  slot.thumb.classList.remove("ph", "cam", "file");
+  slot.thumb.replaceChildren(h("img", { src, alt: "" }), slot.fno);
+}
+
 function renderItem(item) {
   const kind = item.kind || "direct";
   const kindLabel = kind === "youtube" ? "YouTube" : kind.toUpperCase();
@@ -579,13 +697,17 @@ function renderItem(item) {
   // Thumbnail: captured frame if we have one, else a tinted placeholder.
   const camish = kind === "hls" || kind === "dash" || item.isLive;
   const fno = item.isLive ? "LIVE" : (item.duration ? fmtDuration(item.duration) : kindLabel);
-  // The media's own frame if there is one, else the per-tab page screenshot
-  // this slot already showed, else the tinted placeholder.
-  const pic = previewSrc(item.preview) || item.thumb || null;
+  // The media's own frame if there is one, else a frame this popup was already
+  // handed for this row, else the per-tab page screenshot this slot already
+  // showed, else the tinted placeholder.
+  const pic = previewSrc(item.preview) || previewFrames.get(identity) || item.thumb || null;
+  const fnoEl = h("span", { class: "fno", text: fno });
   const thumb = h("div", { class: "thumb" + (pic ? "" : " ph " + (camish ? "cam" : "file")) }, [
     pic ? h("img", { src: pic, alt: "" }) : null,
-    h("span", { class: "fno", text: fno }),
+    fnoEl,
   ]);
+  // Where a frame that arrives later goes, so it lands on this row alone.
+  previewSlots.set(identity, { thumb, fno: fnoEl });
 
   const info = h("div", { class: "item-info" }, [
     h("div", { class: "name", title: item.url, text: displayName }),

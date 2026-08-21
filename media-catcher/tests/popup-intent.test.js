@@ -496,6 +496,16 @@ function extractNamedFunction(source, name) {
   throw new Error("unbalanced braces for " + name);
 }
 
+// The popup's preview bookkeeping is `const` state rather than functions, and
+// render() now reads it. Extract the real declarations so the harness runs
+// against the real containers and the real cap.
+function extractDeclaration(source, name) {
+  const re = new RegExp("^const\\s+" + name + "\\s*=.*$", "m");
+  const m = re.exec(source);
+  if (!m) throw new Error("declaration not found: " + name);
+  return m[0];
+}
+
 function fakeClassList() {
   const values = new Set();
   return {
@@ -553,8 +563,11 @@ function loadPopupRenderHarness() {
       tag,
       props: props || {},
       children: [],
-      classList: { add() {} },
+      classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
       appendChild(child) { this.children.push(child); return child; },
+      replaceChildren() {
+        this.children = Array.from(arguments).filter((child) => child != null);
+      },
     };
     const list = children == null ? [] : (Array.isArray(children) ? children : [children]);
     for (const child of list) if (child != null) node.appendChild(child);
@@ -595,9 +608,14 @@ function loadPopupRenderHarness() {
   };
   const pieces = [
     "isSafeOpaqueId", "itemIdentity", "hostOf", "proposedFilenameOf", "displayNameOf", "fmtDuration",
-    "bitrateLabel", "mediaSizeLabel", "previewSrc", "renderQualities", "renderItem", "render",
+    "bitrateLabel", "mediaSizeLabel", "previewSrc", "renderQualities",
+    "previewTabIdOf", "wantsPreview", "requestPreviews", "settlePreview", "paintPreview",
+    "renderItem", "render",
   ].map((name) => extractNamedFunction(source, name));
-  vm.runInNewContext(pieces.join("\n") + "\nthis.render = render;", sandbox);
+  const state = [
+    "PREVIEW_IN_FLIGHT_CAP", "previewPending", "previewCannot", "previewFrames", "previewSlots",
+  ].map((name) => extractDeclaration(source, name));
+  vm.runInNewContext(state.concat(pieces).join("\n") + "\nthis.render = render;", sandbox);
   return { sandbox, starts, progress, listEl, sentMessages };
 }
 
@@ -1300,7 +1318,9 @@ test("managed Save As asks background to open a persistent opaque window", () =>
     mediaId: "media:opaque:1",
     variantId: null,
   });
-  assert.equal(h.sentMessages.length, 1);
+  // render() also asks for a frame for any row that lacks one, so this counts
+  // the message the test is about rather than every message the popup sent.
+  assert.equal(h.sentMessages.filter((m) => m.type === "open-save-as").length, 1);
 });
 
 test("a managed variant selection travels as an opaque variant ID only", () => {
@@ -1419,5 +1439,6 @@ test("non-opaque legacy rows keep the inline form and never serialize a URL", ()
   clickSaveAs(h, h.listEl.children[0]);
 
   assert.equal(openings.length, 1, "legacy rows keep their existing inline path");
-  assert.equal(h.sentMessages.length, 0, "no open-save-as message for a legacy row");
+  assert.equal(h.sentMessages.filter((m) => m.type === "open-save-as").length, 0,
+    "no open-save-as message for a legacy row");
 });
