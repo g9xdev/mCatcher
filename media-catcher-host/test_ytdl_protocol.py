@@ -5989,3 +5989,134 @@ def test_non_http_url_never_reaches_ytdlp(tmp_path, monkeypatch):
     assert lib_argv[0][-1] == "https://ok.test/v"
     assert wait_for(lambda: any(m.get("type") == "ytmeta" for m in sent),
                     timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# 50. Destination leases sharing an ancestor directory coexist
+# ---------------------------------------------------------------------------
+
+def test_sibling_destination_leases_coexist(tmp_path):
+    """Two destinations under one shared ancestor both acquire a lease."""
+    import mchost.downloads as d
+
+    left = tmp_path / "shared" / "left"
+    right = tmp_path / "shared" / "right"
+    left.mkdir(parents=True)
+    right.mkdir(parents=True)
+
+    lease_left = d._ytdl_acquire_dest_lease(str(left))
+    try:
+        assert lease_left is not None
+        lease_right = d._ytdl_acquire_dest_lease(str(right))
+        try:
+            assert lease_right is not None, (
+                "sibling destination denied a lease while %r was held" % str(left)
+            )
+        finally:
+            if lease_right is not None:
+                d._ytdl_release_dest_lease(lease_right)
+    finally:
+        d._ytdl_release_dest_lease(lease_left)
+
+
+def test_nested_destination_leases_coexist(tmp_path):
+    """A destination and a subdirectory of it both acquire a lease."""
+    import mchost.downloads as d
+
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+
+    lease_outer = d._ytdl_acquire_dest_lease(str(outer))
+    try:
+        assert lease_outer is not None
+        lease_inner = d._ytdl_acquire_dest_lease(str(inner))
+        try:
+            assert lease_inner is not None, (
+                "nested destination denied a lease while its parent was held"
+            )
+        finally:
+            if lease_inner is not None:
+                d._ytdl_release_dest_lease(lease_inner)
+    finally:
+        d._ytdl_release_dest_lease(lease_outer)
+
+
+def test_coexisting_leases_each_still_deny_rename(tmp_path):
+    """Sharing an ancestor does not weaken either destination's pin."""
+    import mchost.downloads as d
+
+    left = tmp_path / "shared" / "left"
+    right = tmp_path / "shared" / "right"
+    left.mkdir(parents=True)
+    right.mkdir(parents=True)
+
+    lease_left = d._ytdl_acquire_dest_lease(str(left))
+    lease_right = d._ytdl_acquire_dest_lease(str(right))
+    try:
+        assert lease_left is not None and lease_right is not None
+        for target in (left, right, tmp_path / "shared"):
+            try:
+                os.rename(str(target), str(target) + ".moved")
+                renamed = True
+            except OSError:
+                renamed = False
+            assert renamed is False, "pinned %r was renameable" % str(target)
+    finally:
+        if lease_left is not None:
+            d._ytdl_release_dest_lease(lease_left)
+        if lease_right is not None:
+            d._ytdl_release_dest_lease(lease_right)
+
+
+def test_created_destination_component_does_not_block_a_sibling(tmp_path):
+    """Components the lease creates are shareable by a later chain too."""
+    import mchost.downloads as d
+
+    made = tmp_path / "series"
+    first = made / "s01"
+    second = made / "s02"
+
+    lease_first = d._ytdl_acquire_dest_lease(str(first))
+    try:
+        assert lease_first is not None
+        assert first.is_dir()
+        lease_second = d._ytdl_acquire_dest_lease(str(second))
+        try:
+            assert lease_second is not None, (
+                "a freshly created ancestor blocked the next destination"
+            )
+            assert second.is_dir()
+        finally:
+            if lease_second is not None:
+                d._ytdl_release_dest_lease(lease_second)
+    finally:
+        d._ytdl_release_dest_lease(lease_first)
+
+
+def test_unvalidatable_created_component_is_removed(tmp_path):
+    """A component the chain creates but cannot validate is not left behind."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "fresh"
+    real_validate = d._ytdl_validate_dir_handle
+    rejected = []
+
+    def reject_the_created_leaf(handle):
+        final = d._ytdl_final_path(handle)
+        if type(final) is str and final.endswith(os.sep + dest.name):
+            rejected.append(final)
+            return False
+        return real_validate(handle)
+
+    d._ytdl_validate_dir_handle = reject_the_created_leaf
+    try:
+        lease = d._ytdl_acquire_dest_lease(str(dest))
+    finally:
+        d._ytdl_validate_dir_handle = real_validate
+    if lease is not None:
+        d._ytdl_release_dest_lease(lease)
+
+    assert rejected, "the created component was never validated"
+    assert lease is None
+    assert not dest.exists(), "unvalidatable created component left on disk"
