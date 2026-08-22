@@ -2649,6 +2649,47 @@ def _ytdl_close_chain(chain):
             _ytdl_close_handle(h)
 
 
+def _ytdl_live_dest_lease(key):
+    """Return the table's lease for `key` when it still holds handles.
+
+    Callers must hold _YTDL_DEST_LOCK.
+    """
+    lease = _YTDL_DEST_LEASES.get(key)
+    if lease and lease.get("handle") and lease.get("refcount", 0) > 0:
+        return lease
+    return None
+
+
+def _ytdl_open_dest_chain(root_display, components):
+    """Open root + every component, returning the handle chain or None.
+
+    Performs only syscalls: the caller owns the lease table and must not hold
+    _YTDL_DEST_LOCK across this.
+    """
+    chain = []
+    try:
+        root_h = _ytdl_open_path_root(root_display)
+        if not root_h:
+            return None
+        chain.append(root_h)
+        parent = root_h
+        for leaf in components:
+            child = _ytdl_open_or_create_component(parent, leaf)
+            if not child:
+                _ytdl_close_chain(chain)
+                return None
+            chain.append(child)
+            parent = child
+        try:
+            _ytdl_final_path(chain[-1])
+        except Exception:
+            pass
+        return chain
+    except Exception:
+        _ytdl_close_chain(chain)
+        return None
+
+
 def _ytdl_acquire_dest_lease(out_path):
     """Pin the full destination directory chain by handle with process-local refcount.
 
@@ -2672,79 +2713,65 @@ def _ytdl_acquire_dest_lease(out_path):
         return None
 
     with _YTDL_DEST_LOCK:
-        existing = _YTDL_DEST_LEASES.get(key)
-        if existing and existing.get("handle") and existing.get("refcount", 0) > 0:
+        existing = _ytdl_live_dest_lease(key)
+        if existing is not None:
             existing["refcount"] += 1
             return existing
 
-        chain = []
-        try:
-            root_h = _ytdl_open_path_root(root_display)
-            if not root_h:
-                return None
-            chain.append(root_h)
-            parent = root_h
-            for leaf in components:
-                child = _ytdl_open_or_create_component(parent, leaf)
-                if not child:
-                    _ytdl_close_chain(chain)
-                    return None
-                chain.append(child)
-                parent = child
-            final_h = chain[-1]
-            try:
-                _ytdl_final_path(final_h)
-            except Exception:
-                pass
+    # Built without the table lock. A destination on an unresponsive volume can
+    # sit in NtCreateFile for as long as the driver takes; holding the lock
+    # across that would stall every unrelated save as well as every release.
+    chain = _ytdl_open_dest_chain(root_display, components)
+    if not chain:
+        return None
 
+    surplus = None
+    with _YTDL_DEST_LOCK:
+        existing = _ytdl_live_dest_lease(key)
+        if existing is not None:
+            # Another job finished the same chain while this one was building.
+            # Share its lease and hand ours back for closing below.
+            existing["refcount"] += 1
+            lease, surplus = existing, chain
+        else:
             lease = {
                 "key": key,
-                "handle": final_h,
+                "handle": chain[-1],
                 "chain": list(chain),
                 "refcount": 1,
                 "display_path": display,
                 "closed": False,
             }
             _YTDL_DEST_LEASES[key] = lease
-            return lease
-        except Exception:
-            _ytdl_close_chain(chain)
-            return None
+    if surplus:
+        _ytdl_close_chain(surplus)
+    return lease
 
 
 def _ytdl_release_dest_lease(lease):
     if not lease or not isinstance(lease, dict):
         return
+    chain = []
     with _YTDL_DEST_LOCK:
         key = lease.get("key")
         cur = _YTDL_DEST_LEASES.get(key) if key else None
-        if cur is not lease:
-            if lease.get("closed"):
-                return
-            rc = int(lease.get("refcount") or 0) - 1
-            if rc < 0:
-                rc = 0
-            lease["refcount"] = rc
-            if rc == 0 and not lease.get("closed"):
-                lease["closed"] = True
-                chain = list(lease.get("chain") or [])
-                lease["handle"] = None
-                lease["chain"] = []
-                if chain:
-                    _ytdl_close_chain(chain)
+        if cur is not lease and lease.get("closed"):
             return
-        rc = int(cur.get("refcount") or 0) - 1
+        rc = int(lease.get("refcount") or 0) - 1
         if rc < 0:
             rc = 0
-        cur["refcount"] = rc
-        if rc == 0:
-            _YTDL_DEST_LEASES.pop(key, None)
-            cur["closed"] = True
-            chain = list(cur.get("chain") or [])
-            cur["handle"] = None
-            cur["chain"] = []
-            if chain:
-                _ytdl_close_chain(chain)
+        lease["refcount"] = rc
+        if rc == 0 and not lease.get("closed"):
+            if cur is lease:
+                _YTDL_DEST_LEASES.pop(key, None)
+            lease["closed"] = True
+            chain = list(lease.get("chain") or [])
+            lease["handle"] = None
+            lease["chain"] = []
+    # Closed outside the table lock for the same reason the chain is opened
+    # outside it: CloseHandle on a wedged volume must not stall other jobs.
+    if chain:
+        _ytdl_close_chain(chain)
 
 
 def _ytdl_create_stage_dir(dest_lease):
