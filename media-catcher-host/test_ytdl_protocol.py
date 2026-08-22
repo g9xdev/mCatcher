@@ -112,6 +112,35 @@ def _wait_terminal(sent, jid, timeout=5):
     return terms[-1]
 
 
+def _eventually(op, timeout=5.0):
+    """Retry op() until it stops raising OSError, then return its value.
+
+    A job sends its terminal frame and only then unwinds: disposing the
+    committed handle, closing the stage handle, releasing the dest lease. The
+    ordering is deliberate -- emit() even unregisters the job before the send
+    so a same-id retry can register -- so a test that touches the destination
+    straight after a terminal is racing that unwind, not observing a defect.
+    Retry briefly rather than failing on a handle that is about to close. A
+    handle that never closes still fails, at the deadline.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return op()
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _read_eventually(path, timeout=5.0):
+    """Read a saved file the worker may still be closing. See _eventually."""
+    def once():
+        with open(path, "rb") as f:
+            return f.read()
+    return _eventually(once, timeout=timeout)
+
+
 def _cmd_from_popen_calls(calls):
     assert calls, "expected Popen"
     args = calls[0][0]
@@ -175,7 +204,7 @@ def test_structured_exact_name_dir_format_token_file_bytes(tmp_path, monkeypatch
     assert term["file"] == str(final)
     assert term["bytes"] == len(payload)
     assert final.is_file()
-    assert final.read_bytes() == payload
+    assert _read_eventually(final) == payload
 
     cmd = _cmd_from_popen_calls(calls)
     assert "-f" in cmd
@@ -278,7 +307,7 @@ def test_dedup_existing_file_reports_actual_path(tmp_path, monkeypatch):
     assert term["file"] == str(expected)
     assert term["bytes"] == len(payload)
     assert existing.read_bytes() == b"OLD"
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
     cmd = _cmd_from_popen_calls(calls)
     outtmpl = cmd[cmd.index("-o") + 1]
     # Stage uses the requested safe leaf; collision is resolved only at commit.
@@ -945,7 +974,7 @@ def test_missing_nonfile_negative_size_no_ytdl_done(tmp_path, monkeypatch):
     assert term["type"] == "ytdl-done"
     assert term["attemptToken"] == "atk-neg"
     assert term["bytes"] == 3
-    assert open(term["file"], "rb").read() == b"ABC"
+    assert _read_eventually(term["file"]) == b"ABC"
 
     # Case D: reject when handle standard info reports unusable EndOfFile.
     sent.clear()
@@ -1024,7 +1053,7 @@ def test_structured_o_is_unique_staging_not_final_target(tmp_path, monkeypatch):
     assert term["file"] == str(final)
     assert term["bytes"] == len(payload)
     assert final.is_file()
-    assert final.read_bytes() == payload
+    assert _read_eventually(final) == payload
 
     cmd = _cmd_from_popen_calls(calls)
     outtmpl = cmd[cmd.index("-o") + 1]
@@ -1112,8 +1141,8 @@ def test_concurrent_same_name_distinct_staging_safe_dedup(tmp_path, monkeypatch)
 
     # Both finals exist with their full payloads (no partial clobber).
     bodies = {
-        open(term_a["file"], "rb").read(),
-        open(term_b["file"], "rb").read(),
+        _read_eventually(term_a["file"]),
+        _read_eventually(term_b["file"]),
     }
     assert bodies == {b"JOB-A-PAYLOAD", b"JOB-B-PAYLOAD"}
 
@@ -1223,7 +1252,10 @@ def test_windows_handle_commit_integration_collision_and_sentinel(tmp_path):
     assert not os.path.exists(src)
     d._ytdl_cleanup_stage_tree(stage_h)
     d._ytdl_release_dest_lease(lease)
-    assert not any(p.name.startswith(".mc-ytdl-") for p in dest.iterdir() if p.is_dir())
+    assert wait_for(
+        lambda: not any(p.name.startswith(".mc-ytdl-")
+                        for p in dest.iterdir() if p.is_dir()),
+        timeout=5), "staging tree outlived the job"
 
 # ---------------------------------------------------------------------------
 # 19. Concurrent same-destination lease/refcount + same-name commits
@@ -1272,12 +1304,12 @@ def test_concurrent_dest_lease_refcount_and_same_name_commits(tmp_path, monkeypa
     t2 = _wait_terminal(sent, "jobL2")
     assert t1["type"] == "ytdl-done" and t2["type"] == "ytdl-done"
     assert t1["file"] != t2["file"]
-    bodies = {open(t1["file"], "rb").read(), open(t2["file"], "rb").read()}
+    bodies = {_read_eventually(t1["file"]), _read_eventually(t2["file"])}
     assert bodies == {b"A" * 10, b"A" * 11}
     # Destination chain opens the immutable root via CreateFileW; components are
     # handle-relative. Process-local lease refcounting still shares one lease.
     key = d._ytdl_canon_path_key(str(dest))
-    assert d._YTDL_DEST_LEASES.get(key) is None
+    assert wait_for(lambda: d._YTDL_DEST_LEASES.get(key) is None, timeout=5),         "dest lease outlived the job"
     assert create_calls, "expected at least one root CreateFileW"
 
 
@@ -1331,7 +1363,7 @@ def test_committed_handle_blocks_replace_until_terminal(tmp_path, monkeypatch):
     term = _wait_terminal(sent, "jobOwn")
     assert term["type"] == "ytdl-done"
     assert term["bytes"] == len(payload)
-    assert term["file"] and open(term["file"], "rb").read() == payload
+    assert term["file"] and _read_eventually(term["file"]) == payload
     assert race["checked"] is True
     assert race["replace_ok"] is False
     assert race["delete_ok"] is False
@@ -1437,7 +1469,7 @@ def test_cleanup_disposition_preserves_replacement_zero_path_deletes(tmp_path, m
     assert not (dest / "clip.mp4").exists()
     # Held stage handle must have been dispositioned; outside never touched.
     assert stage_handle_box["h"] is not None
-    assert stage_handle_box["h"] in disposed_handles
+    assert wait_for(lambda: stage_handle_box["h"] in disposed_handles, timeout=5),         "stage handle never disposed"
     decoys = [p for p in dest.iterdir() if p.name.endswith(".decoy")]
     for decoy in decoys:
         assert (decoy / "decoy.mp4").read_bytes() == b"DECOY"
@@ -1687,7 +1719,7 @@ def test_post_rename_path_helper_failure_still_ytdl_done(tmp_path, monkeypatch):
     assert term["type"] == "ytdl-done"
     assert term["file"] == str(dest / "clip.mp4")
     assert term["bytes"] == len(payload)
-    assert (dest / "clip.mp4").read_bytes() == payload
+    assert _read_eventually(dest / "clip.mp4") == payload
     assert calls["n"] == 1
     assert not any(m.get("type") == "ytdl-error" and m.get("id") == "jobPost" for m in sent)
 
@@ -1795,7 +1827,7 @@ def test_cancel_first_zero_rename_commit_first_inert(tmp_path, monkeypatch):
     term2 = _wait_terminal(sent, "jobLin2")
     assert term2["type"] == "ytdl-done"
     assert term2["bytes"] == len(b"COMMITTED")
-    assert open(term2["file"], "rb").read() == b"COMMITTED"
+    assert _read_eventually(term2["file"]) == b"COMMITTED"
     assert 10 in rename_calls
     assert op.get("commit_claimed") is True
     # Cancel lost the race: no cancelled terminal, final survives.
@@ -1963,7 +1995,7 @@ def test_handle_close_once_matrix(tmp_path, monkeypatch):
         term = _wait_terminal(sent, jid, timeout=5)
         assert d._PGET.get(jid) is None
         key = d._ytdl_canon_path_key(str(dest))
-        assert d._YTDL_DEST_LEASES.get(key) is None
+        assert wait_for(lambda: d._YTDL_DEST_LEASES.get(key) is None, timeout=5),             "dest lease outlived the job"
         # Each closed handle value appears exactly once in the close tracker.
         assert len(close_calls) == len(set(close_calls)), (case, close_calls)
         return term, close_calls, k32_closes
@@ -2049,7 +2081,7 @@ def test_regression_florenfile_percent_merge_default_token(tmp_path, monkeypatch
     term = _wait_terminal(sent, "jobM")
     assert term["type"] == "ytdl-done"
     assert os.path.basename(term["file"]) == "merged-out.mp4"
-    assert open(term["file"], "rb").read() == merge_payload
+    assert _read_eventually(term["file"]) == merge_payload
 
     sent.clear()
     default_dir = dest / "Downloads"
@@ -2134,7 +2166,7 @@ def test_target_occupied_before_commit_preserves_sentinel(tmp_path, monkeypatch)
     assert term["type"] == "ytdl-done"
     assert term["file"] != str(final)
     assert os.path.basename(term["file"]) == "clip (1).mp4"
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
 
 
 # ---------------------------------------------------------------------------
@@ -2183,9 +2215,11 @@ def test_staging_cleanup_only_owned_on_all_terminals(tmp_path, monkeypatch):
             hold.set()
         term = _wait_terminal(sent, jid)
         assert unrelated.read_bytes() == keep
-        leftover = [p for p in dest.iterdir() if p.is_dir() and p.name.startswith(".mc-ytdl")]
+        def _stage_dirs():
+            return [p for p in dest.iterdir()
+                    if p.is_dir() and p.name.startswith(".mc-ytdl")]
         if case in ("success", "fail", "cancel"):
-            assert leftover == [], leftover
+            assert wait_for(lambda: _stage_dirs() == [], timeout=5), _stage_dirs()
         assert d._PGET.get(jid) is None
         return term
 
@@ -2399,7 +2433,7 @@ def test_legitimate_stage_and_merge_descendant_accepted(tmp_path, monkeypatch):
     term = _wait_terminal(sent, "jobLegit1")
     assert term["type"] == "ytdl-done"
     assert os.path.basename(term["file"]) == "wanted.mp4"
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
 
     sent.clear()
     merge_payload = b"MERGED-OUTPUT-BYTES"
@@ -2422,7 +2456,7 @@ def test_legitimate_stage_and_merge_descendant_accepted(tmp_path, monkeypatch):
     term2 = _wait_terminal(sent, "jobLegit2")
     assert term2["type"] == "ytdl-done"
     assert os.path.basename(term2["file"]) == "merged-out.mp4"
-    assert open(term2["file"], "rb").read() == merge_payload
+    assert _read_eventually(term2["file"]) == merge_payload
 
     sent.clear()
     existing = dest / "dedupe-me.mp4"
@@ -2504,7 +2538,7 @@ def test_post_rename_join_failure_claims_done_final_survives(tmp_path, monkeypat
     assert term["type"] == "ytdl-done"
     assert term["file"] == str(dest / "clip.mp4")
     assert term["bytes"] == len(payload)
-    assert (dest / "clip.mp4").read_bytes() == payload
+    assert _read_eventually(dest / "clip.mp4") == payload
     assert not any(m.get("type") == "ytdl-error" and m.get("id") == "jobClaim" for m in sent)
     # Production must not call os.path.join after NT rename success.
     assert join_after["n"] == 0
@@ -2616,7 +2650,7 @@ def test_post_claim_injected_failures_keep_done_and_final(tmp_path, monkeypatch)
         term = _wait_terminal(sent, jid)
         assert term["type"] == "ytdl-done", case
         assert term["bytes"] == len(payload), case
-        assert open(term["file"], "rb").read() == payload, case
+        assert _read_eventually(term["file"]) == payload, case
         assert not any(
             m.get("type") == "ytdl-error" and m.get("id") == jid for m in sent
         ), case
@@ -2728,7 +2762,7 @@ def test_non_bmp_leaf_relative_open_and_commit(tmp_path, monkeypatch):
     assert term["type"] == "ytdl-done"
     assert term["bytes"] == len(payload)
     assert "\U0001f600" in os.path.basename(term["file"])
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
 
     # Non-BMP destination component when the volume accepts it.
     try:
@@ -2886,7 +2920,7 @@ def test_dest_chain_relative_open_create_and_live_until_terminal(tmp_path, monke
     term = _wait_terminal(sent, "jobChain")
     assert term["type"] == "ytdl-done"
     assert nested.is_dir()
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
     # Relative creates/opens happened (chain components under a parent handle).
     assert rel_creates, "expected handle-relative component ops"
     assert any(r for r, _disp, _opt in rel_creates if r), rel_creates
@@ -2895,9 +2929,11 @@ def test_dest_chain_relative_open_create_and_live_until_terminal(tmp_path, monke
     assert live_at_send["chain"] is not None
     assert len(live_at_send["chain"]) >= 2  # root + at least final
     assert all(h for h in live_at_send["chain"])
-    # After terminal, lease released.
+    # After terminal, lease released -- part of the unwind that follows the
+    # terminal frame, so wait for it rather than racing it.
     key = d._ytdl_canon_path_key(str(nested))
-    assert d._YTDL_DEST_LEASES.get(key) is None
+    assert wait_for(lambda: d._YTDL_DEST_LEASES.get(key) is None, timeout=5), \
+        "dest lease outlived the job"
 
 
 def test_dest_reparse_component_rejected(tmp_path, monkeypatch):
@@ -2978,13 +3014,10 @@ def test_dest_parent_rename_denied_while_job_runs(tmp_path, monkeypatch):
     term = _wait_terminal(sent, "jobPin")
     assert term["type"] == "ytdl-done"
     assert race["rename_ok"] is False
-    # After terminal + lease release, rename may succeed.
-    try:
-        os.rename(str(dest), str(dest) + ".after")
-        after_ok = True
-    except OSError:
-        after_ok = False
-    assert after_ok is True
+    # After the terminal frame the worker still has to close the stage handle
+    # and release the dest lease. Wait for that unwind instead of racing it.
+    _eventually(lambda: os.rename(str(dest), str(dest) + ".after"))
+    assert os.path.isdir(str(dest) + ".after")
 
 
 def test_dest_metadata_and_open_failures_fail_closed(tmp_path, monkeypatch):
@@ -3027,7 +3060,10 @@ def test_dest_metadata_and_open_failures_fail_closed(tmp_path, monkeypatch):
     term = _wait_terminal(sent, "jobMeta")
     assert term["type"] == "ytdl-error"
     assert term["reason"] == "local_io"
-    assert not any(p.name.startswith(".mc-ytdl-") for p in dest.iterdir() if p.is_dir())
+    assert wait_for(
+        lambda: not any(p.name.startswith(".mc-ytdl-")
+                        for p in dest.iterdir() if p.is_dir()),
+        timeout=5), "staging tree outlived the job"
 
 
 def test_unc_dest_path_shape_parser():
@@ -3459,7 +3495,7 @@ def test_post_claim_return_transfer_fault_emits_done(tmp_path, monkeypatch):
         "jobXfer still registered after post-claim transfer fault"
     )
     assert final.is_file(), "committed final must survive post-claim transfer fault"
-    assert final.read_bytes() == payload
+    assert _read_eventually(final) == payload
     terminals = [
         m for m in sent
         if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == "jobXfer"
@@ -3471,7 +3507,7 @@ def test_post_claim_return_transfer_fault_emits_done(tmp_path, monkeypatch):
     assert term["file"] == str(final)
     assert term["bytes"] == len(payload)
     key = d._ytdl_canon_path_key(str(dest))
-    assert d._YTDL_DEST_LEASES.get(key) is None
+    assert wait_for(lambda: d._YTDL_DEST_LEASES.get(key) is None, timeout=5),         "dest lease outlived the job"
 
 
 # ---------------------------------------------------------------------------
@@ -4059,7 +4095,7 @@ def test_close_handle_bool_once_no_double_close(tmp_path, monkeypatch):
     term = _wait_terminal(sent, "jobCloseFinal")
     assert term["type"] == "ytdl-done"
     assert term["bytes"] == len(payload)
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
     assert not any(
         m.get("type") == "ytdl-error" and m.get("id") == "jobCloseFinal" for m in sent
     )
@@ -4199,7 +4235,7 @@ def _assert_pin_fail_e2e(r, jid):
     assert race["replace_ok"] is False, "owned handle must deny replace during ytdl-done"
     assert race["path_exists"] is True
     # After worker terminal + final close, payload is readable and renameable.
-    assert open(term["file"], "rb").read() == payload
+    assert _read_eventually(term["file"]) == payload
     terminals = [
         m for m in sent
         if m.get("type") in ("ytdl-done", "ytdl-error") and m.get("id") == jid
@@ -6120,3 +6156,138 @@ def test_unvalidatable_created_component_is_removed(tmp_path):
     assert rejected, "the created component was never validated"
     assert lease is None
     assert not dest.exists(), "unvalidatable created component left on disk"
+
+
+# ---------------------------------------------------------------------------
+# 51. A stalled volume holds up only its own destination
+# ---------------------------------------------------------------------------
+
+def _acquire_in_thread(d, path, out, key):
+    def run():
+        out[key] = d._ytdl_acquire_dest_lease(path)
+    t = threading.Thread(target=run)
+    t.start()
+    return t
+
+
+def test_stalled_chain_build_does_not_block_an_unrelated_lease(tmp_path):
+    """An acquire stuck in NtCreateFile leaves other destinations acquirable."""
+    import mchost.downloads as d
+
+    stalled = tmp_path / "stalled"
+    other = tmp_path / "other"
+    stalled.mkdir()
+    other.mkdir()
+
+    real_open = d._ytdl_open_or_create_component
+    reached = threading.Event()
+    resume = threading.Event()
+
+    def stall_on_the_leaf(parent, leaf):
+        if leaf == "stalled":
+            reached.set()
+            resume.wait(timeout=10)
+        return real_open(parent, leaf)
+
+    out = {}
+    threads = []
+    d._ytdl_open_or_create_component = stall_on_the_leaf
+    try:
+        threads.append(_acquire_in_thread(d, str(stalled), out, "stalled"))
+        assert reached.wait(timeout=5), "the stalling open was never reached"
+        fast = _acquire_in_thread(d, str(other), out, "other")
+        threads.append(fast)
+        fast.join(timeout=5)
+        assert not fast.is_alive(), "unrelated acquire blocked behind the stall"
+        assert out.get("other") is not None
+    finally:
+        resume.set()
+        for t in threads:
+            t.join(timeout=10)
+        d._ytdl_open_or_create_component = real_open
+        for lease in out.values():
+            if lease is not None:
+                d._ytdl_release_dest_lease(lease)
+
+
+def test_stalled_release_does_not_block_an_unrelated_lease(tmp_path):
+    """A release stuck in CloseHandle leaves other destinations acquirable."""
+    import mchost.downloads as d
+
+    closing = tmp_path / "closing"
+    other = tmp_path / "other"
+    closing.mkdir()
+    other.mkdir()
+
+    held = d._ytdl_acquire_dest_lease(str(closing))
+    assert held is not None
+
+    real_close = d._ytdl_close_handle
+    reached = threading.Event()
+    resume = threading.Event()
+
+    def stall_on_close(handle):
+        reached.set()
+        resume.wait(timeout=10)
+        return real_close(handle)
+
+    out = {}
+    threads = []
+    d._ytdl_close_handle = stall_on_close
+    releaser = threading.Thread(target=lambda: d._ytdl_release_dest_lease(held))
+    releaser.start()
+    threads.append(releaser)
+    try:
+        assert reached.wait(timeout=5), "the stalling close was never reached"
+        d._ytdl_close_handle = real_close
+        fast = _acquire_in_thread(d, str(other), out, "other")
+        threads.append(fast)
+        fast.join(timeout=5)
+        assert not fast.is_alive(), "unrelated acquire blocked behind the stall"
+        assert out.get("other") is not None
+    finally:
+        resume.set()
+        for t in threads:
+            t.join(timeout=10)
+        d._ytdl_close_handle = real_close
+        for lease in out.values():
+            if lease is not None:
+                d._ytdl_release_dest_lease(lease)
+
+
+def test_racing_leases_for_one_destination_close_every_handle(tmp_path):
+    """Two acquires racing for one destination leave nothing pinned after release."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "raced"
+    dest.mkdir()
+
+    ready = threading.Barrier(2, timeout=10)
+    real_root = d._ytdl_open_path_root
+
+    def synchronised_root(root_display):
+        try:
+            ready.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return real_root(root_display)
+
+    out = {}
+    d._ytdl_open_path_root = synchronised_root
+    try:
+        first = _acquire_in_thread(d, str(dest), out, "a")
+        second = _acquire_in_thread(d, str(dest), out, "b")
+        first.join(timeout=10)
+        second.join(timeout=10)
+    finally:
+        d._ytdl_open_path_root = real_root
+
+    assert out.get("a") is not None and out.get("b") is not None
+    key = out["a"]["key"]
+    for lease in (out["a"], out["b"]):
+        d._ytdl_release_dest_lease(lease)
+
+    assert key not in d._YTDL_DEST_LEASES, "lease survived both releases"
+    # Any surplus chain the losing racer built must be closed too, or the
+    # destination stays pinned by handles nothing tracks any more.
+    os.rename(str(dest), str(dest) + ".moved")
