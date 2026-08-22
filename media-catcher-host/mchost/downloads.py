@@ -2499,17 +2499,51 @@ def _ytdl_dir_access_min():
     )
 
 
-def _ytdl_dir_access_full():
-    """Full dir access for create/rename-root/stage parents when granted."""
+def _ytdl_dir_access_create():
+    """Create/rename-root/stage-parent access for a chain component.
+
+    DELETE is deliberately absent. Every chain handle withholds
+    FILE_SHARE_DELETE, so a component granted DELETE cannot be opened again
+    by a second job whose destination shares that ancestor. Pinning comes
+    from the withheld share bit, not from holding DELETE, so omitting it
+    lets sibling and nested destinations coexist without weakening the pin.
+    """
     return (
-        _YTDL_DELETE
-        | _YTDL_FILE_LIST_DIRECTORY
+        _YTDL_FILE_LIST_DIRECTORY
         | _YTDL_FILE_ADD_FILE
         | _YTDL_FILE_ADD_SUBDIRECTORY
         | _YTDL_FILE_TRAVERSE
         | _YTDL_FILE_READ_ATTRIBUTES
         | _YTDL_SYNCHRONIZE
     )
+
+
+def _ytdl_delete_created_component(parent_handle, leaf, file_id):
+    """Remove a component this chain just created, identity-checked by FileId.
+
+    Chain handles carry no DELETE, so the created handle cannot mark itself.
+    Reopen for DELETE only after the caller has closed its handle, and act
+    only when the object at `leaf` is still the one that was created.
+    """
+    if file_id is None:
+        return
+    options = (
+        _YTDL_FILE_DIRECTORY_FILE
+        | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
+        | _YTDL_FILE_OPEN_REPARSE_POINT
+    )
+    h = _ytdl_nt_create_relative(
+        parent_handle, leaf, _YTDL_DELETE | _ytdl_dir_access_min(),
+        _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE,
+        _YTDL_FILE_OPEN, options,
+    )
+    if not h:
+        return
+    try:
+        if _ytdl_query_file_id(h) == file_id:
+            _ytdl_set_disposition_delete(h)
+    finally:
+        _ytdl_close_handle(h)
 
 
 def _ytdl_open_path_root(root_display):
@@ -2546,7 +2580,8 @@ def _ytdl_open_or_create_component(parent_handle, leaf):
     """Open existing or atomically create a directory component relative to parent.
 
     Never exists-checks via pathname. On FILE_CREATE name collision, reopen + validate.
-    Prefer full access; fall back to traverse/list when the object denies ADD/DELETE.
+    Prefer create access; fall back to traverse/list when the object denies ADD.
+    No open requests DELETE, so chains sharing an ancestor do not lock each other out.
     Every open uses FILE_OPEN_REPARSE_POINT; never retry without it.
     """
     share = _YTDL_FILE_SHARE_READ | _YTDL_FILE_SHARE_WRITE
@@ -2562,7 +2597,7 @@ def _ytdl_open_or_create_component(parent_handle, leaf):
         )
 
     h = None
-    for desired in (_ytdl_dir_access_full(), _ytdl_dir_access_min()):
+    for desired in (_ytdl_dir_access_create(), _ytdl_dir_access_min()):
         h = _try_open(desired, options_open)
         if h:
             break
@@ -2572,26 +2607,27 @@ def _ytdl_open_or_create_component(parent_handle, leaf):
             return None
         return h
 
-    # Missing: atomic create with full access.
+    # Missing: atomic create with create access.
     options_create = (
         _YTDL_FILE_DIRECTORY_FILE
         | _YTDL_FILE_SYNCHRONOUS_IO_NONALERT
         | _YTDL_FILE_OPEN_REPARSE_POINT
     )
     h, code = _ytdl_nt_create_relative_status(
-        parent_handle, leaf, _ytdl_dir_access_full(), share,
+        parent_handle, leaf, _ytdl_dir_access_create(), share,
         _YTDL_FILE_CREATE, options_create,
         file_attributes=_YTDL_FILE_ATTRIBUTE_DIRECTORY,
     )
     if h:
         if not _ytdl_validate_dir_handle(h):
-            _ytdl_set_disposition_delete(h)
+            created_id = _ytdl_query_file_id(h)
             _ytdl_close_handle(h)
+            _ytdl_delete_created_component(parent_handle, leaf, created_id)
             return None
         return h
     if code == _YTDL_STATUS_OBJECT_NAME_COLLISION:
         # Collision: only the same reparse-aware open + revalidate.
-        for desired in (_ytdl_dir_access_full(), _ytdl_dir_access_min()):
+        for desired in (_ytdl_dir_access_create(), _ytdl_dir_access_min()):
             h = _try_open(desired, options_open)
             if h:
                 break
