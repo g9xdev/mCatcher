@@ -2518,14 +2518,32 @@ def _ytdl_dir_access_create():
     )
 
 
+def _ytdl_distinguishing_file_id(file_id):
+    """True when this id can tell two objects on its volume apart.
+
+    _ytdl_query_file_id already drops the all-zero sentinel. A volume with no
+    real 128-bit ids can answer with a constant instead, and an id every object
+    shares would make an identity check pass for the wrong object.
+    """
+    if not file_id:
+        return False
+    _serial, fid = file_id
+    return fid not in (b"\x00" * 16, b"\xff" * 16)
+
+
 def _ytdl_delete_created_component(parent_handle, leaf, file_id):
     """Remove a component this chain just created, identity-checked by FileId.
 
     Chain handles carry no DELETE, so the created handle cannot mark itself.
     Reopen for DELETE only after the caller has closed its handle, and act
     only when the object at `leaf` is still the one that was created.
+
+    The reopen is the one window here: between the close and it, `leaf` can be
+    replaced. Only an id that distinguishes objects closes that window, so an
+    unusable one means leaving an empty directory behind rather than risking
+    the deletion of whatever took its place.
     """
-    if file_id is None:
+    if not _ytdl_distinguishing_file_id(file_id):
         return
     options = (
         _YTDL_FILE_DIRECTORY_FILE
@@ -2726,23 +2744,31 @@ def _ytdl_acquire_dest_lease(out_path):
         return None
 
     surplus = None
-    with _YTDL_DEST_LOCK:
-        existing = _ytdl_live_dest_lease(key)
-        if existing is not None:
-            # Another job finished the same chain while this one was building.
-            # Share its lease and hand ours back for closing below.
-            existing["refcount"] += 1
-            lease, surplus = existing, chain
-        else:
-            lease = {
-                "key": key,
-                "handle": chain[-1],
-                "chain": list(chain),
-                "refcount": 1,
-                "display_path": display,
-                "closed": False,
-            }
-            _YTDL_DEST_LEASES[key] = lease
+    try:
+        with _YTDL_DEST_LOCK:
+            existing = _ytdl_live_dest_lease(key)
+            if existing is not None:
+                # Another job finished the same chain while this one was
+                # building. Share its lease and hand ours back for closing.
+                existing["refcount"] += 1
+                lease, surplus = existing, chain
+            else:
+                lease = {
+                    "key": key,
+                    "handle": chain[-1],
+                    "chain": list(chain),
+                    "refcount": 1,
+                    "display_path": display,
+                    "closed": False,
+                }
+                _YTDL_DEST_LEASES[key] = lease
+    except Exception:
+        # The chain is open and no lease owns it, so this frame is the only one
+        # that can still close it: a caller holding no lease has nothing to
+        # release, and the destination would stay pinned until the host exits.
+        # One try covered the build and the install before they were split.
+        _ytdl_close_chain(chain)
+        return None
     if surplus:
         _ytdl_close_chain(surplus)
     return lease

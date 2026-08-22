@@ -6291,3 +6291,67 @@ def test_racing_leases_for_one_destination_close_every_handle(tmp_path):
     # Any surplus chain the losing racer built must be closed too, or the
     # destination stays pinned by handles nothing tracks any more.
     os.rename(str(dest), str(dest) + ".moved")
+
+
+# ---------------------------------------------------------------------------
+# 52. The chain is owned until a lease owns it
+# ---------------------------------------------------------------------------
+
+def test_lease_install_fault_closes_the_chain(tmp_path, monkeypatch):
+    """A fault installing the lease must not leave the chain pinning the folder."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "installfault"
+    dest.mkdir()
+
+    real_live = d._ytdl_live_dest_lease
+    seen = []
+
+    def fault_on_install(key):
+        # The first call is the fast-path probe, before any handle is open. The
+        # second runs with a built chain that only this frame can still close.
+        seen.append(key)
+        if len(seen) == 1:
+            return real_live(key)
+        raise MemoryError("install fault")
+
+    monkeypatch.setattr(d, "_ytdl_live_dest_lease", fault_on_install)
+    lease = d._ytdl_acquire_dest_lease(str(dest))
+    monkeypatch.undo()
+    if lease is not None:
+        d._ytdl_release_dest_lease(lease)
+
+    assert len(seen) == 2, seen
+    assert lease is None
+    # A leaked chain would still be pinning the destination.
+    os.rename(str(dest), str(dest) + ".moved")
+
+
+def test_created_component_cleanup_skips_an_unusable_file_id(tmp_path, monkeypatch):
+    """A volume answering with one constant id must not authorise the delete."""
+    import mchost.downloads as d
+
+    dest = tmp_path / "fresh"
+    real_validate = d._ytdl_validate_dir_handle
+    real_id = d._ytdl_query_file_id
+
+    def reject_the_created_leaf(handle):
+        final = d._ytdl_final_path(handle)
+        if type(final) is str and final.endswith(os.sep + dest.name):
+            return False
+        return real_validate(handle)
+
+    def one_id_for_everything(handle):
+        got = real_id(handle)
+        return None if got is None else (got[0], bytes([0xFF]) * 16)
+
+    monkeypatch.setattr(d, "_ytdl_validate_dir_handle", reject_the_created_leaf)
+    monkeypatch.setattr(d, "_ytdl_query_file_id", one_id_for_everything)
+    lease = d._ytdl_acquire_dest_lease(str(dest))
+    monkeypatch.undo()
+    if lease is not None:
+        d._ytdl_release_dest_lease(lease)
+
+    assert lease is None
+    assert dest.is_dir(), \
+        "an id that cannot tell two objects apart must not authorise a delete"
